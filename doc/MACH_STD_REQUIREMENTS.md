@@ -1,6 +1,6 @@
 # Required mach-std work
 
-This file is the temporary issue backlog for upstream `mach-std`. Each numbered section is intended to become one focused issue. The contracts are defined against all supported platforms so downstream libraries do not freeze assumptions from one operating system.
+This file records the standard-library contracts needed for a production service stack. Implementation is tracked in the [`mach-std` v0.29.0 milestone](https://github.com/briar-systems/mach-std/milestone/3). The contracts are defined against all supported platforms so downstream libraries do not freeze assumptions from one operating system.
 
 ## Dependency order
 
@@ -25,11 +25,15 @@ This file is the temporary issue backlog for upstream `mach-std`. Each numbered 
 15 checked byte cursor
 16 test and fault facilities
 17 target-native CI
+
+4 operation completion
+  -> 18 asynchronous name resolution
+  -> 19 asynchronous local sockets
 ```
 
 ## 1. Native resource handles and normalized I/O errors
 
-**Proposed issue:** `feat(os): define native resource handles and normalized I/O errors`
+**Upstream issue:** [`mach-std#484`](https://github.com/briar-systems/mach-std/issues/484)
 
 ### Need
 
@@ -52,7 +56,7 @@ Portable networking currently exposes an `i32` file descriptor assumption. Windo
 
 ## 2. General IPv4 and IPv6 endpoints
 
-**Proposed issue:** `feat(net): make endpoints dual-stack and transport-neutral`
+**Upstream issue:** [`mach-std#485`](https://github.com/briar-systems/mach-std/issues/485)
 
 ### Need
 
@@ -73,7 +77,7 @@ The address union already represents IPv6, but TCP endpoints remain IPv4-specifi
 
 ## 3. Atomic socket creation and production options
 
-**Proposed issue:** `feat(net): expose atomic socket flags and production socket options`
+**Upstream issue:** [`mach-std#486`](https://github.com/briar-systems/mach-std/issues/486)
 
 ### Need
 
@@ -95,7 +99,7 @@ Servers must not race while adding nonblocking or close-on-exec state after crea
 
 ## 4. Portable operation-completion runtime
 
-**Proposed issue:** `feat(io): add a portable operation-completion runtime`
+**Upstream issue:** [`mach-std#487`](https://github.com/briar-systems/mach-std/issues/487)
 
 ### Need
 
@@ -126,7 +130,7 @@ HTTP, TLS, QUIC, MQTT, LSP, files, timers, and process control need one scalable
 
 ## 5. Monotonic timers and runtime wakeups
 
-**Proposed issue:** `feat(io): integrate monotonic timers and wakeups`
+**Upstream issue:** [`mach-std#488`](https://github.com/briar-systems/mach-std/issues/488)
 
 ### Need
 
@@ -148,7 +152,7 @@ Connection deadlines, retries, QUIC recovery, ACME renewal, cache expiry, and gr
 
 ## 6. Hierarchical cancellation
 
-**Proposed issue:** `feat(sync): add hierarchical cancellation scopes`
+**Upstream issue:** [`mach-std#489`](https://github.com/briar-systems/mach-std/issues/489)
 
 ### Need
 
@@ -170,7 +174,7 @@ Process shutdown, listener drain, connection close, request deadlines, upstream 
 
 ## 7. Complete asynchronous TCP and UDP operations
 
-**Proposed issue:** `feat(net): implement asynchronous tcp and udp over std io`
+**Upstream issue:** [`mach-std#490`](https://github.com/briar-systems/mach-std/issues/490)
 
 ### Need
 
@@ -193,7 +197,7 @@ The blocking socket surface cannot drive high connection counts, TLS state, or Q
 
 ## 8. Asynchronous and transfer-oriented files
 
-**Proposed issue:** `feat(io): add asynchronous file operations and transfer metadata`
+**Upstream issue:** [`mach-std#491`](https://github.com/briar-systems/mach-std/issues/491)
 
 ### Need
 
@@ -215,7 +219,7 @@ Static files, logs, caches, certificates, and configuration reload require file 
 
 ## 9. Sleeping synchronization primitives
 
-**Proposed issue:** `feat(sync): add mutex, condition, semaphore, and once primitives`
+**Upstream issue:** [`mach-std#492`](https://github.com/briar-systems/mach-std/issues/492)
 
 ### Need
 
@@ -237,7 +241,7 @@ The current spin mutex is suitable only for extremely short contention. Work que
 
 ## 10. Bounded queues and worker pools
 
-**Proposed issue:** `feat(sync): add bounded channels and worker pools`
+**Upstream issue:** [`mach-std#493`](https://github.com/briar-systems/mach-std/issues/493)
 
 ### Need
 
@@ -259,7 +263,7 @@ File adapters, CPU-heavy cryptography, compression, application work, and teleme
 
 ## 11. Portable process lifecycle events
 
-**Proposed issue:** `feat(process): expose termination and reload events`
+**Upstream issue:** [`mach-std#494`](https://github.com/briar-systems/mach-std/issues/494)
 
 ### Need
 
@@ -281,7 +285,7 @@ Production services must react to native stop, interrupt, reload, console, and s
 
 ## 12. Interruptible listeners and graceful resource close
 
-**Proposed issue:** `feat(io): define close and drain behavior for live resources`
+**Upstream issue:** [`mach-std#495`](https://github.com/briar-systems/mach-std/issues/495)
 
 ### Need
 
@@ -303,7 +307,7 @@ Closing a listener or runtime during shutdown must reliably unblock waiters and 
 
 ## 13. Thread resource ownership
 
-**Proposed issue:** `fix(sync): make thread resources reclaimable on every target`
+**Upstream issue:** [`mach-std#496`](https://github.com/briar-systems/mach-std/issues/496)
 
 ### Need
 
@@ -325,7 +329,7 @@ Thread stacks, startup contexts, handles, and completion state require one porta
 
 ## 14. Atomic structured output
 
-**Proposed issue:** `feat(io): support atomic record writes for concurrent logs`
+**Upstream issue:** [`mach-std#497`](https://github.com/briar-systems/mach-std/issues/497)
 
 ### Need
 
@@ -347,7 +351,7 @@ Current logging emits one record through multiple writes, so concurrent records 
 
 ## 15. Checked bounded byte cursor
 
-**Proposed issue:** `feat(types): add checked byte cursor and builder primitives`
+**Upstream issue:** [`mach-std#498`](https://github.com/briar-systems/mach-std/issues/498)
 
 ### Need
 
@@ -370,7 +374,7 @@ HTTP, TLS, QUIC, DNS, MQTT, compression, and file formats all need bounds-checke
 
 ## 16. Deterministic fault and network test facilities
 
-**Proposed issue:** `feat(test): add deterministic io and allocation fault facilities`
+**Upstream issue:** [`mach-std#499`](https://github.com/briar-systems/mach-std/issues/499)
 
 ### Need
 
@@ -392,7 +396,7 @@ Production protocol code must test every short operation and failure point witho
 
 ## 17. Native CI for supported runtime targets
 
-**Proposed issue:** `ci: run the complete runtime suite on native supported targets`
+**Upstream issue:** [`mach-std#500`](https://github.com/briar-systems/mach-std/issues/500)
 
 ### Need
 
@@ -411,13 +415,55 @@ Networking, signals, IOCP, kqueue, filesystem behavior, and thread lifetime cann
 - release tags require the supported target matrix
 - socket, timer, cancellation, thread, process, and file suites are never selectively omitted without a recorded support change
 
-## Upstream issue conversion
+## 18. Asynchronous system name resolution
 
-When these sections move upstream:
+**Upstream issue:** [`mach-std#501`](https://github.com/briar-systems/mach-std/issues/501)
 
-1. Verify the current `mach-std` source because its active branch may already address part of a requirement.
-2. Open one issue per numbered contract.
-3. Preserve cross-platform acceptance criteria even when the first implementation lands on one target.
-4. Link dependent issues rather than weakening their public contract.
-5. Remove a section from this file only after the upstream issue exists and is linked here.
+### Need
 
+Outbound clients and certificate automation need system-policy name resolution without blocking an I/O owner or assuming one IPv4 result.
+
+### Contract
+
+- resolution is an asynchronous operation with a stable token and caller context
+- queries cover host, service, family, socket kind, protocol, and resolver flags
+- results are bounded, ordered endpoints with optional canonical names
+- numeric addresses take a nonblocking fast path
+- deadlines and cancellation resolve through the common operation model
+- result storage has explicit allocator and lifetime ownership
+- targets without native asynchronous resolution use a bounded worker adapter
+
+### Acceptance
+
+- tests cover numeric IPv4 and IPv6, local names, service names, no result, multiple results, cancellation, and deadlines
+- resolution does not block the runtime owner
+- fallback workers remain bounded under saturation
+- controlled resolver inputs produce deterministic ordering
+
+## 19. Asynchronous local transports
+
+**Upstream issue:** [`mach-std#502`](https://github.com/briar-systems/mach-std/issues/502)
+
+### Need
+
+Administrative endpoints, process supervision, and local service integration need a portable asynchronous transport without forcing TCP onto the host network stack.
+
+### Contract
+
+- a tagged local endpoint represents filesystem paths, abstract names, and target-specific named endpoints
+- listeners and streams support bind, listen, accept, connect, read, write, shutdown, and close through the common operation model
+- byte streams are the portable baseline, with message or datagram behavior exposed only as capabilities
+- path ownership, permissions, stale endpoint removal, cleanup, and rename behavior are explicit
+- peer identity is exposed where the target can provide it
+- truncation is observable for message-oriented variants
+
+### Acceptance
+
+- native lifecycle and cleanup tests run on Linux, Darwin, and Windows
+- Linux tests cover filesystem and abstract namespace endpoints
+- Windows tests cover AF_UNIX or a contract-compatible named-pipe backend
+- peer identity, saturation, cancellation, and close races are tested where supported
+
+## Synchronization policy
+
+The upstream issue is the implementation-status source. Keep this file aligned with accepted contract changes, preserve cross-platform acceptance criteria when implementation lands incrementally, and link follow-up issues rather than weakening a public contract.
