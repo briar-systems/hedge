@@ -46,7 +46,7 @@ kind = "static"
 root = "./public"
 
 [service.application]
-kind = "mach-web"
+kind = "laurel"
 application = "site"
 ```
 
@@ -84,4 +84,3 @@ Providers may include restricted files, environment delivery, operating-system s
 ## Lightweight behavior
 
 Disabled sections create no worker, timer, cache, or background task. Default configuration does not enable proxying, caching, ACME, admin networking, templates, or application sessions.
-
