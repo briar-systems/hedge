@@ -25,7 +25,7 @@ mach-tls
 
 mach-http
   <- mach-acme
-  <- mach-web
+  <- laurel
   <- hedge
 
 mach-quic
@@ -34,7 +34,7 @@ mach-quic
 mach-acme
   <- hedge
 
-mach-web
+laurel
   <- hedge
   <- applications
 ```
@@ -93,7 +93,7 @@ HTTP/3 belongs in `mach-http` because it is an HTTP mapping. The generic QUIC tr
 
 ACME owns accounts, nonces, orders, authorizations, challenges, finalization, certificate retrieval, renewal scheduling, and durable state contracts. Challenge presentation is injected by the server product.
 
-## `mach-web`
+## Laurel
 
 The framework owns application concerns:
 
@@ -121,9 +121,8 @@ Hedge owns the operated product:
 - logging, metrics, tracing, health, readiness, and administration
 - packaging and production compatibility guarantees
 
-Hedge must remain usable without `mach-web`. The framework must remain usable without Hedge.
+Hedge must remain usable without Laurel. Laurel must remain usable without Hedge.
 
 ## Site repositories
 
 A site repository owns content, application code, configuration, migrations, and deployment declarations. It consumes released project contracts and does not become a hidden integration layer for missing server capabilities.
-

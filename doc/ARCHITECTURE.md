@@ -28,7 +28,7 @@ connection plane
   protocol selection, tls, quic, http engines
 
 service plane
-  static files, proxy pools, mach-web applications
+  static files, proxy pools, Laurel applications
 
 telemetry plane
   logs, metrics, traces, health, readiness
@@ -132,7 +132,7 @@ Virtual-host selection precedes route selection. A route resolves to one of:
 - reverse proxy service
 - load-balanced upstream service
 - redirect or fixed response
-- `mach-web` application
+- Laurel application
 - native handler implementing the HTTP service contract
 
 Middleware wraps services through explicit before, after, and error paths. The core does not build a heap-allocated chain for every request. A compiled route graph references immutable middleware plans.
@@ -157,7 +157,7 @@ Caching is an optional service layer with independent memory and disk stores. It
 
 ## Web applications
 
-`mach-web` applications receive only the common HTTP service exchange and framework services declared during composition. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities through typed providers.
+Laurel applications receive only the common HTTP service exchange and framework services declared during composition. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities through typed providers.
 
 Applications cannot reach listener or connection internals. Server reload can replace an application generation without invalidating exchanges already executing in the old generation.
 
@@ -201,4 +201,3 @@ The product remains lightweight through structural choices:
 - one telemetry event construction per event
 
 Lightweight is measured with idle memory, idle wakeups, binary sections, allocations per request, and latency distributions. It is not inferred from source line count.
-

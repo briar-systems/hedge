@@ -9,7 +9,7 @@ Hedge treats every network peer, request field, uploaded byte, upstream response
 - TLS authenticates transport peers according to configured certificate policy.
 - HTTP parsing establishes message boundaries before any routing or middleware decision.
 - Hedge configuration establishes server policy before listeners become ready.
-- Mach Web establishes application-level identity and authorization separately from transport identity.
+- Laurel establishes application-level identity and authorization separately from transport identity.
 
 ## Threat classes
 
@@ -65,4 +65,3 @@ Certificate private keys support reload without exposing mutable key state to re
 Before public release, this section will name a private security contact, expected acknowledgment interval, supported versions, disclosure process, and encrypted reporting channel.
 
 Until then, the local scaffold is not a deployed security-reporting endpoint.
-
