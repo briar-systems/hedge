@@ -33,22 +33,22 @@ Lightweight does not mean omitting production duties. It means that protocol eng
 - `mach-web` provides the production web application framework.
 - `hedge` assembles those libraries into an operated server.
 
-See [Project boundaries](docs/PROJECTS.md) and [Architecture](docs/ARCHITECTURE.md) for the dependency contracts.
+See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md) for the dependency contracts.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Project boundaries](docs/PROJECTS.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Production requirements](docs/PRODUCTION.md)
-- [Security model](docs/SECURITY.md)
-- [Configuration model](docs/CONFIGURATION.md)
-- [Required mach-std work](docs/MACH_STD_REQUIREMENTS.md)
-- [Validation strategy](docs/VALIDATION.md)
+- [Architecture](doc/ARCHITECTURE.md)
+- [Project boundaries](doc/PROJECTS.md)
+- [Roadmap](doc/ROADMAP.md)
+- [Production requirements](doc/PRODUCTION.md)
+- [Security model](doc/SECURITY.md)
+- [Configuration model](doc/CONFIGURATION.md)
+- [Required mach-std work](doc/MACH_STD_REQUIREMENTS.md)
+- [Validation strategy](doc/VALIDATION.md)
 
 ## Local development
 
-All dependencies are local path dependencies. The repositories have no remote configured during scaffolding.
+All dependencies are pinned to released Git tags.
 
 ```sh
 mach dep pull
@@ -56,5 +56,4 @@ mach test .
 mach build .
 ```
 
-Build output is written to the shared sibling directory `.mach-out`, outside this repository.
-
+Build output uses Mach's default `out/` directory.
