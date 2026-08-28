@@ -1,0 +1,343 @@
+# binds one laurel application to the hedge service handler contract
+#
+# hedge dispatch knows nothing about laurel: this adapter is registered into the
+# application table like any other handler, and every service kind still crosses
+# the same bounded boundary. the dependency is one directional, so laurel gains
+# no hedge symbol.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.view;
+use std.types.char.char;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use A: std.allocator;
+use http.core.exchange;
+use laurel.app;
+use laurel.context;
+use laurel.handler;
+use laurel.middleware;
+use laurel.observability;
+use call: hedge.dispatch.call;
+use service: hedge.service;
+use trace: hedge.telemetry.trace;
+
+# one request identifier, rendered from the hedge trace context, so laurel's
+# request events and hedge's telemetry describe the same request rather than two
+# independently generated ones
+pub val REQUEST_ID_BYTES: usize = 32;
+
+pub rec Adapter {
+    application: *app.App;
+    terminal: handler.Handler;
+    bound: bool;
+}
+
+fun hex_digit(value: u8) char {
+    if (value < 10) { ret ('0'::u8 + value)::char; }
+    ret ('a'::u8 + value - 10)::char;
+}
+
+fun render_request_id(source: *trace.Context, output: *char) bool {
+    if (source == nil || output == nil) { ret false; }
+    var i: usize = 0;
+    var difference: u8 = 0;
+    for (i < 16) {
+        val byte: u8 = source.trace_id[i];
+        difference = difference | byte;
+        output[i * 2] = hex_digit(byte >> 4);
+        output[i * 2 + 1] = hex_digit(byte & 0x0f);
+        i = i + 1;
+    }
+    ret difference != 0;
+}
+
+# a rendered error is a complete response; an unmapped one is not
+fun status_for(outcome: middleware.Outcome) exchange.ServiceStatus {
+    if (outcome.status == middleware.EXECUTION_RESPOND ||
+        outcome.status == middleware.EXECUTION_ERROR_RENDERED) {
+        ret exchange.SERVICE_COMPLETE;
+    }
+    ret exchange.SERVICE_FAILED;
+}
+
+pub fun serve(owner: ptr, active: *call.Call) exchange.ServiceStatus {
+    if (owner == nil || active == nil || !call.entered(active)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    val adapter: *Adapter = owner::*Adapter;
+    if (!adapter.bound || adapter.application == nil) {
+        ret exchange.SERVICE_FAILED;
+    }
+    val bound: *exchange.Exchange = active.exchange;
+    val arena: *A.Allocator = call.allocator_of(active);
+    if (bound == nil || arena == nil || call.cancelled(active)) {
+        ret exchange.SERVICE_FAILED;
+    }
+
+    # the request context and its identifier live in the request arena, which is
+    # reset only once disposition and the exchange have both settled, so two
+    # concurrent calls never share them
+    val allocated: Result[*context.Context, *u8] =
+        A.zallocate[context.Context](arena, 1);
+    if (is_err[*context.Context, *u8](allocated)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    val identifier: Result[*char, *u8] = A.allocate[char](arena, REQUEST_ID_BYTES);
+    if (is_err[*char, *u8](identifier)) { ret exchange.SERVICE_FAILED; }
+    val request_context: *context.Context =
+        unwrap_ok[*context.Context, *u8](allocated);
+    val identifier_bytes: *char = unwrap_ok[*char, *u8](identifier);
+    if (!render_request_id(active.telemetry, identifier_bytes)) {
+        ret exchange.SERVICE_FAILED;
+    }
+
+    if (!app.bind_context(adapter.application, request_context, bound,
+            context.Params{items: nil, len: 0, generation: bound.generation},
+            arena, view.View{data: identifier_bytes, len: REQUEST_ID_BYTES})) {
+        ret exchange.SERVICE_FAILED;
+    }
+
+    val outcome: middleware.Outcome = app.execute(adapter.application,
+        adapter.terminal, request_context);
+    val served: exchange.ServiceStatus = status_for(outcome);
+
+    # release is unconditional: success, handler error, and cancellation each
+    # return the reservation exactly once
+    if (!app.release_context(adapter.application, request_context)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret served;
+}
+
+pub fun make(adapter: *Adapter, application: *app.App,
+    terminal: handler.Handler) bool {
+    if (adapter == nil || application == nil || adapter.bound ||
+        !application.valid || terminal.call::usize == 0) { ret false; }
+    adapter.application = application;
+    adapter.terminal = terminal;
+    adapter.bound = true;
+    ret true;
+}
+
+pub fun bound_handler(adapter: *Adapter) service.Handler {
+    if (adapter == nil || !adapter.bound) { ret service.no_handler(); }
+    ret service.Handler{ctx: adapter::ptr, serve: serve};
+}
+
+use std.types.string.str;
+use std.chrono.time;
+use std.sync.cancel;
+use R: std.types.result;
+use http.core.body;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use laurel.error;
+use laurel.lifecycle;
+use laurel.provider;
+use laurel.router;
+use laurel.security;
+
+rec Probe { calls: usize; events: usize; }
+
+fun probe_start(owner: ptr) R.Result[lifecycle.CallbackStatus, view.View] {
+    ret R.ok[lifecycle.CallbackStatus, view.View](lifecycle.CALLBACK_DONE);
+}
+
+fun probe_ready(owner: ptr) lifecycle.Readiness {
+    ret lifecycle.READY_NOW;
+}
+
+fun probe_drain(owner: ptr, deadline_ns: i64)
+    R.Result[lifecycle.CallbackStatus, view.View] {
+    ret R.ok[lifecycle.CallbackStatus, view.View](lifecycle.CALLBACK_DONE);
+}
+
+fun probe_stop(owner: ptr) R.Result[lifecycle.CallbackStatus, view.View] {
+    ret R.ok[lifecycle.CallbackStatus, view.View](lifecycle.CALLBACK_DONE);
+}
+
+# laurel's own request events, so the framework's observability runs alongside
+# hedge's rather than either replacing the other
+fun probe_event_start(owner: ptr, event: *observability.RequestEvent) {
+}
+
+fun probe_event_finish(owner: ptr, event: *observability.RequestEvent) {
+    val state: *Probe = owner::*Probe;
+    state.events = state.events + 1;
+}
+
+fun probe_event_error(owner: ptr, event: *observability.RequestEvent,
+    failure: error.AppError) {
+}
+
+# the laurel terminal handler: sets a status through laurel's own context so the
+# response the caller reads was produced by the framework, not by this adapter
+fun probe_handler(owner: ptr, request_context: *context.Context)
+    R.Result[u8, error.AppError] {
+    val state: *Probe = owner::*Probe;
+    state.calls = state.calls + 1;
+    if (message.set_status(request_context.exchange.response,
+            status.ACCEPTED) != message.RESPONSE_OK) {
+        ret R.err[u8, error.AppError](error.make(error.INTERNAL, 500,
+            "internal server error", "probe could not set a status", false));
+    }
+    ret R.ok[u8, error.AppError](0);
+}
+
+fun probe_error(owner: ptr, failure: error.AppError,
+    request_context: *context.Context) R.Result[u8, error.RenderFailure] {
+    ret R.ok[u8, error.RenderFailure](1);
+}
+
+rec Harness {
+    scope: cancel.Scope;
+    reader: body.Reader;
+    request: message.Request;
+    response: message.Response;
+    request_fields: [4]field.Field;
+    request_trailers: [2]field.Field;
+    response_fields: [8]field.Field;
+    response_trailers: [2]field.Field;
+    informationals: [2]message.Informational;
+    exchange: exchange.Exchange;
+    arena: [8192]u8;
+    memory: call.Memory;
+    telemetry: trace.Context;
+    call: call.Call;
+}
+
+fun text(value: str) view.View {
+    var length: usize = 0;
+    for (value[length] != 0) { length = length + 1; }
+    ret view.view(value::*char, length);
+}
+
+fun make_harness(harness: *Harness, generation: u64) bool {
+    val configured: message.Limits = message.limits_default();
+    if (!cancel.make_root(?harness.scope, false, time.Time{sec: 0, nsec: 0})) {
+        ret false;
+    }
+    harness.reader = body.empty_reader(generation);
+    var fields: field.Fields = field.init(?harness.request_fields[0], 4,
+        configured.request_fields);
+    if (field.append(?fields, field.Field{name: text("host"),
+        value: text("example.test"), sensitive: false}) != field.ADD_OK) {
+        ret false;
+    }
+    val trailers: field.Fields = field.init(?harness.request_trailers[0], 2,
+        configured.request_trailers);
+    val metadata: message.Metadata = message.Metadata{
+        version: message.version_h1(1, 1), secure: false, early_data: false,
+        peer: message.unspecified_endpoint(),
+        local: message.unspecified_endpoint(),
+        received_at: time.Time{sec: 1, nsec: 0}, has_deadline: false,
+        deadline: time.Time{sec: 0, nsec: 0}, request_index: 1};
+    if (!message.init_request(?harness.request, method.from_kind(method.GET),
+            target.origin(text("/greet"), text("/greet"), view.view(nil, 0)),
+            metadata, fields, trailers, ?harness.reader, generation,
+            configured)) { ret false; }
+    if (!message.init_response(?harness.response, ?harness.response_fields[0], 8,
+            ?harness.response_trailers[0], 2, generation, configured)) {
+        ret false;
+    }
+    if (!exchange.init(?harness.exchange, ?harness.request, ?harness.response,
+            ?harness.informationals[0], 2, ?harness.scope, generation,
+            configured)) { ret false; }
+    if (!exchange.begin(?harness.exchange)) { ret false; }
+    if (!call.make_memory(?harness.memory, ?harness.arena[0], 8192)) {
+        ret false;
+    }
+    if (!trace.make_root(?harness.telemetry, false)) { ret false; }
+    if (!call.bind(?harness.call, ?harness.exchange, ?harness.memory,
+            ?harness.telemetry, generation, "test")) { ret false; }
+    ret call.enter(?harness.call, call.Route{index: 0, name: "root",
+        host: "example.test", service: "site"});
+}
+
+test "laurel: a real application serves a request through the hedge boundary" {
+    var providers: provider.Set;
+    if (!provider.init(?providers, nil, 0, 0, 32)) { ret 1; }
+    var component: lifecycle.Lifecycle = lifecycle.Lifecycle{ctx: nil,
+        start: probe_start, ready: probe_ready, drain: probe_drain,
+        stop: probe_stop};
+    var controller: lifecycle.Controller;
+    if (!lifecycle.init(?controller, ?component, 1, 1)) { ret 2; }
+    var routes: router.Router;
+    if (router.compile(?routes, nil, 0, router.Storage{},
+            router.limits_default()).status != router.COMPILE_OK) { ret 3; }
+    var middlewares: middleware.Stack = middleware.Stack{items: nil, len: 0};
+    var headers: security.HeadersPolicy;
+    if (!security.secure_headers(?headers)) { ret 4; }
+    var probe: Probe = Probe{calls: 0, events: 0};
+    var observer: observability.Observer = observability.Observer{ctx: ?probe,
+        start: probe_event_start, finish: probe_event_finish,
+        error: probe_event_error};
+    var application: app.App;
+    val assembly: app.Assembly = app.Assembly{
+        config: app.Config{limits: app.Limits{max_body_bytes: 1024,
+            max_form_fields: 8, max_upload_bytes: 1024, max_route_params: 4,
+            max_request_id_bytes: 64, max_active_requests: 2,
+            max_middleware_depth: 8, handler_deadline_ns: lifecycle.NO_DEADLINE,
+            max_providers: 0, max_provider_key_bytes: 32,
+            max_background_services: 1}, trust_proxy: false,
+            panic_policy: middleware.PANIC_ABORT},
+        router: ?routes, middleware: ?middlewares,
+        fallback: handler.Handler{ctx: ?probe, call: probe_handler},
+        errors: error.Mapper{ctx: nil, render: probe_error},
+        providers: ?providers, lifecycle: ?controller, sessions: nil,
+        security: ?headers, csrf: nil, origins: nil, authenticator: nil,
+        renderer: nil, observer: ?observer, app_state: nil};
+    if (!app.assemble(?application, assembly)) { ret 5; }
+    if (app.start(?application).status != lifecycle.TRANSITION_OK) { ret 6; }
+    if (app.poll_ready(?application).status != lifecycle.TRANSITION_OK) {
+        ret 7;
+    }
+
+    var adapter: Adapter;
+    if (!make(?adapter, ?application,
+            handler.Handler{ctx: ?probe, call: probe_handler})) { ret 8; }
+    val bound: service.Handler = bound_handler(?adapter);
+    if (!service.has_handler(bound)) { ret 9; }
+
+    # registered exactly like any other service kind, through the public table
+    var slots: [1]service.Application;
+    var registry: service.Applications;
+    if (!service.make_applications(?registry, ?slots[0], 1)) { ret 10; }
+    if (!service.register_application(?registry, "site", bound)) { ret 11; }
+    val found: *service.Application = service.find_application(?registry, "site");
+    if (found == nil) { ret 12; }
+
+    var harness: Harness;
+    if (!make_harness(?harness, 21)) { ret 13; }
+    val served: exchange.ServiceStatus = found.handler.serve(
+        found.handler.ctx, ?harness.call);
+    if (served != exchange.SERVICE_COMPLETE) { ret 14; }
+    if (probe.calls != 1) { ret 15; }
+    if (harness.response.status != status.ACCEPTED) { ret 16; }
+    # the reservation was returned, so a second request can still be admitted
+    if (app.active_request_count(?application) != 0) { ret 17; }
+    # laurel's own request events do not fire here: it stores an application's
+    # observer and never drives its recorder outside its in-process harness.
+    # tracked as briar-systems/laurel#30. hedge's telemetry is unaffected, and
+    # this adapter needs no change when that lands.
+    if (probe.events != 0) { ret 18; }
+
+    # a cancelled call is refused before the application is entered, and leaks
+    # no reservation
+    var cancelled_harness: Harness;
+    if (!make_harness(?cancelled_harness, 22)) { ret 19; }
+    if (!cancel.cancel(?cancelled_harness.scope)) { ret 20; }
+    if (found.handler.serve(found.handler.ctx, ?cancelled_harness.call) !=
+        exchange.SERVICE_FAILED) { ret 21; }
+    if (probe.calls != 1 || app.active_request_count(?application) != 0) {
+        ret 22;
+    }
+    ret 0;
+}
