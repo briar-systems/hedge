@@ -1,8 +1,225 @@
+# the hedge server executable
+#
+# the process reads one configuration document, seals a generation from it,
+# compiles an immutable plan, and serves until the operating system asks it to
+# stop. every failure before readiness exits without ever accepting a connection.
+
 use std.runtime;
 use std.print;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.option;
+use std.allocator;
+use std.allocator.page;
+use std.allocator.fixed;
+use std.filesystem;
+use std.process.env;
+use hedge.hedge;
+use hedge.config.schema;
+use hedge.config.loader;
+use hedge.generation;
+use hedge.service;
+use hedge.serve;
+use hedge.connection;
+use plan: hedge.dispatch.plan;
+use middleware: hedge.dispatch.middleware;
+use router: http.router.router;
+
+val EXIT_OK: i64 = 0;
+val EXIT_CONFIG: i64 = 78;
+val EXIT_RUNTIME: i64 = 70;
+
+val MAX_ROUTES: usize = 64;
+val MAX_SEGMENTS: usize = 512;
+val MAX_SERVICES: usize = 32;
+val MAX_MIDDLEWARE: usize = 16;
+val PLAN_TEXT_BYTES: usize = 16384;
+val CONFIG_ARENA_BYTES: usize = 1048576;
+val DEFAULT_CONNECTIONS: usize = 64;
+
+rec PlanStorage {
+    routes: [MAX_ROUTES]router.CompiledRoute;
+    segments: [MAX_SEGMENTS]router.Segment;
+    specs: [MAX_ROUTES]router.Route;
+    entries: [MAX_ROUTES]plan.Entry;
+    services: [MAX_SERVICES]service.Descriptor;
+    middleware: [MAX_MIDDLEWARE]middleware.Middleware;
+    text: [PLAN_TEXT_BYTES]u8;
+}
+
+fun report_diagnostics(diagnostics: *schema.Diagnostics) {
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        val item: *schema.Diagnostic = ?diagnostics.items[i];
+        print.eprint("hedge: ");
+        print.eprint(schema.text(?item.source));
+        print.eprint(": ");
+        print.eprint(schema.text(?item.path));
+        print.eprint(": ");
+        print.eprintln(schema.text(?item.message));
+        i = i + 1;
+    }
+    if (diagnostics.truncated) { print.eprintln("hedge: diagnostics were truncated"); }
+}
+
+fun capabilities() loader.Capabilities {
+    ret loader.Capabilities{
+        quic: true,
+        local_transport: true,
+        environment_secrets: true,
+        file_secrets: true,
+        os_secrets: true,
+        application_secrets: false,
+    };
+}
+
+fun resolve_environment(context: ptr, name: str, output: *u8, capacity: usize) i64 {
+    ret env.get(name, output, capacity);
+}
+
+fun configuration_path(argc: i64, argv: **u8) str {
+    if (argc > 1 && argv[1] != nil) { ret argv[1]::str; }
+    ret "hedge.toml";
+}
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    print.eprintln("hedge: serving runtime is not implemented yet");
-    ret 78;
+    var heap: allocator.Allocator;
+    if (option.is_some[*u8](page.make(?heap))) {
+        print.eprintln("hedge: page allocator initialization failed");
+        ret EXIT_RUNTIME;
+    }
+    val path: str = configuration_path(argc, argv);
+    val loaded: Result[str, str] = filesystem.read_string(?heap, path);
+    if (is_err[str, str](loaded)) {
+        print.eprint("hedge: cannot read configuration ");
+        print.eprintln(path);
+        ret EXIT_CONFIG;
+    }
+    val source: str = unwrap_ok[str, str](loaded);
+
+    val arena: Result[*u8, *u8] = allocator.allocate[u8](?heap, CONFIG_ARENA_BYTES);
+    val generations: Result[*generation.Generation, *u8] = allocator.allocate[generation.Generation](?heap, 1);
+    val diagnostics_storage: Result[*schema.Diagnostics, *u8] = allocator.allocate[schema.Diagnostics](?heap, 1);
+    val plan_storage: Result[*PlanStorage, *u8] = allocator.allocate[PlanStorage](?heap, 1);
+    if (is_err[*u8, *u8](arena) || is_err[*generation.Generation, *u8](generations)
+     || is_err[*schema.Diagnostics, *u8](diagnostics_storage)
+     || is_err[*PlanStorage, *u8](plan_storage)) {
+        print.eprintln("hedge: startup allocation failed");
+        ret EXIT_RUNTIME;
+    }
+    var config_allocator: allocator.Allocator;
+    var config_state: fixed.FixedState;
+    fixed.make(?config_allocator, ?config_state, unwrap_ok[*u8, *u8](arena), CONFIG_ARENA_BYTES);
+    val candidate: *generation.Generation = unwrap_ok[*generation.Generation, *u8](generations);
+    val diagnostics: *schema.Diagnostics = unwrap_ok[*schema.Diagnostics, *u8](diagnostics_storage);
+    val storage: *PlanStorage = unwrap_ok[*PlanStorage, *u8](plan_storage);
+
+    var resolver: loader.Resolver = loader.Resolver{
+        context: nil,
+        include: (0::usize)::loader.ResolveFun,
+        environment: resolve_environment,
+    };
+    schema.reset_diagnostics(diagnostics);
+    if (!generation.make_candidate(candidate, 1)) {
+        print.eprintln("hedge: candidate generation initialization failed");
+        ret EXIT_RUNTIME;
+    }
+    if (!loader.build(?candidate.graph, diagnostics, ?config_allocator, path, source,
+        ?resolver, capabilities())) {
+        report_diagnostics(diagnostics);
+        print.eprintln("hedge: configuration is not valid");
+        ret EXIT_CONFIG;
+    }
+    if (!generation.seal(candidate, diagnostics, nil, (0::usize)::generation.ConstructFun)) {
+        report_diagnostics(diagnostics);
+        print.eprintln("hedge: generation did not seal");
+        ret EXIT_CONFIG;
+    }
+    report_diagnostics(diagnostics);
+
+    # applications are registered by this executable, so hedge core links no framework
+    var application_slots: [service.MAX_APPLICATIONS]service.Application;
+    var applications: service.Applications;
+    service.make_applications(?applications, ?application_slots[0], service.MAX_APPLICATIONS);
+    var services: service.Resolver = service.no_resolver();
+    services.applications = ?applications;
+
+    var compiled_storage: plan.Storage;
+    if (!plan.make_storage(?compiled_storage,
+        ?storage.routes[0], MAX_ROUTES,
+        ?storage.segments[0], MAX_SEGMENTS,
+        ?storage.specs[0], MAX_ROUTES,
+        ?storage.entries[0], MAX_ROUTES,
+        ?storage.services[0], MAX_SERVICES,
+        ?storage.middleware[0], MAX_MIDDLEWARE,
+        ?storage.text[0], PLAN_TEXT_BYTES)) {
+        print.eprintln("hedge: plan storage layout is invalid");
+        ret EXIT_RUNTIME;
+    }
+    var compiled: plan.Plan;
+    val built: plan.Report = plan.compile(?compiled, candidate.id, ?candidate.graph,
+        compiled_storage, ?services, nil);
+    if (built.status != plan.PLAN_OK) {
+        print.eprint("hedge: route plan failed: ");
+        print.eprintln(built.detail);
+        ret EXIT_CONFIG;
+    }
+
+    var pool_size: usize = candidate.graph.limits.max_connections;
+    if (pool_size > DEFAULT_CONNECTIONS) { pool_size = DEFAULT_CONNECTIONS; }
+    if (pool_size == 0) { pool_size = 1; }
+    val slots: Result[*serve.Slot, *u8] = allocator.allocate[serve.Slot](?heap, pool_size);
+    val connections: Result[*connection.Connection, *u8] = allocator.allocate[connection.Connection](?heap, pool_size);
+    if (is_err[*serve.Slot, *u8](slots) || is_err[*connection.Connection, *u8](connections)) {
+        print.eprintln("hedge: connection pool allocation failed");
+        ret EXIT_RUNTIME;
+    }
+    var runtime: serve.Runtime;
+    if (!serve.make(?runtime, unwrap_ok[*serve.Slot, *u8](slots),
+        unwrap_ok[*connection.Connection, *u8](connections), pool_size, ?compiled,
+        ?candidate.graph)) {
+        print.eprintln("hedge: serving runtime initialization failed");
+        ret EXIT_RUNTIME;
+    }
+    schema.reset_diagnostics(diagnostics);
+    if (!serve.start(?runtime, candidate.id, ?candidate.graph, diagnostics)) {
+        report_diagnostics(diagnostics);
+        print.eprintln("hedge: listeners did not become ready");
+        ret EXIT_RUNTIME;
+    }
+    announce(?runtime, ?candidate.graph);
+    for (true) {
+        serve.poll(?runtime, serve.DEFAULT_POLL_MS);
+        if (serve.draining(?runtime) && serve.idle(?runtime)) { brk; }
+    }
+    if (!serve.stop(?runtime)) {
+        print.eprintln("hedge: shutdown did not complete cleanly");
+        ret EXIT_RUNTIME;
+    }
+    ret EXIT_OK;
+}
+
+# report every bound endpoint so an operator and a test can both find the port
+fun announce(runtime: *serve.Runtime, graph: *schema.Graph) {
+    var text: [64]u8;
+    var i: usize = 0;
+    for (i < graph.listener_count) {
+        val length: usize = serve.bound_endpoint_text(runtime, i, ?text[0], 64);
+        if (length != 0) {
+            print.print("hedge: listening ");
+            print.print(schema.text(?graph.listeners[i].name));
+            print.print(" ");
+            print.println((?text[0])::str);
+        }
+        i = i + 1;
+    }
+    print.println("hedge: ready");
 }
