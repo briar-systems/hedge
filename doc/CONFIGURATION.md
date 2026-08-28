@@ -4,9 +4,13 @@ Hedge configuration describes desired server state. It does not contain imperati
 
 ## Sources
 
-The primary document is TOML. A deployment may provide explicit environment substitutions and secret providers. Includes, if implemented, resolve before validation and have deterministic precedence.
+The primary document is TOML. A deployment may provide explicit environment substitutions and secret providers.
 
 Configuration accepts no arbitrary code. Application modules are build-time dependencies selected by the site artifact.
+
+Includes use a top-level `include = ["base.toml"]` array. Included documents are loaded before the including document and duplicate named objects are rejected. Include depth and source size are bounded. Missing sources and include cycles are configuration errors.
+
+General string fields may use an exact `${ENV:NAME}` reference. Resolution is explicit through the loader's environment resolver. Missing and oversized values fail validation. Secret values use the typed secret provider model below and are never interpolated into the general graph.
 
 ## Top-level model
 
@@ -23,6 +27,7 @@ tls = "public"
 [[listener]]
 name = "public-quic"
 address = "[::]:443"
+transport = "quic"
 protocols = ["h3"]
 tls = "public"
 
@@ -30,14 +35,18 @@ tls = "public"
 certificate = "acme:example"
 
 [host.example]
-names = ["example.com", "www.example.com"]
-routes = "example-routes"
+listener = "public-tcp"
+server_name = "example.com"
 
-[[routes.example-routes]]
+[[route]]
+name = "assets"
+host = "example"
 path = "/assets/**"
 service = "assets"
 
-[[routes.example-routes]]
+[[route]]
+name = "application"
+host = "example"
 path = "/**"
 service = "application"
 
@@ -50,7 +59,17 @@ kind = "laurel"
 application = "site"
 ```
 
-This is a design example, not an implemented schema.
+The implemented schema accepts these top-level sections:
+
+- `server` with bounded `limits`, `timeouts`, and feature selection
+- `listener` arrays with `tcp`, `quic`, or `local` transport and explicit protocol sets
+- named `tls`, `host`, `service`, `budget`, and `secret` tables
+- direct `route` arrays or named `routes` groups
+- `telemetry` sinks
+
+Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
+
+Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
 
 ## Validation
 
@@ -69,11 +88,15 @@ Validation resolves:
 
 Unknown fields are errors. Deprecated fields produce actionable diagnostics and follow a published removal policy.
 
+Diagnostics retain severity, stable code, source, field path, and message. The loader reports unknown fields, wrong types, missing values, duplicate names, address conflicts, unresolved references, unreachable routes, unsupported capabilities, include failures, and resource-bound violations in one bounded diagnostic set.
+
 ## Reload
 
 Reload parses and validates a complete candidate configuration. It then constructs candidate certificates, route graphs, upstream pools, application instances, caches, and listeners.
 
 Activation is atomic. If any required component cannot be constructed, the current generation remains active. Diagnostics identify the candidate source and never mutate current state.
+
+The generation store publishes only sealed candidates. Parsing, resolution, validation, and caller-supplied resource construction all complete before the pointer exchange. Readers retain a generation through an atomic publication gate. Replaced generations drain until their last retained reference is released. Failed attempts are observable through attempt count, failure count, candidate identity, and structured failure code.
 
 ## Secrets
 
