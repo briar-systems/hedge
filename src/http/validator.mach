@@ -1,0 +1,251 @@
+# entity tags and conditional request evaluation
+#
+# RFC 9110 section 13. Precondition order is normative: If-Match, then
+# If-Unmodified-Since, then If-None-Match, then If-Modified-Since, then If-Range.
+# If-None-Match uses weak comparison; If-Match and If-Range use strong comparison.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use std.chrono.time;
+use http.core.field;
+use http.core.method;
+use http.core.message;
+use http.core.status;
+use http_date: hedge.http.date;
+
+pub val ETAG_CAPACITY: usize = 80;
+
+pub def Outcome: u8;
+pub val PROCEED: Outcome = 1;
+pub val NOT_MODIFIED: Outcome = 2;
+pub val PRECONDITION_FAILED: Outcome = 3;
+
+pub rec Validators {
+    etag: view.View;
+    has_modified: bool;
+    modified: time.Time;
+}
+
+pub fun none() Validators {
+    ret Validators{etag: view.view(nil, 0), has_modified: false, modified: time.unix(0, 0)};
+}
+
+fun weak(value: view.View) bool {
+    ret value.len >= 2 && value.data[0] == 'W' && value.data[1] == '/';
+}
+
+fun opaque(value: view.View) view.View {
+    if (weak(value)) { ret view.view(?value.data[2], value.len - 2); }
+    ret value;
+}
+
+fun identical(a: view.View, b: view.View) bool {
+    if (a.len != b.len) { ret false; }
+    if (a.len == 0) { ret true; }
+    if (a.data == nil || b.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# strong comparison: both tags must be strong and byte-identical
+pub fun strong_match(candidate: view.View, current: view.View) bool {
+    if (weak(candidate) || weak(current) || candidate.len == 0 || current.len == 0) { ret false; }
+    ret identical(candidate, current);
+}
+
+# weak comparison: the opaque parts must match, whatever either tag's strength
+pub fun weak_match(candidate: view.View, current: view.View) bool {
+    if (candidate.len == 0 || current.len == 0) { ret false; }
+    ret identical(opaque(candidate), opaque(current));
+}
+
+fun trim(value: view.View) view.View {
+    var start: usize = 0;
+    var end: usize = value.len;
+    for (start < end && (value.data[start] == ' ' || value.data[start] == '\t')) { start = start + 1; }
+    for (end > start && (value.data[end - 1] == ' ' || value.data[end - 1] == '\t')) { end = end - 1; }
+    if (end == start) { ret view.view(nil, 0); }
+    ret view.view(?value.data[start], end - start);
+}
+
+fun is_wildcard(value: view.View) bool {
+    val trimmed: view.View = trim(value);
+    ret trimmed.len == 1 && trimmed.data[0] == '*';
+}
+
+# a list member ends at a comma that is not inside a quoted tag
+fun next_member(list: view.View, offset: *usize, output: *view.View) bool {
+    var start: usize = @offset;
+    for (start < list.len && (list.data[start] == ' ' || list.data[start] == '\t'
+        || list.data[start] == ',')) { start = start + 1; }
+    if (start >= list.len) { ret false; }
+    var end: usize = start;
+    var quoted: bool = false;
+    for (end < list.len) {
+        val c: u8 = list.data[end];
+        if (c == '"') { quoted = !quoted; }
+        or (c == ',' && !quoted) { brk; }
+        end = end + 1;
+    }
+    @offset = end;
+    @output = trim(view.view(?list.data[start], end - start));
+    ret output.len != 0;
+}
+
+fun list_matches(list: view.View, current: view.View, strong: bool) bool {
+    var offset: usize = 0;
+    var member: view.View;
+    for (next_member(list, ?offset, ?member)) {
+        if (strong && strong_match(member, current)) { ret true; }
+        if (!strong && weak_match(member, current)) { ret true; }
+    }
+    ret false;
+}
+
+fun header(fields: *field.Fields, name: str, length: usize) view.View {
+    val found: *field.Field = field.find_first(fields, view.view(name, length));
+    if (found == nil) { ret view.view(nil, 0); }
+    ret found.value;
+}
+
+fun present(value: view.View) bool {
+    ret value.data != nil && value.len != 0;
+}
+
+# evaluate the preconditions in the order RFC 9110 requires
+pub fun evaluate(request: *message.Request, current: Validators) Outcome {
+    if (request == nil) { ret PROCEED; }
+    val fields: *field.Fields = ?request.fields;
+    val safe: bool = method.is_safe(request.method.kind);
+
+    val if_match: view.View = header(fields, "if-match", 8);
+    if (present(if_match)) {
+        if (!is_wildcard(if_match) && !list_matches(if_match, current.etag, true)) {
+            ret PRECONDITION_FAILED;
+        }
+    } or {
+        val if_unmodified: view.View = header(fields, "if-unmodified-since", 19);
+        if (present(if_unmodified) && current.has_modified) {
+            var bound: time.Time;
+            if (http_date.parse(if_unmodified, ?bound)
+             && !http_date.not_after(http_date.truncate(current.modified), bound)) {
+                ret PRECONDITION_FAILED;
+            }
+        }
+    }
+
+    val if_none_match: view.View = header(fields, "if-none-match", 13);
+    if (present(if_none_match)) {
+        val matched: bool = is_wildcard(if_none_match)
+            || list_matches(if_none_match, current.etag, false);
+        if (matched) {
+            if (safe) { ret NOT_MODIFIED; }
+            ret PRECONDITION_FAILED;
+        }
+        ret PROCEED;
+    }
+
+    # If-Modified-Since applies only when If-None-Match is absent
+    if (safe && current.has_modified) {
+        val if_modified: view.View = header(fields, "if-modified-since", 17);
+        if (present(if_modified)) {
+            var bound: time.Time;
+            if (http_date.parse(if_modified, ?bound)
+             && http_date.not_after(http_date.truncate(current.modified), bound)) {
+                ret NOT_MODIFIED;
+            }
+        }
+    }
+    ret PROCEED;
+}
+
+# If-Range holds only on an exact match, so a changed representation is served whole
+pub fun range_allowed(request: *message.Request, current: Validators) bool {
+    if (request == nil) { ret true; }
+    val if_range: view.View = header(?request.fields, "if-range", 8);
+    if (!present(if_range)) { ret true; }
+    val trimmed: view.View = trim(if_range);
+    if (trimmed.len != 0 && trimmed.data[0] == '"') { ret strong_match(trimmed, current.etag); }
+    if (trimmed.len != 0 && weak(trimmed)) { ret false; }
+    if (!current.has_modified) { ret false; }
+    var bound: time.Time;
+    if (!http_date.parse(trimmed, ?bound)) { ret false; }
+    ret http_date.truncate(current.modified).sec == bound.sec;
+}
+
+# a strong entity tag over the identity, size, and modification time of one
+# representation: any replacement changes at least one of the three
+pub fun format_etag(device: u64, file: u64, size: u64, modified: time.Time,
+    output: *u8, capacity: usize) usize {
+    if (output == nil || capacity < ETAG_CAPACITY) { ret 0; }
+    var offset: usize = 0;
+    output[offset] = '"';
+    offset = offset + 1;
+    offset = write_hex(output, offset, device);
+    output[offset] = '-';
+    offset = write_hex(output, offset + 1, file);
+    output[offset] = '-';
+    offset = write_hex(output, offset + 1, size);
+    output[offset] = '-';
+    offset = write_hex(output, offset + 1, modified.sec::u64);
+    output[offset] = '"';
+    offset = offset + 1;
+    output[offset] = 0;
+    ret offset;
+}
+
+fun write_hex(output: *u8, offset: usize, value: u64) usize {
+    if (value == 0) {
+        output[offset] = '0';
+        ret offset + 1;
+    }
+    var digits: usize = 0;
+    var scale: u64 = value;
+    for (scale != 0) { scale = scale / 16; digits = digits + 1; }
+    var i: usize = digits;
+    var remaining: u64 = value;
+    for (i > 0) {
+        i = i - 1;
+        val nibble: u64 = remaining % 16;
+        if (nibble < 10) { output[offset + i] = ('0' + nibble::u8); }
+        or { output[offset + i] = ('a' + (nibble - 10)::u8); }
+        remaining = remaining / 16;
+    }
+    ret offset + digits;
+}
+
+test "http validator: strong comparison rejects a weak tag on either side" {
+    if (!strong_match(view.view("\"abc\"", 5), view.view("\"abc\"", 5))) { ret 1; }
+    if (strong_match(view.view("W/\"abc\"", 7), view.view("\"abc\"", 5))) { ret 2; }
+    if (strong_match(view.view("\"abc\"", 5), view.view("W/\"abc\"", 7))) { ret 3; }
+    if (strong_match(view.view("\"abc\"", 5), view.view("\"abd\"", 5))) { ret 4; }
+    ret 0;
+}
+
+test "http validator: weak comparison ignores the strength marker on both sides" {
+    if (!weak_match(view.view("W/\"abc\"", 7), view.view("\"abc\"", 5))) { ret 1; }
+    if (!weak_match(view.view("\"abc\"", 5), view.view("W/\"abc\"", 7))) { ret 2; }
+    if (weak_match(view.view("W/\"abc\"", 7), view.view("\"abd\"", 5))) { ret 3; }
+    ret 0;
+}
+
+test "http validator: an entity tag changes when any representation input changes" {
+    var first: [ETAG_CAPACITY]u8;
+    var second: [ETAG_CAPACITY]u8;
+    val a: usize = format_etag(1, 2, 3, time.unix(4, 0), ?first[0], ETAG_CAPACITY);
+    val b: usize = format_etag(1, 2, 3, time.unix(5, 0), ?second[0], ETAG_CAPACITY);
+    if (a == 0 || b == 0) { ret 1; }
+    if (identical(view.view(?first[0], a), view.view(?second[0], b))) { ret 2; }
+    if (first[0] != '"' || first[a - 1] != '"') { ret 3; }
+    val again: usize = format_etag(1, 2, 3, time.unix(4, 0), ?second[0], ETAG_CAPACITY);
+    if (!identical(view.view(?first[0], a), view.view(?second[0], again))) { ret 4; }
+    ret 0;
+}
