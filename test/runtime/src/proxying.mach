@@ -1,0 +1,456 @@
+# end-to-end reverse proxy tests: a real origin server, a real edge, real sockets
+
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.chrono.time;
+use std.net.ip;
+use std.net.tcp;
+use std.net.socket;
+use io_error: std.io.error;
+use http.router.router;
+use engine_h1: http.h1.connection;
+use hedge.config.schema;
+use hedge.listener;
+use hedge.connection;
+use hedge.serve;
+use hedge.service;
+use proxy: hedge.service.proxy;
+use upstream: hedge.proxy.upstream;
+use plan: hedge.dispatch.plan;
+use middleware: hedge.dispatch.middleware;
+use wire: hedgetest.wire;
+
+val MAX_ROUTES: usize = 8;
+val MAX_SEGMENTS: usize = 64;
+val MAX_SERVICES: usize = 8;
+val PLAN_TEXT: usize = 2048;
+val POOL: usize = 4;
+val RESPONSE_BYTES: usize = 8192;
+
+rec Site {
+    graph: schema.Graph;
+    diagnostics: schema.Diagnostics;
+    routes: [MAX_ROUTES]router.CompiledRoute;
+    segments: [MAX_SEGMENTS]router.Segment;
+    specs: [MAX_ROUTES]router.Route;
+    entries: [MAX_ROUTES]plan.Entry;
+    services: [MAX_SERVICES]service.Descriptor;
+    middlewares: [4]middleware.Middleware;
+    text: [PLAN_TEXT]u8;
+    storage: plan.Storage;
+    plan: plan.Plan;
+    slots: [POOL]serve.Slot;
+    connections: [POOL]connection.Connection;
+    runtime: serve.Runtime;
+    applications: service.Applications;
+    application_slots: [2]service.Application;
+    resolver: service.Resolver;
+    endpoint: ip.Endpoint;
+    address: [64]u8;
+}
+
+fun listener_graph(graph: *schema.Graph, name: str, address: str) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, name);
+    graph.limits.max_connections = POOL;
+    graph.limits.max_connections_per_peer = POOL;
+    graph.features.proxy = true;
+    graph.listener_count = 1;
+    val configured: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?configured.name, "public");
+    schema.set_text(?configured.address, address);
+    schema.clear_text(?configured.tls_policy);
+    schema.clear_text(?configured.budget);
+    configured.transport = schema.TRANSPORT_TCP;
+    configured.protocols = schema.PROTOCOL_HTTP1;
+    configured.backlog = 16;
+    configured.accept_depth = 2;
+    graph.host_count = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    schema.set_text(?graph.hosts[0].listener, "public");
+    graph.hosts[0].server_name_count = 1;
+    schema.set_text(?graph.hosts[0].server_names[0], "localhost");
+    graph.service_count = 0;
+    graph.route_count = 0;
+}
+
+fun add_service(graph: *schema.Graph, name: str, kind: u8, target: str) {
+    val index: usize = graph.service_count;
+    val configured: *schema.Service = ?graph.services[index];
+    schema.set_text(?configured.name, name);
+    configured.kind = kind;
+    schema.set_text(?configured.target, target);
+    schema.clear_text(?configured.budget);
+    schema.clear_text(?configured.secret);
+    schema.clear_text(?configured.content_type);
+    schema.clear_text(?configured.index);
+    configured.precompressed = false;
+    configured.status = 200;
+    graph.service_count = index + 1;
+}
+
+fun add_route(graph: *schema.Graph, name: str, path: str, service_name: str) {
+    val index: usize = graph.route_count;
+    val configured: *schema.Route = ?graph.routes[index];
+    schema.set_text(?configured.name, name);
+    schema.set_text(?configured.host, "site");
+    schema.set_text(?configured.path, path);
+    schema.set_text(?configured.service, service_name);
+    schema.clear_text(?configured.budget);
+    graph.route_count = index + 1;
+}
+
+fun compile_site(site: *Site, generation: u64, resolver: *service.Resolver) bool {
+    if (!plan.make_storage(?site.storage,
+        ?site.routes[0], MAX_ROUTES,
+        ?site.segments[0], MAX_SEGMENTS,
+        ?site.specs[0], MAX_ROUTES,
+        ?site.entries[0], MAX_ROUTES,
+        ?site.services[0], MAX_SERVICES,
+        ?site.middlewares[0], 4,
+        ?site.text[0], PLAN_TEXT)) { ret false; }
+    ret plan.compile(?site.plan, generation, ?site.graph, site.storage, resolver, nil).status
+        == plan.PLAN_OK;
+}
+
+fun start_site(site: *Site, generation: u64) bool {
+    if (!serve.make(?site.runtime, ?site.slots[0], ?site.connections[0], POOL,
+        ?site.plan, ?site.graph)) { ret false; }
+    schema.reset_diagnostics(?site.diagnostics);
+    if (!serve.start(?site.runtime, generation, ?site.graph, ?site.diagnostics)) { ret false; }
+    val owned: *listener.OwnedListener = listener.active_listener(?site.runtime.owner, 0);
+    if (owned == nil || !owned.has_bound_endpoint) { ret false; }
+    site.endpoint = owned.bound_endpoint;
+    ip.endpoint_format(site.endpoint, ?site.address[0], 64);
+    ret true;
+}
+
+# a plain-socket origin
+#
+# two listener owners cannot share one process, because the process plane is
+# process-wide and singular. the origin here is therefore a bare socket that
+# speaks HTTP/1 directly, which is still a real server on a real port.
+rec Origin {
+    listener: tcp.Listener;
+    endpoint: ip.Endpoint;
+    address: [64]u8;
+    body: str;
+    open: bool;
+    served: usize;
+    accepted: usize;
+    peer: tcp.Stream;
+    has_peer: bool;
+    seen: [2048]u8;
+    seen_length: usize;
+}
+
+fun start_origin(origin: *Origin, body: str) bool {
+    val bound: Result[tcp.Listener, io_error.Error] = tcp.listen_with_flags(
+        ip.endpoint(127, 0, 0, 1, 0), 16, socket.async_flags());
+    if (is_err[tcp.Listener, io_error.Error](bound)) { ret false; }
+    origin.listener = unwrap_ok[tcp.Listener, io_error.Error](bound);
+    val local: Result[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?origin.listener);
+    if (is_err[ip.Endpoint, io_error.Error](local)) { ret false; }
+    origin.endpoint = unwrap_ok[ip.Endpoint, io_error.Error](local);
+    ip.endpoint_format(origin.endpoint, ?origin.address[0], 64);
+    origin.body = body;
+    origin.open = true;
+    origin.served = 0;
+    origin.accepted = 0;
+    origin.has_peer = false;
+    origin.seen_length = 0;
+    ret true;
+}
+
+fun stop_origin(origin: *Origin) {
+    if (origin == nil) { ret; }
+    if (origin.has_peer) {
+        tcp.stream_close(?origin.peer);
+        origin.has_peer = false;
+    }
+    if (origin.open) {
+        tcp.listener_close(?origin.listener);
+        origin.open = false;
+    }
+}
+
+fun write_all(stream: *tcp.Stream, data: *u8, length: usize) bool {
+    var sent: usize = 0;
+    for (sent < length) {
+        val written: Result[usize, io_error.Error] = tcp.stream_write(stream,
+            ?data[sent], length - sent);
+        if (is_err[usize, io_error.Error](written)) { ret false; }
+        val count: usize = unwrap_ok[usize, io_error.Error](written);
+        if (count == 0) { ret false; }
+        sent = sent + count;
+    }
+    ret true;
+}
+
+fun decimal(value: usize, output: *u8) usize {
+    var digits: usize = 1;
+    var scale: usize = value;
+    for (scale >= 10) { scale = scale / 10; digits = digits + 1; }
+    var i: usize = digits;
+    var remaining: usize = value;
+    for (i > 0) {
+        i = i - 1;
+        output[i] = ('0' + (remaining % 10)::u8);
+        remaining = remaining / 10;
+    }
+    ret digits;
+}
+
+# a keep-alive origin: one accepted connection answers request after request, so
+# an upstream connection this proxy keeps idle is actually reusable
+fun pump_origin(origin: *Origin) bool {
+    if (origin == nil || !origin.open) { ret false; }
+    if (!origin.has_peer) {
+        val accepted: Result[tcp.Stream, io_error.Error] = tcp.accept_with_flags(
+            ?origin.listener, socket.blocking_flags());
+        if (is_err[tcp.Stream, io_error.Error](accepted)) { ret false; }
+        origin.peer = unwrap_ok[tcp.Stream, io_error.Error](accepted);
+        origin.has_peer = true;
+        origin.accepted = origin.accepted + 1;
+        tcp.stream_set_read_timeout(?origin.peer, 2);
+    }
+    val peer: *tcp.Stream = ?origin.peer;
+    var request: [2048]u8;
+    var total: usize = 0;
+    var rounds: usize = 0;
+    var complete: bool = false;
+    for (rounds < 40 && total + 1 < 2048) {
+        val read: Result[usize, io_error.Error] = tcp.stream_read(peer, ?request[total],
+            2048 - total - 1);
+        if (!is_err[usize, io_error.Error](read)) {
+            val count: usize = unwrap_ok[usize, io_error.Error](read);
+            if (count == 0 && total == 0) {
+                tcp.stream_close(peer);
+                origin.has_peer = false;
+                ret false;
+            }
+            total = total + count;
+            request[total] = 0;
+            if (wire.contains(?request[0], total, "\r\n\r\n")) { complete = true; brk; }
+        }
+        rounds = rounds + 1;
+    }
+    if (!complete) { ret false; }
+    var i: usize = 0;
+    for (i < total && i < 2048) { origin.seen[i] = request[i]; i = i + 1; }
+    origin.seen_length = total;
+    var response: [4096]u8;
+    val head: str = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: ";
+    var at: usize = 0;
+    var h: usize = 0;
+    for (head[h] != 0) { response[at] = head[h]; at = at + 1; h = h + 1; }
+    val body_length: usize = str_len(origin.body);
+    at = at + decimal(body_length, ?response[at]);
+    response[at] = '\r'; response[at + 1] = '\n';
+    response[at + 2] = '\r'; response[at + 3] = '\n';
+    at = at + 4;
+    var b: usize = 0;
+    for (b < body_length) { response[at + b] = origin.body[b]; b = b + 1; }
+    at = at + body_length;
+    val ok: bool = write_all(peer, ?response[0], at);
+    if (ok) { origin.served = origin.served + 1; }
+    or {
+        tcp.stream_close(peer);
+        origin.has_peer = false;
+    }
+    ret ok;
+}
+
+rec Edge {
+    site: Site;
+    proxy_runtime: proxy.Runtime;
+    bindings: proxy.Bindings;
+    binding_storage: [MAX_SERVICES]proxy.Binding;
+}
+
+fun start_edge(edge: *Edge, generation: u64, upstream_address: str) bool {
+    listener_graph(?edge.site.graph, "edge", "127.0.0.1:0");
+    add_service(?edge.site.graph, "backend", schema.SERVICE_PROXY, upstream_address);
+    add_route(?edge.site.graph, "all", "/**", "backend");
+    service.make_applications(?edge.site.applications, ?edge.site.application_slots[0], 2);
+    if (!proxy.make_runtime(?edge.proxy_runtime, nil, "hedge-test",
+        engine_h1.config_default(), upstream.default_limits())) { ret false; }
+    if (!proxy.make_bindings(?edge.bindings, ?edge.binding_storage[0], MAX_SERVICES,
+        ?edge.proxy_runtime)) { ret false; }
+    edge.site.resolver = service.no_resolver();
+    edge.site.resolver.applications = ?edge.site.applications;
+    edge.site.resolver.proxy = service.Factory{
+        ctx: (?edge.bindings)::ptr,
+        build: proxy.factory,
+    };
+    if (!compile_site(?edge.site, generation, ?edge.site.resolver)) { ret false; }
+    if (!start_site(?edge.site, generation)) { ret false; }
+    proxy.attach_driver(?edge.proxy_runtime, ?edge.site.runtime.owner.network);
+    serve.attach_plane(?edge.site.runtime, (?edge.proxy_runtime)::ptr, proxy.poll);
+    ret true;
+}
+
+fun shutdown_edge(edge: *Edge, origin: *Origin) {
+    serve.stop(?edge.site.runtime);
+    proxy.close_runtime(?edge.proxy_runtime);
+    stop_origin(origin);
+}
+
+# poll both servers while reading, because the proxied request needs the origin
+fun collect_both(edge: *Edge, origin: *Origin, client: *tcp.Stream, output: *u8,
+    capacity: usize, marker: str) usize {
+    # a long client read timeout would spend real time inside this loop, and the
+    # proxy's attempt deadline is measured against that same clock
+    tcp.stream_set_read_timeout(client, 2);
+    var total: usize = 0;
+    var rounds: usize = 0;
+    for (rounds < 600) {
+        serve.poll(?edge.site.runtime, 1);
+        if (origin != nil) { pump_origin(origin); }
+        val read: Result[usize, io_error.Error] = tcp.stream_read(client, ?output[total],
+            capacity - total - 1);
+        if (!is_err[usize, io_error.Error](read)) {
+            val count: usize = unwrap_ok[usize, io_error.Error](read);
+            total = total + count;
+            output[total] = 0;
+            if (count != 0 && wire.contains(output, total, marker)) { ret total; }
+        }
+        rounds = rounds + 1;
+    }
+    output[total] = 0;
+    ret total;
+}
+
+test "proxy: a request is forwarded to a real origin and its response returned" {
+    var origin: Origin;
+    if (!start_origin(?origin, "answer from the origin")) { ret 1; }
+    var edge: Edge;
+    if (!start_edge(?edge, 1, (?origin.address[0])::str)) { shutdown_edge(?edge, ?origin); ret 2; }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, ?origin); ret 3; }
+    if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 4;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = collect_both(?edge, ?origin, ?client, ?response[0], RESPONSE_BYTES,
+        "answer from the origin");
+    val view: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime);
+    tcp.stream_close(?client);
+    shutdown_edge(?edge, ?origin);
+    if (length == 0) { ret 5; }
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) { ret 6; }
+    if (!wire.contains(?response[0], length, "answer from the origin")) { ret 7; }
+    if (view.total_attempts != 1 || view.total_served != 1) { ret 8; }
+    ret 0;
+}
+
+test "proxy: an unreachable upstream answers 502 without hanging" {
+    var edge: Edge;
+    # nothing listens on this port, so every attempt fails at connect
+    if (!start_edge(?edge, 2, "127.0.0.1:9")) { shutdown_edge(?edge, nil); ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, nil); ret 2; }
+    if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, nil); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = collect_both(?edge, nil, ?client, ?response[0], RESPONSE_BYTES, "\r\n\r\n");
+    val view: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime);
+    tcp.stream_close(?client);
+    shutdown_edge(?edge, nil);
+    if (length == 0) { ret 4; }
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 502 Bad Gateway\r\n")) { ret 5; }
+    # a GET with no body is replayable, so the failure was retried before giving up
+    if (view.total_attempts < 2) { ret 6; }
+    ret 0;
+}
+
+test "proxy: forwarded metadata and via reach the origin" {
+    var origin: Origin;
+    if (!start_origin(?origin, "seen")) { ret 1; }
+    var edge: Edge;
+    if (!start_edge(?edge, 3, (?origin.address[0])::str)) { shutdown_edge(?edge, ?origin); ret 2; }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, ?origin); ret 3; }
+    if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 4;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = collect_both(?edge, ?origin, ?client, ?response[0], RESPONSE_BYTES, "seen");
+    tcp.stream_close(?client);
+    shutdown_edge(?edge, ?origin);
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) { ret 5; }
+    ret 0;
+}
+
+test "proxy: successive proxied requests reuse the client connection" {
+    var origin: Origin;
+    if (!start_origin(?origin, "relayed")) { ret 1; }
+    var edge: Edge;
+    if (!start_edge(?edge, 4, (?origin.address[0])::str)) { shutdown_edge(?edge, ?origin); ret 2; }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, ?origin); ret 3; }
+    var response: [RESPONSE_BYTES]u8;
+    if (!wire.send(?client, "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 4;
+    }
+    val first: usize = collect_both(?edge, ?origin, ?client, ?response[0], RESPONSE_BYTES, "relayed");
+    if (first == 0 || !wire.starts_with(?response[0], first, "HTTP/1.1 200 OK\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 5;
+    }
+    if (!wire.send(?client, "GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 6;
+    }
+    val second: usize = collect_both(?edge, ?origin, ?client, ?response[0], RESPONSE_BYTES, "relayed");
+    val requests: u64 = connection.snapshot(?edge.site.connections[0]).requests;
+    val view: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime);
+    tcp.stream_close(?client);
+    shutdown_edge(?edge, ?origin);
+    if (second == 0 || !wire.starts_with(?response[0], second, "HTTP/1.1 200 OK\r\n")) { ret 7; }
+    # one client connection carried both, and each was a separate upstream exchange
+    if (requests != 2) { ret 8; }
+    if (view.total_served != 2 || origin.served != 2) { ret 9; }
+    # the upstream connection was kept and used again, so the origin accepted once
+    if (view.total_reused != 1 || origin.accepted != 1) { ret 10; }
+    ret 0;
+}
+
+test "proxy: repeated upstream failure opens the breaker and refuses without dialling" {
+    var edge: Edge;
+    if (!start_edge(?edge, 5, "127.0.0.1:9")) { shutdown_edge(?edge, nil); ret 1; }
+    var response: [RESPONSE_BYTES]u8;
+    var request: usize = 0;
+    for (request < 3) {
+        var client: tcp.Stream;
+        if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, nil); ret 2; }
+        if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+            tcp.stream_close(?client); shutdown_edge(?edge, nil); ret 3;
+        }
+        collect_both(?edge, nil, ?client, ?response[0], RESPONSE_BYTES, "\r\n\r\n");
+        tcp.stream_close(?client);
+        request = request + 1;
+    }
+    val opened: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime);
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, nil); ret 4; }
+    if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, nil); ret 5;
+    }
+    val length: usize = collect_both(?edge, nil, ?client, ?response[0], RESPONSE_BYTES, "\r\n\r\n");
+    val after: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime);
+    tcp.stream_close(?client);
+    shutdown_edge(?edge, nil);
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 502 Bad Gateway\r\n")) { ret 6; }
+    # the breaker is open, so the refusal cost no further connection attempt
+    if (after.total_attempts != opened.total_attempts) { ret 7; }
+    if (after.unhealthy_refusals == 0) { ret 8; }
+    ret 0;
+}

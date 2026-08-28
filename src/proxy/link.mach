@@ -1,0 +1,488 @@
+# one upstream connection
+#
+# The upstream leg runs the same HTTP/1 engine the served leg runs, in client
+# role, over the same transport adapter and the same completion routing. A link
+# is generation-owned and leased for exactly one exchange at a time, so an
+# upstream connection is reused without two requests ever sharing one.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.err;
+use std.chrono.time;
+use std.sync.cancel;
+use std.net.ip;
+use std.net.tcp;
+use std.io.handle;
+use io_handle: std.io.handle;
+use net_async: std.net.async;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
+use io_lifecycle: std.io.lifecycle;
+use http.core.body;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use http.core.transport;
+use engine_h1: http.h1.connection;
+use http.h1.parser;
+use hedge.listener;
+use hedge.connection;
+
+pub val LINK_SLOTS: usize = 1;
+pub val LINK_TRANSPORT_SLOTS: usize = 4;
+pub val LINK_LINE_BYTES: usize = 4096;
+pub val LINK_STORAGE_BYTES: usize = 8192;
+pub val LINK_FIELD_SLOTS: usize = 64;
+pub val LINK_TRAILER_SLOTS: usize = 16;
+pub val LINK_SCRATCH_BYTES: usize = 4096;
+pub val LINK_IO_BYTES: usize = 8192;
+
+pub def State: u8;
+pub val FREE: State = 0;
+pub val IDLE: State = 9;
+pub val CONNECTING: State = 1;
+pub val READY: State = 2;
+pub val SENDING: State = 3;
+pub val AWAITING: State = 4;
+pub val STREAMING: State = 5;
+pub val DONE: State = 6;
+pub val FAILED: State = 7;
+pub val CLOSED: State = 8;
+
+pub def Step: u8;
+pub val STEP_IDLE: Step = 1;
+pub val STEP_PROGRESS: Step = 2;
+pub val STEP_BLOCKED: Step = 3;
+pub val STEP_HEADERS: Step = 4;
+pub val STEP_DONE: Step = 5;
+pub val STEP_ERROR: Step = 6;
+
+pub rec Link {
+    state: State;
+    upstream: usize;
+    generation: u64;
+    leased: bool;
+    reusable: bool;
+    endpoint: ip.Endpoint;
+    stream: tcp.Stream;
+    has_stream: bool;
+    driver: *net_async.Driver;
+    connect_context: listener.ConnectionContext;
+    connect_operation: connection.Operation;
+    connect_pending: bool;
+    connect_failed: bool;
+    runtime_stream: transport.RuntimeStream;
+    adapter: transport.Adapter;
+    channel: transport.Transport;
+    channel_slots: [LINK_TRANSPORT_SLOTS]transport.Slot;
+    contexts: [LINK_TRANSPORT_SLOTS]listener.ConnectionContext;
+    operations: [LINK_TRANSPORT_SLOTS]connection.Operation;
+    operation_root: cancel.Scope;
+    control_scope: cancel.Scope;
+    engine_scope: cancel.Scope;
+    scopes_live: bool;
+    engine: engine_h1.Engine;
+    engine_slots: [LINK_SLOTS]engine_h1.Slot;
+    engine_memories: [LINK_SLOTS]engine_h1.SlotMemory;
+    lines: [LINK_SLOTS][LINK_LINE_BYTES]u8;
+    storages: [LINK_SLOTS][LINK_STORAGE_BYTES]u8;
+    slot_fields: [LINK_SLOTS][LINK_FIELD_SLOTS]field.Field;
+    slot_trailers: [LINK_SLOTS][LINK_TRAILER_SLOTS]field.Field;
+    scratches: [LINK_SLOTS][LINK_SCRATCH_BYTES]u8;
+    read_buffer: [LINK_IO_BYTES]u8;
+    write_buffer: [LINK_IO_BYTES]u8;
+    slot: usize;
+    have_headers: bool;
+    body_offset: usize;
+    body_length: usize;
+    body_final: bool;
+    inbound_complete: bool;
+    configured: engine_h1.Config;
+    initialized: bool;
+}
+
+fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion) {
+    val link: *Link = context::*Link;
+    if (link == nil || !link.initialized) { ret; }
+    var settled: transport.Completion;
+    if (!connection.translate(?settled, completion, token_context)) { ret; }
+    val event: engine_h1.Event = engine_h1.complete_io(?link.engine, ?settled, time.now());
+    absorb(link, event);
+}
+
+fun rejected() Result[io_runtime.Token, io_error.Error] {
+    ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_SUBMIT));
+}
+
+fun operation_for(link: *Link, token_context: usize) usize {
+    var token: transport.Token;
+    if (!transport.context_token(token_context, ?token)) { ret LINK_TRANSPORT_SLOTS; }
+    val index: usize = token.index::usize;
+    if (index >= LINK_TRANSPORT_SLOTS) { ret LINK_TRANSPORT_SLOTS; }
+    if (!connection.bind_operation(?link.operations[index], ?link.contexts[index],
+        (link)::ptr, settle, token_context)) { ret LINK_TRANSPORT_SLOTS; }
+    ret index;
+}
+
+fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val link: *Link = context::*Link;
+    val index: usize = operation_for(link, token_context);
+    if (index >= LINK_TRANSPORT_SLOTS) { ret rejected(); }
+    ret net_async.submit_read(link.driver, scope, ?link.stream, buffer, length,
+        (?link.contexts[index])::usize);
+}
+
+fun submit_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val link: *Link = context::*Link;
+    val index: usize = operation_for(link, token_context);
+    if (index >= LINK_TRANSPORT_SLOTS) { ret rejected(); }
+    ret net_async.submit_write(link.driver, scope, ?link.stream, buffer, length,
+        (?link.contexts[index])::usize);
+}
+
+fun submit_shutdown(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val link: *Link = context::*Link;
+    val index: usize = operation_for(link, token_context);
+    if (index >= LINK_TRANSPORT_SLOTS) { ret rejected(); }
+    ret net_async.submit_shutdown_write(link.driver, scope, ?link.stream,
+        (?link.contexts[index])::usize);
+}
+
+fun submit_close(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val link: *Link = context::*Link;
+    val index: usize = operation_for(link, token_context);
+    if (index >= LINK_TRANSPORT_SLOTS) { ret rejected(); }
+    ret net_async.submit_stream_close(link.driver, scope, ?link.stream,
+        io_lifecycle.EXPLICIT, (?link.contexts[index])::usize);
+}
+
+# the connect completion carries the socket this link owns from then on
+fun connect_settled(context: ptr, token_context: usize, completion: io_runtime.Completion) {
+    val link: *Link = context::*Link;
+    if (link == nil || !link.connect_pending) { ret; }
+    link.connect_pending = false;
+    if (completion.has_error) {
+        link.connect_failed = true;
+        link.state = FAILED;
+        ret;
+    }
+    link.stream = tcp.Stream{handle: io_handle.SocketHandle{value: completion.resource}};
+    link.has_stream = true;
+}
+
+# the engine must be configured to the storage this link actually owns: a
+# pipeline depth or header bound larger than these buffers would have the engine
+# index past them
+pub fun link_config(base: engine_h1.Config) engine_h1.Config {
+    var configured: engine_h1.Config = base;
+    configured.max_pipeline = LINK_SLOTS;
+    if (configured.parser.max_header_bytes > LINK_STORAGE_BYTES) {
+        configured.parser.max_header_bytes = LINK_STORAGE_BYTES;
+    }
+    if (configured.parser.max_trailer_bytes > LINK_STORAGE_BYTES) {
+        configured.parser.max_trailer_bytes = LINK_STORAGE_BYTES;
+    }
+    if (configured.parser.max_headers > LINK_FIELD_SLOTS) {
+        configured.parser.max_headers = LINK_FIELD_SLOTS;
+    }
+    if (configured.parser.max_trailers > LINK_TRAILER_SLOTS) {
+        configured.parser.max_trailers = LINK_TRAILER_SLOTS;
+    }
+    if (configured.parser.max_start_line > LINK_LINE_BYTES) {
+        configured.parser.max_start_line = LINK_LINE_BYTES;
+    }
+    if (configured.parser.max_header_line > LINK_LINE_BYTES) {
+        configured.parser.max_header_line = LINK_LINE_BYTES;
+    }
+    if (configured.parser.max_chunk_line > LINK_LINE_BYTES) {
+        configured.parser.max_chunk_line = LINK_LINE_BYTES;
+    }
+    if (configured.parser.max_target_bytes > LINK_LINE_BYTES) {
+        configured.parser.max_target_bytes = LINK_LINE_BYTES;
+    }
+    ret configured;
+}
+
+pub fun free(link: *Link) bool {
+    ret link != nil && link.state == FREE && !link.leased;
+}
+
+# an idle link keeps its connected socket for the next request to the same upstream
+pub fun idle_for(link: *Link, upstream_index: usize) bool {
+    ret link != nil && link.state == IDLE && !link.leased && link.initialized
+     && link.upstream == upstream_index
+     && link.engine.state == engine_h1.OPEN;
+}
+
+# take an idle connection for one more exchange
+pub fun lease(link: *Link) bool {
+    if (link == nil || link.state != IDLE || link.leased) { ret false; }
+    link.leased = true;
+    link.generation = link.generation + 1;
+    link.reusable = false;
+    link.slot = engine_h1.NO_SLOT;
+    link.have_headers = false;
+    link.inbound_complete = false;
+    link.state = READY;
+    ret true;
+}
+
+# hand a finished connection back, keeping it only when both sides agreed it may
+# be reused and the engine is still open for another exchange
+pub fun release_idle(link: *Link, now: time.Time) bool {
+    if (link == nil || !link.initialized || !link.reusable
+     || link.slot == engine_h1.NO_SLOT
+     || link.engine.state != engine_h1.OPEN) { ret false; }
+    if (!engine_h1.release(?link.engine, link.slot, now)) { ret false; }
+    link.leased = false;
+    link.slot = engine_h1.NO_SLOT;
+    link.have_headers = false;
+    link.inbound_complete = false;
+    link.state = IDLE;
+    ret true;
+}
+
+pub fun make(link: *Link, driver: *net_async.Driver, upstream: usize,
+    endpoint: ip.Endpoint, configured: engine_h1.Config, now: time.Time) bool {
+    if (link == nil || driver == nil) { ret false; }
+    link.state = CONNECTING;
+    link.upstream = upstream;
+    link.generation = link.generation + 1;
+    link.leased = true;
+    link.reusable = false;
+    link.endpoint = endpoint;
+    link.driver = driver;
+    link.configured = link_config(configured);
+    link.has_stream = false;
+    link.connect_pending = false;
+    link.connect_failed = false;
+    link.scopes_live = false;
+    link.initialized = false;
+    link.slot = engine_h1.NO_SLOT;
+    link.have_headers = false;
+    link.body_offset = 0;
+    link.body_length = 0;
+    link.body_final = false;
+    link.inbound_complete = false;
+    if (!connection.bind_operation(?link.connect_operation, ?link.connect_context,
+        (link)::ptr, connect_settled, 0)) { ret false; }
+    if (!cancel.make_root(?link.operation_root, false, time.Time{sec: 0, nsec: 0})
+     || !cancel.make_root(?link.control_scope, false, time.Time{sec: 0, nsec: 0})
+     || !cancel.make_child(?link.engine_scope, ?link.operation_root, false,
+        time.Time{sec: 0, nsec: 0})) { ret false; }
+    link.scopes_live = true;
+    val submitted: Result[io_runtime.Token, io_error.Error] = net_async.submit_connect(
+        driver, ?link.operation_root, endpoint, (?link.connect_context)::usize);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) {
+        link.state = FAILED;
+        ret false;
+    }
+    link.connect_pending = true;
+    ret true;
+}
+
+# bind the transport and engine once the socket exists
+fun activate(link: *Link, now: time.Time) bool {
+    link.runtime_stream = transport.RuntimeStream{
+        runtime: link.driver.runtime,
+        context: (link)::ptr,
+        submit_read: submit_read,
+        submit_write: submit_write,
+        submit_shutdown_write: submit_shutdown,
+        submit_close: submit_close,
+    };
+    if (!transport.make_runtime_adapter(?link.adapter, ?link.runtime_stream, transport.PLAINTEXT)) {
+        ret false;
+    }
+    link.channel.initialized = false;
+    if (!transport.init(?link.channel, link.adapter, ?link.operation_root,
+        ?link.control_scope, ?link.channel_slots[0], LINK_TRANSPORT_SLOTS)) { ret false; }
+    var i: usize = 0;
+    for (i < LINK_SLOTS) {
+        link.engine_memories[i] = engine_h1.SlotMemory{
+            line: ?link.lines[i][0],
+            line_capacity: LINK_LINE_BYTES,
+            storage: ?link.storages[i][0],
+            storage_capacity: LINK_STORAGE_BYTES,
+            fields: ?link.slot_fields[i][0],
+            field_capacity: LINK_FIELD_SLOTS,
+            trailers: ?link.slot_trailers[i][0],
+            trailer_capacity: LINK_TRAILER_SLOTS,
+            scratch: ?link.scratches[i][0],
+            scratch_capacity: LINK_SCRATCH_BYTES,
+        };
+        i = i + 1;
+    }
+    link.engine.initialized = false;
+    if (!engine_h1.init(?link.engine, engine_h1.CLIENT, ?link.channel, ?link.engine_scope,
+        ?link.engine_slots[0], ?link.engine_memories[0], LINK_SLOTS,
+        ?link.read_buffer[0], LINK_IO_BYTES, ?link.write_buffer[0], LINK_IO_BYTES,
+        link.configured, now)) { ret false; }
+    link.initialized = true;
+    link.state = READY;
+    ret true;
+}
+
+# publish the outbound request head; the body follows through `offer_body`
+pub fun send(link: *Link, request_method: method.Method, request_target: target.Target,
+    fields: *field.Fields, now: time.Time) bool {
+    if (link == nil || link.state != READY) { ret false; }
+    link.slot = engine_h1.enqueue_request(?link.engine, message.version_h1(1, 1),
+        request_method, request_target, fields, nil, now);
+    if (link.slot == engine_h1.NO_SLOT) { ret false; }
+    link.state = SENDING;
+    ret true;
+}
+
+fun absorb(link: *Link, event: engine_h1.Event) {
+    if (event.kind == engine_h1.EVENT_RESPONSE_HEADERS) {
+        link.have_headers = true;
+        ret;
+    }
+    if (event.kind == engine_h1.EVENT_RESPONSE_BODY) {
+        ret;
+    }
+    if (event.kind == engine_h1.EVENT_RESPONSE_COMPLETE) {
+        link.inbound_complete = true;
+        ret;
+    }
+    if (event.kind == engine_h1.EVENT_ERROR || event.kind == engine_h1.EVENT_TIMED_OUT
+     || event.kind == engine_h1.EVENT_CANCELLED || event.kind == engine_h1.EVENT_CLOSED
+     || event.kind == engine_h1.EVENT_PEER_CLOSED) {
+        if (!link.inbound_complete) { link.state = FAILED; }
+    }
+}
+
+pub fun headers_ready(link: *Link) bool {
+    ret link != nil && link.have_headers;
+}
+
+pub fun failed(link: *Link) bool {
+    ret link == nil || link.state == FAILED;
+}
+
+pub fun finished(link: *Link) bool {
+    ret link != nil && (link.state == DONE || link.inbound_complete);
+}
+
+pub fun response(link: *Link) *parser.Parsed {
+    if (link == nil || !link.initialized || link.slot == engine_h1.NO_SLOT) { ret nil; }
+    ret engine_h1.parsed(?link.engine, link.slot);
+}
+
+# drive the upstream leg one step
+pub fun step(link: *Link, now: time.Time) Step {
+    if (link == nil) { ret STEP_ERROR; }
+    if (link.state == FAILED) { ret STEP_ERROR; }
+    if (link.state == CONNECTING) {
+        if (link.connect_pending) { ret STEP_BLOCKED; }
+        if (link.connect_failed || !link.has_stream) { link.state = FAILED; ret STEP_ERROR; }
+        if (!activate(link, now)) { link.state = FAILED; ret STEP_ERROR; }
+        ret STEP_PROGRESS;
+    }
+    if (!link.initialized) { ret STEP_BLOCKED; }
+    if (link.state == SENDING) {
+        if (link.engine.write_pending) { ret STEP_BLOCKED; }
+        if (link.engine.write_length != 0) {
+            engine_h1.submit_write(?link.engine);
+            ret STEP_PROGRESS;
+        }
+        if (link.engine_slots[link.slot].outbound_complete) {
+            link.state = AWAITING;
+            ret STEP_PROGRESS;
+        }
+        val offered: engine_h1.Offer = engine_h1.offer(?link.engine, link.slot, nil, 0, true);
+        if (offered.status == engine_h1.OFFER_ERROR) { link.state = FAILED; ret STEP_ERROR; }
+        if (offered.status == engine_h1.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+        if (link.engine.write_length != 0) { engine_h1.submit_write(?link.engine); }
+        ret STEP_PROGRESS;
+    }
+    if (link.state == IDLE) { ret STEP_BLOCKED; }
+    if (link.state == AWAITING || link.state == STREAMING) {
+        if (link.have_headers && link.state == AWAITING) {
+            link.state = STREAMING;
+            ret STEP_HEADERS;
+        }
+        if (link.inbound_complete) {
+            link.state = DONE;
+            # the engine forbids reuse when the exchange said so, and this only
+            # records that the upstream side finished cleanly
+            link.reusable = !link.engine_slots[link.slot].close_after;
+            ret STEP_DONE;
+        }
+        val event: engine_h1.Event = engine_h1.process(?link.engine, now);
+        if (event.kind == engine_h1.EVENT_NEED_READ) {
+            engine_h1.submit_read(?link.engine);
+            ret STEP_BLOCKED;
+        }
+        if (event.kind == engine_h1.EVENT_NONE) { ret STEP_BLOCKED; }
+        absorb(link, event);
+        if (link.state == FAILED) { ret STEP_ERROR; }
+        if (event.kind == engine_h1.EVENT_RESPONSE_HEADERS) {
+            link.state = STREAMING;
+            ret STEP_HEADERS;
+        }
+        ret STEP_PROGRESS;
+    }
+    if (link.state == DONE) { ret STEP_DONE; }
+    ret STEP_BLOCKED;
+}
+
+# take whatever response body bytes the engine is holding
+pub fun take_body(link: *Link, output: *u8, capacity: usize, produced: *usize,
+    complete: *bool) bool {
+    if (link == nil || produced == nil || complete == nil) { ret false; }
+    @produced = 0;
+    @complete = link.inbound_complete;
+    if (!link.initialized || link.slot == engine_h1.NO_SLOT) { ret false; }
+    if (link.engine.held_slot != link.slot || link.engine.held_length == 0) { ret true; }
+    var count: usize = link.engine.held_length;
+    if (count > capacity) { count = capacity; }
+    var i: usize = 0;
+    for (i < count) {
+        output[i] = link.engine.held_body[i];
+        i = i + 1;
+    }
+    if (!engine_h1.consume_body(?link.engine, link.slot, count)) { ret false; }
+    @produced = count;
+    @complete = link.inbound_complete && link.engine.held_length == 0;
+    ret true;
+}
+
+pub fun release(link: *Link) bool {
+    if (link == nil) { ret false; }
+    close(link);
+    ret true;
+}
+
+pub fun close(link: *Link) bool {
+    if (link == nil || link.state == FREE) { ret false; }
+    if (link.initialized) { engine_h1.cancel_connection(?link.engine); }
+    if (link.has_stream) {
+        tcp.stream_close(?link.stream);
+        link.has_stream = false;
+    }
+    if (link.scopes_live) {
+        cancel.destroy(?link.engine_scope);
+        cancel.destroy(?link.control_scope);
+        cancel.destroy(?link.operation_root);
+        link.scopes_live = false;
+    }
+    link.initialized = false;
+    link.leased = false;
+    link.state = FREE;
+    ret true;
+}
