@@ -1,0 +1,207 @@
+# isolated authenticated administration handler
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.sync.atomic;
+use hedge.telemetry.health;
+
+pub def AuthenticateFun: fun(ptr, str) bool;
+pub def RenderFun: fun(ptr, *u8, usize) usize;
+
+pub rec Policy {
+    listener: str;
+    auth_context: ptr;
+    authenticate: AuthenticateFun;
+    metrics_context: ptr;
+    render_metrics: RenderFun;
+    state_context: ptr;
+    render_state: RenderFun;
+    max_response_bytes: usize;
+}
+
+pub rec Handler {
+    policy: Policy;
+    health: *health.Health;
+    requests: i64;
+    unauthorized: i64;
+    not_found: i64;
+    failed: i64;
+    initialized: bool;
+}
+
+pub rec Request {
+    listener: str;
+    method: str;
+    path: str;
+    authorization: str;
+}
+
+pub rec Response {
+    status: u16;
+    content_type: str;
+    length: usize;
+}
+
+pub rec Stats {
+    requests: u64;
+    unauthorized: u64;
+    not_found: u64;
+    failed: u64;
+}
+
+fun write_text(output: *u8, capacity: usize, value: str) usize {
+    if (output == nil || value == nil) { ret 0; }
+    var length: usize = 0;
+    for (value[length] != 0) { length = length + 1; }
+    if (length > capacity) { ret 0; }
+    var i: usize = 0;
+    for (i < length) { output[i] = value[i]; i = i + 1; }
+    ret length;
+}
+
+pub fun make(handler: *Handler, policy: Policy, health_state: *health.Health) bool {
+    if (handler == nil || health_state == nil || policy.listener == nil || policy.listener[0] == 0
+        || policy.authenticate::usize == 0 || policy.max_response_bytes == 0) {
+        ret false;
+    }
+    handler.policy = policy;
+    handler.health = health_state;
+    handler.requests = 0;
+    handler.unauthorized = 0;
+    handler.not_found = 0;
+    handler.failed = 0;
+    handler.initialized = true;
+    ret true;
+}
+
+fun fixed(response: *Response, output: *u8, capacity: usize, status: u16, body: str) bool {
+    val length: usize = write_text(output, capacity, body);
+    if (length == 0 && body[0] != 0) { ret false; }
+    response.status = status;
+    response.content_type = "application/json";
+    response.length = length;
+    ret true;
+}
+
+pub fun handle(handler: *Handler, request: Request, output: *u8, capacity: usize, response: *Response) bool {
+    if (handler == nil || !handler.initialized || output == nil || response == nil || capacity == 0) { ret false; }
+    atomic.fetch_add(?handler.requests, 1);
+    var limit: usize = handler.policy.max_response_bytes;
+    if (capacity < handler.policy.max_response_bytes) { limit = capacity; }
+    if (!str_equals(request.listener, handler.policy.listener)) {
+        atomic.fetch_add(?handler.not_found, 1);
+        ret fixed(response, output, limit, 404, "{\"error\":\"not_found\"}\n");
+    }
+    if (!handler.policy.authenticate(handler.policy.auth_context, request.authorization)) {
+        atomic.fetch_add(?handler.unauthorized, 1);
+        ret fixed(response, output, limit, 401, "{\"error\":\"unauthorized\"}\n");
+    }
+    if (!str_equals(request.method, "GET")) {
+        ret fixed(response, output, limit, 405, "{\"error\":\"method_not_allowed\"}\n");
+    }
+    if (str_equals(request.path, "/live")) {
+        val live_state: health.Snapshot = health.snapshot(handler.health);
+        if (live_state.live) { ret fixed(response, output, limit, 200, "{\"live\":true}\n"); }
+        ret fixed(response, output, limit, 503, "{\"live\":false}\n");
+    }
+    if (str_equals(request.path, "/ready")) {
+        val ready_state: health.Snapshot = health.snapshot(handler.health);
+        if (ready_state.ready) { ret fixed(response, output, limit, 200, "{\"ready\":true}\n"); }
+        ret fixed(response, output, limit, 503, "{\"ready\":false}\n");
+    }
+    if (str_equals(request.path, "/metrics") && handler.policy.render_metrics::usize != 0) {
+        val metrics_length: usize = handler.policy.render_metrics(handler.policy.metrics_context, output, limit);
+        if (metrics_length == 0 || metrics_length > limit) {
+            atomic.fetch_add(?handler.failed, 1);
+            ret fixed(response, output, limit, 503, "{\"error\":\"metrics_unavailable\"}\n");
+        }
+        response.status = 200;
+        response.content_type = "text/plain; version=0.0.4";
+        response.length = metrics_length;
+        ret true;
+    }
+    if (str_equals(request.path, "/state") && handler.policy.render_state::usize != 0) {
+        val state_length: usize = handler.policy.render_state(handler.policy.state_context, output, limit);
+        if (state_length == 0 || state_length > limit) {
+            atomic.fetch_add(?handler.failed, 1);
+            ret fixed(response, output, limit, 503, "{\"error\":\"state_unavailable\"}\n");
+        }
+        response.status = 200;
+        response.content_type = "application/json";
+        response.length = state_length;
+        ret true;
+    }
+    atomic.fetch_add(?handler.not_found, 1);
+    ret fixed(response, output, limit, 404, "{\"error\":\"not_found\"}\n");
+}
+
+pub fun stats(handler: *Handler) Stats {
+    var result: Stats;
+    if (handler == nil || !handler.initialized) { ret result; }
+    result.requests = atomic.load(?handler.requests)::u64;
+    result.unauthorized = atomic.load(?handler.unauthorized)::u64;
+    result.not_found = atomic.load(?handler.not_found)::u64;
+    result.failed = atomic.load(?handler.failed)::u64;
+    ret result;
+}
+
+fun test_authenticate(context: ptr, authorization: str) bool {
+    ret str_equals(authorization, "Bearer valid");
+}
+
+fun test_render(context: ptr, output: *u8, capacity: usize) usize {
+    ret write_text(output, capacity, "hedge_requests 1\n");
+}
+
+test "telemetry admin: listener isolation and authentication precede routing" {
+    var checks: [1]health.Check;
+    var health_state: health.Health;
+    health.make(?health_state, ?checks[0], 1);
+    health.begin_accepting(?health_state);
+    val policy: Policy = Policy{
+        listener: "admin",
+        auth_context: nil,
+        authenticate: test_authenticate,
+        metrics_context: nil,
+        render_metrics: test_render,
+        state_context: nil,
+        render_state: test_render,
+        max_response_bytes: 128,
+    };
+    var handler: Handler;
+    if (!make(?handler, policy, ?health_state)) { ret 1; }
+    var output: [128]u8;
+    var response: Response;
+    if (!handle(?handler, Request{listener: "public", method: "GET", path: "/ready", authorization: "Bearer valid"}, ?output[0], 128, ?response) || response.status != 404) { ret 2; }
+    if (!handle(?handler, Request{listener: "admin", method: "GET", path: "/ready", authorization: "Bearer wrong"}, ?output[0], 128, ?response) || response.status != 401) { ret 3; }
+    if (!handle(?handler, Request{listener: "admin", method: "GET", path: "/ready", authorization: "Bearer valid"}, ?output[0], 128, ?response) || response.status != 200) { ret 4; }
+    val state: Stats = stats(?handler);
+    if (state.requests != 3 || state.unauthorized != 1 || state.not_found != 1) { ret 5; }
+    ret 0;
+}
+
+test "telemetry admin: response limits fail closed" {
+    var checks: [1]health.Check;
+    var health_state: health.Health;
+    health.make(?health_state, ?checks[0], 1);
+    val policy: Policy = Policy{
+        listener: "admin",
+        auth_context: nil,
+        authenticate: test_authenticate,
+        metrics_context: nil,
+        render_metrics: test_render,
+        state_context: nil,
+        render_state: (0::usize)::RenderFun,
+        max_response_bytes: 8,
+    };
+    var handler: Handler;
+    make(?handler, policy, ?health_state);
+    var output: [8]u8;
+    var response: Response;
+    if (handle(?handler, Request{listener: "admin", method: "GET", path: "/metrics", authorization: "Bearer valid"}, ?output[0], 8, ?response)) { ret 1; }
+    ret 0;
+}
