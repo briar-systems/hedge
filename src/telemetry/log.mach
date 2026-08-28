@@ -1,0 +1,271 @@
+# bounded structured logging contract
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.sync.atomic;
+use std.log.record;
+use std.log.sink;
+
+pub val MAX_FIELDS: usize = 32;
+
+pub rec Stats {
+    offered: u64;
+    persisted: u64;
+    partial: u64;
+    enqueued: u64;
+    truncated: u64;
+    rejected: u64;
+    dropped: u64;
+    failed: u64;
+    suppressed: u64;
+}
+
+pub rec Logger {
+    output: *sink.Sink;
+    clock: record.Clock;
+    minimum_level: record.Level;
+    field_limit: usize;
+    allow_blocking: bool;
+    initialized: bool;
+    offered: i64;
+    persisted: i64;
+    partial: i64;
+    enqueued: i64;
+    truncated: i64;
+    rejected: i64;
+    dropped: i64;
+    failed: i64;
+    suppressed: i64;
+}
+
+pub fun make(
+    logger: *Logger,
+    output: *sink.Sink,
+    clock: record.Clock,
+    minimum_level: record.Level,
+    field_limit: usize,
+    allow_blocking: bool,
+) bool {
+    if (logger == nil || output == nil || !sink.contract_valid(output.contract) || !record.clock_valid(?clock)
+        || minimum_level > record.OFF || field_limit == 0 || field_limit > MAX_FIELDS) {
+        ret false;
+    }
+    if (!allow_blocking && output.contract.overload == sink.OVERLOAD_BLOCK) { ret false; }
+    logger.output = output;
+    logger.clock = clock;
+    logger.minimum_level = minimum_level;
+    logger.field_limit = field_limit;
+    logger.allow_blocking = allow_blocking;
+    logger.initialized = true;
+    atomic.store(?logger.offered, 0);
+    atomic.store(?logger.persisted, 0);
+    atomic.store(?logger.partial, 0);
+    atomic.store(?logger.enqueued, 0);
+    atomic.store(?logger.truncated, 0);
+    atomic.store(?logger.rejected, 0);
+    atomic.store(?logger.dropped, 0);
+    atomic.store(?logger.failed, 0);
+    atomic.store(?logger.suppressed, 0);
+    ret true;
+}
+
+fun account(logger: *Logger, report: sink.WriteReport) {
+    if (report.truncated) { atomic.fetch_add(?logger.truncated, 1); }
+    if (report.status == sink.WRITE_PERSISTED) {
+        atomic.fetch_add(?logger.persisted, 1);
+    } or (report.status == sink.WRITE_PARTIAL) {
+        atomic.fetch_add(?logger.partial, 1);
+    } or (report.status == sink.WRITE_ENQUEUED) {
+        atomic.fetch_add(?logger.enqueued, 1);
+    } or (report.status == sink.WRITE_REJECTED) {
+        atomic.fetch_add(?logger.rejected, 1);
+    } or (report.status == sink.WRITE_DROPPED) {
+        atomic.fetch_add(?logger.dropped, 1);
+    } or (report.status == sink.WRITE_SUPPRESSED) {
+        atomic.fetch_add(?logger.suppressed, 1);
+    } or {
+        atomic.fetch_add(?logger.failed, 1);
+    }
+}
+
+pub fun emit(logger: *Logger, level: record.Level, message: str, fields: *record.Field, field_count: usize) sink.WriteReport {
+    if (logger == nil || !logger.initialized || level > record.ERROR || message == nil || (field_count > 0 && fields == nil)) {
+        ret sink.failed(0, 0, record.ERR_INVALID_RECORD);
+    }
+    atomic.fetch_add(?logger.offered, 1);
+    if (level < logger.minimum_level || logger.minimum_level == record.OFF) {
+        val suppressed: sink.WriteReport = sink.suppressed();
+        account(logger, suppressed);
+        ret suppressed;
+    }
+    if (field_count > logger.field_limit) {
+        val rejected: sink.WriteReport = sink.report(sink.WRITE_REJECTED, 0, 0, false, record.ERR_INVALID_RECORD);
+        account(logger, rejected);
+        ret rejected;
+    }
+    var data: [8192]u8;
+    var item: record.Record = record.record_at(
+        record.clock_now(?logger.clock),
+        logger.clock.precision,
+        level,
+        message,
+        fields,
+        field_count,
+    );
+    val encoded: record.Encoded = record.encode(
+        ?item,
+        ?data[0],
+        record.MAX_RECORD_BYTES,
+        logger.output.contract.max_record,
+        logger.output.contract.oversize,
+    );
+    if (encoded.status == record.ENCODE_REJECTED || encoded.status == record.ENCODE_INVALID) {
+        val rejected: sink.WriteReport = sink.report(sink.WRITE_REJECTED, encoded.required, 0, false, encoded.error);
+        account(logger, rejected);
+        ret rejected;
+    }
+    var report: sink.WriteReport = sink.publish(logger.output, ?data[0], encoded.len);
+    if (encoded.status == record.ENCODED_TRUNCATED) { report.truncated = true; }
+    account(logger, report);
+    ret report;
+}
+
+pub fun stats(logger: *Logger) Stats {
+    var result: Stats;
+    if (logger == nil || !logger.initialized) { ret result; }
+    result.offered = atomic.load(?logger.offered)::u64;
+    result.persisted = atomic.load(?logger.persisted)::u64;
+    result.partial = atomic.load(?logger.partial)::u64;
+    result.enqueued = atomic.load(?logger.enqueued)::u64;
+    result.truncated = atomic.load(?logger.truncated)::u64;
+    result.rejected = atomic.load(?logger.rejected)::u64;
+    result.dropped = atomic.load(?logger.dropped)::u64;
+    result.failed = atomic.load(?logger.failed)::u64;
+    result.suppressed = atomic.load(?logger.suppressed)::u64;
+    ret result;
+}
+
+rec TestSink {
+    data: [512]u8;
+    len: usize;
+    fail: bool;
+    partial: bool;
+}
+
+rec TestQueue {
+    mode: sink.WriteStatus;
+    calls: usize;
+}
+
+fun test_publish(context: ptr, data: *u8, length: usize) sink.WriteReport {
+    val output: *TestSink = context::*TestSink;
+    if (output.fail) { ret sink.failed(length, 0, "test failure"); }
+    if (output.partial) { ret sink.partial(length, length - 1, "test partial"); }
+    if (length > 512) { ret sink.failed(length, 0, "test capacity"); }
+    var i: usize = 0;
+    for (i < length) { output.data[i] = data[i]; i = i + 1; }
+    output.len = length;
+    ret sink.persisted(length);
+}
+
+fun test_sink(output: *TestSink, max_record: usize) sink.Sink {
+    val contract: sink.Contract = sink.Contract{
+        delivery: sink.DELIVERY_DIRECT,
+        max_record: max_record,
+        oversize: record.OVERSIZE_REJECT,
+        adapter: sink.ADAPTER_CUSTOM,
+        target_atomic_limit: 0,
+        queue_capacity: 0,
+        overload: sink.OVERLOAD_REJECT_NEW,
+    };
+    ret sink.Sink{ctx: output::ptr, f_publish: test_publish, contract: contract};
+}
+
+fun test_queue_publish(context: ptr, data: *u8, length: usize) sink.WriteReport {
+    val output: *TestQueue = context::*TestQueue;
+    output.calls = output.calls + 1;
+    if (output.mode == sink.WRITE_ENQUEUED) { ret sink.report(sink.WRITE_ENQUEUED, length, 0, false, nil); }
+    if (output.mode == sink.WRITE_DROPPED) { ret sink.report(sink.WRITE_DROPPED, length, 0, false, nil); }
+    ret sink.report(sink.WRITE_REJECTED, length, 0, false, sink.ERR_QUEUE_FULL);
+}
+
+fun test_queue_sink(output: *TestQueue, overload: sink.OverloadPolicy) sink.Sink {
+    val contract: sink.Contract = sink.Contract{
+        delivery: sink.DELIVERY_BOUNDED_QUEUED,
+        max_record: 512,
+        oversize: record.OVERSIZE_REJECT,
+        adapter: sink.ADAPTER_CUSTOM,
+        target_atomic_limit: 0,
+        queue_capacity: 1,
+        overload: overload,
+    };
+    ret sink.Sink{ctx: output::ptr, f_publish: test_queue_publish, contract: contract};
+}
+
+test "telemetry log: record escaping and sink failure remain structured" {
+    var target: TestSink;
+    target.fail = false;
+    target.partial = false;
+    var output: sink.Sink = test_sink(?target, 512);
+    var logger: Logger;
+    if (!make(?logger, ?output, record.system_clock(record.PRECISION_MILLIS), record.INFO, 4, false)) { ret 1; }
+    var fields: [1]record.Field;
+    fields[0] = record.field_string("peer", "line\nbreak=value");
+    val written: sink.WriteReport = emit(?logger, record.INFO, "request\ninjected=true", ?fields[0], 1);
+    if (written.status != sink.WRITE_PERSISTED || target.len == 0) { ret 2; }
+    var line_feeds: usize = 0;
+    var i: usize = 0;
+    for (i < target.len) {
+        if (target.data[i] == '\n') { line_feeds = line_feeds + 1; }
+        if (target.data[i] == '\r') { ret 3; }
+        i = i + 1;
+    }
+    if (line_feeds != 1 || target.data[target.len - 1] != '\n') { ret 4; }
+    target.partial = true;
+    if (emit(?logger, record.WARN, "partial", nil, 0).status != sink.WRITE_PARTIAL) { ret 5; }
+    target.partial = false;
+    target.fail = true;
+    if (emit(?logger, record.ERROR, "failure", nil, 0).status != sink.WRITE_FAILED) { ret 6; }
+    val state: Stats = stats(?logger);
+    if (state.offered != 3 || state.persisted != 1 || state.partial != 1 || state.failed != 1) { ret 7; }
+    ret 0;
+}
+
+test "telemetry log: queued overload is bounded and observable" {
+    var queue: TestQueue;
+    queue.mode = sink.WRITE_REJECTED;
+    queue.calls = 0;
+    var output: sink.Sink = test_queue_sink(?queue, sink.OVERLOAD_REJECT_NEW);
+    var logger: Logger;
+    if (!make(?logger, ?output, record.system_clock(record.PRECISION_SECONDS), record.INFO, 2, false)) { ret 1; }
+    if (emit(?logger, record.INFO, "rejected", nil, 0).status != sink.WRITE_REJECTED) { ret 2; }
+    queue.mode = sink.WRITE_DROPPED;
+    output.contract.overload = sink.OVERLOAD_DROP_NEW;
+    if (emit(?logger, record.INFO, "dropped", nil, 0).status != sink.WRITE_DROPPED) { ret 3; }
+    queue.mode = sink.WRITE_ENQUEUED;
+    if (emit(?logger, record.INFO, "enqueued", nil, 0).status != sink.WRITE_ENQUEUED) { ret 4; }
+    val state: Stats = stats(?logger);
+    if (queue.calls != 3 || state.offered != 3 || state.rejected != 1 || state.dropped != 1 || state.enqueued != 1) { ret 5; }
+    var blocking: sink.Sink = test_queue_sink(?queue, sink.OVERLOAD_BLOCK);
+    if (make(?logger, ?blocking, record.system_clock(record.PRECISION_SECONDS), record.INFO, 2, false)) { ret 6; }
+    ret 0;
+}
+
+test "telemetry log: field and event bounds reject without sink work" {
+    var target: TestSink;
+    target.len = 0;
+    target.fail = false;
+    target.partial = false;
+    var output: sink.Sink = test_sink(?target, 64);
+    var logger: Logger;
+    if (!make(?logger, ?output, record.system_clock(record.PRECISION_SECONDS), record.DEBUG, 1, false)) { ret 1; }
+    var fields: [2]record.Field;
+    fields[0] = record.field_u64("one", 1);
+    fields[1] = record.field_u64("two", 2);
+    if (emit(?logger, record.INFO, "fields", ?fields[0], 2).status != sink.WRITE_REJECTED || target.len != 0) { ret 2; }
+    if (emit(?logger, record.INFO, "this message is deliberately much longer than the configured record budget", nil, 0).status != sink.WRITE_REJECTED || target.len != 0) { ret 3; }
+    ret 0;
+}

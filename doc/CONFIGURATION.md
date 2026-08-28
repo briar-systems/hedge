@@ -67,13 +67,50 @@ The implemented schema accepts these top-level sections:
 - `listener` arrays with `tcp`, `quic`, or `local` transport and explicit protocol sets
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
 - direct `route` arrays or named `routes` groups
-- `telemetry` sinks
+- bounded `telemetry` and isolated `admin` policy
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. A named listener `budget` limits its accepted connections. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
 
 Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
+
+## Telemetry and administration
+
+```toml
+[[listener]]
+name = "admin"
+address = "127.0.0.1:9090"
+protocols = ["http/1.1"]
+
+[secret.admin-token]
+provider = "env"
+key = "HEDGE_ADMIN_TOKEN"
+
+[telemetry]
+logs = true
+metrics = true
+traces = true
+endpoint = "https://collector.example/v1/traces"
+log_record_bytes = 2048
+log_queue_depth = 256
+metric_series = 1024
+trace_state_bytes = 512
+
+[admin]
+enabled = true
+listener = "admin"
+auth_secret = "admin-token"
+max_response_bytes = 8192
+```
+
+Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
+
+Metric storage is caller-owned and fixed at `metric_series`. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+
+Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512.
+
+The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. It exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
 
 ## Validation
 
@@ -88,6 +125,7 @@ Validation resolves:
 - cache and buffer budgets
 - timeout relationships
 - telemetry destinations
+- telemetry storage dimensions and administration isolation
 - application provider requirements
 
 Unknown fields are errors. Deprecated fields produce actionable diagnostics and follow a published removal policy.

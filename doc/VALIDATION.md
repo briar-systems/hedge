@@ -26,6 +26,8 @@ Coverage-guided harnesses target parsers, state machines, configuration, certifi
 
 Tests inject allocation failure, short I/O, cancellation, timeout, reset, disk-full, descriptor exhaustion, unavailable entropy, clock changes, packet loss, reordering, duplication, and stale configuration generations.
 
+Telemetry fault cases include sink failure, full-queue rejection and dropping, structured-record injection, series-cardinality exhaustion, administration response exhaustion, authentication failure, and shutdown flush failure. Tests assert the externally visible status and the accounting counters for each outcome.
+
 ### Interoperability tests
 
 Client and server matrices cover major HTTP, TLS, QUIC, and ACME implementations. Results record version and configuration so changes are attributable.
@@ -61,4 +63,3 @@ Every randomized failure records a seed, minimized input, configuration, target 
 ## Production canary
 
 The final qualification stage serves a real public site with controlled canary traffic. Automated rollback watches correctness, crash, resource, certificate, and latency signals. Canary success supplements the test program and never replaces it.
-
