@@ -1,0 +1,232 @@
+# the serving runtime: listeners, a bounded connection pool, and one sealed plan
+#
+# this module owns the loop that turns accepted connections into served requests.
+# it is the only place that knows both the listener plane and the connection
+# plane, and it hands each connection the same immutable plan for its lifetime.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.chrono.time;
+use std.net.ip;
+use http.core.message;
+use hedge.config.schema;
+use hedge.listener;
+use hedge.connection;
+use hedge.telemetry;
+use plan: hedge.dispatch.plan;
+use telemetry_health: hedge.telemetry.health;
+
+pub val DEFAULT_POLL_MS: i32 = 50;
+
+pub def State: u8;
+pub val NEW: State = 1;
+pub val READY: State = 2;
+pub val DRAINING: State = 3;
+pub val STOPPED: State = 4;
+
+pub rec Slot {
+    live: bool;
+    token: listener.ConnectionToken;
+    handle: *connection.Connection;
+}
+
+pub rec Runtime {
+    state: State;
+    generation: u64;
+    owner: listener.Owner;
+    slots: *Slot;
+    connections: *connection.Connection;
+    capacity: usize;
+    live: usize;
+    next_id: u64;
+    plan: *plan.Plan;
+    configured: connection.Config;
+    limits: message.Limits;
+    observability: *telemetry.Runtime;
+    served: u64;
+    accepted: u64;
+    rejected: u64;
+}
+
+pub fun make(
+    runtime: *Runtime,
+    slots: *Slot,
+    connections: *connection.Connection,
+    capacity: usize,
+    active_plan: *plan.Plan,
+    graph: *schema.Graph,
+) bool {
+    if (runtime == nil || slots == nil || connections == nil || capacity == 0
+     || active_plan == nil || !plan.sealed(active_plan) || graph == nil) { ret false; }
+    runtime.state = NEW;
+    runtime.generation = 0;
+    runtime.slots = slots;
+    runtime.connections = connections;
+    runtime.capacity = capacity;
+    runtime.live = 0;
+    runtime.next_id = 1;
+    runtime.plan = active_plan;
+    runtime.configured = connection.config_from(graph);
+    runtime.limits = connection.message_limits(graph, runtime.configured);
+    runtime.observability = nil;
+    runtime.served = 0;
+    runtime.accepted = 0;
+    runtime.rejected = 0;
+    var i: usize = 0;
+    for (i < capacity) {
+        slots[i].live = false;
+        slots[i].handle = ?connections[i];
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun attach_telemetry(runtime: *Runtime, observability: *telemetry.Runtime) bool {
+    if (runtime == nil || observability == nil || runtime.state != NEW) { ret false; }
+    runtime.observability = observability;
+    ret true;
+}
+
+pub fun start(runtime: *Runtime, generation: u64, graph: *schema.Graph,
+    diagnostics: *schema.Diagnostics) bool {
+    if (runtime == nil || runtime.state != NEW) { ret false; }
+    if (!listener.start(?runtime.owner, generation, graph, diagnostics)) { ret false; }
+    if (!listener.attach_connections(?runtime.owner, nil, connection.complete)) {
+        listener.stop(?runtime.owner);
+        ret false;
+    }
+    runtime.generation = generation;
+    runtime.state = READY;
+    if (runtime.observability != nil && !telemetry.begin_ready(runtime.observability)) {
+        listener.stop(?runtime.owner);
+        runtime.state = STOPPED;
+        ret false;
+    }
+    ret true;
+}
+
+fun free_slot(runtime: *Runtime) usize {
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (!runtime.slots[i].live) { ret i; }
+        i = i + 1;
+    }
+    ret runtime.capacity;
+}
+
+fun listener_name(runtime: *Runtime, index: usize) str {
+    val owned: *listener.OwnedListener = listener.active_listener(?runtime.owner, index);
+    if (owned == nil) { ret "unknown"; }
+    ret schema.text(?owned.name);
+}
+
+# admit every queued connection the pool can hold and refuse the rest at once
+fun admit(runtime: *Runtime, now: time.Time) usize {
+    var admitted: usize = 0;
+    for (true) {
+        var token: listener.ConnectionToken;
+        if (!listener.take_connection(?runtime.owner, ?token)) { brk; }
+        val source: *listener.Connection = listener.inspect_connection(?runtime.owner, token);
+        val index: usize = free_slot(runtime);
+        if (source == nil || index >= runtime.capacity) {
+            runtime.rejected = runtime.rejected + 1;
+            listener.close_connection(?runtime.owner, token);
+            cnt;
+        }
+        val slot: *Slot = ?runtime.slots[index];
+        if (!connection.make(slot.handle, runtime.next_id, runtime.generation, token, source,
+            ?runtime.owner.network, runtime.plan, runtime.configured, runtime.limits,
+            listener_name(runtime, source.listener_index), now)) {
+            runtime.rejected = runtime.rejected + 1;
+            listener.close_connection(?runtime.owner, token);
+            cnt;
+        }
+        slot.live = true;
+        slot.token = token;
+        runtime.next_id = runtime.next_id + 1;
+        runtime.live = runtime.live + 1;
+        runtime.accepted = runtime.accepted + 1;
+        admitted = admitted + 1;
+    }
+    ret admitted;
+}
+
+fun retire(runtime: *Runtime, index: usize) {
+    val slot: *Slot = ?runtime.slots[index];
+    if (!slot.live) { ret; }
+    runtime.served = runtime.served + slot.handle.requests;
+    connection.close(slot.handle);
+    listener.release_connection(?runtime.owner, slot.token);
+    slot.live = false;
+    if (runtime.live > 0) { runtime.live = runtime.live - 1; }
+}
+
+# drive one connection until it blocks on I/O or finishes
+fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
+    val slot: *Slot = ?runtime.slots[index];
+    val progress: connection.Step = connection.advance(slot.handle, now);
+    if (progress == connection.STEP_DONE || progress == connection.STEP_ERROR) {
+        retire(runtime, index);
+        ret true;
+    }
+    ret false;
+}
+
+pub fun poll(runtime: *Runtime, timeout_ms: i32) bool {
+    if (runtime == nil || (runtime.state != READY && runtime.state != DRAINING)) { ret false; }
+    val polled: bool = listener.poll(?runtime.owner, timeout_ms);
+    val now: time.Time = time.now();
+    if (runtime.state == READY) { admit(runtime, now); }
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (runtime.slots[i].live) { drive(runtime, i, now); }
+        i = i + 1;
+    }
+    if (runtime.owner.state == listener.OWNER_DRAINING && runtime.state == READY) {
+        runtime.state = DRAINING;
+        if (runtime.observability != nil) { telemetry.begin_drain(runtime.observability); }
+        var j: usize = 0;
+        for (j < runtime.capacity) {
+            if (runtime.slots[j].live) { connection.begin_graceful(runtime.slots[j].handle); }
+            j = j + 1;
+        }
+    }
+    ret polled;
+}
+
+pub fun draining(runtime: *Runtime) bool {
+    ret runtime != nil && runtime.state == DRAINING;
+}
+
+pub fun idle(runtime: *Runtime) bool {
+    ret runtime != nil && runtime.live == 0;
+}
+
+pub fun stop(runtime: *Runtime) bool {
+    if (runtime == nil || (runtime.state != READY && runtime.state != DRAINING)) { ret false; }
+    runtime.state = DRAINING;
+    if (runtime.observability != nil) { telemetry.begin_drain(runtime.observability); }
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (runtime.slots[i].live) { retire(runtime, i); }
+        i = i + 1;
+    }
+    val stopped: bool = listener.stop(?runtime.owner);
+    var flushed: bool = true;
+    if (runtime.observability != nil) { flushed = telemetry.shutdown(runtime.observability); }
+    runtime.state = STOPPED;
+    ret stopped && flushed;
+}
+
+pub fun bound_endpoint_text(runtime: *Runtime, index: usize, output: *u8, capacity: usize) usize {
+    val owned: *listener.OwnedListener = listener.active_listener(?runtime.owner, index);
+    if (owned == nil || !owned.has_bound_endpoint) { ret 0; }
+    ret endpoint_text(owned, output, capacity);
+}
+
+fun endpoint_text(owned: *listener.OwnedListener, output: *u8, capacity: usize) usize {
+    ret ip.endpoint_format(owned.bound_endpoint, output, capacity);
+}

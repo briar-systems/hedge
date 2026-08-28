@@ -1,0 +1,888 @@
+# the cleartext HTTP/1 connection plane
+#
+# a connection owns its transport, its protocol engine, and one exchange at a
+# time. it translates connection state into the common service exchange and then
+# calls into dispatch. dispatch learns nothing about the transport from here, so
+# TLS, ALPN, and the other protocol engines attach in front of this module rather
+# than inside it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.unwrap_ok;
+use std.chrono.time;
+use std.sync.cancel;
+use std.system.os;
+use std.net.ip;
+use std.net.tcp;
+use net_async: std.net.async;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
+use io_lifecycle: std.io.lifecycle;
+use http.core.body;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use http.h1.connection;
+use http.h1.parser;
+use http.h1.framing;
+use http.router.router;
+use http.core.transport;
+use hedge.config.schema;
+use hedge.dispatch;
+use hedge.service;
+use call: hedge.dispatch.call;
+use plan: hedge.dispatch.plan;
+use hedge.listener;
+use telemetry_trace: hedge.telemetry.trace;
+
+pub val PIPELINE_DEPTH: usize = 2;
+pub val TRANSPORT_SLOTS: usize = 4;
+pub val LINE_BYTES: usize = 4096;
+pub val STORAGE_BYTES: usize = 8192;
+pub val FIELD_SLOTS: usize = 64;
+pub val TRAILER_SLOTS: usize = 16;
+pub val SCRATCH_BYTES: usize = 4096;
+pub val READ_BYTES: usize = 8192;
+pub val WRITE_BYTES: usize = 8192;
+pub val ARENA_BYTES: usize = 4096;
+pub val RESPONSE_FIELD_SLOTS: usize = 32;
+pub val RESPONSE_TRAILER_SLOTS: usize = 8;
+pub val INFORMATIONAL_SLOTS: usize = 4;
+pub val CAPTURE_SLOTS: usize = 8;
+pub val MAX_STEPS: usize = 64;
+
+# where exchange construction stopped, reported through the connection snapshot
+pub def Setup: u8;
+pub val SETUP_OK: Setup = 0;
+pub val SETUP_PARSED: Setup = 1;
+pub val SETUP_SCOPE: Setup = 2;
+pub val SETUP_BODY: Setup = 3;
+pub val SETUP_REQUEST: Setup = 4;
+pub val SETUP_RESPONSE: Setup = 5;
+pub val SETUP_EXCHANGE: Setup = 6;
+pub val SETUP_BEGIN: Setup = 7;
+pub val SETUP_TRACE: Setup = 8;
+pub val SETUP_BIND: Setup = 9;
+pub val PEER_BYTES: usize = 64;
+
+pub def State: u8;
+pub val NEW: State = 1;
+pub val ACTIVE: State = 2;
+pub val CLOSING: State = 3;
+pub val CLOSED: State = 4;
+pub val FAILED: State = 5;
+
+pub def Step: u8;
+pub val STEP_IDLE: Step = 1;
+pub val STEP_PROGRESS: Step = 2;
+pub val STEP_BLOCKED: Step = 3;
+pub val STEP_DONE: Step = 4;
+pub val STEP_ERROR: Step = 5;
+
+# each in-flight transport operation carries the connection it belongs to and the
+# transport token the connection must settle when the completion arrives
+rec Operation {
+    connection: *Connection;
+    token_context: usize;
+}
+
+pub rec Config {
+    engine: connection.Config;
+    request_timeout_ns: u64;
+}
+
+pub fun config_from(graph: *schema.Graph) Config {
+    var engine: connection.Config = connection.config_default();
+    engine.max_pipeline = PIPELINE_DEPTH;
+    engine.parser.max_header_bytes = graph.limits.max_header_bytes;
+    engine.parser.max_headers = graph.limits.max_header_count;
+    engine.parser.max_body_bytes = graph.limits.max_body_bytes::u64;
+    engine.header_timeout_ns = graph.timeouts.header_ms * 1000000;
+    engine.request_timeout_ns = graph.timeouts.request_ms * 1000000;
+    engine.idle_timeout_ns = graph.timeouts.keep_alive_ms * 1000000;
+    engine.write_timeout_ns = graph.timeouts.write_ms * 1000000;
+    if (engine.parser.max_header_bytes > STORAGE_BYTES) { engine.parser.max_header_bytes = STORAGE_BYTES; }
+    if (engine.parser.max_headers > FIELD_SLOTS) { engine.parser.max_headers = FIELD_SLOTS; }
+    if (engine.parser.max_start_line > LINE_BYTES) { engine.parser.max_start_line = LINE_BYTES; }
+    if (engine.parser.max_header_line > LINE_BYTES) { engine.parser.max_header_line = LINE_BYTES; }
+    if (engine.parser.max_trailer_bytes > STORAGE_BYTES) { engine.parser.max_trailer_bytes = STORAGE_BYTES; }
+    if (engine.parser.max_trailers > TRAILER_SLOTS) { engine.parser.max_trailers = TRAILER_SLOTS; }
+    if (engine.parser.max_chunk_line > LINE_BYTES) { engine.parser.max_chunk_line = LINE_BYTES; }
+    ret Config{engine: engine, request_timeout_ns: graph.timeouts.request_ms * 1000000};
+}
+
+# the exchange limits a service sees must admit everything the parser will accept,
+# so both are derived from one set of configured bounds rather than defaulted apart
+pub fun message_limits(graph: *schema.Graph, configured: Config) message.Limits {
+    val parsing: parser.Limits = configured.engine.parser;
+    var limits: message.Limits = message.limits_default();
+    limits.max_method_bytes = parsing.max_method_bytes;
+    limits.max_endpoint_bytes = PEER_BYTES;
+    limits.target = target.limits(parsing.max_target_bytes, 16, parsing.max_target_bytes,
+        parsing.max_target_bytes, parsing.max_target_bytes);
+    limits.request_fields = field.limits(parsing.max_headers, parsing.max_header_bytes,
+        parsing.max_header_line, parsing.max_header_line);
+    limits.request_trailers = field.limits(parsing.max_trailers, parsing.max_trailer_bytes,
+        parsing.max_header_line, parsing.max_header_line);
+    limits.request_body = body.limits(parsing.max_body_bytes, READ_BYTES, 0xffffffff);
+    limits.response_body = body.limits(graph.limits.max_body_bytes::u64, READ_BYTES, 0xffffffff);
+    ret limits;
+}
+
+# the request body reader pulls the bytes the engine is holding and reports
+# pending when the connection has not read them yet, so backpressure reaches the
+# service instead of being buffered behind its back
+rec RequestBody {
+    owner: *Connection;
+    slot: usize;
+    reader: body.Reader;
+    pending_token: u64;
+    next_token: u64;
+}
+
+pub rec Connection {
+    state: State;
+    id: u64;
+    generation: u64;
+    token: listener.ConnectionToken;
+    stream: tcp.Stream;
+    peer: ip.Endpoint;
+    peer_text: [PEER_BYTES]u8;
+    local_text: [PEER_BYTES]u8;
+    listener_name: str;
+    driver: *net_async.Driver;
+    runtime_stream: transport.RuntimeStream;
+    adapter: transport.Adapter;
+    channel: transport.Transport;
+    channel_slots: [TRANSPORT_SLOTS]transport.Slot;
+    contexts: [TRANSPORT_SLOTS]listener.ConnectionContext;
+    operations: [TRANSPORT_SLOTS]Operation;
+    operation_root: cancel.Scope;
+    control_scope: cancel.Scope;
+    engine_scope: cancel.Scope;
+    request_scope: cancel.Scope;
+    request_scope_live: bool;
+    engine: connection.Engine;
+    engine_slots: [PIPELINE_DEPTH]connection.Slot;
+    engine_memories: [PIPELINE_DEPTH]connection.SlotMemory;
+    lines: [PIPELINE_DEPTH][LINE_BYTES]u8;
+    storages: [PIPELINE_DEPTH][STORAGE_BYTES]u8;
+    slot_fields: [PIPELINE_DEPTH][FIELD_SLOTS]field.Field;
+    slot_trailers: [PIPELINE_DEPTH][TRAILER_SLOTS]field.Field;
+    scratches: [PIPELINE_DEPTH][SCRATCH_BYTES]u8;
+    read_buffer: [READ_BYTES]u8;
+    write_buffer: [WRITE_BYTES]u8;
+    stage: [READ_BYTES]u8;
+    request_body: RequestBody;
+    request: message.Request;
+    response: message.Response;
+    response_fields: [RESPONSE_FIELD_SLOTS]field.Field;
+    response_trailers: [RESPONSE_TRAILER_SLOTS]field.Field;
+    informationals: [INFORMATIONAL_SLOTS]message.Informational;
+    captures: [CAPTURE_SLOTS]router.Capture;
+    arena: [ARENA_BYTES]u8;
+    memory: call.Memory;
+    trace: telemetry_trace.Context;
+    exchange: exchange.Exchange;
+    active_call: call.Call;
+    active_slot: usize;
+    exchange_live: bool;
+    response_started: bool;
+    request_generation: u64;
+    configured: Config;
+    limits: message.Limits;
+    plan: *plan.Plan;
+    requests: u64;
+    last_event: connection.EventKind;
+    last_step: Step;
+    setup_failure: Setup;
+    request_failure: message.RequestStatus;
+    pending_slot: usize;
+    has_pending: bool;
+    initialized: bool;
+}
+
+fun no_slot() usize {
+    ret connection.NO_SLOT;
+}
+
+fun operation_for(owner: *Connection, token_context: usize) usize {
+    var token: transport.Token;
+    if (!transport.context_token(token_context, ?token)) { ret TRANSPORT_SLOTS; }
+    val index: usize = token.index::usize;
+    if (index >= TRANSPORT_SLOTS) { ret TRANSPORT_SLOTS; }
+    owner.operations[index].connection = owner;
+    owner.operations[index].token_context = token_context;
+    listener.make_connection_context(?owner.contexts[index], (?owner.operations[index])::usize);
+    ret index;
+}
+
+fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val owner: *Connection = context::*Connection;
+    val index: usize = operation_for(owner, token_context);
+    if (index >= TRANSPORT_SLOTS) {
+        ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_READ));
+    }
+    ret net_async.submit_read(owner.driver, scope, ?owner.stream, buffer, length,
+        (?owner.contexts[index])::usize);
+}
+
+fun submit_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val owner: *Connection = context::*Connection;
+    val index: usize = operation_for(owner, token_context);
+    if (index >= TRANSPORT_SLOTS) {
+        ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_WRITE));
+    }
+    ret net_async.submit_write(owner.driver, scope, ?owner.stream, buffer, length,
+        (?owner.contexts[index])::usize);
+}
+
+fun submit_shutdown(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val owner: *Connection = context::*Connection;
+    val index: usize = operation_for(owner, token_context);
+    if (index >= TRANSPORT_SLOTS) {
+        ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_OPTION));
+    }
+    ret net_async.submit_shutdown_write(owner.driver, scope, ?owner.stream,
+        (?owner.contexts[index])::usize);
+}
+
+fun submit_close(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val owner: *Connection = context::*Connection;
+    val index: usize = operation_for(owner, token_context);
+    if (index >= TRANSPORT_SLOTS) {
+        ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_CLOSE));
+    }
+    ret net_async.submit_stream_close(owner.driver, scope, ?owner.stream,
+        io_lifecycle.EXPLICIT, (?owner.contexts[index])::usize);
+}
+
+fun logical_kind(kind: io_runtime.Kind) transport.Kind {
+    if (kind == io_runtime.READ) { ret transport.READ; }
+    if (kind == io_runtime.WRITE) { ret transport.WRITE; }
+    if (kind == io_runtime.SHUTDOWN) { ret transport.SHUTDOWN_WRITE; }
+    if (kind == io_runtime.CLOSE) { ret transport.CLOSE; }
+    ret 0;
+}
+
+# translate a runtime completion into a transport completion without settling it
+#
+# the protocol engine owns transport settlement: it checks the completion against
+# its own pending operation before releasing the slot. translating here and
+# settling there keeps exactly one owner for each transport slot.
+fun translate(settled: *transport.Completion, source: io_runtime.Completion,
+    token_context: usize) bool {
+    var token: transport.Token;
+    if (!transport.context_token(token_context, ?token)) { ret false; }
+    val kind: transport.Kind = logical_kind(source.kind);
+    if (kind == 0) { ret false; }
+    if (source.has_error) {
+        @settled = transport.failed(token, kind, source.bytes, source.error);
+        ret true;
+    }
+    if (source.end_of_stream) {
+        if (kind == transport.READ) {
+            @settled = transport.end(token, source.bytes);
+            ret true;
+        }
+        @settled = transport.failed(token, kind, 0,
+            io_error.from_code(os.EPIPE, io_error.OP_WRITE));
+        ret true;
+    }
+    @settled = transport.completed(token, kind, source.bytes);
+    ret true;
+}
+
+# one completion belongs to exactly one connection and settles exactly one operation
+pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Completion) {
+    val operation: *Operation = owner_context::*Operation;
+    if (operation == nil || operation.connection == nil) { ret; }
+    val owner: *Connection = operation.connection;
+    if (!owner.initialized) { ret; }
+    var settled: transport.Completion;
+    if (!translate(?settled, completion, operation.token_context)) { ret; }
+    val now: time.Time = time.now();
+    # complete_io settles the transport slot and advances the engine, so the event
+    # it returns is the next event this connection will ever produce. dropping it
+    # would silently skip a request.
+    val event: connection.Event = connection.complete_io(?owner.engine, ?settled, now);
+    if (!runnable(owner)) { ret; }
+    if (apply(owner, event, now) == STEP_PROGRESS) { advance(owner, now); }
+}
+
+fun format_endpoint(endpoint: ip.Endpoint, output: *u8, capacity: usize) usize {
+    ret ip.endpoint_format(endpoint, output, capacity);
+}
+
+fun endpoint_metadata(text: *u8, length: usize, port: u16) message.Endpoint {
+    if (length == 0) { ret message.unspecified_endpoint(); }
+    ret message.endpoint(message.ENDPOINT_IP, view.view(text, length), port);
+}
+
+pub fun make(
+    owner: *Connection,
+    id: u64,
+    generation: u64,
+    token: listener.ConnectionToken,
+    source: *listener.Connection,
+    net_driver: *net_async.Driver,
+    active_plan: *plan.Plan,
+    configured: Config,
+    limits: message.Limits,
+    listener_name: str,
+    now: time.Time,
+) bool {
+    if (owner == nil || source == nil || net_driver == nil || active_plan == nil
+     || id == 0 || generation == 0) { ret false; }
+    owner.state = NEW;
+    owner.id = id;
+    owner.generation = generation;
+    owner.token = token;
+    owner.stream = source.tcp_stream;
+    owner.peer = source.peer;
+    owner.listener_name = listener_name;
+    owner.driver = net_driver;
+    owner.plan = active_plan;
+    owner.configured = configured;
+    owner.limits = limits;
+    owner.active_slot = no_slot();
+    owner.exchange_live = false;
+    owner.response_started = false;
+    owner.request_scope_live = false;
+    owner.request_generation = 0;
+    owner.requests = 0;
+    owner.last_event = connection.EVENT_NONE;
+    owner.last_step = STEP_IDLE;
+    owner.setup_failure = SETUP_OK;
+    owner.request_failure = 0;
+    owner.pending_slot = 0;
+    owner.has_pending = false;
+    owner.initialized = false;
+    if (!cancel.make_root(?owner.operation_root, false, time.Time{sec: 0, nsec: 0})
+     || !cancel.make_root(?owner.control_scope, false, time.Time{sec: 0, nsec: 0})
+     || !cancel.make_child(?owner.engine_scope, ?owner.operation_root, false, time.Time{sec: 0, nsec: 0})) {
+        ret false;
+    }
+    owner.runtime_stream = transport.RuntimeStream{
+        runtime: net_driver.runtime,
+        context: (owner)::ptr,
+        submit_read: submit_read,
+        submit_write: submit_write,
+        submit_shutdown_write: submit_shutdown,
+        submit_close: submit_close,
+    };
+    if (!transport.make_runtime_adapter(?owner.adapter, ?owner.runtime_stream, transport.PLAINTEXT)) {
+        ret false;
+    }
+    owner.channel.initialized = false;
+    if (!transport.init(?owner.channel, owner.adapter, ?owner.operation_root,
+        ?owner.control_scope, ?owner.channel_slots[0], TRANSPORT_SLOTS)) { ret false; }
+    var i: usize = 0;
+    for (i < PIPELINE_DEPTH) {
+        owner.engine_memories[i] = connection.SlotMemory{
+            line: ?owner.lines[i][0],
+            line_capacity: LINE_BYTES,
+            storage: ?owner.storages[i][0],
+            storage_capacity: STORAGE_BYTES,
+            fields: ?owner.slot_fields[i][0],
+            field_capacity: FIELD_SLOTS,
+            trailers: ?owner.slot_trailers[i][0],
+            trailer_capacity: TRAILER_SLOTS,
+            scratch: ?owner.scratches[i][0],
+            scratch_capacity: SCRATCH_BYTES,
+        };
+        i = i + 1;
+    }
+    owner.engine.initialized = false;
+    if (!connection.init(?owner.engine, connection.SERVER, ?owner.channel, ?owner.engine_scope,
+        ?owner.engine_slots[0], ?owner.engine_memories[0], PIPELINE_DEPTH,
+        ?owner.read_buffer[0], READ_BYTES, ?owner.write_buffer[0], WRITE_BYTES,
+        configured.engine, now)) { ret false; }
+    if (!call.make_memory(?owner.memory, ?owner.arena[0], ARENA_BYTES)) { ret false; }
+    owner.state = ACTIVE;
+    owner.initialized = true;
+    ret true;
+}
+
+# --- request body: engine-held bytes surfaced through the exchange contract ---
+
+fun body_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
+    val state: *RequestBody = context::*RequestBody;
+    if (state == nil || state.owner == nil) { ret body.failed("request body has no owner", body.REUSE_FORBIDDEN); }
+    val engine: *connection.Engine = ?state.owner.engine;
+    if (engine.held_slot == state.slot && engine.held_length != 0) {
+        var count: usize = engine.held_length;
+        if (count > capacity) { count = capacity; }
+        var i: usize = 0;
+        for (i < count) {
+            output[i] = engine.held_body[i];
+            i = i + 1;
+        }
+        if (!connection.consume_body(engine, state.slot, count)) {
+            ret body.failed("request body consumption was refused", body.REUSE_FORBIDDEN);
+        }
+        ret body.data(count);
+    }
+    if (state.owner.engine_slots[state.slot].inbound_complete) {
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    state.next_token = state.next_token + 1;
+    state.pending_token = state.next_token;
+    ret body.pending(state.pending_token);
+}
+
+fun body_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
+    val state: *RequestBody = context::*RequestBody;
+    if (state == nil || state.owner == nil) { ret body.failed("request body has no owner", body.REUSE_FORBIDDEN); }
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    if (mode == body.REJECT) {
+        connection.set_disposition(?state.owner.engine, state.slot, connection.BODY_REJECT);
+        ret body.rejected(body.REUSE_FORBIDDEN);
+    }
+    connection.set_disposition(?state.owner.engine, state.slot, connection.BODY_DRAIN);
+    if (state.owner.engine_slots[state.slot].inbound_complete) {
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    state.next_token = state.next_token + 1;
+    state.pending_token = state.next_token;
+    ret body.pending(state.pending_token);
+}
+
+fun body_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
+    val state: *RequestBody = context::*RequestBody;
+    if (state == nil || state.owner == nil || token != state.pending_token) {
+        ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
+    }
+    state.pending_token = 0;
+    if (state.owner.engine_slots[state.slot].inbound_complete) {
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    ret body_read(context, nil, 0, trailers);
+}
+
+fun body_release(context: ptr) {
+}
+
+# --- exchange construction from one parsed request head ---
+
+fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
+    val parsed: *parser.Parsed = connection.parsed(?owner.engine, slot);
+    if (parsed == nil) { ret SETUP_PARSED; }
+    owner.requests = owner.requests + 1;
+    owner.request_generation = owner.requests;
+    var has_deadline: bool = owner.configured.request_timeout_ns != 0;
+    var deadline: time.Time = now;
+    if (has_deadline) {
+        deadline.sec = now.sec + (owner.configured.request_timeout_ns / 1000000000)::i64;
+        deadline.nsec = now.nsec + (owner.configured.request_timeout_ns % 1000000000)::i64;
+        if (deadline.nsec >= 1000000000) {
+            deadline.nsec = deadline.nsec - 1000000000;
+            deadline.sec = deadline.sec + 1;
+        }
+    }
+    if (owner.request_scope_live) { cancel.destroy(?owner.request_scope); }
+    owner.request_scope_live = false;
+    if (!cancel.make_child(?owner.request_scope, ?owner.engine_scope, has_deadline, deadline)) { ret SETUP_SCOPE; }
+    owner.request_scope_live = true;
+    owner.request_body.owner = owner;
+    owner.request_body.slot = slot;
+    owner.request_body.pending_token = 0;
+    owner.request_body.next_token = 0;
+    # the parser already resolved framing; it stays the single authority for length
+    val length_known: bool = parsed.plan.mode == framing.FRAME_NONE
+        || parsed.plan.mode == framing.FRAME_LENGTH;
+    var declared: u64 = 0;
+    if (parsed.plan.mode == framing.FRAME_LENGTH) { declared = parsed.plan.length; }
+    owner.request_body.reader = body.init_reader(
+        (?owner.request_body)::ptr,
+        body_read,
+        body_finish,
+        body_complete,
+        body_release,
+        body.OWNER_APPLICATION,
+        owner.request_generation,
+        length_known,
+        declared,
+        owner.limits.request_body,
+        nil,
+        ?owner.request_scope,
+    );
+    if (!owner.request_body.reader.valid) { ret SETUP_BODY; }
+    val peer_length: usize = format_endpoint(owner.peer, ?owner.peer_text[0], PEER_BYTES);
+    val metadata: message.Metadata = message.Metadata{
+        version: parsed.version,
+        secure: false,
+        early_data: false,
+        peer: endpoint_metadata(?owner.peer_text[0], peer_length, owner.peer.port),
+        local: message.unspecified_endpoint(),
+        received_at: now,
+        has_deadline: has_deadline,
+        deadline: deadline,
+        request_index: owner.request_generation,
+    };
+    if (!message.init_request(?owner.request, parsed.method, parsed.target, metadata,
+        parsed.fields, parsed.trailers, ?owner.request_body.reader,
+        owner.request_generation, owner.limits)) {
+        owner.request_failure = message.validate_request_status(?owner.request, owner.limits);
+        ret SETUP_REQUEST;
+    }
+    if (!message.init_response(?owner.response, ?owner.response_fields[0], RESPONSE_FIELD_SLOTS,
+        ?owner.response_trailers[0], RESPONSE_TRAILER_SLOTS, owner.request_generation,
+        owner.limits)) { ret SETUP_RESPONSE; }
+    owner.exchange.valid = false;
+    if (!exchange.init(?owner.exchange, ?owner.request, ?owner.response,
+        ?owner.informationals[0], INFORMATIONAL_SLOTS, ?owner.request_scope,
+        owner.request_generation, owner.limits)) { ret SETUP_EXCHANGE; }
+    if (!exchange.begin(?owner.exchange)) { ret SETUP_BEGIN; }
+    call.reset_memory(?owner.memory);
+    if (!telemetry_trace.make_root(?owner.trace, false)) { ret SETUP_TRACE; }
+    if (!call.bind(?owner.active_call, ?owner.exchange, ?owner.memory, ?owner.trace,
+        owner.plan.generation, owner.listener_name)) { ret SETUP_BIND; }
+    owner.active_slot = slot;
+    owner.exchange_live = true;
+    owner.response_started = false;
+    ret SETUP_OK;
+}
+
+fun engine_disposition(chosen: call.Disposition) connection.Disposition {
+    if (chosen == call.BODY_DELIVER) { ret connection.BODY_DELIVER; }
+    if (chosen == call.BODY_REJECT) { ret connection.BODY_REJECT; }
+    if (chosen == call.BODY_CLOSE) { ret connection.BODY_CLOSE; }
+    ret connection.BODY_DRAIN;
+}
+
+# RFC 9112 permits an empty reason phrase, which is the honest answer for a status
+# this table does not name. a wrong phrase would misdescribe the response.
+fun reason_for(code: status.Status) view.View {
+    if (code == status.CONTINUE) { ret view.view("Continue", 8); }
+    if (code == status.SWITCHING_PROTOCOLS) { ret view.view("Switching Protocols", 19); }
+    if (code == status.EARLY_HINTS) { ret view.view("Early Hints", 11); }
+    if (code == status.OK) { ret view.view("OK", 2); }
+    if (code == status.CREATED) { ret view.view("Created", 7); }
+    if (code == status.ACCEPTED) { ret view.view("Accepted", 8); }
+    if (code == status.NO_CONTENT) { ret view.view("No Content", 10); }
+    if (code == status.RESET_CONTENT) { ret view.view("Reset Content", 13); }
+    if (code == status.PARTIAL_CONTENT) { ret view.view("Partial Content", 15); }
+    if (code == status.MOVED_PERMANENTLY) { ret view.view("Moved Permanently", 17); }
+    if (code == status.FOUND) { ret view.view("Found", 5); }
+    if (code == status.SEE_OTHER) { ret view.view("See Other", 9); }
+    if (code == status.NOT_MODIFIED) { ret view.view("Not Modified", 12); }
+    if (code == status.TEMPORARY_REDIRECT) { ret view.view("Temporary Redirect", 18); }
+    if (code == status.PERMANENT_REDIRECT) { ret view.view("Permanent Redirect", 18); }
+    if (code == status.BAD_REQUEST) { ret view.view("Bad Request", 11); }
+    if (code == status.UNAUTHORIZED) { ret view.view("Unauthorized", 12); }
+    if (code == status.FORBIDDEN) { ret view.view("Forbidden", 9); }
+    if (code == status.NOT_FOUND) { ret view.view("Not Found", 9); }
+    if (code == status.METHOD_NOT_ALLOWED) { ret view.view("Method Not Allowed", 18); }
+    if (code == status.NOT_ACCEPTABLE) { ret view.view("Not Acceptable", 14); }
+    if (code == status.REQUEST_TIMEOUT) { ret view.view("Request Timeout", 15); }
+    if (code == status.GONE) { ret view.view("Gone", 4); }
+    if (code == status.LENGTH_REQUIRED) { ret view.view("Length Required", 15); }
+    if (code == status.PRECONDITION_FAILED) { ret view.view("Precondition Failed", 19); }
+    if (code == status.CONTENT_TOO_LARGE) { ret view.view("Content Too Large", 17); }
+    if (code == status.URI_TOO_LONG) { ret view.view("URI Too Long", 12); }
+    if (code == status.UNSUPPORTED_MEDIA_TYPE) { ret view.view("Unsupported Media Type", 22); }
+    if (code == status.RANGE_NOT_SATISFIABLE) { ret view.view("Range Not Satisfiable", 21); }
+    if (code == status.EXPECTATION_FAILED) { ret view.view("Expectation Failed", 18); }
+    if (code == status.MISDIRECTED_REQUEST) { ret view.view("Misdirected Request", 19); }
+    if (code == status.UPGRADE_REQUIRED) { ret view.view("Upgrade Required", 16); }
+    if (code == status.TOO_MANY_REQUESTS) { ret view.view("Too Many Requests", 17); }
+    if (code == status.REQUEST_HEADER_FIELDS_TOO_LARGE) { ret view.view("Request Header Fields Too Large", 31); }
+    if (code == status.INTERNAL_SERVER_ERROR) { ret view.view("Internal Server Error", 21); }
+    if (code == status.NOT_IMPLEMENTED) { ret view.view("Not Implemented", 15); }
+    if (code == status.BAD_GATEWAY) { ret view.view("Bad Gateway", 11); }
+    if (code == status.SERVICE_UNAVAILABLE) { ret view.view("Service Unavailable", 19); }
+    if (code == status.GATEWAY_TIMEOUT) { ret view.view("Gateway Timeout", 15); }
+    if (code == status.HTTP_VERSION_NOT_SUPPORTED) { ret view.view("HTTP Version Not Supported", 26); }
+    if (code == status.INSUFFICIENT_STORAGE) { ret view.view("Insufficient Storage", 20); }
+    ret view.view(nil, 0);
+}
+
+fun begin_response(owner: *Connection, now: time.Time) bool {
+    if (owner.response_started) { ret true; }
+    if (!owner.response.committed) { ret false; }
+    var trailers: *field.Fields = nil;
+    if (owner.response.trailers.len != 0) { trailers = ?owner.response.trailers; }
+    if (!connection.prepare_response(?owner.engine, owner.active_slot, owner.response.status,
+        reason_for(owner.response.status), ?owner.response.fields, trailers, now)) { ret false; }
+    owner.response_started = true;
+    # a response the framing plan cannot keep alive stops this connection from
+    # admitting another request, so the engine drains rather than waiting to read
+    if (owner.engine_slots[owner.active_slot].close_after) {
+        connection.begin_graceful(?owner.engine);
+    }
+    ret true;
+}
+
+# the engine marks a response complete when its terminal write settles, so that
+# flag is the single authority. a bodyless response reaches it on its first offer.
+fun response_complete(owner: *Connection) bool {
+    if (!owner.response_started || owner.active_slot >= PIPELINE_DEPTH) { ret false; }
+    ret owner.engine_slots[owner.active_slot].outbound_complete;
+}
+
+# pull one chunk from the response body and hand it to the serializer
+fun advance_response(owner: *Connection, now: time.Time) Step {
+    if (!owner.response_started || response_complete(owner)) { ret STEP_IDLE; }
+    if (owner.engine.write_pending || owner.engine.write_length != 0) { ret STEP_BLOCKED; }
+    var payload: *u8 = nil;
+    var length: usize = 0;
+    var final: bool = true;
+    if (owner.response.body_kind == message.BODY_READER) {
+        val progress: body.Progress = body.read(owner.response.body_reader, ?owner.stage[0], READ_BYTES);
+        if (progress.status == body.DATA) {
+            payload = ?owner.stage[0];
+            length = progress.count;
+            final = false;
+        } or (progress.status == body.PENDING) {
+            ret STEP_BLOCKED;
+        } or (progress.status != body.COMPLETE) {
+            ret STEP_ERROR;
+        }
+    }
+    val offered: connection.Offer = connection.offer(?owner.engine, owner.active_slot,
+        payload, length, final);
+    if (offered.status == connection.OFFER_ERROR) { ret STEP_ERROR; }
+    if (offered.status == connection.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    ret STEP_PROGRESS;
+}
+
+fun settle_exchange(owner: *Connection, now: time.Time) bool {
+    if (!owner.exchange_live) { ret true; }
+    if (exchange.finish(?owner.exchange) != exchange.FINISH_OK) { ret false; }
+    call.release(?owner.active_call);
+    connection.release(?owner.engine, owner.active_slot, now);
+    owner.exchange_live = false;
+    owner.active_slot = no_slot();
+    ret true;
+}
+
+fun fail_exchange(owner: *Connection, code: status.Status, now: time.Time) bool {
+    if (owner.response.committed) { ret false; }
+    if (message.set_status(?owner.response, code) != message.RESPONSE_OK) { ret false; }
+    if (call.disposition(?owner.active_call) == call.BODY_UNRESOLVED
+     && !call.resolve_body(?owner.active_call, call.BODY_CLOSE)) { ret false; }
+    if (exchange.commit(?owner.exchange, owner.limits) != message.RESPONSE_OK) { ret false; }
+    ret begin_response(owner, now);
+}
+
+# response progress is the connection's own work: it owns the serializer and the
+# write buffer, and the service supplies only the body reader
+fun pump_response(owner: *Connection, now: time.Time) Step {
+    if (!owner.response_started) { ret STEP_IDLE; }
+    if (!response_complete(owner)) {
+        val advanced: Step = advance_response(owner, now);
+        if (advanced == STEP_ERROR) { owner.state = FAILED; ret STEP_ERROR; }
+        if (advanced == STEP_PROGRESS || (owner.engine.write_length != 0 && !owner.engine.write_pending)) {
+            connection.submit_write(?owner.engine);
+            ret STEP_PROGRESS;
+        }
+        if (!response_complete(owner)) { ret STEP_BLOCKED; }
+    }
+    if (owner.engine.write_pending) { ret STEP_BLOCKED; }
+    if (owner.engine.write_length != 0) {
+        connection.submit_write(?owner.engine);
+        ret STEP_BLOCKED;
+    }
+    # an exchange settles only once the request body has reached a terminal
+    # disposition, so a service that ignored the body cannot strand the slot
+    if (!body.reader_terminal_state(owner.request.body)) {
+        if (owner.request.body.pending_kind != body.OP_NONE) { ret STEP_BLOCKED; }
+        val settled: body.Progress = body.drain(owner.request.body);
+        if (settled.status == body.PENDING) { ret STEP_BLOCKED; }
+        if (!body.reader_terminal_state(owner.request.body)) { owner.state = FAILED; ret STEP_ERROR; }
+    }
+    if (!settle_exchange(owner, now)) { owner.state = FAILED; ret STEP_ERROR; }
+    ret STEP_PROGRESS;
+}
+
+fun runnable(owner: *Connection) bool {
+    if (owner == nil || !owner.initialized || owner.state != ACTIVE) { ret false; }
+    ret owner.engine.state != connection.CLOSED && owner.engine.state != connection.FAILED;
+}
+
+# build one exchange and cross the dispatch boundary with it exactly once
+fun start_exchange(owner: *Connection, slot: usize, now: time.Time) Step {
+    owner.setup_failure = make_exchange(owner, slot, now);
+    if (owner.setup_failure != SETUP_OK) { owner.state = FAILED; ret STEP_ERROR; }
+    val served: dispatch.Result = dispatch.serve(owner.plan, ?owner.active_call,
+        ?owner.captures[0], CAPTURE_SLOTS);
+    if (served.outcome == dispatch.FAILED) {
+        if (!fail_exchange(owner, status.INTERNAL_SERVER_ERROR, now)) {
+            owner.state = FAILED;
+            ret STEP_ERROR;
+        }
+        ret STEP_PROGRESS;
+    }
+    connection.set_disposition(?owner.engine, owner.active_slot,
+        engine_disposition(call.disposition(?owner.active_call)));
+    if (!begin_response(owner, now)) { owner.state = FAILED; ret STEP_ERROR; }
+    ret STEP_PROGRESS;
+}
+
+# translate one protocol event into product work
+#
+# this is the only place a connection event becomes a service call. a pipelined
+# request that arrives while an exchange is live is held, not started, so
+# responses stay wire-ordered and one exchange owns the arena at a time.
+fun apply(owner: *Connection, event: connection.Event, now: time.Time) Step {
+    owner.last_event = event.kind;
+    if (event.kind == connection.EVENT_NEED_READ) {
+        connection.submit_read(?owner.engine);
+        ret STEP_BLOCKED;
+    }
+    if (event.kind == connection.EVENT_NONE || event.kind == connection.EVENT_SATURATED) {
+        ret STEP_BLOCKED;
+    }
+    if (event.kind == connection.EVENT_CLOSED || event.kind == connection.EVENT_PEER_CLOSED
+     || event.kind == connection.EVENT_ERROR || event.kind == connection.EVENT_TIMED_OUT
+     || event.kind == connection.EVENT_CANCELLED || event.kind == connection.EVENT_TUNNEL) {
+        owner.state = CLOSING;
+        ret STEP_DONE;
+    }
+    if (event.kind == connection.EVENT_REQUEST_HEADERS) {
+        if (owner.exchange_live) {
+            owner.pending_slot = event.slot;
+            owner.has_pending = true;
+            ret STEP_BLOCKED;
+        }
+        ret start_exchange(owner, event.slot, now);
+    }
+    if (event.kind == connection.EVENT_REQUEST_BODY
+     || event.kind == connection.EVENT_REQUEST_COMPLETE) {
+        if (owner.exchange_live && owner.request_body.pending_token != 0) {
+            body.complete_reader(owner.request.body, owner.request_body.pending_token);
+        }
+        ret STEP_PROGRESS;
+    }
+    ret STEP_PROGRESS;
+}
+
+# advancing the engine is how a request body reaches its terminal state, so the
+# inbound side keeps moving even while a response is still being written
+fun pump_inbound(owner: *Connection, now: time.Time) Step {
+    if (owner.has_pending) { ret STEP_BLOCKED; }
+    ret apply(owner, connection.process(?owner.engine, now), now);
+}
+
+# one step: response work first, then whatever the protocol has next
+pub fun step(owner: *Connection, now: time.Time) Step {
+    if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
+    if (owner.state != ACTIVE) { ret STEP_DONE; }
+    if (owner.engine.state == connection.CLOSED || owner.engine.state == connection.FAILED) {
+        owner.state = CLOSING;
+        ret STEP_DONE;
+    }
+    if (owner.exchange_live) {
+        val pumped: Step = pump_response(owner, now);
+        if (pumped == STEP_PROGRESS || pumped == STEP_ERROR) {
+            owner.last_step = pumped;
+            ret pumped;
+        }
+        val inbound: Step = pump_inbound(owner, now);
+        owner.last_step = inbound;
+        ret inbound;
+    }
+    if (owner.has_pending) {
+        owner.has_pending = false;
+        val started: Step = start_exchange(owner, owner.pending_slot, now);
+        owner.last_step = started;
+        ret started;
+    }
+    # a draining engine finishes its close handshake instead of reading again
+    if (owner.engine.state == connection.DRAINING && connection.progress_close(?owner.engine)) {
+        owner.last_step = STEP_PROGRESS;
+        ret STEP_PROGRESS;
+    }
+    val taken: Step = pump_inbound(owner, now);
+    owner.last_step = taken;
+    ret taken;
+}
+
+# drive until the connection blocks on I/O or finishes
+pub fun advance(owner: *Connection, now: time.Time) Step {
+    if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
+    var steps: usize = 0;
+    for (steps < MAX_STEPS) {
+        val progress: Step = step(owner, now);
+        if (progress != STEP_PROGRESS) { ret progress; }
+        steps = steps + 1;
+    }
+    ret STEP_BLOCKED;
+}
+
+pub fun begin_graceful(owner: *Connection) bool {
+    if (owner == nil || !owner.initialized) { ret false; }
+    ret connection.begin_graceful(?owner.engine);
+}
+
+pub fun close(owner: *Connection) bool {
+    if (owner == nil || !owner.initialized || owner.state == CLOSED) { ret false; }
+    connection.cancel_connection(?owner.engine);
+    if (owner.request_scope_live) {
+        cancel.destroy(?owner.request_scope);
+        owner.request_scope_live = false;
+    }
+    val closed: Result[bool, io_error.Error] = tcp.stream_close(?owner.stream);
+    cancel.destroy(?owner.engine_scope);
+    cancel.destroy(?owner.control_scope);
+    cancel.destroy(?owner.operation_root);
+    owner.state = CLOSED;
+    owner.initialized = false;
+    ret !is_err[bool, io_error.Error](closed);
+}
+
+# the operational view of one connection, for tests and telemetry alike
+pub rec Snapshot {
+    state: State;
+    engine_state: connection.State;
+    engine_error: connection.Error;
+    last_event: connection.EventKind;
+    last_step: Step;
+    setup_failure: Setup;
+    request_failure: message.RequestStatus;
+    requests: u64;
+    exchange_live: bool;
+    response_status: status.Status;
+}
+
+pub fun snapshot(owner: *Connection) Snapshot {
+    if (owner == nil) {
+        ret Snapshot{state: CLOSED, engine_state: 0, engine_error: 0,
+            last_event: connection.EVENT_NONE, last_step: STEP_IDLE, setup_failure: SETUP_OK, request_failure: 0, requests: 0,
+            exchange_live: false, response_status: 0};
+    }
+    ret Snapshot{
+        state: owner.state,
+        engine_state: owner.engine.state,
+        engine_error: owner.engine.error,
+        last_event: owner.last_event,
+        last_step: owner.last_step,
+        setup_failure: owner.setup_failure,
+        request_failure: owner.request_failure,
+        requests: owner.requests,
+        exchange_live: owner.exchange_live,
+        response_status: owner.response.status,
+    };
+}
+
+pub fun finished(owner: *Connection) bool {
+    ret owner == nil || !owner.initialized || owner.state == CLOSING
+     || owner.state == CLOSED || owner.state == FAILED;
+}

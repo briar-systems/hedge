@@ -1,0 +1,464 @@
+# compiled route graphs and middleware plans, immutable for one generation
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.types.view;
+use std.types.result.Result;
+use std.types.result.err;
+use http.core.message;
+use http.core.status;
+use http.router.router;
+use hedge.config.schema;
+use hedge.service;
+use call: hedge.dispatch.call;
+use middleware: hedge.dispatch.middleware;
+
+pub val NO_INDEX: usize = 0xffffffffffffffff;
+
+pub def Status: u8;
+pub val PLAN_OK: Status = 1;
+pub val PLAN_INVALID: Status = 2;
+pub val PLAN_CAPACITY: Status = 3;
+pub val PLAN_UNRESOLVED: Status = 4;
+pub val PLAN_UNSUPPORTED: Status = 5;
+pub val PLAN_ROUTE: Status = 6;
+pub val PLAN_SEALED: Status = 7;
+
+# one compiled route: which service answers it, under which middleware plan
+pub rec Entry {
+    name: str;
+    host: str;
+    service: str;
+    service_index: usize;
+    middleware_start: usize;
+    middleware_count: usize;
+    budget_index: usize;
+}
+
+# caller-owned storage for one generation's compiled graph
+pub rec Storage {
+    routes: *router.CompiledRoute;
+    route_capacity: usize;
+    segments: *router.Segment;
+    segment_capacity: usize;
+    specs: *router.Route;
+    spec_capacity: usize;
+    entries: *Entry;
+    entry_capacity: usize;
+    services: *service.Descriptor;
+    service_capacity: usize;
+    middleware: *middleware.Middleware;
+    middleware_capacity: usize;
+    text: *u8;
+    text_capacity: usize;
+}
+
+pub rec Report {
+    status: Status;
+    route: usize;
+    service: usize;
+    detail: str;
+}
+
+# a plan is written once during construction and read-only once sealed
+pub rec Plan {
+    generation: u64;
+    storage: Storage;
+    graph: router.Router;
+    entry_count: usize;
+    service_count: usize;
+    middleware_count: usize;
+    text_len: usize;
+    sealed: bool;
+}
+
+fun report(code: Status, route: usize, service_index: usize, detail: str) Report {
+    ret Report{status: code, route: route, service: service_index, detail: detail};
+}
+
+# every borrowed view a compiled route holds points into plan-owned text, never
+# into the configuration graph, so a plan outlives the document that produced it
+fun intern(plan: *Plan, value: str) str {
+    if (value == nil) { ret nil; }
+    val length: usize = str_len(value);
+    if (plan.text_len + length + 1 > plan.storage.text_capacity) { ret nil; }
+    val start: usize = plan.text_len;
+    var i: usize = 0;
+    for (i < length) {
+        plan.storage.text[start + i] = value[i];
+        i = i + 1;
+    }
+    plan.storage.text[start + length] = 0;
+    plan.text_len = start + length + 1;
+    ret (?plan.storage.text[start])::str;
+}
+
+pub fun make_storage(
+    storage: *Storage,
+    routes: *router.CompiledRoute,
+    route_capacity: usize,
+    segments: *router.Segment,
+    segment_capacity: usize,
+    specs: *router.Route,
+    spec_capacity: usize,
+    entries: *Entry,
+    entry_capacity: usize,
+    services: *service.Descriptor,
+    service_capacity: usize,
+    middlewares: *middleware.Middleware,
+    middleware_capacity: usize,
+    text: *u8,
+    text_capacity: usize,
+) bool {
+    if (storage == nil || routes == nil || segments == nil || specs == nil || entries == nil
+     || services == nil || text == nil || route_capacity == 0 || segment_capacity == 0
+     || spec_capacity == 0 || entry_capacity == 0 || service_capacity == 0 || text_capacity == 0
+     || (middleware_capacity != 0 && middlewares == nil)) { ret false; }
+    storage.routes = routes;
+    storage.route_capacity = route_capacity;
+    storage.segments = segments;
+    storage.segment_capacity = segment_capacity;
+    storage.specs = specs;
+    storage.spec_capacity = spec_capacity;
+    storage.entries = entries;
+    storage.entry_capacity = entry_capacity;
+    storage.services = services;
+    storage.service_capacity = service_capacity;
+    storage.middleware = middlewares;
+    storage.middleware_capacity = middleware_capacity;
+    storage.text = text;
+    storage.text_capacity = text_capacity;
+    ret true;
+}
+
+# a configured path pattern becomes a router pattern: `/**` is a terminal catch-all
+fun translate_pattern(plan: *Plan, configured: str) str {
+    if (configured == nil || configured[0] != '/') { ret nil; }
+    val length: usize = str_len(configured);
+    if (length >= 3 && configured[length - 1] == '*' && configured[length - 2] == '*'
+     && configured[length - 3] == '/') {
+        if (plan.text_len + length + 5 > plan.storage.text_capacity) { ret nil; }
+        val start: usize = plan.text_len;
+        var i: usize = 0;
+        for (i < length - 2) {
+            plan.storage.text[start + i] = configured[i];
+            i = i + 1;
+        }
+        plan.storage.text[start + length - 2] = '*';
+        plan.storage.text[start + length - 1] = 'r';
+        plan.storage.text[start + length] = 'e';
+        plan.storage.text[start + length + 1] = 's';
+        plan.storage.text[start + length + 2] = 't';
+        plan.storage.text[start + length + 3] = 0;
+        plan.text_len = start + length + 4;
+        ret (?plan.storage.text[start])::str;
+    }
+    ret intern(plan, configured);
+}
+
+fun find_service(plan: *Plan, name: str) usize {
+    var i: usize = 0;
+    for (i < plan.service_count) {
+        if (str_equals(plan.storage.services[i].name, name)) { ret i; }
+        i = i + 1;
+    }
+    ret NO_INDEX;
+}
+
+# service construction happens once per generation, before any listener is ready
+fun compile_service(plan: *Plan, configured: *schema.Service, resolver: *service.Resolver) Report {
+    val index: usize = plan.service_count;
+    if (index >= plan.storage.service_capacity) {
+        ret report(PLAN_CAPACITY, NO_INDEX, index, "service storage is exhausted");
+    }
+    val descriptor: *service.Descriptor = ?plan.storage.services[index];
+    descriptor.kind = configured.kind;
+    descriptor.name = intern(plan, schema.text(?configured.name));
+    descriptor.target = intern(plan, schema.text(?configured.target));
+    descriptor.content_type = intern(plan, schema.text(?configured.content_type));
+    descriptor.status = configured.status::status.Status;
+    descriptor.handler = service.no_handler();
+    if (descriptor.name == nil || descriptor.target == nil) {
+        ret report(PLAN_CAPACITY, NO_INDEX, index, "service text storage is exhausted");
+    }
+    if (configured.kind == schema.SERVICE_FIXED) {
+        descriptor.handler = service.Handler{ctx: (descriptor)::ptr, serve: service.serve_fixed};
+    } or (configured.kind == schema.SERVICE_REDIRECT) {
+        descriptor.handler = service.Handler{ctx: (descriptor)::ptr, serve: service.serve_redirect};
+    } or (configured.kind == schema.SERVICE_LAUREL) {
+        val application: *service.Application = service.find_application(resolver.applications, descriptor.target);
+        if (application == nil) {
+            ret report(PLAN_UNRESOLVED, NO_INDEX, index, "no application is registered under this name");
+        }
+        descriptor.handler = application.handler;
+    } or (configured.kind == schema.SERVICE_STATIC) {
+        if (resolver.static_files::usize == 0
+         || !resolver.static_files(resolver.ctx, configured, ?descriptor.handler)) {
+            ret report(PLAN_UNSUPPORTED, NO_INDEX, index, "static file service is unavailable");
+        }
+    } or (configured.kind == schema.SERVICE_PROXY) {
+        if (resolver.proxy::usize == 0
+         || !resolver.proxy(resolver.ctx, configured, ?descriptor.handler)) {
+            ret report(PLAN_UNSUPPORTED, NO_INDEX, index, "proxy service is unavailable");
+        }
+    } or (configured.kind == schema.SERVICE_NATIVE) {
+        if (resolver.native::usize == 0
+         || !resolver.native(resolver.ctx, configured, ?descriptor.handler)) {
+            ret report(PLAN_UNSUPPORTED, NO_INDEX, index, "native service is unavailable");
+        }
+    } or {
+        ret report(PLAN_INVALID, NO_INDEX, index, "unknown service kind");
+    }
+    if (!service.has_handler(descriptor.handler)) {
+        ret report(PLAN_UNRESOLVED, NO_INDEX, index, "service produced no handler");
+    }
+    plan.service_count = index + 1;
+    ret report(PLAN_OK, NO_INDEX, index, nil);
+}
+
+fun host_pattern(plan: *Plan, graph: *schema.Graph, route: *schema.Route) str {
+    val host: *schema.Host = schema.find_host(graph, schema.text(?route.host));
+    if (host == nil || host.server_name_count == 0) { ret intern(plan, "*"); }
+    ret intern(plan, schema.text(?host.server_names[0]));
+}
+
+# compile a configuration graph into an immutable route graph and service set
+pub fun compile(
+    plan: *Plan,
+    generation: u64,
+    graph: *schema.Graph,
+    storage: Storage,
+    resolver: *service.Resolver,
+    plans: *middleware.Chains,
+) Report {
+    if (plan == nil || graph == nil || resolver == nil || generation == 0) {
+        ret report(PLAN_INVALID, NO_INDEX, NO_INDEX, "invalid plan inputs");
+    }
+    plan.generation = generation;
+    plan.storage = storage;
+    plan.entry_count = 0;
+    plan.service_count = 0;
+    plan.middleware_count = 0;
+    plan.text_len = 0;
+    plan.sealed = false;
+    plan.graph.generation = 0;
+    plan.graph.initialized = false;
+    if (graph.route_count > storage.spec_capacity || graph.route_count > storage.entry_capacity) {
+        ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX, "route storage is exhausted");
+    }
+    var i: usize = 0;
+    for (i < graph.service_count) {
+        val built: Report = compile_service(plan, ?graph.services[i], resolver);
+        if (built.status != PLAN_OK) { ret built; }
+        i = i + 1;
+    }
+    if (plans != nil && !middleware.install(plans, plan.storage.middleware, plan.storage.middleware_capacity, ?plan.middleware_count)) {
+        ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX, "middleware storage is exhausted");
+    }
+    i = 0;
+    for (i < graph.route_count) {
+        val configured: *schema.Route = ?graph.routes[i];
+        val entry: *Entry = ?plan.storage.entries[i];
+        val spec: *router.Route = ?plan.storage.specs[i];
+        val service_name: str = schema.text(?configured.service);
+        val resolved: usize = find_service(plan, service_name);
+        if (resolved == NO_INDEX) {
+            ret report(PLAN_UNRESOLVED, i, NO_INDEX, "route references an unknown service");
+        }
+        entry.name = intern(plan, schema.text(?configured.name));
+        entry.host = host_pattern(plan, graph, configured);
+        entry.service = plan.storage.services[resolved].name;
+        entry.service_index = resolved;
+        entry.budget_index = NO_INDEX;
+        if (!middleware.select(plans, entry.name, ?entry.middleware_start, ?entry.middleware_count)) {
+            entry.middleware_start = 0;
+            entry.middleware_count = 0;
+        }
+        val pattern: str = translate_pattern(plan, schema.text(?configured.path));
+        if (entry.name == nil || entry.host == nil || pattern == nil) {
+            ret report(PLAN_CAPACITY, i, NO_INDEX, "route text storage is exhausted");
+        }
+        spec.method = view.view(nil, 0);
+        spec.host = service.text_view(entry.host);
+        spec.pattern = service.text_view(pattern);
+        spec.handler_ctx = (entry)::ptr;
+        spec.handler = matched_route;
+        i = i + 1;
+    }
+    plan.entry_count = graph.route_count;
+    var configured_limits: router.Limits = router.limits_default();
+    configured_limits.max_routes = storage.route_capacity;
+    configured_limits.max_segments = storage.segment_capacity;
+    val compiled: router.Compile = router.compile(
+        ?plan.graph,
+        plan.storage.specs,
+        plan.entry_count,
+        plan.storage.routes,
+        plan.storage.route_capacity,
+        plan.storage.segments,
+        plan.storage.segment_capacity,
+        configured_limits,
+    );
+    if (compiled.status != router.COMPILE_OK) {
+        ret report(PLAN_ROUTE, compiled.route, NO_INDEX, "route pattern did not compile");
+    }
+    plan.sealed = true;
+    ret report(PLAN_OK, NO_INDEX, NO_INDEX, nil);
+}
+
+# route compilation requires a handler, but hedge matches and serves in separate
+# steps so the exchange, the request arena, and telemetry context stay with dispatch.
+# reaching this function means a caller invoked the router directly, which is a
+# layering error rather than a runtime condition to recover from.
+fun matched_route(context: ptr, request: *message.Request, response: *message.Response,
+    params: *router.Params) Result[u8, str] {
+    ret err[u8, str]("hedge dispatches through the service exchange, not the router handler");
+}
+
+pub fun entry(plan: *Plan, index: usize) *Entry {
+    if (plan == nil || !plan.sealed || index >= plan.entry_count) { ret nil; }
+    ret ?plan.storage.entries[index];
+}
+
+pub fun descriptor(plan: *Plan, index: usize) *service.Descriptor {
+    if (plan == nil || !plan.sealed || index >= plan.service_count) { ret nil; }
+    ret ?plan.storage.services[index];
+}
+
+pub fun handler_for(plan: *Plan, selected: *Entry) service.Handler {
+    if (plan == nil || !plan.sealed || selected == nil
+     || selected.service_index >= plan.service_count) { ret service.no_handler(); }
+    ret plan.storage.services[selected.service_index].handler;
+}
+
+# matching is a read of immutable state: a sealed plan is never mutated by a request
+pub fun match(plan: *Plan, request: *message.Request, captures: *router.Capture,
+    capture_capacity: usize) router.Dispatch {
+    if (plan == nil || !plan.sealed) {
+        ret router.Dispatch{
+            status: router.DISPATCH_INVALID,
+            route: router.NO_INDEX,
+            source_index: router.NO_INDEX,
+            handler_ctx: nil,
+            handler: (0::usize)::router.Handler,
+            params: router.Params{items: nil, len: 0, router_generation: 0, request_generation: 0},
+        };
+    }
+    ret router.dispatch(?plan.graph, request, captures, capture_capacity);
+}
+
+pub fun sealed(plan: *Plan) bool {
+    ret plan != nil && plan.sealed;
+}
+
+
+fun test_graph(graph: *schema.Graph, service_kind: u8, target: str) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "plan-test");
+    graph.host_count = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    graph.hosts[0].server_name_count = 1;
+    schema.set_text(?graph.hosts[0].server_names[0], "example.test");
+    graph.service_count = 1;
+    schema.set_text(?graph.services[0].name, "svc");
+    graph.services[0].kind = service_kind;
+    schema.set_text(?graph.services[0].target, target);
+    graph.services[0].status = 200;
+    graph.route_count = 1;
+    schema.set_text(?graph.routes[0].name, "root");
+    schema.set_text(?graph.routes[0].host, "site");
+    schema.set_text(?graph.routes[0].path, "/a/**");
+    schema.set_text(?graph.routes[0].service, "svc");
+}
+
+rec Fixture {
+    routes: [4]router.CompiledRoute;
+    segments: [32]router.Segment;
+    specs: [4]router.Route;
+    entries: [4]Entry;
+    services: [4]service.Descriptor;
+    middlewares: [4]middleware.Middleware;
+    text: [1024]u8;
+    storage: Storage;
+    plan: Plan;
+}
+
+fun build(fixture: *Fixture, generation: u64, graph: *schema.Graph,
+    resolver: *service.Resolver, chains: *middleware.Chains) Report {
+    make_storage(?fixture.storage,
+        ?fixture.routes[0], 4,
+        ?fixture.segments[0], 32,
+        ?fixture.specs[0], 4,
+        ?fixture.entries[0], 4,
+        ?fixture.services[0], 4,
+        ?fixture.middlewares[0], 4,
+        ?fixture.text[0], 1024);
+    ret compile(?fixture.plan, generation, graph, fixture.storage, resolver, chains);
+}
+
+test "plan: a sealed graph owns its text and outlives the configuration it came from" {
+    var graph: schema.Graph;
+    test_graph(?graph, schema.SERVICE_FIXED, "body");
+    var fixture: Fixture;
+    var resolver: service.Resolver = service.no_resolver();
+    if (build(?fixture, 2, ?graph, ?resolver, nil).status != PLAN_OK) { ret 1; }
+    val selected: *Entry = entry(?fixture.plan, 0);
+    if (selected == nil || !str_equals(selected.name, "root")
+     || !str_equals(selected.host, "example.test")
+     || !str_equals(selected.service, "svc")) { ret 2; }
+    val compiled_pattern: view.View = fixture.plan.storage.specs[0].pattern;
+    if (!view.view_eq_str(compiled_pattern, "/a/*rest")) { ret 3; }
+    # rewriting the source document must not reach the sealed plan
+    schema.set_text(?graph.routes[0].name, "rewritten");
+    schema.set_text(?graph.hosts[0].server_names[0], "rewritten.test");
+    schema.set_text(?graph.services[0].name, "rewritten");
+    schema.reset_graph(?graph);
+    if (!str_equals(selected.name, "root") || !str_equals(selected.host, "example.test")
+     || !str_equals(selected.service, "svc")) { ret 4; }
+    if (!view.view_eq_str(fixture.plan.storage.specs[0].pattern, "/a/*rest")) { ret 5; }
+    if (!sealed(?fixture.plan) || fixture.plan.generation != 2) { ret 6; }
+    ret 0;
+}
+
+test "plan: an unregistered application fails before the plan seals" {
+    var graph: schema.Graph;
+    test_graph(?graph, schema.SERVICE_LAUREL, "site");
+    var fixture: Fixture;
+    var slots: [2]service.Application;
+    var registry: service.Applications;
+    service.make_applications(?registry, ?slots[0], 2);
+    var resolver: service.Resolver = service.no_resolver();
+    resolver.applications = ?registry;
+    val built: Report = build(?fixture, 2, ?graph, ?resolver, nil);
+    if (built.status != PLAN_UNRESOLVED || sealed(?fixture.plan)) { ret 1; }
+    ret 0;
+}
+
+test "plan: a service kind with no registered factory fails before the plan seals" {
+    var graph: schema.Graph;
+    test_graph(?graph, schema.SERVICE_STATIC, "./public");
+    var fixture: Fixture;
+    var resolver: service.Resolver = service.no_resolver();
+    if (build(?fixture, 2, ?graph, ?resolver, nil).status != PLAN_UNSUPPORTED) { ret 1; }
+    if (sealed(?fixture.plan)) { ret 2; }
+    test_graph(?graph, schema.SERVICE_PROXY, "http://127.0.0.1:1");
+    if (build(?fixture, 2, ?graph, ?resolver, nil).status != PLAN_UNSUPPORTED) { ret 3; }
+    if (sealed(?fixture.plan)) { ret 4; }
+    ret 0;
+}
+
+test "plan: a route naming an absent service fails before the plan seals" {
+    var graph: schema.Graph;
+    test_graph(?graph, schema.SERVICE_FIXED, "body");
+    schema.set_text(?graph.routes[0].service, "missing");
+    var fixture: Fixture;
+    var resolver: service.Resolver = service.no_resolver();
+    if (build(?fixture, 2, ?graph, ?resolver, nil).status != PLAN_UNRESOLVED) { ret 1; }
+    if (sealed(?fixture.plan)) { ret 2; }
+    ret 0;
+}
