@@ -186,6 +186,14 @@ Shutdown proceeds through explicit states:
 
 HTTP/2 uses GOAWAY. HTTP/3 closes request acceptance through its control and QUIC state. HTTP/1.1 marks responses for connection close and stops reading new requests.
 
+## Telemetry ownership
+
+One telemetry runtime owns the log sink contract, fixed metric registry, health checks, trace propagation bound, and administration handler for a server generation. Access and error events are encoded directly into a fixed record buffer. A direct sink completes within the call. A queued sink copies into a caller-bounded queue and reports enqueued, rejected, or dropped without waiting for space.
+
+Metric series are registered against caller-owned storage. Tokens identify stable series, updates are atomic, and histogram samples commit bucket, count, and sum together. Rendering performs a sizing pass before writing so an undersized administration response cannot expose a partial metric document.
+
+The administration handler has no public route access. Its listener identity and authentication callback are required policy inputs. Metrics and state renderers retain independent contexts. Shutdown makes readiness false before listener drain and invokes the telemetry flush operation exactly once.
+
 ## Lightweight composition
 
 The product remains lightweight through structural choices:
