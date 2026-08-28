@@ -1,0 +1,711 @@
+# the confined static file service
+#
+# A request target never becomes a filesystem path by concatenation. The decoded
+# target is split into segments, every segment is checked, and the result is
+# resolved one component at a time from an opened root handle. Traversal and
+# symlink escape are refused by construction rather than by inspection, because
+# an inspection can be defeated by an encoding this code did not anticipate.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.types.option;
+use std.types.view;
+use std.chrono.time;
+use std.allocator;
+use std.filesystem;
+use std.io.file;
+use std.system.os;
+use io_error: std.io.error;
+use http.core.body;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use hedge.config.schema;
+use hedge.service;
+use call: hedge.dispatch.call;
+use http_date: hedge.http.date;
+use http_range: hedge.http.range;
+use validator: hedge.http.validator;
+use media: hedge.http.media;
+
+pub val MAX_PATH_BYTES: usize = 1024;
+pub val MAX_SEGMENTS: usize = 64;
+pub val DEFAULT_INDEX: str = "index.html";
+pub val READ_CHUNK: usize = 65536;
+
+# mach-std resolves every component with O_NOFOLLOW, so a symlink anywhere on
+# the path is refused. that is the only policy this platform layer can express,
+# and naming it here keeps the choice explicit rather than incidental.
+pub def SymlinkPolicy: u8;
+pub val SYMLINK_DENY: SymlinkPolicy = 1;
+
+pub rec Options {
+    index: str;
+    symlinks: SymlinkPolicy;
+    precompressed: bool;
+}
+
+pub fun default_options() Options {
+    ret Options{index: DEFAULT_INDEX, symlinks: SYMLINK_DENY, precompressed: false};
+}
+
+pub rec Site {
+    name: str;
+    root: file.Root;
+    options: Options;
+    open: bool;
+}
+
+# generation-owned storage: one opened root per configured static service
+pub rec Registry {
+    items: *Site;
+    capacity: usize;
+    len: usize;
+    options: Options;
+}
+
+pub fun make_registry(registry: *Registry, items: *Site, capacity: usize, options: Options) bool {
+    if (registry == nil || (capacity != 0 && items == nil)) { ret false; }
+    registry.items = items;
+    registry.capacity = capacity;
+    registry.len = 0;
+    registry.options = options;
+    var i: usize = 0;
+    for (i < capacity) {
+        items[i].open = false;
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every root is closed together with the generation that opened it
+pub fun close_registry(registry: *Registry) bool {
+    if (registry == nil) { ret false; }
+    var ok: bool = true;
+    var i: usize = 0;
+    for (i < registry.len) {
+        if (registry.items[i].open) {
+            if (is_err[bool, io_error.Error](file.root_close(?registry.items[i].root))) { ok = false; }
+            registry.items[i].open = false;
+        }
+        i = i + 1;
+    }
+    registry.len = 0;
+    ret ok;
+}
+
+# --- path resolution ---
+
+pub def Resolution: u8;
+pub val PATH_OK: Resolution = 1;
+pub val PATH_INVALID: Resolution = 2;
+pub val PATH_TOO_LONG: Resolution = 3;
+
+pub rec Path {
+    status: Resolution;
+    length: usize;
+    directory: bool;
+}
+
+fun hex_value(c: u8) i16 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i16; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a' + 10)::i16; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A' + 10)::i16; }
+    ret -1;
+}
+
+# decode and check one path, producing a relative path for confined resolution
+#
+# `..` and `.` are rejected outright rather than collapsed. an encoded separator
+# is rejected too: allowing `%2f` would let a request smuggle a segment boundary
+# past the segment checks below.
+pub fun resolve(target: view.View, output: *u8, capacity: usize) Path {
+    var result: Path = Path{status: PATH_INVALID, length: 0, directory: false};
+    if (output == nil || capacity == 0) { ret result; }
+    if (target.data == nil || target.len == 0 || target.data[0] != '/') { ret result; }
+    var written: usize = 0;
+    var segments: usize = 0;
+    var offset: usize = 1;
+    var segment_length: usize = 0;
+    var segment_start: usize = 0;
+    result.directory = true;
+    for (offset <= target.len) {
+        val at_end: bool = offset == target.len;
+        var c: u8 = 0;
+        if (!at_end) { c = target.data[offset]; }
+        if (at_end || c == '/') {
+            if (segment_length == 0) {
+                # a repeated or trailing separator names the same directory
+                if (!at_end) { offset = offset + 1; cnt; }
+                result.directory = true;
+                brk;
+            }
+            if (segment_length == 1 && output[segment_start] == '.') { ret result; }
+            if (segment_length == 2 && output[segment_start] == '.'
+             && output[segment_start + 1] == '.') { ret result; }
+            segments = segments + 1;
+            if (segments > MAX_SEGMENTS) {
+                result.status = PATH_TOO_LONG;
+                ret result;
+            }
+            segment_length = 0;
+            if (at_end) {
+                result.directory = false;
+                brk;
+            }
+            if (written + 1 >= capacity) {
+                result.status = PATH_TOO_LONG;
+                ret result;
+            }
+            output[written] = '/';
+            written = written + 1;
+            segment_start = written;
+            offset = offset + 1;
+            cnt;
+        }
+        if (c == '%') {
+            if (offset + 2 >= target.len) { ret result; }
+            val high: i16 = hex_value(target.data[offset + 1]);
+            val low: i16 = hex_value(target.data[offset + 2]);
+            if (high < 0 || low < 0) { ret result; }
+            c = (high * 16 + low)::u8;
+            # an encoded separator, NUL, or control byte would defeat the checks above
+            if (c == 0 || c == '/' || c == '\\' || c < ' ' || c == 127) { ret result; }
+            offset = offset + 3;
+        } or {
+            if (c == 0 || c == '\\' || c < ' ' || c == 127) { ret result; }
+            offset = offset + 1;
+        }
+        if (written + 1 >= capacity) {
+            result.status = PATH_TOO_LONG;
+            ret result;
+        }
+        output[written] = c;
+        written = written + 1;
+        segment_length = segment_length + 1;
+    }
+    if (written != 0 && output[written - 1] == '/') { written = written - 1; }
+    output[written] = 0;
+    result.status = PATH_OK;
+    result.length = written;
+    ret result;
+}
+
+# --- the served representation ---
+
+rec Opened {
+    handle: filesystem.File;
+    metadata: filesystem.Metadata;
+    open: bool;
+}
+
+fun no_file() Opened {
+    var value: Opened;
+    value.open = false;
+    ret value;
+}
+
+fun open_at(site: *Site, path: str) Opened {
+    var result: Opened = no_file();
+    if (path == nil || path[0] == 0) { ret result; }
+    val opened: Result[filesystem.File, io_error.Error] = file.open_confined(
+        ?site.root, path, file.read_options());
+    if (is_err[filesystem.File, io_error.Error](opened)) { ret result; }
+    result.handle = unwrap_ok[filesystem.File, io_error.Error](opened);
+    val stat: Result[filesystem.Metadata, io_error.Error] = filesystem.stat_of_error(result.handle);
+    if (is_err[filesystem.Metadata, io_error.Error](stat)) {
+        filesystem.close(?result.handle);
+        ret result;
+    }
+    result.metadata = unwrap_ok[filesystem.Metadata, io_error.Error](stat);
+    result.open = true;
+    ret result;
+}
+
+fun close_file(value: *Opened) {
+    if (value.open) {
+        filesystem.close(?value.handle);
+        value.open = false;
+    }
+}
+
+# a body reader over one open descriptor and one byte span
+#
+# the descriptor pins the inode, so a file replaced under this request keeps
+# serving the representation whose validators were already sent.
+rec FileBody {
+    handle: filesystem.File;
+    offset: u64;
+    remaining: u64;
+    reader: body.Reader;
+    released: bool;
+}
+
+fun file_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
+    val state: *FileBody = context::*FileBody;
+    if (state == nil) { ret body.failed("file body has no state", body.REUSE_FORBIDDEN); }
+    if (state.remaining == 0) { ret body.complete(body.REUSE_ALLOWED); }
+    var wanted: usize = capacity;
+    if (wanted::u64 > state.remaining) { wanted = state.remaining::usize; }
+    if (wanted == 0) { ret body.failed("file body read admitted no capacity", body.REUSE_FORBIDDEN); }
+    val read: Result[usize, io_error.Error] = file.read_at(state.handle, output, wanted, state.offset);
+    if (is_err[usize, io_error.Error](read)) {
+        ret body.failed("static file read failed", body.REUSE_FORBIDDEN);
+    }
+    val count: usize = unwrap_ok[usize, io_error.Error](read);
+    # a short file means the representation changed after its length was declared,
+    # and the declared content-length can no longer be honoured
+    if (count == 0) { ret body.failed("static file ended before its declared length", body.REUSE_FORBIDDEN); }
+    state.offset = state.offset + count::u64;
+    state.remaining = state.remaining - count::u64;
+    ret body.data(count);
+}
+
+fun file_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
+    val state: *FileBody = context::*FileBody;
+    if (state == nil) { ret body.failed("file body has no state", body.REUSE_FORBIDDEN); }
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    if (mode == body.REJECT) { ret body.rejected(body.REUSE_FORBIDDEN); }
+    state.remaining = 0;
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+fun file_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+# the descriptor is closed exactly once, whether the body finished or was cut short
+fun file_release(context: ptr) {
+    val state: *FileBody = context::*FileBody;
+    if (state == nil || state.released) { ret; }
+    state.released = true;
+    filesystem.close(?state.handle);
+}
+
+# --- the handler ---
+
+fun add_view(active: *call.Call, name: str, value: view.View) bool {
+    val response: *message.Response = call.response(active);
+    if (response == nil) { ret false; }
+    ret message.add_field(response, field.Field{
+        name: service.text_view(name),
+        value: value,
+        sensitive: false,
+    }) == field.ADD_OK;
+}
+
+fun arena_bytes(active: *call.Call, count: usize) *u8 {
+    val a: *allocator.Allocator = call.allocator_of(active);
+    if (a == nil) { ret nil; }
+    val allocated: Result[*u8, *u8] = allocator.allocate[u8](a, count);
+    if (is_err[*u8, *u8](allocated)) { ret nil; }
+    ret unwrap_ok[*u8, *u8](allocated);
+}
+
+fun header(active: *call.Call, name: str, length: usize) view.View {
+    val found: *field.Field = field.find_first(?call.request(active).fields,
+        view.view(name, length));
+    if (found == nil) { ret view.view(nil, 0); }
+    ret found.value;
+}
+
+fun accepts(value: view.View, token: str) bool {
+    val length: usize = str_len(token);
+    if (value.data == nil || value.len < length) { ret false; }
+    var i: usize = 0;
+    for (i + length <= value.len) {
+        var j: usize = 0;
+        for (j < length && value.data[i + j] == token[j]) { j = j + 1; }
+        if (j == length) {
+            val before_ok: bool = i == 0 || value.data[i - 1] == ',' || value.data[i - 1] == ' ';
+            val after: usize = i + length;
+            val after_ok: bool = after == value.len || value.data[after] == ','
+                || value.data[after] == ';' || value.data[after] == ' ';
+            if (before_ok && after_ok) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun append_suffix(path: *u8, length: usize, capacity: usize, suffix: str) bool {
+    val extra: usize = str_len(suffix);
+    if (length + extra + 1 > capacity) { ret false; }
+    var i: usize = 0;
+    for (i < extra) {
+        path[length + i] = suffix[i];
+        i = i + 1;
+    }
+    path[length + extra] = 0;
+    ret true;
+}
+
+fun join_index(path: *u8, length: usize, capacity: usize, index: str) bool {
+    var at: usize = length;
+    if (at != 0) {
+        if (at + 1 >= capacity) { ret false; }
+        path[at] = '/';
+        at = at + 1;
+    }
+    ret append_suffix(path, at, capacity, index);
+}
+
+fun validators_of(active: *call.Call, metadata: filesystem.Metadata,
+    output: *validator.Validators) bool {
+    val storage: *u8 = arena_bytes(active, validator.ETAG_CAPACITY);
+    if (storage == nil) { ret false; }
+    val length: usize = validator.format_etag(metadata.identity.device, metadata.identity.file,
+        metadata.size::u64, metadata.modified, storage, validator.ETAG_CAPACITY);
+    if (length == 0) { ret false; }
+    output.etag = view.view(storage, length);
+    output.has_modified = true;
+    output.modified = metadata.modified;
+    ret true;
+}
+
+fun emit_validators(active: *call.Call, current: validator.Validators) bool {
+    if (!add_view(active, field.ETAG, current.etag)) { ret false; }
+    val storage: *u8 = arena_bytes(active, http_date.IMF_LENGTH + 1);
+    if (storage == nil) { ret false; }
+    val length: usize = http_date.format(current.modified, storage, http_date.IMF_LENGTH + 1);
+    if (length == 0) { ret true; }
+    ret add_view(active, field.LAST_MODIFIED, view.view(storage, length));
+}
+
+fun fail_with(active: *call.Call, code: status.Status) exchange.ServiceStatus {
+    ret service.respond(active, code);
+}
+
+# redirect a directory request that arrived without its trailing separator, so
+# relative references inside the index resolve against the directory
+fun redirect_to_directory(active: *call.Call) exchange.ServiceStatus {
+    val target: view.View = call.request(active).target.path;
+    val storage: *u8 = arena_bytes(active, target.len + 2);
+    if (storage == nil) { ret fail_with(active, status.INTERNAL_SERVER_ERROR); }
+    var i: usize = 0;
+    for (i < target.len) {
+        storage[i] = target.data[i];
+        i = i + 1;
+    }
+    storage[target.len] = '/';
+    storage[target.len + 1] = 0;
+    val response: *message.Response = call.response(active);
+    if (message.set_status(response, status.MOVED_PERMANENTLY) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!add_view(active, field.LOCATION, view.view(storage, target.len + 1))) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret service.commit_bodyless(active, call.BODY_DRAIN);
+}
+
+fun serve_body(active: *call.Call, opened: *Opened, first: u64, length: u64,
+    head_only: bool) exchange.ServiceStatus {
+    val response: *message.Response = call.response(active);
+    val configured: message.Limits = call.limits(active);
+    val measured: str = service.arena_number(active, length);
+    if (measured == nil || !service.add_field(active, field.CONTENT_LENGTH, measured)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (head_only) {
+        close_file(opened);
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+    val a: *allocator.Allocator = call.allocator_of(active);
+    if (a == nil) { ret exchange.SERVICE_FAILED; }
+    val allocated: Result[*FileBody, *u8] = allocator.allocate[FileBody](a, 1);
+    if (is_err[*FileBody, *u8](allocated)) { ret exchange.SERVICE_FAILED; }
+    val state: *FileBody = unwrap_ok[*FileBody, *u8](allocated);
+    state.handle = opened.handle;
+    state.offset = first;
+    state.remaining = length;
+    state.released = false;
+    # ownership of the descriptor moves to the body reader here, and the reader's
+    # release closes it exactly once
+    opened.open = false;
+    state.reader = body.init_reader(
+        (state)::ptr,
+        file_read,
+        file_finish,
+        file_complete,
+        file_release,
+        body.OWNER_APPLICATION,
+        response.generation,
+        true,
+        length,
+        configured.response_body,
+        nil,
+        call.scope(active),
+    );
+    if (!state.reader.valid) {
+        file_release((state)::ptr);
+        ret exchange.SERVICE_FAILED;
+    }
+    if (message.set_body_reader(response, ?state.reader, configured) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!call.resolve_body(active, call.BODY_DRAIN)) { ret exchange.SERVICE_FAILED; }
+    if (exchange.commit(active.exchange, configured) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret exchange.SERVICE_COMPLETE;
+}
+
+pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    val site: *Site = context::*Site;
+    if (site == nil || !site.open) { ret fail_with(active, status.INTERNAL_SERVER_ERROR); }
+    val request: *message.Request = call.request(active);
+    val kind: method.Kind = request.method.kind;
+    if (kind != method.GET && kind != method.HEAD) {
+        if (!service.add_field(active, "allow", "GET, HEAD")) { ret exchange.SERVICE_FAILED; }
+        ret fail_with(active, status.METHOD_NOT_ALLOWED);
+    }
+    val head_only: bool = kind == method.HEAD;
+
+    var path_bytes: [MAX_PATH_BYTES]u8;
+    val resolved: Path = resolve(request.target.path, ?path_bytes[0], MAX_PATH_BYTES);
+    if (resolved.status == PATH_TOO_LONG) { ret fail_with(active, status.URI_TOO_LONG); }
+    if (resolved.status != PATH_OK) { ret fail_with(active, status.NOT_FOUND); }
+
+    var relative: str = (?path_bytes[0])::str;
+    var length: usize = resolved.length;
+    var indexed: bool = false;
+    if (length == 0) {
+        if (!join_index(?path_bytes[0], 0, MAX_PATH_BYTES, site.options.index)) {
+            ret fail_with(active, status.URI_TOO_LONG);
+        }
+        length = str_len(relative);
+        indexed = true;
+    }
+
+    var opened: Opened = open_at(site, relative);
+    if (!opened.open) { ret fail_with(active, status.NOT_FOUND); }
+    if (opened.metadata.kind == filesystem.KIND_DIR) {
+        close_file(?opened);
+        if (!resolved.directory) { ret redirect_to_directory(active); }
+        if (indexed || !join_index(?path_bytes[0], length, MAX_PATH_BYTES, site.options.index)) {
+            ret fail_with(active, status.NOT_FOUND);
+        }
+        length = str_len(relative);
+        opened = open_at(site, relative);
+        if (!opened.open) { ret fail_with(active, status.NOT_FOUND); }
+    }
+    if (opened.metadata.kind != filesystem.KIND_FILE) {
+        close_file(?opened);
+        ret fail_with(active, status.NOT_FOUND);
+    }
+
+    # a precompressed variant is a distinct representation, so it carries its own
+    # validators and the response varies on the negotiation input
+    val media_type: str = media.for_path(view.view(relative, length));
+    var encoding: str = nil;
+    if (site.options.precompressed) {
+        val accepted: view.View = header(active, field.ACCEPT_ENCODING, 15);
+        var variant: Opened = no_file();
+        if (accepts(accepted, "br") && append_suffix(?path_bytes[0], length, MAX_PATH_BYTES, ".br")) {
+            variant = open_at(site, relative);
+            if (variant.open) { encoding = "br"; }
+        }
+        if (!variant.open && accepts(accepted, "gzip")
+         && append_suffix(?path_bytes[0], length, MAX_PATH_BYTES, ".gz")) {
+            variant = open_at(site, relative);
+            if (variant.open) { encoding = "gzip"; }
+        }
+        path_bytes[length] = 0;
+        if (variant.open && variant.metadata.kind == filesystem.KIND_FILE) {
+            close_file(?opened);
+            opened = variant;
+        } or {
+            close_file(?variant);
+            encoding = nil;
+        }
+    }
+
+    var current: validator.Validators;
+    if (!validators_of(active, opened.metadata, ?current)) {
+        close_file(?opened);
+        ret fail_with(active, status.INTERNAL_SERVER_ERROR);
+    }
+    val complete_length: u64 = opened.metadata.size::u64;
+
+    val decision: validator.Outcome = validator.evaluate(request, current);
+    if (decision == validator.PRECONDITION_FAILED) {
+        close_file(?opened);
+        ret fail_with(active, status.PRECONDITION_FAILED);
+    }
+    if (decision == validator.NOT_MODIFIED) {
+        close_file(?opened);
+        if (message.set_status(call.response(active), status.NOT_MODIFIED) != message.RESPONSE_OK) {
+            ret exchange.SERVICE_FAILED;
+        }
+        if (!emit_validators(active, current)) { ret exchange.SERVICE_FAILED; }
+        if (site.options.precompressed && !service.add_field(active, field.VARY, field.ACCEPT_ENCODING)) {
+            ret exchange.SERVICE_FAILED;
+        }
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+
+    var span: http_range.Span = http_range.Span{
+        outcome: http_range.NO_RANGE, first: 0, last: 0, length: 0,
+    };
+    if (validator.range_allowed(request, current)) {
+        span = http_range.resolve(header(active, field.RANGE, 5), complete_length);
+    }
+    if (span.outcome == http_range.UNSATISFIABLE) {
+        close_file(?opened);
+        val storage: *u8 = arena_bytes(active, http_range.CONTENT_RANGE_CAPACITY);
+        if (storage == nil) { ret exchange.SERVICE_FAILED; }
+        val written: usize = http_range.format_unsatisfied(complete_length, storage,
+            http_range.CONTENT_RANGE_CAPACITY);
+        if (message.set_status(call.response(active), status.RANGE_NOT_SATISFIABLE) != message.RESPONSE_OK) {
+            ret exchange.SERVICE_FAILED;
+        }
+        if (!add_view(active, "content-range", view.view(storage, written))) {
+            ret exchange.SERVICE_FAILED;
+        }
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+
+    if (!emit_validators(active, current)) {
+        close_file(?opened);
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!service.add_field(active, "accept-ranges", "bytes")) {
+        close_file(?opened);
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!service.add_field(active, field.CONTENT_TYPE, media_type)) {
+        close_file(?opened);
+        ret exchange.SERVICE_FAILED;
+    }
+    if (encoding != nil) {
+        if (!service.add_field(active, field.CONTENT_ENCODING, encoding)
+         || !service.add_field(active, field.VARY, field.ACCEPT_ENCODING)) {
+            close_file(?opened);
+            ret exchange.SERVICE_FAILED;
+        }
+    } or (site.options.precompressed && !service.add_field(active, field.VARY, field.ACCEPT_ENCODING)) {
+        close_file(?opened);
+        ret exchange.SERVICE_FAILED;
+    }
+
+    if (span.outcome == http_range.SATISFIABLE) {
+        val storage: *u8 = arena_bytes(active, http_range.CONTENT_RANGE_CAPACITY);
+        if (storage == nil) { close_file(?opened); ret exchange.SERVICE_FAILED; }
+        val written: usize = http_range.format_content_range(span, complete_length, storage,
+            http_range.CONTENT_RANGE_CAPACITY);
+        if (message.set_status(call.response(active), status.PARTIAL_CONTENT) != message.RESPONSE_OK) {
+            close_file(?opened);
+            ret exchange.SERVICE_FAILED;
+        }
+        if (!add_view(active, "content-range", view.view(storage, written))) {
+            close_file(?opened);
+            ret exchange.SERVICE_FAILED;
+        }
+        ret serve_body(active, ?opened, span.first, span.length, head_only);
+    }
+    if (message.set_status(call.response(active), status.OK) != message.RESPONSE_OK) {
+        close_file(?opened);
+        ret exchange.SERVICE_FAILED;
+    }
+    ret serve_body(active, ?opened, 0, complete_length, head_only);
+}
+
+# construct one static service for a generation, opening its root before any
+# listener is ready so a missing or unreadable root fails the reload
+pub fun factory(context: ptr, configured: *schema.Service, handler: *service.Handler) bool {
+    val registry: *Registry = context::*Registry;
+    if (registry == nil || configured == nil || handler == nil
+     || registry.len >= registry.capacity) { ret false; }
+    val root_path: str = schema.text(?configured.target);
+    if (root_path == nil || root_path[0] == 0) { ret false; }
+    val opened: Result[file.Root, io_error.Error] = file.root_open(root_path);
+    if (is_err[file.Root, io_error.Error](opened)) { ret false; }
+    val site: *Site = ?registry.items[registry.len];
+    site.root = unwrap_ok[file.Root, io_error.Error](opened);
+    site.name = schema.text(?configured.name);
+    site.options = registry.options;
+    if (configured.index.len != 0) { site.options.index = schema.text(?configured.index); }
+    site.options.precompressed = configured.precompressed;
+    site.open = true;
+    registry.len = registry.len + 1;
+    @handler = service.Handler{ctx: (site)::ptr, serve: serve};
+    ret true;
+}
+
+fun resolved_is(target: str, expected: str, directory: bool) bool {
+    var output: [MAX_PATH_BYTES]u8;
+    val result: Path = resolve(view.view(target, str_len(target)), ?output[0], MAX_PATH_BYTES);
+    if (result.status != PATH_OK || result.directory != directory) { ret false; }
+    var i: usize = 0;
+    for (expected[i] != 0) {
+        if (output[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret output[i] == 0 && result.length == i;
+}
+
+fun rejected(target: str) bool {
+    var output: [MAX_PATH_BYTES]u8;
+    ret resolve(view.view(target, str_len(target)), ?output[0], MAX_PATH_BYTES).status != PATH_OK;
+}
+
+test "static path: a normal target becomes a relative path with no leading separator" {
+    if (!resolved_is("/a/b.txt", "a/b.txt", false)) { ret 1; }
+    if (!resolved_is("/a/b/", "a/b", true)) { ret 2; }
+    if (!resolved_is("/a//b", "a/b", false)) { ret 3; }
+    if (!resolved_is("/", "", true)) { ret 4; }
+    if (!resolved_is("/a%20b.txt", "a b.txt", false)) { ret 5; }
+    ret 0;
+}
+
+test "static path: traversal is refused in every encoding rather than collapsed" {
+    if (!rejected("/../etc/passwd")) { ret 1; }
+    if (!rejected("/a/../../etc/passwd")) { ret 2; }
+    if (!rejected("/a/./b")) { ret 3; }
+    if (!rejected("/%2e%2e/etc/passwd")) { ret 4; }
+    if (!rejected("/%2E%2E/etc/passwd")) { ret 5; }
+    if (!rejected("/a/%2e%2e/b")) { ret 6; }
+    # an encoded separator would smuggle a segment boundary past the segment checks
+    if (!rejected("/a%2fb")) { ret 7; }
+    if (!rejected("/a%2Fb")) { ret 8; }
+    if (!rejected("/a%5cb")) { ret 9; }
+    if (!rejected("/a\\b")) { ret 10; }
+    ret 0;
+}
+
+test "static path: a NUL, a control byte, and a bad escape are all refused" {
+    if (!rejected("/a%00b")) { ret 1; }
+    if (!rejected("/a%01b")) { ret 2; }
+    if (!rejected("/a%zzb")) { ret 3; }
+    if (!rejected("/a%2")) { ret 4; }
+    if (!rejected("relative")) { ret 5; }
+    ret 0;
+}
+
+test "static path: an overlong target is refused rather than truncated" {
+    var output: [16]u8;
+    val result: Path = resolve(view.view("/aaaaaaaaaaaaaaaaaaaaaaaa", 25), ?output[0], 16);
+    if (result.status != PATH_TOO_LONG) { ret 1; }
+    ret 0;
+}
+
+test "static: an accept-encoding token matches only on a whole member" {
+    if (!accepts(view.view("gzip, br", 8), "br")) { ret 1; }
+    if (!accepts(view.view("br;q=1.0", 8), "br")) { ret 2; }
+    if (accepts(view.view("brotli", 6), "br")) { ret 3; }
+    if (accepts(view.view("xbr", 3), "br")) { ret 4; }
+    if (!accepts(view.view("gzip", 4), "gzip")) { ret 5; }
+    ret 0;
+}
