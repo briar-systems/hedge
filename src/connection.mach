@@ -184,6 +184,10 @@ pub rec Connection {
     read_buffer: [READ_BYTES]u8;
     write_buffer: [WRITE_BYTES]u8;
     stage: [READ_BYTES]u8;
+    stage_length: usize;
+    stage_offset: usize;
+    body_done: bool;
+    body_chunks: u64;
     request_body: RequestBody;
     request: message.Request;
     response: message.Response;
@@ -557,6 +561,10 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
     owner.active_slot = slot;
     owner.exchange_live = true;
     owner.response_started = false;
+    owner.stage_length = 0;
+    owner.stage_offset = 0;
+    owner.body_done = false;
+    owner.body_chunks = 0;
     ret SETUP_OK;
 }
 
@@ -637,29 +645,47 @@ fun response_complete(owner: *Connection) bool {
     ret owner.engine_slots[owner.active_slot].outbound_complete;
 }
 
-# pull one chunk from the response body and hand it to the serializer
+# pull from the response body into the staging buffer and hand it to the
+# serializer
+#
+# the serializer consumes only what fits in the write buffer, so the unconsumed
+# remainder of a staged chunk is offered again before the body is read further.
+# dropping it would silently corrupt every response larger than one buffer.
 fun advance_response(owner: *Connection, now: time.Time) Step {
     if (!owner.response_started || response_complete(owner)) { ret STEP_IDLE; }
     if (owner.engine.write_pending || owner.engine.write_length != 0) { ret STEP_BLOCKED; }
-    var payload: *u8 = nil;
-    var length: usize = 0;
-    var final: bool = true;
-    if (owner.response.body_kind == message.BODY_READER) {
-        val progress: body.Progress = body.read(owner.response.body_reader, ?owner.stage[0], READ_BYTES);
-        if (progress.status == body.DATA) {
-            payload = ?owner.stage[0];
-            length = progress.count;
-            final = false;
-        } or (progress.status == body.PENDING) {
-            ret STEP_BLOCKED;
-        } or (progress.status != body.COMPLETE) {
-            ret STEP_ERROR;
+    if (owner.stage_offset >= owner.stage_length) {
+        owner.stage_offset = 0;
+        owner.stage_length = 0;
+        if (!owner.body_done) {
+            if (owner.response.body_kind == message.BODY_READER) {
+                val progress: body.Progress = body.read(owner.response.body_reader,
+                    ?owner.stage[0], READ_BYTES);
+                if (progress.status == body.DATA) {
+                    owner.stage_length = progress.count;
+                    owner.body_chunks = owner.body_chunks + 1;
+                }
+                or (progress.status == body.PENDING) { ret STEP_BLOCKED; }
+                or (progress.status == body.COMPLETE) { owner.body_done = true; }
+                or { ret STEP_ERROR; }
+            } or {
+                owner.body_done = true;
+            }
         }
     }
+    var payload: *u8 = nil;
+    var length: usize = 0;
+    if (owner.stage_offset < owner.stage_length) {
+        payload = ?owner.stage[owner.stage_offset];
+        length = owner.stage_length - owner.stage_offset;
+    }
+    val final: bool = owner.body_done && length == 0;
     val offered: connection.Offer = connection.offer(?owner.engine, owner.active_slot,
         payload, length, final);
     if (offered.status == connection.OFFER_ERROR) { ret STEP_ERROR; }
     if (offered.status == connection.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    owner.stage_offset = owner.stage_offset + offered.consumed;
+    if (offered.consumed == 0 && offered.produced == 0 && !final) { ret STEP_BLOCKED; }
     ret STEP_PROGRESS;
 }
 
@@ -834,6 +860,13 @@ pub fun begin_graceful(owner: *Connection) bool {
 
 pub fun close(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || owner.state == CLOSED) { ret false; }
+    # a live exchange must settle before the connection goes away, or a service
+    # holding a resource in its body reader never gets its release call
+    if (owner.exchange_live) {
+        exchange.cancel_exchange(?owner.exchange);
+        call.release(?owner.active_call);
+        owner.exchange_live = false;
+    }
     connection.cancel_connection(?owner.engine);
     if (owner.request_scope_live) {
         cancel.destroy(?owner.request_scope);
@@ -857,6 +890,7 @@ pub rec Snapshot {
     last_step: Step;
     setup_failure: Setup;
     request_failure: message.RequestStatus;
+    body_chunks: u64;
     requests: u64;
     exchange_live: bool;
     response_status: status.Status;
@@ -865,7 +899,7 @@ pub rec Snapshot {
 pub fun snapshot(owner: *Connection) Snapshot {
     if (owner == nil) {
         ret Snapshot{state: CLOSED, engine_state: 0, engine_error: 0,
-            last_event: connection.EVENT_NONE, last_step: STEP_IDLE, setup_failure: SETUP_OK, request_failure: 0, requests: 0,
+            last_event: connection.EVENT_NONE, last_step: STEP_IDLE, setup_failure: SETUP_OK, request_failure: 0, body_chunks: 0, requests: 0,
             exchange_live: false, response_status: 0};
     }
     ret Snapshot{
@@ -876,6 +910,7 @@ pub fun snapshot(owner: *Connection) Snapshot {
         last_step: owner.last_step,
         setup_failure: owner.setup_failure,
         request_failure: owner.request_failure,
+        body_chunks: owner.body_chunks,
         requests: owner.requests,
         exchange_live: owner.exchange_live,
         response_status: owner.response.status,
