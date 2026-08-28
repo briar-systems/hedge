@@ -23,6 +23,8 @@ name = "public-tcp"
 address = "[::]:443"
 protocols = ["http/1.1", "h2"]
 tls = "public"
+backlog = 512
+accept_depth = 16
 
 [[listener]]
 name = "public-quic"
@@ -69,6 +71,8 @@ The implemented schema accepts these top-level sections:
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
+Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. A named listener `budget` limits its accepted connections. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+
 Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
 
 ## Validation
@@ -95,6 +99,8 @@ Diagnostics retain severity, stable code, source, field path, and message. The l
 Reload parses and validates a complete candidate configuration. It then constructs candidate certificates, route graphs, upstream pools, application instances, caches, and listeners.
 
 Activation is atomic. If any required component cannot be constructed, the current generation remains active. Diagnostics identify the candidate source and never mutate current state.
+
+The listener owner binds every candidate TCP, UDP, IPv4, IPv6, and local endpoint before activation. It reserves the configured accept depth before readiness. On successful publication it cancels and closes only the replaced listeners. Connections retain the generation under which they were accepted. A failed bind or accept reservation closes the candidate without changing the active generation or its connections.
 
 The generation store publishes only sealed candidates. Parsing, resolution, validation, and caller-supplied resource construction all complete before the pointer exchange. Readers retain a generation through an atomic publication gate. Replaced generations drain until their last retained reference is released. Failed attempts are observable through attempt count, failure count, candidate identity, and structured failure code.
 
