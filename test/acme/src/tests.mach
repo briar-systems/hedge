@@ -1,0 +1,1168 @@
+# live acme conformance: a real authority issues a certificate through hedge
+#
+# the stack under test/acme/harness runs pebble, its challenge test server, and
+# a plain-http front end, all on loopback. nothing here is a fixture: the order
+# is real, the authority validates by connecting to hedge's own listener, and
+# the certificate that comes back is parsed and checked against what was
+# ordered.
+#
+# challtestsrv's http-01 responder is disabled by the harness, so the only
+# process that can answer the validation request is the one this suite starts.
+
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use O: std.types.option;
+use R: std.types.result;
+use T: std.chrono.time;
+use std.allocator;
+use std.print;
+use problem: acme.problem;
+use std.allocator.fixed;
+use fs: std.filesystem;
+use std.types.path.Path;
+use std.net.ip;
+use std.net.tcp;
+use io_error: std.io.error;
+use ch: acme.challenge;
+use http.core.field;
+use identifier: acme.identifier;
+use cert: acme.certificate;
+use storage: acme.storage;
+use hedge.config.schema;
+use hedge.listener;
+use hedge.connection;
+use hedge.serve;
+use hedge.service;
+use plan: hedge.dispatch.plan;
+use middleware: hedge.dispatch.middleware;
+use router: http.router.router;
+use challenge: hedge.acme.challenge;
+use acme: hedge.acme.manager;
+use handler: hedge.acme.handler;
+use protocol: hedge.protocol.credentials;
+use credentials: tls.cert.credentials;
+use tls_cert: tls.cert;
+use load: tls.cert.load;
+use crypto_keys: crypto.encoding.keys;
+use secret: crypto.secret;
+use contracts: crypto.contracts;
+use ct: std.crypto.ct;
+use issue: hedge.acme.issue;
+use keys: hedge.acme.keys;
+use session: hedge.acme.session;
+use durable: hedge.acme.durable;
+use transport: hedge.acme.transport;
+
+val MAX_ROUTES: usize = 8;
+val MAX_SEGMENTS: usize = 64;
+val MAX_SERVICES: usize = 8;
+val PLAN_TEXT: usize = 2048;
+val POOL: usize = 8;
+
+# the harness binds pebble's http-01 validation port to this process
+val CHALLENGE_PORT: u16 = 5002;
+val AUTHORITY_PORT: u16 = 14001;
+val DIRECTORY_URL: str = "https://127.0.0.1:14000/dir";
+
+# a run takes a few seconds; this is the ceiling before the suite gives up
+val MAX_ROUNDS: usize = 400000;
+
+rec Server {
+    graph:       schema.Graph;
+    diagnostics: schema.Diagnostics;
+    routes:      [MAX_ROUTES]router.CompiledRoute;
+    segments:    [MAX_SEGMENTS]router.Segment;
+    specs:       [MAX_ROUTES]router.Route;
+    entries:     [MAX_ROUTES]plan.Entry;
+    services:    [MAX_SERVICES]service.Descriptor;
+    middlewares: [4]middleware.Middleware;
+    text:        [PLAN_TEXT]u8;
+    storage:     plan.Storage;
+    plan:        plan.Plan;
+    slots:       [POOL]serve.Slot;
+    connections: [POOL]connection.Connection;
+    runtime:     serve.Runtime;
+    applications: service.Applications;
+    application_slots: [4]service.Application;
+    resolver:    service.Resolver;
+    binding:     handler.Binding;
+    endpoint:    ip.Endpoint;
+}
+
+rec Client {
+    request:  [8192]u8;
+    response: [65536]u8;
+    items:    [64]field.Field;
+    engine:   transport.Transport;
+    session:  session.Session;
+    run:      issue.Issue;
+    table:    challenge.Http01;
+    account:  keys.Key;
+    certificate: keys.Key;
+    names:    [1]identifier.Identifier;
+    name:     [64]u8;
+    name_len: usize;
+}
+
+fun configure(server: *Server, address: str) {
+    val graph: *schema.Graph = ?server.graph;
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "acme-live");
+    graph.limits.max_connections = POOL;
+    graph.limits.max_connections_per_peer = POOL;
+    graph.features.acme = true;
+    graph.listener_count = 1;
+    val configured: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?configured.name, "public");
+    schema.set_text(?configured.address, address);
+    schema.clear_text(?configured.tls_policy);
+    schema.clear_text(?configured.budget);
+    configured.transport = schema.TRANSPORT_TCP;
+    configured.protocols = schema.PROTOCOL_HTTP1;
+    configured.backlog = 16;
+    configured.accept_depth = 4;
+    # the authority validates by name, and every name it fetches resolves to
+    # this listener, so the host matches any authority
+    graph.host_count = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    schema.set_text(?graph.hosts[0].listener, "public");
+    graph.hosts[0].server_name_count = 0;
+    graph.service_count = 1;
+    schema.set_text(?graph.services[0].name, "acme-challenge");
+    graph.services[0].kind = schema.SERVICE_NATIVE;
+    schema.set_text(?graph.services[0].target, schema.NATIVE_ACME_CHALLENGE);
+    schema.clear_text(?graph.services[0].budget);
+    schema.clear_text(?graph.services[0].secret);
+    graph.services[0].status = 200;
+    schema.clear_text(?graph.services[0].content_type);
+    graph.route_count = 1;
+    schema.set_text(?graph.routes[0].name, "acme");
+    schema.set_text(?graph.routes[0].host, "site");
+    schema.set_text(?graph.routes[0].path, "/.well-known/acme-challenge/**");
+    schema.set_text(?graph.routes[0].service, "acme-challenge");
+    schema.clear_text(?graph.routes[0].budget);
+}
+
+# the tests run as separate processes in parallel, so only the run that must
+# receive the authority's validation takes pebble's fixed http-01 port
+fun boot_at(server: *Server, table: *challenge.Http01, address: str,
+    expected: u16) bool {
+    configure(server, address);
+    if (!handler.bind(?server.binding, table)) { ret false; }
+    service.make_applications(?server.applications,
+        ?server.application_slots[0], 4);
+    server.resolver = service.no_resolver();
+    server.resolver.applications = ?server.applications;
+    server.resolver.native = handler.factory(?server.binding);
+    if (!plan.make_storage(?server.storage, ?server.routes[0], MAX_ROUTES,
+        ?server.segments[0], MAX_SEGMENTS, ?server.specs[0], MAX_ROUTES,
+        ?server.entries[0], MAX_ROUTES, ?server.services[0], MAX_SERVICES,
+        ?server.middlewares[0], 4, ?server.text[0], PLAN_TEXT)) { ret false; }
+    if (plan.compile(?server.plan, 1, ?server.graph, server.storage,
+        ?server.resolver, nil).status != plan.PLAN_OK) {
+        print.eprintln("boot: plan");
+        ret false;
+    }
+    if (!serve.make(?server.runtime, ?server.slots[0], ?server.connections[0],
+        POOL, ?server.plan, ?server.graph)) { ret false; }
+    schema.reset_diagnostics(?server.diagnostics);
+    if (!serve.start(?server.runtime, 1, ?server.graph,
+        ?server.diagnostics)) {
+        print.eprintln("boot: start");
+        var i: usize = 0;
+        for (i < server.diagnostics.count) {
+            print.eprintln(schema.text(?server.diagnostics.items[i].message));
+            i = i + 1;
+        }
+        ret false;
+    }
+    val owned: *listener.OwnedListener = listener.active_listener(
+        ?server.runtime.owner, 0);
+    if (owned == nil || !owned.has_bound_endpoint) { ret false; }
+    server.endpoint = owned.bound_endpoint;
+    ret expected == 0 || server.endpoint.port == expected;
+}
+
+fun boot(server: *Server, table: *challenge.Http01) bool {
+    ret boot_at(server, table, "127.0.0.1:5002", CHALLENGE_PORT);
+}
+
+fun monotonic_ns() i64 {
+    val current: T.Time = T.monotonic();
+    ret current.sec * 1000000000 + current.nsec;
+}
+
+# a run-unique name. the authority keeps order state for the life of its
+# process, so a fixed name would make a second run depend on the first.
+fun unique_name(client: *Client, prefix: str) usize {
+    var at: usize = 0;
+    for (prefix[at] != 0) {
+        client.name[at] = prefix[at];
+        at = at + 1;
+    }
+    client.name[at] = '-';
+    at = at + 1;
+    var value: u64 = monotonic_ns()::u64;
+    var digits: [24]u8;
+    var count: usize = 0;
+    for (count < 12) {
+        digits[count] = ('0'::u64 + value % 10)::u8;
+        value = value / 10;
+        count = count + 1;
+    }
+    var i: usize = 0;
+    for (i < count) {
+        client.name[at + i] = digits[count - 1 - i];
+        i = i + 1;
+    }
+    at = at + count;
+    val suffix: str = ".acme.example";
+    i = 0;
+    for (suffix[i] != 0) {
+        client.name[at + i] = suffix[i];
+        i = i + 1;
+    }
+    ret at + i;
+}
+
+fun prepare(client: *Client, prefix: str) bool {
+    challenge.http01_reset(?client.table);
+    if (!keys.generate(?client.account) || !keys.generate(?client.certificate)) {
+        ret false;
+    }
+    if (!transport.make(?client.engine, ?client.request[0], 8192,
+        ?client.response[0], 65536, ?client.items[0], 64,
+        session.limits().response_fields, transport.literal_addresses())) {
+        ret false;
+    }
+    # the authority's urls are https, as rfc 8555 requires. the harness
+    # terminates tls in front of pebble, so the configured origin says where
+    # that authority is actually reached.
+    if (!transport.set_origin(?client.engine, transport.cleartext_origin(
+        ip.endpoint(127, 0, 0, 1, AUTHORITY_PORT)))) { ret false; }
+    if (session.make(?client.session, view.view(DIRECTORY_URL, 27))
+        != session.OK) { ret false; }
+    client.name_len = unique_name(client, prefix);
+    client.names[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view(?client.name[0], client.name_len)};
+    var policy: identifier.Policy = identifier.policy_default();
+    policy.allow_wildcard = false;
+    ret issue.make(?client.run, ?client.names[0], 1, policy);
+}
+
+fun context(client: *Client) issue.Context {
+    var value: issue.Context;
+    value.session = ?client.session;
+    value.engine = ?client.engine;
+    value.account_key = ?client.account;
+    value.certificate_key = ?client.certificate;
+    value.provider = challenge.http01_provider(?client.table);
+    value.contact = view.view(nil, 0);
+    value.agree_terms = true;
+    ret value;
+}
+
+# drives the server and the issuance together, exactly as the serving loop
+# would: one poll of each per round, neither blocking the other.
+fun run_issuance(server: *Server, client: *Client) issue.Status {
+    var active: issue.Context = context(client);
+    var status: issue.Status = issue.PENDING;
+    var rounds: usize = 0;
+    val deadline: i64 = monotonic_ns() + 120000000000;
+    for (status == issue.PENDING && rounds < MAX_ROUNDS) {
+        serve.poll(?server.runtime, 1);
+        status = issue.poll(?client.run, ?active, T.now());
+        if (monotonic_ns() > deadline) { brk; }
+        rounds = rounds + 1;
+    }
+    ret status;
+}
+
+fun discover(server: *Server, client: *Client) bool {
+    if (session.begin_discovery(?client.session) != session.PENDING) {
+        ret false;
+    }
+    var status: session.Status = session.PENDING;
+    var rounds: usize = 0;
+    for (status == session.PENDING && rounds < MAX_ROUNDS) {
+        serve.poll(?server.runtime, 1);
+        status = session.poll(?client.session, ?client.engine,
+            ?client.account, T.now());
+        rounds = rounds + 1;
+    }
+    if (status != session.OK) { ret false; }
+    session.complete(?client.session, ?client.engine);
+    ret true;
+}
+
+fun report(run: *issue.Issue) {
+    val cause: problem.Error = issue.failure(run);
+    var rendered: [512]u8;
+    var at: usize = 0;
+    if (cause.problem.detail.len != 0 && cause.problem.detail.len < 512) {
+        for (at < cause.problem.detail.len) {
+            rendered[at] = cause.problem.detail.data[at];
+            at = at + 1;
+        }
+    }
+    rendered[at] = 0;
+    var detail: str = cause.detail;
+    if (detail == nil) { detail = ""; }
+    print.eprintlnf("acme failed: phase {} kind {} code {} status {} {} | {}",
+        issue.phase(run)::i64, cause.kind::i64, cause.code::i64,
+        cause.http.status::i64, detail, (?rendered[0])::str);
+}
+
+fun shutdown(server: *Server, client: *Client) {
+    serve.stop(?server.runtime);
+    session.release(?client.session);
+    transport.destroy(?client.engine);
+    keys.destroy(?client.account);
+    keys.destroy(?client.certificate);
+}
+
+test "live: a real authority issues a certificate through hedge" {
+    var server: Server;
+    var client: Client;
+    if (!prepare(?client, "issued")) { ret 1; }
+    if (!boot(?server, ?client.table)) {
+        transport.destroy(?client.engine);
+        ret 2;
+    }
+    if (!discover(?server, ?client)) {
+        shutdown(?server, ?client);
+        ret 3;
+    }
+    if (issue.begin(?client.run) != issue.PENDING) {
+        shutdown(?server, ?client);
+        ret 4;
+    }
+    val status: issue.Status = run_issuance(?server, ?client);
+    if (status != issue.OK) {
+        # the phase and the authority's own words are what make a live failure
+        # diagnosable; a bare code would only say that something went wrong
+        report(?client.run);
+        shutdown(?server, ?client);
+        ret 5;
+    }
+    if (issue.phase(?client.run) != issue.DONE) {
+        shutdown(?server, ?client);
+        ret 6;
+    }
+    # the authority answered the challenge by fetching it from this process,
+    # and the presentation was retired exactly once
+    if (client.table.presented != 1 || client.table.withdrawn != 1
+     || challenge.http01_live(?client.table) != 0) {
+        shutdown(?server, ?client);
+        ret 7;
+    }
+    # a real authority returns the leaf plus at least one issuer
+    val chain: cert.Chain = issue.chain(?client.run);
+    if (chain.len < 2) {
+        shutdown(?server, ?client);
+        ret 8;
+    }
+    val leaf: cert.Parsed = issue.leaf(?client.run);
+    if (leaf.name_len != 1 || leaf.names[0].kind != identifier.DNS
+     || leaf.names[0].value.len != client.name_len) {
+        shutdown(?server, ?client);
+        ret 9;
+    }
+    var i: usize = 0;
+    for (i < client.name_len) {
+        if (leaf.names[0].value.data[i] != client.name[i]) {
+            shutdown(?server, ?client);
+            ret 10;
+        }
+        i = i + 1;
+    }
+    if (leaf.not_after_unix <= leaf.not_before_unix) {
+        shutdown(?server, ?client);
+        ret 11;
+    }
+    if (issue.certificate_url(?client.run).len == 0
+     || issue.account_url(?client.run).len == 0) {
+        shutdown(?server, ?client);
+        ret 12;
+    }
+    shutdown(?server, ?client);
+    ret 0;
+}
+
+val TEST_TOKEN: str = "tokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+val TEST_AUTHORIZATION: str = "tokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.thumbBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+val TEST_PATH: str = "/.well-known/acme-challenge/tokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fun text_view(value: str) view.View {
+    var i: usize = 0;
+    for (value[i] != 0) { i = i + 1; }
+    ret view.view(value, i);
+}
+
+fun http_get(server: *Server, path: str, response: *u8,
+    capacity: usize) usize {
+    val connected: R.Result[tcp.Stream, io_error.Error] = tcp.connect(
+        server.endpoint);
+    if (R.is_err[tcp.Stream, io_error.Error](connected)) { ret 0; }
+    var client: tcp.Stream = R.unwrap_ok[tcp.Stream, io_error.Error](connected);
+    tcp.stream_set_read_timeout(?client, 200);
+    var request: [512]u8;
+    var at: usize = 0;
+    val head: str = "GET ";
+    var i: usize = 0;
+    for (head[i] != 0) { request[at + i] = head[i]; i = i + 1; }
+    at = at + i;
+    i = 0;
+    for (path[i] != 0) { request[at + i] = path[i]; i = i + 1; }
+    at = at + i;
+    val tail: str = " HTTP/1.1\r\nhost: issued.acme.example\r\nconnection: close\r\n\r\n";
+    i = 0;
+    for (tail[i] != 0) { request[at + i] = tail[i]; i = i + 1; }
+    at = at + i;
+    tcp.stream_write(?client, ?request[0], at);
+    var total: usize = 0;
+    var rounds: usize = 0;
+    for (rounds < 512) {
+        serve.poll(?server.runtime, 1);
+        val read: R.Result[usize, io_error.Error] = tcp.stream_read(?client,
+            ?response[total], capacity - total);
+        if (!R.is_err[usize, io_error.Error](read)) {
+            val count: usize = R.unwrap_ok[usize, io_error.Error](read);
+            if (count == 0 && total != 0) { brk; }
+            total = total + count;
+        }
+        if (total > 4 && response[total - 1] == 10) { brk; }
+        rounds = rounds + 1;
+    }
+    tcp.stream_close(?client);
+    ret total;
+}
+
+fun body_contains(data: *u8, len: usize, needle: str) bool {
+    var wanted: usize = 0;
+    for (needle[wanted] != 0) { wanted = wanted + 1; }
+    if (wanted == 0 || len < wanted) { ret false; }
+    var at: usize = 0;
+    for (at + wanted <= len) {
+        var i: usize = 0;
+        for (i < wanted && data[at + i] == needle[i]) { i = i + 1; }
+        if (i == wanted) { ret true; }
+        at = at + 1;
+    }
+    ret false;
+}
+
+test "live: hedge serves a presented challenge on its own listener" {
+    var server: Server;
+    var client: Client;
+    if (!prepare(?client, "route")) { ret 1; }
+    if (!boot_at(?server, ?client.table, "127.0.0.1:0", 0)) {
+        transport.destroy(?client.engine);
+        ret 2;
+    }
+    var value: ch.Challenge;
+    value.typ = ch.HTTP_01;
+    value.url = text_view("https://127.0.0.1:14000/chalZ/1");
+    value.token = text_view(TEST_TOKEN);
+    value.status = ch.PENDING;
+    value.validated = view.view(nil, 0);
+    var attempt: ch.Attempt;
+    ch.attempt_init(?attempt, challenge.http01_provider(?client.table));
+    if (problem.failed(ch.begin(?attempt, client.names[0], value,
+        text_view(TEST_AUTHORIZATION)))) {
+        shutdown(?server, ?client);
+        ret 3;
+    }
+    var answer: [4096]u8;
+    val length: usize = http_get(?server, TEST_PATH, ?answer[0], 4096);
+    if (length == 0) {
+        shutdown(?server, ?client);
+        ret 4;
+    }
+    if (!body_contains(?answer[0], length, "200")) {
+        print.eprintlnf("challenge response: {}", (?answer[0])::str);
+        shutdown(?server, ?client);
+        ret 5;
+    }
+    if (!body_contains(?answer[0], length, TEST_AUTHORIZATION)) {
+        shutdown(?server, ?client);
+        ret 6;
+    }
+    # an unknown token is a plain not-found, not a hint
+    val missing: usize = http_get(?server,
+        "/.well-known/acme-challenge/otherAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ?answer[0], 4096);
+    if (missing == 0 || !body_contains(?answer[0], missing, "404")) {
+        shutdown(?server, ?client);
+        ret 7;
+    }
+    ch.finish(?attempt);
+    shutdown(?server, ?client);
+    ret 0;
+}
+
+test "live: a stopped listener releases its port for the next generation" {
+    # a fixed port is the normal deployment, and a restart or a reload must be
+    # able to take it again. anything else makes a configuration change a
+    # scheduled outage.
+    var first: Server;
+    var table: challenge.Http01;
+    challenge.http01_reset(?table);
+    if (!boot_at(?first, ?table, "127.0.0.1:5111", 5111)) { ret 1; }
+    if (!serve.stop(?first.runtime)) { ret 2; }
+    var second: Server;
+    if (!boot_at(?second, ?table, "127.0.0.1:5111", 5111)) { ret 3; }
+    if (!serve.stop(?second.runtime)) { ret 4; }
+    ret 0;
+}
+
+rec Deployment {
+    graph:   schema.Graph;
+    manager: acme.Manager;
+    name:    [64]u8;
+    name_len: usize;
+}
+
+fun configure_acme(deployment: *Deployment, storage_path: str, name_len: usize) {
+    val graph: *schema.Graph = ?deployment.graph;
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "acme-managed");
+    graph.features.acme = true;
+    graph.acme.enabled = true;
+    schema.set_text(?graph.acme.directory, DIRECTORY_URL);
+    schema.set_text(?graph.acme.storage, storage_path);
+    schema.set_text(?graph.acme.origin, "127.0.0.1:14001");
+    graph.acme.terms_agreed = true;
+    graph.acme.challenge = schema.CHALLENGE_HTTP_01;
+    graph.acme.name_count = 1;
+    deployment.name[name_len] = 0;
+    schema.set_text(?graph.acme.names[0], (?deployment.name[0])::str);
+}
+
+fun drive_manager(server: *Server, deployment: *Deployment,
+    wanted: acme.State) bool {
+    var rounds: usize = 0;
+    val deadline: i64 = monotonic_ns() + 120000000000;
+    for (rounds < MAX_ROUNDS) {
+        serve.poll(?server.runtime, 1);
+        acme.poll((?deployment.manager)::ptr, T.now());
+        if (acme.state(?deployment.manager) == wanted) { ret true; }
+        if (acme.failure_count(?deployment.manager) != 0) {
+            val cause: problem.Error = acme.last_failure(?deployment.manager);
+            var detail: str = cause.detail;
+            if (detail == nil) { detail = ""; }
+            print.eprintlnf("manager failed: kind {} code {} status {} {}",
+                cause.kind::i64, cause.code::i64, cause.http.status::i64,
+                detail);
+            ret false;
+        }
+        if (monotonic_ns() > deadline) { ret false; }
+        rounds = rounds + 1;
+    }
+    ret false;
+}
+
+test "live: the manager obtains, stores, and recovers a certificate" {
+    var memory: [262144]u8;
+    var state: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?state, ?memory[0], 262144))) { ret 1; }
+    val directory: str = "out/acme-managed";
+    fs.remove_all(?a, directory::Path);
+
+    var deployment: Deployment;
+    var client: Client;
+    val name_len: usize = unique_name(?client, "managed");
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    deployment.name_len = name_len;
+    configure_acme(?deployment, directory, name_len);
+    if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.OK) {
+        ret 2;
+    }
+    var server: Server;
+    if (!boot(?server, acme.challenge_table(?deployment.manager))) {
+        acme.close(?deployment.manager);
+        ret 3;
+    }
+    # with nothing stored, the first certificate is due immediately
+    if (acme.state(?deployment.manager) != acme.IDLE) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 4;
+    }
+    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 5;
+    }
+    if (!acme.installation_ready(?deployment.manager)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 6;
+    }
+    val count: usize = acme.chain_count(?deployment.manager);
+    if (count < 2) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 7;
+    }
+    var leaf: view.View;
+    if (!acme.chain_entry(?deployment.manager, 0, ?leaf) || leaf.len < 64
+     || leaf.data[0] != 0x30) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 8;
+    }
+    var issuer: view.View;
+    if (!acme.chain_entry(?deployment.manager, count - 1, ?issuer)
+     || issuer.len < 64) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 9;
+    }
+    if (acme.not_after(?deployment.manager) <= T.now().sec::u64) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 10;
+    }
+    val expiry: u64 = acme.not_after(?deployment.manager);
+    val key_point: u8 = acme.certificate_key(?deployment.manager).point[1];
+    acme.installed(?deployment.manager, T.now());
+    if (acme.issued_count(?deployment.manager) != 1
+     || acme.failure_count(?deployment.manager) != 0) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 11;
+    }
+    acme.close(?deployment.manager);
+
+    # a restart recovers the certificate and its key from disk and does not
+    # order a second one
+    var restarted: Deployment;
+    i = 0;
+    for (i < name_len) {
+        restarted.name[i] = deployment.name[i];
+        i = i + 1;
+    }
+    configure_acme(?restarted, directory, name_len);
+    # the renewal lead is stated by this test rather than inherited from the
+    # authority: pebble picks between a ninety-day and a six-day profile when
+    # an order names none, so a lead compared against its choice would be a
+    # coin toss rather than an assertion
+    restarted.graph.acme.renew_before_seconds = 3600;
+    if (acme.open(?restarted.manager, ?a, ?restarted.graph) != acme.OK) {
+        serve.stop(?server.runtime);
+        ret 12;
+    }
+    if (acme.chain_count(?restarted.manager) != count
+     || acme.not_after(?restarted.manager) != expiry) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 13;
+    }
+    if (acme.certificate_key(?restarted.manager).point[1] != key_point) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 14;
+    }
+    var recovered: view.View;
+    if (!acme.chain_entry(?restarted.manager, 0, ?recovered)
+     || recovered.len != leaf.len) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 15;
+    }
+    # a stored certificate that is not near expiry produces no work at all
+    var rounds: usize = 0;
+    for (rounds < 64) {
+        acme.poll((?restarted.manager)::ptr, T.now());
+        rounds = rounds + 1;
+    }
+    if (acme.state(?restarted.manager) != acme.IDLE
+     || acme.issued_count(?restarted.manager) != 0) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 16;
+    }
+    acme.close(?restarted.manager);
+
+    # and with a lead longer than the certificate has left, the same recovered
+    # state is due, so the schedule fires rather than sitting idle forever
+    var expiring: Deployment;
+    i = 0;
+    for (i < name_len) {
+        expiring.name[i] = deployment.name[i];
+        i = i + 1;
+    }
+    configure_acme(?expiring, directory, name_len);
+    expiring.graph.acme.renew_before_seconds = 31536000;
+    if (acme.open(?expiring.manager, ?a, ?expiring.graph) != acme.OK) {
+        serve.stop(?server.runtime);
+        ret 17;
+    }
+    # a restart builds a new generation whose challenge route reads the
+    # manager that process owns. this suite reuses one listener, so the route
+    # is pointed at the manager that is now live.
+    if (!handler.bind(?server.binding,
+        acme.challenge_table(?expiring.manager))) {
+        acme.close(?expiring.manager);
+        serve.stop(?server.runtime);
+        ret 24;
+    }
+    var fired: bool = false;
+    rounds = 0;
+    for (rounds < 64 && !fired) {
+        acme.poll((?expiring.manager)::ptr, T.now());
+        if (acme.state(?expiring.manager) != acme.IDLE) { fired = true; }
+        rounds = rounds + 1;
+    }
+    if (!fired) {
+        acme.close(?expiring.manager);
+        serve.stop(?server.runtime);
+        ret 18;
+    }
+    # and it renews for real: the same account key registers again, a second
+    # certificate is issued and stored, and the superseded generation's key
+    # is discarded
+    if (!drive_manager(?server, ?expiring, acme.INSTALLING)) {
+        acme.close(?expiring.manager);
+        serve.stop(?server.runtime);
+        ret 19;
+    }
+    if (acme.issued_count(?expiring.manager) != 1
+     || acme.failure_count(?expiring.manager) != 0) {
+        acme.close(?expiring.manager);
+        serve.stop(?server.runtime);
+        ret 20;
+    }
+    var renewed: view.View;
+    if (!acme.chain_entry(?expiring.manager, 0, ?renewed)) {
+        acme.close(?expiring.manager);
+        serve.stop(?server.runtime);
+        ret 21;
+    }
+    # a renewal is a new certificate, not the same bytes served again
+    if (renewed.len == leaf.len
+     && renewed.data[renewed.len - 1] == leaf.data[leaf.len - 1]
+     && renewed.data[16] == leaf.data[16]) {
+        acme.close(?expiring.manager);
+        serve.stop(?server.runtime);
+        ret 22;
+    }
+    if (acme.certificate_key(?expiring.manager).point[1] == key_point) {
+        acme.close(?expiring.manager);
+        serve.stop(?server.runtime);
+        ret 23;
+    }
+    acme.installed(?expiring.manager, T.now());
+    acme.close(?expiring.manager);
+    serve.stop(?server.runtime);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+val MANAGEMENT_PORT: u16 = 8055;
+
+fun put_str(target: *u8, at: usize, value: str) usize {
+    var i: usize = 0;
+    for (value[i] != 0) {
+        target[at + i] = value[i];
+        i = i + 1;
+    }
+    ret at + i;
+}
+
+fun put_number(target: *u8, at: usize, value: usize) usize {
+    var digits: [20]u8;
+    var count: usize = 0;
+    var remaining: usize = value;
+    for (true) {
+        digits[count] = ('0' + (remaining % 10)::u8);
+        count = count + 1;
+        remaining = remaining / 10;
+        if (remaining == 0) { brk; }
+    }
+    var i: usize = 0;
+    for (i < count) {
+        target[at + i] = digits[count - 1 - i];
+        i = i + 1;
+    }
+    ret at + count;
+}
+
+fun send_all(stream: *tcp.Stream, data: *u8, len: usize) bool {
+    var sent: usize = 0;
+    for (sent < len) {
+        val written: R.Result[usize, io_error.Error] = tcp.stream_write(stream,
+            ?data[sent], len - sent);
+        if (R.is_err[usize, io_error.Error](written)) { ret false; }
+        val count: usize = R.unwrap_ok[usize, io_error.Error](written);
+        if (count == 0) { ret false; }
+        sent = sent + count;
+    }
+    ret true;
+}
+
+# posts one json document to the challenge test server's management api, which
+# is what publishes the dns record the authority then resolves
+fun manage(path: str, body: *u8, len: usize) bool {
+    var head: [512]u8;
+    var at: usize = put_str(?head[0], 0, "POST ");
+    at = put_str(?head[0], at, path);
+    at = put_str(?head[0], at,
+        " HTTP/1.1\r\nhost: 127.0.0.1:8055\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: ");
+    at = put_number(?head[0], at, len);
+    at = put_str(?head[0], at, "\r\n\r\n");
+    val connected: R.Result[tcp.Stream, io_error.Error] = tcp.connect(
+        ip.endpoint(127, 0, 0, 1, MANAGEMENT_PORT));
+    if (R.is_err[tcp.Stream, io_error.Error](connected)) { ret false; }
+    var stream: tcp.Stream = R.unwrap_ok[tcp.Stream, io_error.Error](connected);
+    tcp.stream_set_read_timeout(?stream, 5000);
+    var ok: bool = send_all(?stream, ?head[0], at)
+        && send_all(?stream, body, len);
+    var reply: [1024]u8;
+    var total: usize = 0;
+    for (ok && total < 1024) {
+        val received: R.Result[usize, io_error.Error] = tcp.stream_read(?stream,
+            ?reply[total], 1024 - total);
+        if (R.is_err[usize, io_error.Error](received)) { brk; }
+        val count: usize = R.unwrap_ok[usize, io_error.Error](received);
+        if (count == 0) { brk; }
+        total = total + count;
+    }
+    tcp.stream_close(?stream);
+    ret ok && total > 12 && reply[9] == '2';
+}
+
+rec Zone {
+    published: usize;
+    withdrawn: usize;
+    body:      [512]u8;
+}
+
+fun zone_document(zone: *Zone, name: view.View, value: view.View) usize {
+    var at: usize = put_str(?zone.body[0], 0, "{\"host\":\"");
+    var i: usize = 0;
+    for (i < name.len) {
+        zone.body[at + i] = name.data[i];
+        i = i + 1;
+    }
+    at = at + name.len;
+    at = put_str(?zone.body[0], at, "\",\"value\":\"");
+    i = 0;
+    for (i < value.len) {
+        zone.body[at + i] = value.data[i];
+        i = i + 1;
+    }
+    at = at + value.len;
+    ret put_str(?zone.body[0], at, "\"}");
+}
+
+fun zone_publish(context: ptr, name: view.View, value: view.View) bool {
+    val zone: *Zone = context::*Zone;
+    val length: usize = zone_document(zone, name, value);
+    if (!manage("/set-txt", ?zone.body[0], length)) { ret false; }
+    zone.published = zone.published + 1;
+    ret true;
+}
+
+fun zone_withdraw(context: ptr, name: view.View, value: view.View) bool {
+    val zone: *Zone = context::*Zone;
+    var body: [512]u8;
+    var at: usize = put_str(?body[0], 0, "{\"host\":\"");
+    var i: usize = 0;
+    for (i < name.len) {
+        body[at + i] = name.data[i];
+        i = i + 1;
+    }
+    at = at + name.len;
+    at = put_str(?body[0], at, "\"}");
+    zone.withdrawn = zone.withdrawn + 1;
+    ret manage("/clear-txt", ?body[0], at);
+}
+
+test "live: dns-01 issues a certificate through a publisher" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 262144))) { ret 1; }
+    val directory: str = "out/acme-dns01";
+    fs.remove_all(?a, directory::Path);
+
+    var client: Client;
+    val name_len: usize = unique_name(?client, "dns01");
+    var deployment: Deployment;
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    configure_acme(?deployment, directory, name_len);
+    deployment.graph.acme.challenge = schema.CHALLENGE_DNS_01;
+    var zone: Zone;
+    zone.published = 0;
+    zone.withdrawn = 0;
+    val publisher: challenge.Publisher = challenge.Publisher{
+        ctx: (?zone)::ptr, publish: zone_publish, withdraw: zone_withdraw};
+    # http-01 has no route here on purpose: the only way this certificate can
+    # be issued is through the published record
+    if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.INVALID) {
+        ret 2;
+    }
+    if (acme.open_with_publisher(?deployment.manager, ?a, ?deployment.graph,
+        publisher) != acme.OK) { ret 3; }
+    var server: Server;
+    if (!boot_at(?server, acme.challenge_table(?deployment.manager),
+        "127.0.0.1:0", 0)) {
+        acme.close(?deployment.manager);
+        ret 4;
+    }
+    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 5;
+    }
+    if (zone.published != 1 || zone.withdrawn != 1) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 6;
+    }
+    if (acme.chain_count(?deployment.manager) < 2) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 7;
+    }
+    acme.installed(?deployment.manager, T.now());
+    acme.close(?deployment.manager);
+    serve.stop(?server.runtime);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+# one installed credential: the chain and key copied out of the manager, in
+# the shape mach-tls serves and hedge's credential generation holds
+rec Installed {
+    der:          [16384]u8;
+    certificates: [8]tls_cert.Certificate;
+    chain:        tls_cert.Chain;
+    key:          keys.Key;
+    private:      crypto_keys.PrivateKey;
+    name:         [64]u8;
+    live:         bool;
+}
+
+fun install(target: *Installed, manager: *acme.Manager, name: view.View,
+    owner: *secret.Allocator) bool {
+    val count: usize = acme.chain_count(manager);
+    if (count == 0 || count > 8) { ret false; }
+    var at: usize = 0;
+    var i: usize = 0;
+    for (i < count) {
+        var entry: view.View;
+        if (!acme.chain_entry(manager, i, ?entry)) { ret false; }
+        if (at + entry.len > 16384) { ret false; }
+        var j: usize = 0;
+        for (j < entry.len) {
+            target.der[at + j] = entry.data[j];
+            j = j + 1;
+        }
+        target.certificates[i] = tls_cert.Certificate{der: ?target.der[at],
+            der_len: entry.len};
+        at = at + entry.len;
+        i = i + 1;
+    }
+    target.chain = tls_cert.Chain{certificates: ?target.certificates[0],
+        len: count};
+    if (!keys.adopt(?target.key, keys.material(
+        acme.certificate_key(manager)).data)) { ret false; }
+    var scratch: [keys.PKCS8_BYTES]^u8;
+    target.private = crypto_keys.empty_private();
+    val loaded: contracts.Error = load.private_der(
+        keys.private_der(?target.key, ?scratch[0]), tls_cert.PKCS8_DER, owner,
+        ?target.private);
+    ct.zeroize(?scratch[0], keys.PKCS8_BYTES);
+    if (loaded != contracts.OK) { ret false; }
+    i = 0;
+    for (i < name.len && i < 63) {
+        target.name[i] = name.data[i];
+        i = i + 1;
+    }
+    target.name[i] = 0;
+    target.live = true;
+    ret true;
+}
+
+fun installed_identity(target: *Installed) credentials.Identity {
+    ret protocol.identity((?target.name[0])::str, target.chain,
+        ?target.private);
+}
+
+test "live: a renewed certificate rotates without disturbing a live connection" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 262144))) { ret 1; }
+    val directory: str = "out/acme-rotation";
+    fs.remove_all(?a, directory::Path);
+    var owner: secret.Allocator = secret.system_allocator();
+
+    var client: Client;
+    val name_len: usize = unique_name(?client, "rotate");
+    var deployment: Deployment;
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    configure_acme(?deployment, directory, name_len);
+    if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.OK) {
+        ret 2;
+    }
+    var server: Server;
+    if (!boot(?server, acme.challenge_table(?deployment.manager))) {
+        acme.close(?deployment.manager);
+        ret 3;
+    }
+    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 4;
+    }
+    val served: view.View = acme.name(?deployment.manager, 0);
+    var first: Installed;
+    if (!install(?first, ?deployment.manager, served, ?owner)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 5;
+    }
+    acme.installed(?deployment.manager, T.now());
+
+    # a connection established on the first certificate holds its lease for
+    # its whole life
+    var identities: [1]credentials.Identity;
+    identities[0] = installed_identity(?first);
+    var generation: credentials.Generation = credentials.empty_generation();
+    var bindings: protocol.Bindings;
+    if (protocol.publish(?bindings, ?generation, ?identities[0], 1,
+        protocol.NO_DEFAULT, nil, false) != protocol.OK) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 6;
+    }
+    var established: protocol.Held;
+    if (protocol.acquire(?bindings, (?first.name[0])::str, ?established)
+        != protocol.OK) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 7;
+    }
+    val original: *u8 = established.lease.identity.chain.certificates.der;
+
+    # the certificate is renewed while that connection is still open
+    acme.close(?deployment.manager);
+    var renewing: Deployment;
+    i = 0;
+    for (i < name_len) {
+        renewing.name[i] = deployment.name[i];
+        i = i + 1;
+    }
+    configure_acme(?renewing, directory, name_len);
+    renewing.graph.acme.renew_before_seconds = 31536000;
+    if (acme.open(?renewing.manager, ?a, ?renewing.graph) != acme.OK) {
+        serve.stop(?server.runtime);
+        ret 8;
+    }
+    if (!handler.bind(?server.binding,
+        acme.challenge_table(?renewing.manager))) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 9;
+    }
+    if (!drive_manager(?server, ?renewing, acme.INSTALLING)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 10;
+    }
+    var second: Installed;
+    if (!install(?second, ?renewing.manager, served, ?owner)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 11;
+    }
+    var replacements: [1]credentials.Identity;
+    replacements[0] = installed_identity(?second);
+    var next: credentials.Generation = credentials.empty_generation();
+    if (credentials.initialize(?next, ?replacements[0], 1,
+        protocol.NO_DEFAULT, nil, false) != contracts.OK) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 12;
+    }
+    var retired: *credentials.Generation = nil;
+    if (protocol.rotate(?bindings, ?next, ?retired) != protocol.OK
+     || retired != ?generation) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 13;
+    }
+
+    # the established connection still holds the certificate it handshook on
+    if (established.lease.identity.chain.certificates.der != original) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 14;
+    }
+    if (original != ?first.der[0]) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 15;
+    }
+    # a connection that arrives after the rotation gets the renewed one
+    var arriving: protocol.Held;
+    if (protocol.acquire(?bindings, (?first.name[0])::str, ?arriving)
+        != protocol.OK) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 16;
+    }
+    if (arriving.lease.identity.chain.certificates.der != ?second.der[0]) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 17;
+    }
+    # and the old generation stays alive until its last lease is gone
+    if (protocol.reclaimable(?generation)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 18;
+    }
+    if (protocol.release(?established) != protocol.OK) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 19;
+    }
+    if (!protocol.reclaimable(?generation)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 20;
+    }
+    protocol.release(?arriving);
+    crypto_keys.destroy_private(?first.private);
+    crypto_keys.destroy_private(?second.private);
+    keys.destroy(?first.key);
+    keys.destroy(?second.key);
+    acme.installed(?renewing.manager, T.now());
+    acme.close(?renewing.manager);
+    serve.stop(?server.runtime);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}

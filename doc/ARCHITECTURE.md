@@ -185,6 +185,31 @@ Configuration processing has four stages:
 
 Only the sealed generation is published. A failed reload leaves the current generation untouched. Listener transitions are planned before publication so address conflicts and unsupported socket options fail safely.
 
+## Certificate management
+
+ACME is an optional control-plane subsystem. It owns an account, one
+certificate covering the configured names, its durable state, and the schedule
+that renews it. It performs no work when it is not configured.
+
+Every step is a step the serving loop takes: one outbound exchange at a time
+on the subsystem's own completion runtime, one protocol decision per round,
+and every wait expressed as a wake time. Nothing in the path blocks an accept
+or a request.
+
+The subsystem does not own TLS credentials. It produces a verified chain and
+its key material and reports that an installation is ready; the owner of the
+credential generation installs it and rotates. A connection holds its
+credential lease for its whole life, so a rotation publishes a new generation
+for new connections without disturbing an established one, and the retired
+generation stays alive until its last lease is released.
+
+Challenge presentation is a provider contract. HTTP-01 is answered by the
+server being validated, through a native route that serves only tokens a
+presentation put there. DNS-01 is answered by a publisher the deployment
+supplies. TLS-ALPN-01 presents an RFC 8737 certificate on a TLS listener.
+Cleanup is owed exactly when presentation succeeded and runs exactly once
+across success, failure, timeout, and cancellation.
+
 ## Graceful shutdown
 
 Shutdown proceeds through explicit states:

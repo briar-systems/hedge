@@ -1,0 +1,886 @@
+# the certificate manager: one account, one certificate, one schedule
+#
+# this is the part of acme that runs forever. it owns the durable state, the
+# renewal schedule, and the issuance run, and it advances all three from the
+# serving loop's plane without ever blocking it.
+#
+# it does not own the tls credentials and cannot: mach-tls's private key type
+# is secret-qualified, so a record holding it cannot be erased to the `ptr` a
+# plane callback receives. so the direction of the handoff is fixed by the
+# language and not by preference. the manager produces a verified chain and
+# its key material and reports that an installation is ready; the owner of the
+# credential generation, which holds typed pointers to all of it, installs and
+# rotates. data flows one way and the welded types stay out of the plane.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use O: std.types.option;
+use R: std.types.result;
+use T: std.chrono.time;
+use std.allocator;
+use std.allocator.fixed;
+use fs: std.filesystem;
+use std.types.path.Path;
+use std.crypto.rand;
+use std.net.ip;
+use contracts: crypto.contracts;
+use http.core.field;
+use cert: acme.certificate;
+use ch: acme.challenge;
+use identifier: acme.identifier;
+use problem: acme.problem;
+use renewal: acme.renewal;
+use renewal_info: acme.renewal_info;
+use storage: acme.storage;
+use schema: hedge.config.schema;
+use telemetry: hedge.telemetry;
+use challenge: hedge.acme.challenge;
+use durable: hedge.acme.durable;
+use issue: hedge.acme.issue;
+use keys: hedge.acme.keys;
+use session: hedge.acme.session;
+use transport: hedge.acme.transport;
+
+pub val MAX_NAMES:      usize = 8;
+pub val MAX_NAME_BYTES: usize = 256;
+pub val MAX_URL_BYTES:  usize = 512;
+pub val REQUEST_BYTES:  usize = 8192;
+pub val RESPONSE_BYTES: usize = 65536;
+pub val MAX_FIELDS:     usize = 64;
+pub val MAX_CHAIN_BYTES: usize = 16384;
+
+pub def Status: u8;
+pub val OK:      Status = 1;
+pub val PENDING: Status = 2;
+pub val FAILED:  Status = 3;
+pub val INVALID: Status = 4;
+
+pub def State: u8;
+# nothing is due; the plane costs one comparison per round
+pub val IDLE:       State = 0;
+pub val DISCOVERING: State = 1;
+pub val ISSUING:    State = 2;
+# a verified certificate is waiting for its owner to install it
+pub val INSTALLING: State = 3;
+pub val ADVISING:   State = 4;
+pub val STOPPED:    State = 5;
+
+pub rec Manager {
+    store:    durable.Store;
+    session:  session.Session;
+    engine:   transport.Transport;
+    run:      issue.Issue;
+    table:    challenge.Http01;
+    zone:     challenge.Dns01;
+    challenge_kind: u8;
+
+    request:  [REQUEST_BYTES]u8;
+    response: [RESPONSE_BYTES]u8;
+    items:    [MAX_FIELDS]field.Field;
+
+    account:     keys.Key;
+    pending_key: keys.Key;
+    active_key:  keys.Key;
+
+    name_bytes: [MAX_NAMES][MAX_NAME_BYTES]u8;
+    name_lens:  [MAX_NAMES]usize;
+    names:      [MAX_NAMES]identifier.Identifier;
+    name_count: usize;
+
+    directory_url: [MAX_URL_BYTES]u8;
+    directory_len: usize;
+    contact:       [MAX_NAME_BYTES]u8;
+    contact_len:   usize;
+    certificate_url: [MAX_URL_BYTES]u8;
+    certificate_url_len: usize;
+
+    chain:       [MAX_CHAIN_BYTES]u8;
+    chain_bytes: usize;
+    chain_count: usize;
+    not_before:  u64;
+    not_after:   u64;
+
+    advice_url:  [MAX_URL_BYTES]u8;
+    advice_len:  usize;
+    advice:      renewal_info.Window;
+
+    schedule:   renewal.Schedule;
+    storage_key: view.View;
+    generation: u64;
+    have_certificate: bool;
+    agree_terms: bool;
+
+    observability: *telemetry.Runtime;
+    issued:     u64;
+    failures:   u64;
+    last_failure: problem.Error;
+
+    state: State;
+    live:  bool;
+}
+
+fun text_length(value: str) usize {
+    if (value == nil) { ret 0; }
+    var i: usize = 0;
+    for (value[i] != 0) { i = i + 1; }
+    ret i;
+}
+
+fun random_next(context: ptr) u64 {
+    ret rand.u64();
+}
+
+# a fleet that renews in lockstep is a fleet that fails in lockstep
+fun jitter() renewal.Random {
+    var value: renewal.Random;
+    value.ctx = nil;
+    value.next = random_next;
+    ret value;
+}
+
+fun policy(graph: *schema.Graph) renewal.Policy {
+    var value: renewal.Policy = renewal.policy_default();
+    if (graph.acme.renew_before_seconds != 0) {
+        value.renew_before_seconds = graph.acme.renew_before_seconds;
+    }
+    ret value;
+}
+
+fun report(manager: *Manager, operation: str, code: str, message: str) {
+    if (manager.observability == nil) { ret; }
+    telemetry.error(manager.observability, telemetry.Failure{
+        component: "acme", operation: operation, code: code,
+        message: message, trace_id: nil});
+}
+
+pub fun attach_telemetry(manager: *Manager,
+    observability: *telemetry.Runtime) bool {
+    if (manager == nil || !manager.live) { ret false; }
+    manager.observability = observability;
+    ret true;
+}
+
+fun copy_names(manager: *Manager, graph: *schema.Graph) bool {
+    if (graph.acme.name_count == 0
+     || graph.acme.name_count > MAX_NAMES) { ret false; }
+    var i: usize = 0;
+    for (i < graph.acme.name_count) {
+        val configured: *schema.Text = ?graph.acme.names[i];
+        if (configured.len == 0 || configured.len >= MAX_NAME_BYTES) {
+            ret false;
+        }
+        var j: usize = 0;
+        for (j < configured.len) {
+            manager.name_bytes[i][j] = configured.data[j];
+            j = j + 1;
+        }
+        manager.name_lens[i] = configured.len;
+        manager.names[i] = identifier.Identifier{kind: identifier.DNS,
+            value: view.view(?manager.name_bytes[i][0], configured.len)};
+        i = i + 1;
+    }
+    manager.name_count = graph.acme.name_count;
+    manager.storage_key = manager.names[0].value;
+    ret true;
+}
+
+fun copy_text(target: *u8, capacity: usize, source: *schema.Text,
+    length: *usize) bool {
+    if (source.len >= capacity) { ret false; }
+    var i: usize = 0;
+    for (i < source.len) {
+        target[i] = source.data[i];
+        i = i + 1;
+    }
+    @length = source.len;
+    ret true;
+}
+
+fun configure_origin(manager: *Manager, graph: *schema.Graph) bool {
+    if (graph.acme.origin.len == 0) { ret true; }
+    var text: [64]u8;
+    if (graph.acme.origin.len >= 64) { ret false; }
+    var i: usize = 0;
+    for (i < graph.acme.origin.len) {
+        text[i] = graph.acme.origin.data[i];
+        i = i + 1;
+    }
+    text[graph.acme.origin.len] = 0;
+    val parsed: R.Result[ip.Endpoint, str] = ip.endpoint_parse((?text[0])::str);
+    if (R.is_err[ip.Endpoint, str](parsed)) { ret false; }
+    ret transport.set_origin(?manager.engine, transport.cleartext_origin(
+        R.unwrap_ok[ip.Endpoint, str](parsed)));
+}
+
+# splits a stored chain back into its certificates. the durable record holds
+# the der end to end plus a count, and der states its own lengths, so the
+# boundaries are recovered rather than stored twice.
+pub fun chain_entry(manager: *Manager, index: usize,
+    output: *view.View) bool {
+    if (manager == nil || output == nil || index >= manager.chain_count) {
+        ret false;
+    }
+    var at: usize = 0;
+    var seen: usize = 0;
+    for (seen <= index) {
+        if (at + 2 > manager.chain_bytes) { ret false; }
+        if (manager.chain[at] != 0x30) { ret false; }
+        val first: u8 = manager.chain[at + 1];
+        var header: usize = 2;
+        var length: usize = 0;
+        if ((first & 0x80) == 0) {
+            length = first::usize;
+        } or {
+            val count: usize = (first & 0x7f)::usize;
+            if (count == 0 || count > 4 || at + 2 + count > manager.chain_bytes) {
+                ret false;
+            }
+            var i: usize = 0;
+            for (i < count) {
+                length = (length << 8) | manager.chain[at + 2 + i]::usize;
+                i = i + 1;
+            }
+            header = 2 + count;
+        }
+        if (length == 0 || header + length > manager.chain_bytes - at) {
+            ret false;
+        }
+        if (seen == index) {
+            @output = view.view(?manager.chain[at], header + length);
+            ret true;
+        }
+        at = at + header + length;
+        seen = seen + 1;
+    }
+    ret false;
+}
+
+pub fun chain_count(manager: *Manager) usize {
+    if (manager == nil) { ret 0; }
+    ret manager.chain_count;
+}
+
+pub fun certificate_key(manager: *Manager) *keys.Key {
+    ret ?manager.active_key;
+}
+
+pub fun name(manager: *Manager, index: usize) view.View {
+    if (manager == nil || index >= manager.name_count) {
+        ret view.view(nil, 0);
+    }
+    ret manager.names[index].value;
+}
+
+pub fun name_count(manager: *Manager) usize {
+    if (manager == nil) { ret 0; }
+    ret manager.name_count;
+}
+
+pub fun not_after(manager: *Manager) u64 {
+    ret manager.not_after;
+}
+
+pub fun state(manager: *Manager) State {
+    if (manager == nil) { ret STOPPED; }
+    ret manager.state;
+}
+
+pub fun issued_count(manager: *Manager) u64 {
+    ret manager.issued;
+}
+
+pub fun failure_count(manager: *Manager) u64 {
+    ret manager.failures;
+}
+
+pub fun last_failure(manager: *Manager) problem.Error {
+    ret manager.last_failure;
+}
+
+pub fun challenge_table(manager: *Manager) *challenge.Http01 {
+    ret ?manager.table;
+}
+
+# a certificate is ready to be installed into a credential generation
+pub fun installation_ready(manager: *Manager) bool {
+    ret manager != nil && manager.live && manager.state == INSTALLING;
+}
+
+# the owner acknowledges that it has installed what was ready. the manager
+# does not decide when that happened, because it is not what holds the
+# credentials.
+pub fun installed(manager: *Manager, now: T.Time) bool {
+    if (manager == nil || manager.state != INSTALLING) { ret false; }
+    manager.state = ADVISING;
+    return_to_schedule(manager, now);
+    ret true;
+}
+
+fun load_certificate(manager: *Manager) Status {
+    var snapshot: storage.CertificateSnapshot;
+    val found: durable.Status = durable.certificate_snapshot(?manager.store,
+        manager.storage_key, ?snapshot);
+    if (found == durable.MISSING) { ret OK; }
+    if (found != durable.OK) { ret FAILED; }
+    if (snapshot.current.chain_der.len == 0
+     || snapshot.current.chain_der.len > MAX_CHAIN_BYTES) { ret FAILED; }
+    var i: usize = 0;
+    for (i < snapshot.current.chain_der.len) {
+        manager.chain[i] = snapshot.current.chain_der.data[i];
+        i = i + 1;
+    }
+    manager.chain_bytes = snapshot.current.chain_der.len;
+    manager.chain_count = snapshot.current.chain_len;
+    manager.not_before = snapshot.current.not_before_unix;
+    manager.not_after = snapshot.current.not_after_unix;
+    manager.generation = snapshot.current.generation;
+    if (durable.open_certificate_key(?manager.store, manager.generation,
+        ?manager.active_key) != durable.OK) {
+        # the record and its key are written together; a record whose key is
+        # gone is unusable and the next renewal replaces both
+        report(manager, "load", "key-missing",
+            "the stored certificate has no usable private key");
+        manager.chain_count = 0;
+        ret OK;
+    }
+    manager.have_certificate = true;
+    ret OK;
+}
+
+# http-01 is what a server can answer by itself, and it is the only challenge
+# a toml deployment can select. dns-01 needs a zone, which hedge does not have
+# and will not invent: an embedder supplies the two calls that publish and
+# withdraw a record, and gets dns-01 with everything else identical.
+pub fun open(manager: *Manager, a: *allocator.Allocator,
+    graph: *schema.Graph) Status {
+    if (manager == nil || graph == nil) { ret INVALID; }
+    if (graph.acme.challenge != schema.CHALLENGE_HTTP_01) { ret INVALID; }
+    ret open_managed(manager, a, graph);
+}
+
+pub fun open_with_publisher(manager: *Manager, a: *allocator.Allocator,
+    graph: *schema.Graph, publisher: challenge.Publisher) Status {
+    if (manager == nil || graph == nil) { ret INVALID; }
+    if (graph.acme.challenge != schema.CHALLENGE_DNS_01) { ret INVALID; }
+    if (!challenge.dns01_make(?manager.zone, publisher)) { ret INVALID; }
+    ret open_managed(manager, a, graph);
+}
+
+fun open_managed(manager: *Manager, a: *allocator.Allocator,
+    graph: *schema.Graph) Status {
+    if (manager == nil || a == nil || graph == nil) { ret INVALID; }
+    manager.live = false;
+    manager.state = STOPPED;
+    manager.observability = nil;
+    manager.issued = 0;
+    manager.failures = 0;
+    manager.last_failure = problem.none();
+    manager.generation = 0;
+    manager.have_certificate = false;
+    manager.chain_bytes = 0;
+    manager.chain_count = 0;
+    manager.not_before = 0;
+    manager.not_after = 0;
+    manager.advice_len = 0;
+    manager.advice = renewal_info.empty_window();
+    manager.certificate_url_len = 0;
+    manager.contact_len = 0;
+    if (!graph.acme.enabled || !graph.features.acme) { ret INVALID; }
+    if (!copy_names(manager, graph)) { ret INVALID; }
+    if (!copy_text(?manager.directory_url[0], MAX_URL_BYTES,
+        ?graph.acme.directory, ?manager.directory_len)
+     || manager.directory_len == 0) { ret INVALID; }
+    copy_text(?manager.contact[0], MAX_NAME_BYTES, ?graph.acme.contact,
+        ?manager.contact_len);
+    manager.agree_terms = graph.acme.terms_agreed;
+    challenge.http01_reset(?manager.table);
+    manager.challenge_kind = graph.acme.challenge;
+    if (!transport.make(?manager.engine, ?manager.request[0], REQUEST_BYTES,
+        ?manager.response[0], RESPONSE_BYTES, ?manager.items[0], MAX_FIELDS,
+        session.limits().response_fields, transport.literal_addresses())) {
+        ret FAILED;
+    }
+    if (!configure_origin(manager, graph)) { ret INVALID; }
+    if (session.make(?manager.session,
+        view.view(?manager.directory_url[0], manager.directory_len))
+        != session.OK) { ret FAILED; }
+    var storage_path: [512]u8;
+    var storage_len: usize = 0;
+    if (!copy_text(?storage_path[0], 512, ?graph.acme.storage, ?storage_len)
+     || storage_len == 0) { ret INVALID; }
+    storage_path[storage_len] = 0;
+    if (durable.open(?manager.store, a, (?storage_path[0])::str)
+        != durable.OK) { ret FAILED; }
+    if (durable.open_account_key(?manager.store, ?manager.account)
+        != durable.OK) { ret FAILED; }
+    manager.live = true;
+    if (load_certificate(manager) != OK) {
+        manager.live = false;
+        ret FAILED;
+    }
+    var policy_value: renewal.Policy = policy(graph);
+    if (manager.have_certificate) {
+        if (problem.failed(renewal.begin(?manager.schedule, policy_value,
+            manager.storage_key, manager.not_before, manager.not_after))) {
+            manager.live = false;
+            ret FAILED;
+        }
+        renewal.plan(?manager.schedule, manager.advice, jitter(),
+            T.now().sec::u64, renewal.no_observer());
+    } or {
+        # with nothing to serve, the first order is due now
+        if (problem.failed(renewal.begin(?manager.schedule, policy_value,
+            manager.storage_key, 0, 1))) {
+            manager.live = false;
+            ret FAILED;
+        }
+    }
+    manager.state = IDLE;
+    ret OK;
+}
+
+fun context(manager: *Manager) issue.Context {
+    var value: issue.Context;
+    value.session = ?manager.session;
+    value.engine = ?manager.engine;
+    value.account_key = ?manager.account;
+    value.certificate_key = ?manager.pending_key;
+    value.provider = challenge.http01_provider(?manager.table);
+    if (manager.challenge_kind == schema.CHALLENGE_DNS_01) {
+        value.provider = challenge.dns01_provider(?manager.zone);
+    }
+    value.contact = view.view(nil, 0);
+    if (manager.contact_len != 0) {
+        value.contact = view.view(?manager.contact[0], manager.contact_len);
+    }
+    value.agree_terms = manager.agree_terms;
+    ret value;
+}
+
+fun record_failure(manager: *Manager, cause: problem.Error, now: T.Time) {
+    manager.failures = manager.failures + 1;
+    manager.last_failure = cause;
+    renewal.failed(?manager.schedule, cause, jitter(), now.sec::u64,
+        renewal.no_observer());
+    report(manager, "issue", "failed", cause.detail);
+    manager.state = IDLE;
+}
+
+fun persist(manager: *Manager, now: T.Time) Status {
+    val next: u64 = manager.generation + 1;
+    if (durable.commit_certificate_key(?manager.store, next,
+        ?manager.pending_key) != durable.OK) { ret FAILED; }
+    val issued: cert.Chain = issue.chain(?manager.run);
+    val bytes: view.View = issue.chain_bytes(?manager.run);
+    if (bytes.len == 0 || bytes.len > MAX_CHAIN_BYTES) { ret FAILED; }
+    var i: usize = 0;
+    for (i < bytes.len) {
+        manager.chain[i] = bytes.data[i];
+        i = i + 1;
+    }
+    val parsed: cert.Parsed = issue.leaf(?manager.run);
+    val url: view.View = issue.certificate_url(?manager.run);
+    if (url.len == 0 || url.len > MAX_URL_BYTES) { ret FAILED; }
+    i = 0;
+    for (i < url.len) {
+        manager.certificate_url[i] = url.data[i];
+        i = i + 1;
+    }
+    manager.certificate_url_len = url.len;
+    var record: storage.CertificateRecord;
+    record.storage_key = manager.storage_key;
+    record.certificate_url = view.view(?manager.certificate_url[0], url.len);
+    record.chain_der = view.view(?manager.chain[0], bytes.len);
+    record.chain_len = issued.len;
+    record.private_key_owner = durable.secret_owner(?manager.store);
+    record.identifiers = ?manager.names[0];
+    record.identifier_len = manager.name_count;
+    record.not_before_unix = parsed.not_before_unix;
+    record.not_after_unix = parsed.not_after_unix;
+    record.generation = next;
+    if (durable.save_certificate(?manager.store, manager.generation, record)
+        != durable.OK) { ret FAILED; }
+    val superseded: u64 = manager.generation;
+    manager.generation = next;
+    manager.chain_bytes = bytes.len;
+    manager.chain_count = issued.len;
+    manager.not_before = parsed.not_before_unix;
+    manager.not_after = parsed.not_after_unix;
+    manager.have_certificate = true;
+    manager.issued = manager.issued + 1;
+    keys.destroy(?manager.active_key);
+    if (!keys.adopt(?manager.active_key,
+        keys.material(?manager.pending_key).data)) { ret FAILED; }
+    keys.destroy(?manager.pending_key);
+    if (superseded != 0) {
+        durable.discard_certificate_key(?manager.store, superseded);
+    }
+    renewal.succeeded(?manager.schedule, now.sec::u64,
+        renewal.no_observer());
+    ret OK;
+}
+
+fun return_to_schedule(manager: *Manager, now: T.Time) {
+    manager.advice = renewal_info.empty_window();
+    renewal.begin(?manager.schedule, manager.schedule.policy,
+        manager.storage_key, manager.not_before, manager.not_after);
+    renewal.plan(?manager.schedule, manager.advice, jitter(), now.sec::u64,
+        renewal.no_observer());
+    manager.state = IDLE;
+}
+
+fun start_run(manager: *Manager, now: T.Time) Status {
+    if (!keys.generate(?manager.pending_key)) {
+        report(manager, "issue", "keygen", "a certificate key could not be drawn");
+        ret FAILED;
+    }
+    var policy_value: identifier.Policy = identifier.policy_default();
+    policy_value.allow_wildcard = false;
+    if (!issue.make(?manager.run, ?manager.names[0], manager.name_count,
+        policy_value)) {
+        report(manager, "issue", "names", "the configured names are not orderable");
+        ret FAILED;
+    }
+    if (issue.begin(?manager.run) != issue.PENDING) { ret FAILED; }
+    manager.state = ISSUING;
+    ret PENDING;
+}
+
+# the plane entry point. one step of whatever is outstanding, or one clock
+# comparison when nothing is.
+pub fun poll(context_pointer: ptr, now: T.Time) bool {
+    val manager: *Manager = context_pointer::*Manager;
+    if (manager == nil || !manager.live) { ret false; }
+    if (manager.state == INSTALLING) { ret true; }
+    if (manager.state == DISCOVERING) {
+        val progress: session.Status = session.poll(?manager.session,
+            ?manager.engine, ?manager.account, now);
+        if (progress == session.PENDING) { ret true; }
+        session.complete(?manager.session, ?manager.engine);
+        if (progress != session.OK) {
+            record_failure(manager, session.failure(?manager.session), now);
+            ret true;
+        }
+        if (start_run(manager, now) != PENDING) {
+            record_failure(manager, problem.local(problem.STATE,
+                "an issuance run could not start"), now);
+        }
+        ret true;
+    }
+    if (manager.state == ISSUING) {
+        var active: issue.Context = context(manager);
+        val progress: issue.Status = issue.poll(?manager.run, ?active, now);
+        if (progress == issue.PENDING) { ret true; }
+        if (progress != issue.OK) {
+            record_failure(manager, issue.failure(?manager.run), now);
+            keys.destroy(?manager.pending_key);
+            ret true;
+        }
+        if (persist(manager, now) != OK) {
+            record_failure(manager, problem.local(problem.STORAGE,
+                "the issued certificate could not be stored"), now);
+            keys.destroy(?manager.pending_key);
+            ret true;
+        }
+        manager.state = INSTALLING;
+        ret true;
+    }
+    if (manager.state == ADVISING) {
+        # advice is a courtesy: an authority that cannot be asked leaves the
+        # schedule on hedge's own policy rather than stalling it
+        return_to_schedule(manager, now);
+        ret true;
+    }
+    if (manager.state != IDLE) { ret true; }
+    val now_unix: u64 = now.sec::u64;
+    if (renewal.clock_moved_back(?manager.schedule, now_unix)) {
+        # a clock that jumped backwards is not evidence that a renewal is due
+        report(manager, "schedule", "clock-skew",
+            "the clock moved backwards further than the tolerated skew");
+        return_to_schedule(manager, now);
+        ret true;
+    }
+    if (!renewal.ready(?manager.schedule, now_unix)) { ret true; }
+    # the attempt is marked running before anything that can fail, so a
+    # failure during discovery backs the schedule off exactly as a failure
+    # during the order does
+    if (problem.failed(renewal.start(?manager.schedule, now_unix,
+        renewal.no_observer()))) { ret true; }
+    if (!session.discovered(?manager.session)) {
+        if (session.begin_discovery(?manager.session) != session.PENDING) {
+            record_failure(manager, problem.local(problem.STATE,
+                "discovery could not start"), now);
+            ret true;
+        }
+        manager.state = DISCOVERING;
+        ret true;
+    }
+    if (start_run(manager, now) != PENDING) {
+        record_failure(manager, problem.local(problem.STATE,
+            "an issuance run could not start"), now);
+    }
+    ret true;
+}
+
+pub fun close(manager: *Manager) bool {
+    if (manager == nil || !manager.live) { ret false; }
+    issue.cancel(?manager.run);
+    session.release(?manager.session);
+    transport.destroy(?manager.engine);
+    keys.destroy(?manager.account);
+    keys.destroy(?manager.pending_key);
+    keys.destroy(?manager.active_key);
+    manager.state = STOPPED;
+    manager.live = false;
+    ret true;
+}
+
+fun test_allocator(a: *allocator.Allocator, state: *fixed.FixedState,
+    memory: *u8, capacity: usize) bool {
+    ret !O.is_some[*u8](fixed.make(a, state, memory, capacity));
+}
+
+fun test_graph(graph: *schema.Graph, directory: str, origin: str) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "acme-manager-test");
+    graph.features.acme = true;
+    graph.acme.enabled = true;
+    schema.set_text(?graph.acme.directory, "https://acme.example/dir");
+    schema.set_text(?graph.acme.storage, directory);
+    schema.set_text(?graph.acme.origin, origin);
+    graph.acme.terms_agreed = true;
+    graph.acme.challenge = schema.CHALLENGE_HTTP_01;
+    graph.acme.name_count = 1;
+    schema.set_text(?graph.acme.names[0], "managed.example");
+}
+
+# a der certificate this test can store: a SEQUENCE with a known length, which
+# is all the chain splitter reads
+fun test_chain(buffer: *u8, count: usize) usize {
+    var at: usize = 0;
+    var i: usize = 0;
+    for (i < count) {
+        buffer[at] = 0x30;
+        buffer[at + 1] = 0x40;
+        var j: usize = 0;
+        for (j < 64) {
+            buffer[at + 2 + j] = (i * 64 + j)::u8;
+            j = j + 1;
+        }
+        at = at + 66;
+        i = i + 1;
+    }
+    ret at;
+}
+
+fun store_certificate(directory: str, a: *allocator.Allocator,
+    not_after: u64) bool {
+    var store: durable.Store;
+    if (durable.open(?store, a, directory) != durable.OK) { ret false; }
+    var account: keys.Key;
+    if (durable.open_account_key(?store, ?account) != durable.OK) { ret false; }
+    var certificate: keys.Key;
+    if (!keys.generate(?certificate)) { ret false; }
+    if (durable.commit_certificate_key(?store, 1, ?certificate)
+        != durable.OK) { ret false; }
+    var chain: [256]u8;
+    val length: usize = test_chain(?chain[0], 2);
+    var names: [1]identifier.Identifier;
+    names[0] = identifier.Identifier{kind: identifier.DNS,
+        value: view.view("managed.example", 15)};
+    var record: storage.CertificateRecord;
+    record.storage_key = view.view("managed.example", 15);
+    record.certificate_url = view.view("https://acme.example/cert/1", 27);
+    record.chain_der = view.view(?chain[0], length);
+    record.chain_len = 2;
+    record.private_key_owner = durable.secret_owner(?store);
+    record.identifiers = ?names[0];
+    record.identifier_len = 1;
+    record.not_before_unix = 1;
+    record.not_after_unix = not_after;
+    record.generation = 1;
+    val saved: durable.Status = durable.save_certificate(?store, 0, record);
+    keys.destroy(?account);
+    keys.destroy(?certificate);
+    ret saved == durable.OK;
+}
+
+test "acme manager: a stored certificate is recovered and produces no work" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (!test_allocator(?a, ?arena, ?memory[0], 262144)) { ret 1; }
+    val directory: str = "out/acme-manager-idle";
+    fs.remove_all(?a, directory::Path);
+    val expiry: u64 = T.now().sec::u64 + 7776000;
+    if (!store_certificate(directory, ?a, expiry)) { ret 2; }
+    var graph: schema.Graph;
+    test_graph(?graph, directory, "127.0.0.1:1");
+    var manager: Manager;
+    if (open(?manager, ?a, ?graph) != OK) { ret 3; }
+    if (!manager.have_certificate || manager.chain_count != 2
+     || manager.not_after != expiry || manager.generation != 1) {
+        close(?manager);
+        ret 4;
+    }
+    var first: view.View;
+    if (!chain_entry(?manager, 0, ?first) || first.len != 66
+     || first.data[2] != 0) {
+        close(?manager);
+        ret 5;
+    }
+    var second: view.View;
+    if (!chain_entry(?manager, 1, ?second) || second.len != 66
+     || second.data[2] != 64) {
+        close(?manager);
+        ret 6;
+    }
+    if (chain_entry(?manager, 2, ?second)) {
+        close(?manager);
+        ret 7;
+    }
+    # a certificate nowhere near expiry costs the plane a comparison and
+    # nothing else: no socket, no order, no state change
+    var i: usize = 0;
+    for (i < 256) {
+        poll((?manager)::ptr, T.now());
+        i = i + 1;
+    }
+    if (state(?manager) != IDLE || issued_count(?manager) != 0
+     || failure_count(?manager) != 0) {
+        close(?manager);
+        ret 8;
+    }
+    close(?manager);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+test "acme manager: a clock that moved backwards replans instead of renewing" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (!test_allocator(?a, ?arena, ?memory[0], 262144)) { ret 1; }
+    val directory: str = "out/acme-manager-skew";
+    fs.remove_all(?a, directory::Path);
+    val now: T.Time = T.now();
+    # a certificate that is planned but not yet due, so the only thing the
+    # backwards jump can change is the plan
+    if (!store_certificate(directory, ?a, now.sec::u64 + 7776000)) { ret 2; }
+    var graph: schema.Graph;
+    test_graph(?graph, directory, "127.0.0.1:1");
+    var manager: Manager;
+    if (open(?manager, ?a, ?graph) != OK) { ret 3; }
+    poll((?manager)::ptr, now);
+    val before: u64 = manager.schedule.last_seen_unix;
+    if (before == 0) {
+        close(?manager);
+        ret 4;
+    }
+    # the clock jumps a day backwards: not evidence that anything is due
+    var moved: T.Time = now;
+    moved.sec = now.sec - 86400;
+    poll((?manager)::ptr, moved);
+    if (state(?manager) != IDLE) {
+        close(?manager);
+        ret 5;
+    }
+    if (manager.schedule.last_seen_unix > before) {
+        close(?manager);
+        ret 6;
+    }
+    if (issued_count(?manager) != 0 || failure_count(?manager) != 0) {
+        close(?manager);
+        ret 7;
+    }
+    close(?manager);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+test "acme manager: an unreachable authority backs off instead of spinning" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (!test_allocator(?a, ?arena, ?memory[0], 262144)) { ret 1; }
+    val directory: str = "out/acme-manager-outage";
+    fs.remove_all(?a, directory::Path);
+    var graph: schema.Graph;
+    # port 1 serves nothing, so every attempt fails at connect
+    test_graph(?graph, directory, "127.0.0.1:1");
+    var manager: Manager;
+    if (open(?manager, ?a, ?graph) != OK) { ret 2; }
+    # with nothing stored the first order is due immediately
+    var rounds: usize = 0;
+    for (rounds < 100000 && failure_count(?manager) == 0) {
+        poll((?manager)::ptr, T.now());
+        rounds = rounds + 1;
+    }
+    if (failure_count(?manager) != 1) {
+        close(?manager);
+        ret 3;
+    }
+    if (state(?manager) != IDLE) {
+        close(?manager);
+        ret 4;
+    }
+    # the failure moved the schedule into backoff rather than straight back
+    # into another attempt
+    val next: u64 = manager.schedule.next_run_unix;
+    if (next <= T.now().sec::u64) {
+        close(?manager);
+        ret 5;
+    }
+    var i: usize = 0;
+    for (i < 4096) {
+        poll((?manager)::ptr, T.now());
+        i = i + 1;
+    }
+    if (failure_count(?manager) != 1) {
+        close(?manager);
+        ret 6;
+    }
+    # a prolonged outage produces bounded, widely spaced attempts: after the
+    # backoff elapses exactly one more attempt is made
+    var later: T.Time = T.now();
+    later.sec = next::i64 + 1;
+    rounds = 0;
+    for (rounds < 100000 && failure_count(?manager) == 1) {
+        poll((?manager)::ptr, later);
+        rounds = rounds + 1;
+    }
+    if (failure_count(?manager) != 2 || manager.schedule.attempts != 2) {
+        close(?manager);
+        ret 7;
+    }
+    if (manager.schedule.next_run_unix <= next) {
+        close(?manager);
+        ret 8;
+    }
+    close(?manager);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+test "acme manager: a deployment with acme off constructs nothing" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (!test_allocator(?a, ?arena, ?memory[0], 262144)) { ret 1; }
+    var graph: schema.Graph;
+    test_graph(?graph, "out/acme-manager-off", "127.0.0.1:1");
+    graph.acme.enabled = false;
+    var manager: Manager;
+    if (open(?manager, ?a, ?graph) != INVALID) { ret 2; }
+    if (manager.live || state(?manager) != STOPPED) { ret 3; }
+    # a challenge type this build cannot answer is refused at construction
+    graph.acme.enabled = true;
+    graph.acme.challenge = schema.CHALLENGE_DNS_01;
+    if (open(?manager, ?a, ?graph) != INVALID) { ret 4; }
+    if (!fs.is_dir("out/acme-manager-off"::Path)) { ret 0; }
+    ret 5;
+}

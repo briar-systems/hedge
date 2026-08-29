@@ -60,6 +60,19 @@ Secrets use dedicated types and explicit lifetimes. Copies are minimized and obs
 
 Certificate private keys support reload without exposing mutable key state to request handlers. Session ticket keys rotate through immutable key generations with controlled overlap.
 
+Automatically managed certificate and account keys are a stated exception to
+secret-typed storage, and it is a property of the toolchain rather than a
+choice. Mach forbids dropping the `^` secret qualifier, and it welds
+transitively: a record that transitively contains secret storage cannot be
+erased to the untyped `ptr` that every callback seam in the server uses, and
+`mach-std` exposes no secret-aware file interface, so a key that must survive a
+restart cannot reach a file at all. ACME key material is therefore held as
+public bytes and classified into a secret stack buffer for the exact call that
+consumes it, which is zeroized immediately after. Every crossing is one
+`scratch` argument in `src/acme/keys.mach` and there are no others. The
+material is zeroized when the key is destroyed, is never rendered in
+diagnostics, and reaches disk only in files created owner-only.
+
 ## Reporting
 
 Before public release, this section will name a private security contact, expected acknowledgment interval, supported versions, disclosure process, and encrypted reporting channel.

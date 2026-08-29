@@ -1,0 +1,762 @@
+# one outbound acme exchange, driven by the serving loop and never blocking it
+#
+# certificate management is a background activity inside a server whose whole
+# job is to answer other connections. an authority that stops responding must
+# cost hedge a bounded wait on a timer, not a stalled accept loop, so every
+# step here is a submission plus a completion rather than a blocking call.
+#
+# the transport owns its own completion runtime. the listener's runtime routes
+# completions to the connection plane by context kind, and an acme request is
+# not a connection; borrowing it would mean teaching the accept path about a
+# subsystem that has nothing to do with serving. a runtime that exists only
+# while acme is configured keeps that boundary and costs nothing when it is not.
+#
+# address resolution is a contract rather than a call: a deployment that can
+# resolve names supplies a provider that answers PENDING until its own
+# completion arrives, and the state machine above it does not change.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use R: std.types.result;
+use std.chrono.time;
+use std.net.ip;
+use std.net.tcp;
+use io_error: std.io.error;
+use io_handle: std.io.handle;
+use io_runtime: std.io.runtime;
+use lifecycle: std.io.lifecycle;
+use net_async: std.net.async;
+use cancel: std.sync.cancel;
+use http.core.field;
+use http.core.method;
+use ac: acme.client;
+use problem: acme.problem;
+use wire: hedge.acme.wire;
+
+pub val USER_AGENT: str = "hedge-acme/0.1";
+pub val USER_AGENT_BYTES: usize = 14;
+
+# one exchange at a time, plus its close, is all this transport ever has in
+# flight; the runtime is sized for that and nothing else
+val RUNTIME_SLOTS: usize = 8;
+
+val CONTEXT_CONNECT: usize = 1;
+val CONTEXT_WRITE:   usize = 2;
+val CONTEXT_READ:    usize = 3;
+val CONTEXT_CLOSE:   usize = 4;
+
+pub def Status: u8;
+pub val OK:      Status = 1;
+pub val PENDING: Status = 2;
+pub val FAILED:  Status = 3;
+pub val INVALID: Status = 4;
+
+pub def Stage: u8;
+pub val IDLE:       Stage = 0;
+pub val RESOLVING:  Stage = 1;
+pub val CONNECTING: Stage = 2;
+pub val WRITING:    Stage = 3;
+pub val READING:    Stage = 4;
+pub val CLOSING:    Stage = 5;
+pub val COMPLETE:   Stage = 6;
+pub val BROKEN:     Stage = 7;
+
+pub def Cause: u8;
+pub val CAUSE_NONE:       Cause = 0;
+pub val CAUSE_ADDRESS:    Cause = 1;
+pub val CAUSE_CONNECT:    Cause = 2;
+pub val CAUSE_WRITE:      Cause = 3;
+pub val CAUSE_READ:       Cause = 4;
+pub val CAUSE_PROTOCOL:   Cause = 5;
+pub val CAUSE_LIMIT:      Cause = 6;
+pub val CAUSE_TIMEOUT:    Cause = 7;
+pub val CAUSE_CANCELLED:  Cause = 8;
+
+# resolution is a step, not a call, so an asynchronous resolver reports PENDING
+# until its own completion arrives without changing anything above it
+pub def ResolveFun: fun(ptr, view.View, u16, *ip.Endpoint) Status;
+
+pub rec Addresses {
+    ctx:     ptr;
+    resolve: ResolveFun;
+}
+
+# where a configured authority is actually reached.
+#
+# rfc 8555 urls are https, and mach-acme refuses any other scheme in a
+# directory, an account url, or a durable record. a local authority is
+# reached through a cleartext front end that passes every acme byte through
+# unchanged, which is how the reference conformance stack works. an origin
+# states that mapping explicitly for one configured authority, so a cleartext
+# exchange is always a deployment decision and never a silent downgrade of
+# whatever url an authority happened to return.
+pub rec Origin {
+    endpoint:   ip.Endpoint;
+    cleartext:  bool;
+    configured: bool;
+}
+
+pub fun no_origin() Origin {
+    var value: Origin;
+    value.endpoint = ip.endpoint(0, 0, 0, 0, 0);
+    value.cleartext = false;
+    value.configured = false;
+    ret value;
+}
+
+pub fun cleartext_origin(endpoint: ip.Endpoint) Origin {
+    var value: Origin;
+    value.endpoint = endpoint;
+    value.cleartext = true;
+    value.configured = true;
+    ret value;
+}
+
+fun resolve_literal(context: ptr, host: view.View, port: u16,
+    output: *ip.Endpoint) Status {
+    if (output == nil || host.len == 0 || host.len > 63) { ret INVALID; }
+    var text: [64]u8;
+    var i: usize = 0;
+    for (i < host.len) {
+        text[i] = host.data[i];
+        i = i + 1;
+    }
+    text[host.len] = 0;
+    val parsed: R.Result[ip.Addr, str] = ip.addr_parse((?text[0])::str);
+    if (R.is_err[ip.Addr, str](parsed)) { ret FAILED; }
+    val address: ip.Addr = R.unwrap_ok[ip.Addr, str](parsed);
+    if (address.is_v6) {
+        @output = ip.endpoint_v6(address.v6, port, 0);
+        ret OK;
+    }
+    @output = ip.endpoint_v4(address.v4, port);
+    ret OK;
+}
+
+# a deployment that cannot resolve names reaches only address literals. every
+# name is refused here rather than silently reaching some other authority.
+pub fun literal_addresses() Addresses {
+    var value: Addresses;
+    value.ctx = nil;
+    value.resolve = resolve_literal;
+    ret value;
+}
+
+pub rec Transport {
+    runtime:   io_runtime.Runtime;
+    driver:    net_async.Driver;
+    scope:     cancel.Scope;
+    addresses: Addresses;
+    origin:    Origin;
+
+    request:          *u8;
+    request_capacity: usize;
+    request_len:      usize;
+    request_sent:     usize;
+
+    response:          *u8;
+    response_capacity: usize;
+    response_len:      usize;
+
+    items:          *field.Field;
+    item_capacity:  usize;
+    fields:         field.Fields;
+    field_limits:   field.Limits;
+
+    stream:    tcp.Stream;
+    endpoint:  ip.Endpoint;
+    target:    wire.Target;
+    parsed:    ac.Response;
+
+    stage:          Stage;
+    cause:          Cause;
+    request_method: method.Kind;
+    deadline:       time.Time;
+    max_body:       usize;
+    pending:        bool;
+    eof:            bool;
+    stream_live:    bool;
+    scope_live:     bool;
+    live:           bool;
+}
+
+fun empty_view() view.View {
+    var value: view.View;
+    value.data = nil;
+    value.len = 0;
+    ret value;
+}
+
+fun clear_exchange(transport: *Transport) {
+    transport.request_len = 0;
+    transport.request_sent = 0;
+    transport.response_len = 0;
+    transport.pending = false;
+    transport.eof = false;
+    transport.cause = CAUSE_NONE;
+    transport.parsed.status = 0;
+    transport.parsed.fields = nil;
+    transport.parsed.body = empty_view();
+    transport.parsed.retry_after_seconds = 0;
+}
+
+# storage stays caller owned for the life of the transport
+pub fun make(transport: *Transport, request: *u8, request_capacity: usize,
+    response: *u8, response_capacity: usize, items: *field.Field,
+    item_capacity: usize, limits: field.Limits,
+    addresses: Addresses) bool {
+    if (transport == nil || request == nil || response == nil || items == nil
+     || request_capacity == 0 || response_capacity == 0 || item_capacity == 0
+     || addresses.resolve::usize == 0) { ret false; }
+    transport.live = false;
+    transport.scope_live = false;
+    transport.stream_live = false;
+    transport.stage = IDLE;
+    transport.addresses = addresses;
+    transport.origin = no_origin();
+    transport.request = request;
+    transport.request_capacity = request_capacity;
+    transport.response = response;
+    transport.response_capacity = response_capacity;
+    transport.items = items;
+    transport.item_capacity = item_capacity;
+    transport.field_limits = limits;
+    transport.max_body = response_capacity;
+    transport.request_method = method.GET;
+    transport.deadline = time.Time{sec: 0, nsec: 0};
+    transport.stream = tcp.Stream{handle: io_handle.invalid_socket()};
+    clear_exchange(transport);
+    val made: R.Result[bool, io_error.Error] = io_runtime.make(?transport.runtime,
+        RUNTIME_SLOTS);
+    if (R.is_err[bool, io_error.Error](made)) { ret false; }
+    val driven: R.Result[bool, io_error.Error] = net_async.make(?transport.driver,
+        ?transport.runtime);
+    if (R.is_err[bool, io_error.Error](driven)) {
+        io_runtime.destroy(?transport.runtime);
+        ret false;
+    }
+    if (!cancel.make_root(?transport.scope, false, time.Time{sec: 0, nsec: 0})) {
+        net_async.destroy(?transport.driver);
+        io_runtime.destroy(?transport.runtime);
+        ret false;
+    }
+    transport.scope_live = true;
+    transport.live = true;
+    ret true;
+}
+
+# binds the authority this transport reaches. it applies to every exchange,
+# because one transport serves exactly one configured authority.
+pub fun set_origin(transport: *Transport, origin: Origin) bool {
+    if (transport == nil || !transport.live || transport.stage != IDLE) {
+        ret false;
+    }
+    transport.origin = origin;
+    ret true;
+}
+
+fun fail(transport: *Transport, cause: Cause) Status {
+    transport.cause = cause;
+    transport.stage = BROKEN;
+    ret FAILED;
+}
+
+fun deadline_from(now: time.Time, timeout_ns: u64) time.Time {
+    var seconds: i64 = (timeout_ns / 1000000000)::i64;
+    if (seconds <= 0) { seconds = 1; }
+    ret time.Time{sec: now.sec + seconds, nsec: now.nsec};
+}
+
+fun expired(transport: *Transport, now: time.Time) bool {
+    ret now.sec > transport.deadline.sec
+     || (now.sec == transport.deadline.sec && now.nsec > transport.deadline.nsec);
+}
+
+# begins one request. the caller keeps every byte the request views point at
+# alive until the exchange completes.
+pub fun begin(transport: *Transport, request: ac.WireRequest,
+    now: time.Time) Status {
+    if (transport == nil || !transport.live) { ret INVALID; }
+    if (transport.stage != IDLE) { ret INVALID; }
+    clear_exchange(transport);
+    if (!wire.split_url(request.url, ?transport.target)) {
+        ret fail(transport, CAUSE_ADDRESS);
+    }
+    # without a configured origin an https authority needs tls origination,
+    # which this build does not have. it is refused rather than reached in
+    # cleartext behind the caller's back.
+    if (transport.target.secure && !transport.origin.configured) {
+        ret fail(transport, CAUSE_ADDRESS);
+    }
+    if (transport.origin.configured && !transport.origin.cleartext) {
+        ret fail(transport, CAUSE_ADDRESS);
+    }
+    val written: usize = wire.encode_request(request, transport.target,
+        USER_AGENT, USER_AGENT_BYTES, transport.request,
+        transport.request_capacity);
+    if (written == 0) { ret fail(transport, CAUSE_LIMIT); }
+    transport.request_len = written;
+    transport.request_method = request.method.kind;
+    transport.deadline = deadline_from(now, request.timeout_ns);
+    transport.max_body = request.max_response_bytes;
+    if (transport.max_body == 0 || transport.max_body > transport.response_capacity) {
+        transport.max_body = transport.response_capacity;
+    }
+    transport.stage = RESOLVING;
+    ret PENDING;
+}
+
+fun submit_read(transport: *Transport) bool {
+    val room: usize = transport.max_body - transport.response_len;
+    if (room == 0) { ret false; }
+    val submitted: R.Result[io_runtime.Token, io_error.Error] = net_async.submit_read(
+        ?transport.driver, ?transport.scope, ?transport.stream,
+        ?transport.response[transport.response_len], room, CONTEXT_READ);
+    if (R.is_err[io_runtime.Token, io_error.Error](submitted)) { ret false; }
+    transport.pending = true;
+    ret true;
+}
+
+fun submit_write(transport: *Transport) bool {
+    val remaining: usize = transport.request_len - transport.request_sent;
+    val submitted: R.Result[io_runtime.Token, io_error.Error] = net_async.submit_write(
+        ?transport.driver, ?transport.scope, ?transport.stream,
+        ?transport.request[transport.request_sent], remaining, CONTEXT_WRITE);
+    if (R.is_err[io_runtime.Token, io_error.Error](submitted)) { ret false; }
+    transport.pending = true;
+    ret true;
+}
+
+fun begin_close(transport: *Transport) {
+    if (!transport.stream_live) { ret; }
+    val submitted: R.Result[io_runtime.Token, io_error.Error] = net_async.submit_stream_close(
+        ?transport.driver, ?transport.scope, ?transport.stream,
+        lifecycle.ABORTIVE, CONTEXT_CLOSE);
+    transport.stream_live = false;
+    if (R.is_err[io_runtime.Token, io_error.Error](submitted)) { ret; }
+    transport.pending = true;
+}
+
+fun parse_available(transport: *Transport) Status {
+    transport.fields = field.init(transport.items, transport.item_capacity,
+        transport.field_limits);
+    val parsed: wire.Parse = wire.parse_response(transport.response,
+        transport.response_len, transport.eof, transport.request_method,
+        ?transport.fields, ?transport.parsed);
+    if (parsed == wire.PARSE_OK) { ret OK; }
+    if (parsed == wire.PARSE_INCOMPLETE) { ret PENDING; }
+    if (parsed == wire.PARSE_LIMIT) { ret fail(transport, CAUSE_LIMIT); }
+    ret fail(transport, CAUSE_PROTOCOL);
+}
+
+fun handle_connect(transport: *Transport, completion: io_runtime.Completion) {
+    if (completion.has_error) {
+        fail(transport, CAUSE_CONNECT);
+        ret;
+    }
+    transport.stream = tcp.Stream{handle: io_handle.SocketHandle{value: completion.resource}};
+    transport.stream_live = true;
+    if (!submit_write(transport)) { fail(transport, CAUSE_WRITE); ret; }
+    transport.stage = WRITING;
+}
+
+fun handle_write(transport: *Transport, completion: io_runtime.Completion) {
+    if (completion.has_error || completion.bytes == 0) {
+        fail(transport, CAUSE_WRITE);
+        ret;
+    }
+    transport.request_sent = transport.request_sent + completion.bytes;
+    if (transport.request_sent < transport.request_len) {
+        if (!submit_write(transport)) { fail(transport, CAUSE_WRITE); }
+        ret;
+    }
+    if (!submit_read(transport)) { fail(transport, CAUSE_READ); ret; }
+    transport.stage = READING;
+}
+
+fun handle_read(transport: *Transport, completion: io_runtime.Completion) {
+    if (completion.has_error) {
+        fail(transport, CAUSE_READ);
+        ret;
+    }
+    transport.response_len = transport.response_len + completion.bytes;
+    if (completion.bytes == 0 || completion.end_of_stream) { transport.eof = true; }
+    val parsed: Status = parse_available(transport);
+    if (parsed == OK) {
+        transport.stage = COMPLETE;
+        ret;
+    }
+    if (parsed != PENDING) { ret; }
+    if (transport.eof) { fail(transport, CAUSE_PROTOCOL); ret; }
+    if (transport.response_len >= transport.max_body) {
+        fail(transport, CAUSE_LIMIT);
+        ret;
+    }
+    if (!submit_read(transport)) { fail(transport, CAUSE_READ); }
+}
+
+fun dispatch(transport: *Transport, completion: io_runtime.Completion) {
+    transport.pending = false;
+    if (completion.context == CONTEXT_CLOSE) { ret; }
+    # a completion that arrives after the exchange gave up releases its
+    # resource and changes nothing else
+    if (transport.stage == BROKEN || transport.stage == COMPLETE) {
+        if (completion.context == CONTEXT_CONNECT && !completion.has_error) {
+            transport.stream = tcp.Stream{handle: io_handle.SocketHandle{value: completion.resource}};
+            transport.stream_live = true;
+            begin_close(transport);
+        }
+        ret;
+    }
+    if (completion.context == CONTEXT_CONNECT && transport.stage == CONNECTING) {
+        handle_connect(transport, completion);
+        ret;
+    }
+    if (completion.context == CONTEXT_WRITE && transport.stage == WRITING) {
+        handle_write(transport, completion);
+        ret;
+    }
+    if (completion.context == CONTEXT_READ && transport.stage == READING) {
+        handle_read(transport, completion);
+    }
+}
+
+fun drain(transport: *Transport, timeout_ms: i32) bool {
+    var completions: [8]io_runtime.Completion;
+    val waited: R.Result[usize, io_error.Error] = io_runtime.wait(?transport.runtime,
+        ?completions[0], 8, timeout_ms);
+    if (R.is_err[usize, io_error.Error](waited)) { ret false; }
+    val count: usize = R.unwrap_ok[usize, io_error.Error](waited);
+    var i: usize = 0;
+    for (i < count) {
+        dispatch(transport, completions[i]);
+        i = i + 1;
+    }
+    ret true;
+}
+
+# advances the exchange by whatever has completed. never waits.
+pub fun poll(transport: *Transport, now: time.Time) Status {
+    if (transport == nil || !transport.live) { ret INVALID; }
+    if (transport.stage == IDLE) { ret INVALID; }
+    if (transport.stage == RESOLVING) {
+        var resolved: Status = OK;
+        if (transport.origin.configured) {
+            transport.endpoint = transport.origin.endpoint;
+        } or {
+            resolved = transport.addresses.resolve(transport.addresses.ctx,
+                transport.target.host, transport.target.port,
+                ?transport.endpoint);
+        }
+        if (resolved == PENDING) {
+            if (expired(transport, now)) { ret fail(transport, CAUSE_TIMEOUT); }
+            ret PENDING;
+        }
+        if (resolved != OK) { ret fail(transport, CAUSE_ADDRESS); }
+        val submitted: R.Result[io_runtime.Token, io_error.Error] = net_async.submit_connect(
+            ?transport.driver, ?transport.scope, transport.endpoint,
+            CONTEXT_CONNECT);
+        if (R.is_err[io_runtime.Token, io_error.Error](submitted)) {
+            ret fail(transport, CAUSE_CONNECT);
+        }
+        transport.pending = true;
+        transport.stage = CONNECTING;
+    }
+    drain(transport, 0);
+    if (transport.stage == COMPLETE) { ret OK; }
+    if (transport.stage == BROKEN) { ret FAILED; }
+    # an expired exchange is cancelled, and its outstanding completion is
+    # reaped before anything it owns is released
+    if (expired(transport, now)) {
+        cancel.cancel(?transport.scope);
+        ret fail(transport, CAUSE_TIMEOUT);
+    }
+    ret PENDING;
+}
+
+pub fun stage(transport: *Transport) Stage {
+    if (transport == nil) { ret BROKEN; }
+    ret transport.stage;
+}
+
+pub fun cause(transport: *Transport) Cause {
+    if (transport == nil) { ret CAUSE_PROTOCOL; }
+    ret transport.cause;
+}
+
+# valid only while the transport holds this exchange
+pub fun response(transport: *Transport) ac.Response {
+    ret transport.parsed;
+}
+
+# releases the exchange's socket and returns the transport to idle. every
+# outstanding completion is reaped first, so no buffer is released while the
+# kernel can still write to it.
+pub fun finish(transport: *Transport) bool {
+    if (transport == nil || !transport.live) { ret false; }
+    if (transport.stage == IDLE) { ret true; }
+    if (transport.pending) { cancel.cancel(?transport.scope); }
+    var guard: usize = 0;
+    for (transport.pending && guard < 64) {
+        if (!drain(transport, 50)) { brk; }
+        guard = guard + 1;
+    }
+    begin_close(transport);
+    guard = 0;
+    for (transport.pending && guard < 64) {
+        if (!drain(transport, 50)) { brk; }
+        guard = guard + 1;
+    }
+    if (!cancel.make_root(?transport.scope, false, time.Time{sec: 0, nsec: 0})) {
+        transport.scope_live = false;
+    }
+    clear_exchange(transport);
+    transport.stage = IDLE;
+    ret true;
+}
+
+pub fun destroy(transport: *Transport) bool {
+    if (transport == nil || !transport.live) { ret false; }
+    finish(transport);
+    if (transport.scope_live) {
+        cancel.destroy(?transport.scope);
+        transport.scope_live = false;
+    }
+    net_async.destroy(?transport.driver);
+    io_runtime.destroy(?transport.runtime);
+    transport.live = false;
+    ret true;
+}
+
+rec Fixture {
+    request:  [4096]u8;
+    response: [8192]u8;
+    items:    [32]field.Field;
+    url:      [64]u8;
+    engine:   Transport;
+}
+
+fun fixture_url(fixture: *Fixture, port: u16) view.View {
+    val prefix: str = "http://127.0.0.1:";
+    var at: usize = 0;
+    for (prefix[at] != 0) {
+        fixture.url[at] = prefix[at];
+        at = at + 1;
+    }
+    var digits: [8]u8;
+    var count: usize = 0;
+    var value: usize = port::usize;
+    for (true) {
+        digits[count] = ('0' + (value % 10)::u8);
+        count = count + 1;
+        value = value / 10;
+        if (value == 0) { brk; }
+    }
+    var i: usize = 0;
+    for (i < count) {
+        fixture.url[at] = digits[count - 1 - i];
+        at = at + 1;
+        i = i + 1;
+    }
+    val suffix: str = "/dir";
+    i = 0;
+    for (suffix[i] != 0) {
+        fixture.url[at] = suffix[i];
+        at = at + 1;
+        i = i + 1;
+    }
+    ret view.view(?fixture.url[0], at);
+}
+
+fun fixture_make(fixture: *Fixture) bool {
+    ret make(?fixture.engine, ?fixture.request[0], 4096, ?fixture.response[0],
+        8192, ?fixture.items[0], 32, field.limits(32, 8192, 128, 4096),
+        literal_addresses());
+}
+
+fun advance(fixture: *Fixture, wanted: Stage, limit: usize) bool {
+    var i: usize = 0;
+    for (i < limit) {
+        if (fixture.engine.stage == wanted || fixture.engine.stage == BROKEN
+         || fixture.engine.stage == COMPLETE) { ret fixture.engine.stage == wanted; }
+        poll(?fixture.engine, time.now());
+        i = i + 1;
+    }
+    ret false;
+}
+
+test "acme transport: a configured cleartext origin reaches an https authority" {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    # a port nothing serves, so the exchange reaches connect and stops there
+    if (!set_origin(?fixture.engine,
+        cleartext_origin(ip.endpoint(127, 0, 0, 1, 1)))) { ret 2; }
+    var request: ac.WireRequest;
+    request.method = method.from_kind(method.GET);
+    request.url = view.view("https://acme.example:14000/dir", 30);
+    request.content_type = view.view("application/json", 16);
+    request.body = view.view(nil, 0);
+    request.timeout_ns = 5000000000;
+    request.max_response_bytes = 4096;
+    request.error = problem.none();
+    request.response_fields = field.limits(32, 8192, 128, 4096);
+    request.replay_safe = true;
+    if (begin(?fixture.engine, request, time.now()) != PENDING) { ret 3; }
+    # the failure is at connect rather than at the address, which is what
+    # proves the origin was used in place of the url's own authority
+    var status: Status = PENDING;
+    var rounds: usize = 0;
+    for (status == PENDING && rounds < 4096) {
+        status = poll(?fixture.engine, time.now());
+        rounds = rounds + 1;
+    }
+    if (status != FAILED || cause(?fixture.engine) != CAUSE_CONNECT) { ret 4; }
+    finish(?fixture.engine);
+    destroy(?fixture.engine);
+    ret 0;
+}
+
+test "acme transport: an https authority is refused until tls origination exists" {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    var request: ac.WireRequest;
+    request.method = method.from_kind(method.GET);
+    request.url = view.view("https://acme.example/dir", 24);
+    request.content_type = view.view("application/json", 16);
+    request.body = view.view(nil, 0);
+    request.timeout_ns = 5000000000;
+    request.max_response_bytes = 4096;
+    request.error = problem.none();
+    request.response_fields = field.limits(32, 8192, 128, 4096);
+    request.replay_safe = true;
+    if (begin(?fixture.engine, request, time.now()) != FAILED) { ret 2; }
+    if (cause(?fixture.engine) != CAUSE_ADDRESS) { ret 3; }
+    if (!finish(?fixture.engine) || stage(?fixture.engine) != IDLE) { ret 4; }
+    if (!destroy(?fixture.engine)) { ret 5; }
+    ret 0;
+}
+
+test "acme transport: a name is refused while only literal addresses resolve" {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    var request: ac.WireRequest;
+    request.method = method.from_kind(method.GET);
+    request.url = view.view("http://acme.example/dir", 23);
+    request.content_type = view.view("application/json", 16);
+    request.body = view.view(nil, 0);
+    request.timeout_ns = 5000000000;
+    request.max_response_bytes = 4096;
+    request.error = problem.none();
+    request.response_fields = field.limits(32, 8192, 128, 4096);
+    request.replay_safe = true;
+    if (begin(?fixture.engine, request, time.now()) != PENDING) { ret 2; }
+    if (poll(?fixture.engine, time.now()) != FAILED) { ret 3; }
+    if (cause(?fixture.engine) != CAUSE_ADDRESS) { ret 4; }
+    finish(?fixture.engine);
+    destroy(?fixture.engine);
+    ret 0;
+}
+
+test "acme transport: one exchange completes against a real socket" {
+    val listening: R.Result[tcp.Listener, io_error.Error] = tcp.listen(
+        ip.endpoint(127, 0, 0, 1, 0), 4);
+    if (R.is_err[tcp.Listener, io_error.Error](listening)) { ret 1; }
+    var server: tcp.Listener = R.unwrap_ok[tcp.Listener, io_error.Error](listening);
+    val bound: R.Result[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?server);
+    if (R.is_err[ip.Endpoint, io_error.Error](bound)) {
+        tcp.listener_close(?server);
+        ret 2;
+    }
+    val endpoint: ip.Endpoint = R.unwrap_ok[ip.Endpoint, io_error.Error](bound);
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) {
+        tcp.listener_close(?server);
+        ret 3;
+    }
+    var request: ac.WireRequest;
+    request.method = method.from_kind(method.GET);
+    request.url = fixture_url(?fixture, endpoint.port);
+    request.content_type = view.view("application/json", 16);
+    request.body = view.view(nil, 0);
+    request.timeout_ns = 10000000000;
+    request.max_response_bytes = 8192;
+    request.error = problem.none();
+    request.response_fields = field.limits(32, 8192, 128, 4096);
+    request.replay_safe = true;
+    if (begin(?fixture.engine, request, time.now()) != PENDING) {
+        destroy(?fixture.engine);
+        tcp.listener_close(?server);
+        ret 4;
+    }
+    if (!advance(?fixture, WRITING, 4096) && fixture.engine.stage != READING) {
+        destroy(?fixture.engine);
+        tcp.listener_close(?server);
+        ret 5;
+    }
+    val accepted: R.Result[tcp.Stream, io_error.Error] = tcp.accept(?server);
+    if (R.is_err[tcp.Stream, io_error.Error](accepted)) {
+        destroy(?fixture.engine);
+        tcp.listener_close(?server);
+        ret 6;
+    }
+    var peer: tcp.Stream = R.unwrap_ok[tcp.Stream, io_error.Error](accepted);
+    tcp.stream_set_read_timeout(?peer, 5000);
+    var received: [1024]u8;
+    var total: usize = 0;
+    var rounds: usize = 0;
+    for (total < 4 && rounds < 64) {
+        poll(?fixture.engine, time.now());
+        val read: R.Result[usize, io_error.Error] = tcp.stream_read(?peer,
+            ?received[total], 1024 - total);
+        if (!R.is_err[usize, io_error.Error](read)) {
+            total = total + R.unwrap_ok[usize, io_error.Error](read);
+        }
+        rounds = rounds + 1;
+    }
+    if (total < 20 || !view.view_eq_str(view.view(?received[0], 20),
+        "GET /dir HTTP/1.1\r\nh")) {
+        tcp.stream_close(?peer);
+        destroy(?fixture.engine);
+        tcp.listener_close(?server);
+        ret 7;
+    }
+    val reply: str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi";
+    var body: [64]u8;
+    var length: usize = 0;
+    for (reply[length] != 0) {
+        body[length] = reply[length];
+        length = length + 1;
+    }
+    tcp.stream_write(?peer, ?body[0], length);
+    var status: Status = PENDING;
+    rounds = 0;
+    for (status == PENDING && rounds < 4096) {
+        status = poll(?fixture.engine, time.now());
+        rounds = rounds + 1;
+    }
+    tcp.stream_close(?peer);
+    tcp.listener_close(?server);
+    if (status != OK) {
+        destroy(?fixture.engine);
+        ret 8;
+    }
+    val answer: ac.Response = response(?fixture.engine);
+    if (answer.status != 200 || !view.view_eq_str(answer.body, "hi")) {
+        destroy(?fixture.engine);
+        ret 9;
+    }
+    if (answer.fields.len == 0) {
+        destroy(?fixture.engine);
+        ret 10;
+    }
+    if (!finish(?fixture.engine) || stage(?fixture.engine) != IDLE) {
+        destroy(?fixture.engine);
+        ret 11;
+    }
+    if (!destroy(?fixture.engine)) { ret 12; }
+    ret 0;
+}
