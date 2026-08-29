@@ -42,6 +42,7 @@ use plan: hedge.dispatch.plan;
 use middleware: hedge.dispatch.middleware;
 use router: http.router.router;
 use challenge: hedge.acme.challenge;
+use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
 use issue: hedge.acme.issue;
 use keys: hedge.acme.keys;
@@ -509,5 +510,170 @@ test "live: a stopped listener releases its port for the next generation" {
     var second: Server;
     if (!boot_at(?second, ?table, "127.0.0.1:5111", 5111)) { ret 3; }
     if (!serve.stop(?second.runtime)) { ret 4; }
+    ret 0;
+}
+
+rec Deployment {
+    graph:   schema.Graph;
+    manager: acme.Manager;
+    name:    [64]u8;
+    name_len: usize;
+}
+
+fun configure_acme(deployment: *Deployment, storage_path: str, name_len: usize) {
+    val graph: *schema.Graph = ?deployment.graph;
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "acme-managed");
+    graph.features.acme = true;
+    graph.acme.enabled = true;
+    schema.set_text(?graph.acme.directory, DIRECTORY_URL);
+    schema.set_text(?graph.acme.storage, storage_path);
+    schema.set_text(?graph.acme.origin, "127.0.0.1:14001");
+    graph.acme.terms_agreed = true;
+    graph.acme.challenge = schema.CHALLENGE_HTTP_01;
+    graph.acme.name_count = 1;
+    deployment.name[name_len] = 0;
+    schema.set_text(?graph.acme.names[0], (?deployment.name[0])::str);
+}
+
+fun drive_manager(server: *Server, deployment: *Deployment,
+    wanted: acme.State) bool {
+    var rounds: usize = 0;
+    val deadline: i64 = monotonic_ns() + 120000000000;
+    for (rounds < MAX_ROUNDS) {
+        serve.poll(?server.runtime, 1);
+        acme.poll((?deployment.manager)::ptr, T.now());
+        if (acme.state(?deployment.manager) == wanted) { ret true; }
+        if (acme.failure_count(?deployment.manager) != 0) { ret false; }
+        if (monotonic_ns() > deadline) { ret false; }
+        rounds = rounds + 1;
+    }
+    ret false;
+}
+
+test "live: the manager obtains, stores, and recovers a certificate" {
+    var memory: [262144]u8;
+    var state: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?state, ?memory[0], 262144))) { ret 1; }
+    val directory: str = "out/acme-managed";
+    fs.remove_all(?a, directory::Path);
+
+    var deployment: Deployment;
+    var client: Client;
+    val name_len: usize = unique_name(?client, "managed");
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    deployment.name_len = name_len;
+    configure_acme(?deployment, directory, name_len);
+    if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.OK) {
+        ret 2;
+    }
+    var server: Server;
+    if (!boot(?server, acme.challenge_table(?deployment.manager))) {
+        acme.close(?deployment.manager);
+        ret 3;
+    }
+    # with nothing stored, the first certificate is due immediately
+    if (acme.state(?deployment.manager) != acme.IDLE) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 4;
+    }
+    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 5;
+    }
+    if (!acme.installation_ready(?deployment.manager)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 6;
+    }
+    val count: usize = acme.chain_count(?deployment.manager);
+    if (count < 2) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 7;
+    }
+    var leaf: view.View;
+    if (!acme.chain_entry(?deployment.manager, 0, ?leaf) || leaf.len < 64
+     || leaf.data[0] != 0x30) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 8;
+    }
+    var issuer: view.View;
+    if (!acme.chain_entry(?deployment.manager, count - 1, ?issuer)
+     || issuer.len < 64) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 9;
+    }
+    if (acme.not_after(?deployment.manager) <= T.now().sec::u64) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 10;
+    }
+    val expiry: u64 = acme.not_after(?deployment.manager);
+    val key_point: u8 = acme.certificate_key(?deployment.manager).point[1];
+    acme.installed(?deployment.manager, T.now());
+    if (acme.issued_count(?deployment.manager) != 1
+     || acme.failure_count(?deployment.manager) != 0) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 11;
+    }
+    acme.close(?deployment.manager);
+
+    # a restart recovers the certificate and its key from disk and does not
+    # order a second one
+    var restarted: Deployment;
+    i = 0;
+    for (i < name_len) {
+        restarted.name[i] = deployment.name[i];
+        i = i + 1;
+    }
+    configure_acme(?restarted, directory, name_len);
+    if (acme.open(?restarted.manager, ?a, ?restarted.graph) != acme.OK) {
+        serve.stop(?server.runtime);
+        ret 12;
+    }
+    if (acme.chain_count(?restarted.manager) != count
+     || acme.not_after(?restarted.manager) != expiry) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 13;
+    }
+    if (acme.certificate_key(?restarted.manager).point[1] != key_point) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 14;
+    }
+    var recovered: view.View;
+    if (!acme.chain_entry(?restarted.manager, 0, ?recovered)
+     || recovered.len != leaf.len) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 15;
+    }
+    # a stored certificate that is not near expiry produces no work at all
+    var rounds: usize = 0;
+    for (rounds < 64) {
+        acme.poll((?restarted.manager)::ptr, T.now());
+        rounds = rounds + 1;
+    }
+    if (acme.state(?restarted.manager) != acme.IDLE
+     || acme.issued_count(?restarted.manager) != 0) {
+        acme.close(?restarted.manager);
+        serve.stop(?server.runtime);
+        ret 16;
+    }
+    acme.close(?restarted.manager);
+    serve.stop(?server.runtime);
+    fs.remove_all(?a, directory::Path);
     ret 0;
 }
