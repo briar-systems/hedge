@@ -48,6 +48,11 @@ use trust: hedge.protocol.trust;
 use selection: hedge.protocol.selection;
 use prologue: hedge.protocol.prologue;
 use proxy_protocol: hedge.protocol.proxy_protocol;
+use hedge_tls: hedge.protocol.tls;
+use secure: hedge.protocol.secure;
+use tls_engine: tls.engine;
+use tls_error: tls.error;
+use contracts: crypto.contracts;
 use telemetry_trace: hedge.telemetry.trace;
 
 pub val PIPELINE_DEPTH: usize = 2;
@@ -266,6 +271,10 @@ pub rec Connection {
     prologue_context: listener.ConnectionContext;
     prologue_scope: cancel.Scope;
     prologue_scope_live: bool;
+    tls_policy: usize;
+    session: usize;
+    handshaking: bool;
+    secure_operation: Operation;
     proxy_scratch: [PROXY_SCRATCH_BYTES]u8;
 }
 
@@ -319,7 +328,8 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     if (index >= TRANSPORT_SLOTS) {
         ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_READ));
     }
-    if (owner.prologue_read < owner.prologue_len && length != 0) {
+    if (owner.session == secure.NO_SESSION
+     && owner.prologue_read < owner.prologue_len && length != 0) {
         ret deliver_staged(owner, scope, buffer, length, index);
     }
     ret net_async.submit_read(owner.driver, scope, ?owner.stream, buffer, length,
@@ -547,10 +557,17 @@ pub fun make(
     configured: Config,
     limits: message.Limits,
     owned: *listener.OwnedListener,
+    policy: usize,
     now: time.Time,
 ) bool {
     if (owner == nil || source == nil || net_driver == nil || active_plan == nil
      || owned == nil || id == 0 || generation == 0) { ret false; }
+    # a TLS listener whose policy did not resolve must not fall back to
+    # cleartext, so the connection is refused before it is admitted
+    if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
+    owner.tls_policy = policy;
+    owner.session = secure.NO_SESSION;
+    owner.handshaking = false;
     owner.state = NEW;
     owner.id = id;
     owner.generation = generation;
@@ -618,8 +635,6 @@ pub fun make(
         ret false;
     }
     owner.channel.initialized = false;
-    if (!transport.init(?owner.channel, owner.adapter, ?owner.operation_root,
-        ?owner.control_scope, ?owner.channel_slots[0], TRANSPORT_SLOTS)) { ret false; }
     var i: usize = 0;
     for (i < PIPELINE_DEPTH) {
         owner.engine_memories[i] = connection.SlotMemory{
@@ -657,6 +672,16 @@ fun refuse(owner: *Connection, reason: prologue.Refusal) Step {
 }
 
 fun start_engine(owner: *Connection, now: time.Time) Step {
+    var adapter: transport.Adapter = owner.adapter;
+    if (owner.session != secure.NO_SESSION) { adapter = secure.adapter(owner.session); }
+    if (!transport.adapter_valid(?adapter)) {
+        ret refuse(owner, prologue.REFUSED_TRANSPORT);
+    }
+    owner.channel.initialized = false;
+    if (!transport.init(?owner.channel, adapter, ?owner.operation_root,
+        ?owner.control_scope, ?owner.channel_slots[0], TRANSPORT_SLOTS)) {
+        ret refuse(owner, prologue.REFUSED_TRANSPORT);
+    }
     if (owner.protocol == selection.HTTP1) {
         owner.engine.initialized = false;
         if (!connection.init(?owner.engine, connection.SERVER, ?owner.channel,
@@ -671,6 +696,91 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
         ret STEP_PROGRESS;
     }
     ret refuse(owner, prologue.REFUSED_UNBOUND);
+}
+
+# the bytes the prologue read past the PROXY header are TLS records, and the
+# record layer must see them before the socket is read again
+fun staged_bytes(context: ptr, buffer: *u8, length: usize) usize {
+    val owner: *Connection = context::*Connection;
+    if (owner == nil || buffer == nil || length == 0) { ret 0; }
+    var count: usize = owner.prologue_len - owner.prologue_read;
+    if (count == 0) { ret 0; }
+    if (count > length) { count = length; }
+    var i: usize = 0;
+    for (i < count) {
+        buffer[i] = owner.prologue_buffer[owner.prologue_read + i];
+        i = i + 1;
+    }
+    owner.prologue_read = owner.prologue_read + count;
+    ret count;
+}
+
+fun settle_secure(context: ptr, token_context: usize,
+    completion: io_runtime.Completion) {
+    val owner: *Connection = context::*Connection;
+    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) {
+        ret;
+    }
+    var settled: io_runtime.Completion = completion;
+    secure.accept(owner.session, ?settled);
+    advance(owner, time.now());
+}
+
+fun begin_secure(owner: *Connection, now: time.Time) Step {
+    owner.session = secure.acquire();
+    if (owner.session == secure.NO_SESSION) {
+        ret refuse(owner, prologue.REFUSED_EXHAUSTED);
+    }
+    val channel: *secure.Channel = secure.channel(owner.session);
+    if (channel == nil
+     || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
+        staged_bytes)
+     || !bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
+        settle_secure, 0)
+     || !secure.begin(owner.session, hedge_tls.policy_at(owner.tls_policy),
+        time.time_unix_sec(time.now()))) {
+        ret refuse(owner, prologue.REFUSED_TLS);
+    }
+    owner.handshaking = true;
+    ret STEP_BLOCKED;
+}
+
+# mach-tls chose the protocol from the listener's own ALPN list, and this checks
+# the answer back against listener policy rather than trusting it. a selection
+# that is not one this listener serves is a refusal, never a fallback.
+fun protocol_from_alpn(owner: *Connection, negotiated: contracts.Bytes) selection.Decision {
+    var offered: [1]view.View;
+    var count: usize = 0;
+    if (negotiated.len != 0 && negotiated.data != nil) {
+        offered[0] = view.view(negotiated.data, negotiated.len);
+        count = 1;
+    }
+    ret selection.select_alpn(owner.prologue_policy.selection, ?offered[0], count);
+}
+
+fun refuse_handshake(owner: *Connection) Step {
+    val failure: tls_error.Error = secure.handshake_error(owner.session);
+    if (failure == tls_error.UNRECOGNIZED_NAME) {
+        ret refuse(owner, prologue.REFUSED_UNKNOWN_NAME);
+    }
+    if (failure == tls_error.NO_APPLICATION_PROTOCOL) {
+        ret refuse(owner, prologue.REFUSED_ALPN);
+    }
+    ret refuse(owner, prologue.REFUSED_TLS);
+}
+
+fun advance_handshake(owner: *Connection, now: time.Time) Step {
+    secure.drive(owner.session);
+    if (!secure.handshake_settled(owner.session)) { ret STEP_BLOCKED; }
+    owner.handshaking = false;
+    if (!secure.open(owner.session)) { ret refuse_handshake(owner); }
+    val negotiated: tls_engine.Snapshot = secure.negotiated(owner.session);
+    val chosen: selection.Decision = protocol_from_alpn(owner, negotiated.selected_alpn);
+    if (chosen.outcome != selection.SELECTED) {
+        ret refuse(owner, prologue.REFUSED_ALPN);
+    }
+    owner.protocol = chosen.protocol;
+    ret start_engine(owner, now);
 }
 
 fun submit_prologue_read(owner: *Connection) Step {
@@ -708,6 +818,8 @@ fun advance_prologue(owner: *Connection, now: time.Time) Step {
     if (decided.outcome == prologue.NEED_MORE) { ret submit_prologue_read(owner); }
     if (decided.has_peer) { record_decoded(owner, decided); }
     owner.prologue_read = decided.consumed;
+    # a TLS listener has decided nothing yet: its handshake names the protocol
+    if (owner.prologue_policy.secure) { ret begin_secure(owner, now); }
     owner.protocol = decided.protocol;
     ret start_engine(owner, now);
 }
@@ -1146,9 +1258,24 @@ fun pump_inbound(owner: *Connection, now: time.Time) Step {
 pub fun step(owner: *Connection, now: time.Time) Step {
     if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
     if (owner.state == NEW) {
-        val opened: Step = advance_prologue(owner, now);
+        var opened: Step = STEP_BLOCKED;
+        if (owner.handshaking) { opened = advance_handshake(owner, now); }
+        or { opened = advance_prologue(owner, now); }
         owner.last_step = opened;
         ret opened;
+    }
+    # a secure connection's transport work is driven by this loop rather than by
+    # the engine, because exactly one TLS operation may run at a time
+    if (owner.session != secure.NO_SESSION && owner.engine_live) {
+        var settled: transport.Completion;
+        if (secure.take(owner.session, ?settled)) {
+            val event: connection.Event = connection.complete_io(?owner.engine,
+                ?settled, now);
+            if (runnable(owner)) { apply(owner, event, now); }
+            owner.last_step = STEP_PROGRESS;
+            ret STEP_PROGRESS;
+        }
+        secure.drive(owner.session);
     }
     if (owner.state != ACTIVE) { ret STEP_DONE; }
     if (owner.engine.state == connection.CLOSED || owner.engine.state == connection.FAILED) {
@@ -1224,6 +1351,11 @@ pub fun close(owner: *Connection) bool {
     }
     if (owner.engine_live) { connection.cancel_connection(?owner.engine); }
     owner.engine_live = false;
+    if (owner.session != secure.NO_SESSION) {
+        secure.release(owner.session);
+        owner.session = secure.NO_SESSION;
+    }
+    owner.handshaking = false;
     release_prologue_scope(owner);
     if (owner.request_scope_live) {
         cancel.destroy(?owner.request_scope);
