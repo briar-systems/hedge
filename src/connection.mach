@@ -44,6 +44,16 @@ use hedge.service;
 use call: hedge.dispatch.call;
 use plan: hedge.dispatch.plan;
 use hedge.listener;
+use trust: hedge.protocol.trust;
+use selection: hedge.protocol.selection;
+use prologue: hedge.protocol.prologue;
+use proxy_protocol: hedge.protocol.proxy_protocol;
+use hedge_tls: hedge.protocol.tls;
+use secure: hedge.protocol.secure;
+use h2: hedge.protocol.h2;
+use tls_engine: tls.engine;
+use tls_error: tls.error;
+use contracts: crypto.contracts;
 use telemetry_trace: hedge.telemetry.trace;
 
 pub val PIPELINE_DEPTH: usize = 2;
@@ -61,6 +71,8 @@ pub val RESPONSE_TRAILER_SLOTS: usize = 8;
 pub val INFORMATIONAL_SLOTS: usize = 4;
 pub val CAPTURE_SLOTS: usize = 8;
 pub val MAX_STEPS: usize = 64;
+pub val PROLOGUE_BYTES: usize = prologue.MAX_BYTES;
+pub val PROXY_SCRATCH_BYTES: usize = proxy_protocol.MAX_TEXT_BYTES;
 
 # where exchange construction stopped, reported through the connection snapshot
 pub def Setup: u8;
@@ -121,6 +133,8 @@ pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Comp
 pub rec Config {
     engine: connection.Config;
     request_timeout_ns: u64;
+    # bounds the prologue and, on a TLS listener, the handshake behind it
+    prologue_timeout_ns: u64;
 }
 
 pub fun config_from(graph: *schema.Graph) Config {
@@ -140,7 +154,8 @@ pub fun config_from(graph: *schema.Graph) Config {
     if (engine.parser.max_trailer_bytes > STORAGE_BYTES) { engine.parser.max_trailer_bytes = STORAGE_BYTES; }
     if (engine.parser.max_trailers > TRAILER_SLOTS) { engine.parser.max_trailers = TRAILER_SLOTS; }
     if (engine.parser.max_chunk_line > LINE_BYTES) { engine.parser.max_chunk_line = LINE_BYTES; }
-    ret Config{engine: engine, request_timeout_ns: graph.timeouts.request_ms * 1000000};
+    ret Config{engine: engine, request_timeout_ns: graph.timeouts.request_ms * 1000000,
+        prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000};
 }
 
 # the exchange limits a service sees must admit everything the parser will accept,
@@ -180,7 +195,14 @@ pub rec Connection {
     stream: tcp.Stream;
     peer: ip.Endpoint;
     peer_text: [PEER_BYTES]u8;
+    peer_len: usize;
+    peer_port: u16;
+    peer_kind: message.EndpointKind;
     local_text: [PEER_BYTES]u8;
+    local_len: usize;
+    local_port: u16;
+    local_kind: message.EndpointKind;
+    secure: bool;
     listener_name: str;
     driver: *net_async.Driver;
     runtime_stream: transport.RuntimeStream;
@@ -237,6 +259,25 @@ pub rec Connection {
     has_pending: bool;
     service_pending: bool;
     initialized: bool;
+    engine_live: bool;
+    protocol: selection.Protocol;
+    refusal: prologue.Refusal;
+    prologue_policy: prologue.Policy;
+    prologue_buffer: [PROLOGUE_BYTES]u8;
+    prologue_len: usize;
+    prologue_read: usize;
+    prologue_pending: bool;
+    prologue_ended: bool;
+    prologue_operation: Operation;
+    prologue_context: listener.ConnectionContext;
+    prologue_scope: cancel.Scope;
+    prologue_scope_live: bool;
+    tls_policy: usize;
+    session: usize;
+    h2_session: usize;
+    handshaking: bool;
+    secure_operation: Operation;
+    proxy_scratch: [PROXY_SCRATCH_BYTES]u8;
 }
 
 fun no_slot() usize {
@@ -253,12 +294,45 @@ fun operation_for(owner: *Connection, token_context: usize) usize {
     ret index;
 }
 
+# the prologue read past the PROXY header, so the bytes behind it were already
+# taken off the socket. they are handed to whatever reads next before the socket
+# is touched again, or the first request on every proxied connection is lost.
+fun deliver_staged(owner: *Connection, scope: *cancel.Scope, buffer: *u8,
+    length: usize, index: usize) Result[io_runtime.Token, io_error.Error] {
+    var count: usize = owner.prologue_len - owner.prologue_read;
+    if (count > length) { count = length; }
+    var i: usize = 0;
+    for (i < count) {
+        buffer[i] = owner.prologue_buffer[owner.prologue_read + i];
+        i = i + 1;
+    }
+    val submitted: Result[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
+        owner.driver.runtime, scope,
+        io_runtime.Operation{kind: io_runtime.READ, resource: owner.stream.handle.value,
+            buffer: buffer, length: length, offset: 0,
+            context: (?owner.contexts[index])::usize});
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val published: Result[bool, io_error.Error] = io_runtime.complete(owner.driver.runtime,
+        token, count, owner.stream.handle.value, false);
+    if (is_err[bool, io_error.Error](published)) {
+        # nothing was delivered, so the staged bytes stay staged
+        ret err[io_runtime.Token, io_error.Error](io_error.from_code(-5, io_error.OP_READ));
+    }
+    owner.prologue_read = owner.prologue_read + count;
+    ret submitted;
+}
+
 fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) Result[io_runtime.Token, io_error.Error] {
     val owner: *Connection = context::*Connection;
     val index: usize = operation_for(owner, token_context);
     if (index >= TRANSPORT_SLOTS) {
         ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_READ));
+    }
+    if (owner.session == secure.NO_SESSION
+     && owner.prologue_read < owner.prologue_len && length != 0) {
+        ret deliver_staged(owner, scope, buffer, length, index);
     }
     ret net_async.submit_read(owner.driver, scope, ?owner.stream, buffer, length,
         (?owner.contexts[index])::usize);
@@ -336,10 +410,19 @@ pub fun translate(settled: *transport.Completion, source: io_runtime.Completion,
 # one completion belongs to exactly one connection and settles exactly one operation
 fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion) {
     val owner: *Connection = context::*Connection;
-    if (owner == nil || !owner.initialized) { ret; }
+    if (owner == nil || !owner.initialized || !owner.engine_live) { ret; }
     var settled: transport.Completion;
     if (!translate(?settled, completion, token_context)) { ret; }
     val now: time.Time = time.now();
+    if (owner.h2_session != h2.NO_SESSION) {
+        val stepped: Step = from_h2(h2.complete_io(owner.h2_session, ?settled, now));
+        if (stepped == STEP_DONE || stepped == STEP_ERROR) {
+            owner.state = CLOSING;
+            ret;
+        }
+        advance(owner, now);
+        ret;
+    }
     # complete_io settles the transport slot and advances the engine, so the event
     # it returns is the next event this connection will ever produce. dropping it
     # would silently skip a request.
@@ -352,9 +435,126 @@ fun format_endpoint(endpoint: ip.Endpoint, output: *u8, capacity: usize) usize {
     ret ip.endpoint_format(endpoint, output, capacity);
 }
 
-fun endpoint_metadata(text: *u8, length: usize, port: u16) message.Endpoint {
-    if (length == 0) { ret message.unspecified_endpoint(); }
-    ret message.endpoint(message.ENDPOINT_IP, view.view(text, length), port);
+fun endpoint_metadata(kind: message.EndpointKind, text: *u8, length: usize,
+    port: u16) message.Endpoint {
+    if (kind == message.ENDPOINT_UNSPECIFIED || length == 0) {
+        ret message.unspecified_endpoint();
+    }
+    ret message.endpoint(kind, view.view(text, length), port);
+}
+
+fun write_port(value: u16, output: *u8, at: usize, capacity: usize) usize {
+    var digits: [5]u8;
+    var count: usize = 0;
+    var remaining: usize = value::usize;
+    if (remaining == 0) { digits[0] = '0'::u8; count = 1; }
+    for (remaining != 0) {
+        digits[count] = '0'::u8 + (remaining % 10)::u8;
+        remaining = remaining / 10;
+        count = count + 1;
+    }
+    if (at + count > capacity) { ret 0; }
+    var i: usize = 0;
+    for (i < count) {
+        output[at + i] = digits[count - 1 - i];
+        i = i + 1;
+    }
+    ret at + count;
+}
+
+# the decoded peer is rendered the same way an observed one is, so a service or
+# a log reading `metadata.peer.address` cannot tell which path produced it and
+# cannot accidentally treat the two differently
+fun format_decoded(peer: proxy_protocol.Peer, output: *u8, capacity: usize) usize {
+    if (peer.address.len == 0 || peer.address.data == nil) { ret 0; }
+    val bracket: bool = peer.family == proxy_protocol.FAMILY_INET6;
+    var at: usize = 0;
+    if (bracket) {
+        if (at >= capacity) { ret 0; }
+        output[at] = '['::u8;
+        at = at + 1;
+    }
+    if (at + peer.address.len > capacity) { ret 0; }
+    var i: usize = 0;
+    for (i < peer.address.len) {
+        output[at + i] = peer.address.data[i];
+        i = i + 1;
+    }
+    at = at + peer.address.len;
+    if (bracket) {
+        if (at >= capacity) { ret 0; }
+        output[at] = ']'::u8;
+        at = at + 1;
+    }
+    if (at >= capacity) { ret 0; }
+    output[at] = ':'::u8;
+    at = at + 1;
+    ret write_port(peer.port, output, at, capacity);
+}
+
+fun record_observed(owner: *Connection, source: *listener.Connection) {
+    owner.peer_kind = message.ENDPOINT_UNSPECIFIED;
+    owner.peer_len = 0;
+    owner.peer_port = 0;
+    if (source.has_peer) {
+        owner.peer = source.peer;
+        owner.peer_len = format_endpoint(owner.peer, ?owner.peer_text[0], PEER_BYTES);
+        if (owner.peer_len != 0) {
+            owner.peer_kind = message.ENDPOINT_IP;
+            owner.peer_port = owner.peer.port;
+        }
+    }
+    owner.local_kind = message.ENDPOINT_UNSPECIFIED;
+    owner.local_len = 0;
+    owner.local_port = 0;
+    # the bound address of a wildcard listener is not the address this
+    # connection arrived on, so the socket is asked rather than the listener
+    val local: Result[ip.Endpoint, io_error.Error] = tcp.stream_local_endpoint(?owner.stream);
+    if (!is_err[ip.Endpoint, io_error.Error](local)) {
+        val endpoint: ip.Endpoint = unwrap_ok[ip.Endpoint, io_error.Error](local);
+        owner.local_len = format_endpoint(endpoint, ?owner.local_text[0], PEER_BYTES);
+        if (owner.local_len != 0) {
+            owner.local_kind = message.ENDPOINT_IP;
+            owner.local_port = endpoint.port;
+        }
+    }
+}
+
+# a decoded header replaces the observed peer for every later reader. leaving the
+# observed one in place would make logging and policy disagree about who the
+# client is, which is worse than not decoding the header at all.
+fun record_decoded(owner: *Connection, decided: prologue.Result) {
+    owner.peer_kind = message.ENDPOINT_UNSPECIFIED;
+    owner.peer_port = 0;
+    owner.peer_len = format_decoded(decided.peer, ?owner.peer_text[0], PEER_BYTES);
+    if (owner.peer_len != 0) {
+        owner.peer_kind = message.ENDPOINT_FORWARDED;
+        owner.peer_port = decided.peer.port;
+    }
+    if (decided.local.family == proxy_protocol.FAMILY_UNSPEC) { ret; }
+    owner.local_kind = message.ENDPOINT_UNSPECIFIED;
+    owner.local_port = 0;
+    owner.local_len = format_decoded(decided.local, ?owner.local_text[0], PEER_BYTES);
+    if (owner.local_len != 0) {
+        owner.local_kind = message.ENDPOINT_FORWARDED;
+        owner.local_port = decided.local.port;
+    }
+}
+
+# the listener's policy becomes the connection's prologue policy exactly once,
+# at accept time. the trust decision is taken here from the observed socket
+# address, before a single header byte has been read.
+fun bind_policy(owner: *Connection, owned: *listener.OwnedListener,
+    source: *listener.Connection) {
+    var trusted: bool = false;
+    if (source.has_peer) {
+        trusted = trust.trusts(?owned.policy.trusted, source.peer.addr);
+    }
+    owner.secure = owned.policy.secure;
+    owner.prologue_policy = prologue.policy(owned.policy.proxy_protocol, trusted,
+        owned.policy.secure,
+        selection.policy(owned.policy.protocols, owned.policy.secure,
+            owned.policy.secure));
 }
 
 pub fun make(
@@ -367,19 +567,35 @@ pub fun make(
     active_plan: *plan.Plan,
     configured: Config,
     limits: message.Limits,
-    listener_name: str,
+    owned: *listener.OwnedListener,
+    policy: usize,
     now: time.Time,
 ) bool {
     if (owner == nil || source == nil || net_driver == nil || active_plan == nil
-     || id == 0 || generation == 0) { ret false; }
+     || owned == nil || id == 0 || generation == 0) { ret false; }
+    # a TLS listener whose policy did not resolve must not fall back to
+    # cleartext, so the connection is refused before it is admitted
+    if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
+    owner.tls_policy = policy;
+    owner.session = secure.NO_SESSION;
+    owner.h2_session = h2.NO_SESSION;
+    owner.handshaking = false;
     owner.state = NEW;
     owner.id = id;
     owner.generation = generation;
     owner.token = token;
     owner.stream = source.tcp_stream;
-    owner.peer = source.peer;
-    owner.listener_name = listener_name;
+    owner.listener_name = schema.text(?owned.name);
     owner.driver = net_driver;
+    owner.engine_live = false;
+    owner.protocol = selection.NONE;
+    owner.refusal = prologue.REFUSED_NONE;
+    owner.prologue_len = 0;
+    owner.prologue_read = 0;
+    owner.prologue_pending = false;
+    owner.prologue_ended = false;
+    bind_policy(owner, owned, source);
+    record_observed(owner, source);
     owner.plan = active_plan;
     owner.configured = configured;
     owner.limits = limits;
@@ -402,6 +618,23 @@ pub fun make(
      || !cancel.make_child(?owner.engine_scope, ?owner.operation_root, false, time.Time{sec: 0, nsec: 0})) {
         ret false;
     }
+    # a peer that opens a connection and then says nothing must not hold a slot
+    # until something else notices. the prologue owns its own deadline because
+    # no protocol engine exists yet to apply one.
+    owner.prologue_scope_live = false;
+    val bounded: bool = configured.prologue_timeout_ns != 0;
+    var prologue_deadline: time.Time = now;
+    if (bounded) {
+        prologue_deadline.sec = now.sec + (configured.prologue_timeout_ns / 1000000000)::i64;
+        prologue_deadline.nsec = now.nsec + (configured.prologue_timeout_ns % 1000000000)::i64;
+        if (prologue_deadline.nsec >= 1000000000) {
+            prologue_deadline.nsec = prologue_deadline.nsec - 1000000000;
+            prologue_deadline.sec = prologue_deadline.sec + 1;
+        }
+    }
+    if (!cancel.make_child(?owner.prologue_scope, ?owner.operation_root, bounded,
+        prologue_deadline)) { ret false; }
+    owner.prologue_scope_live = true;
     owner.runtime_stream = transport.RuntimeStream{
         runtime: net_driver.runtime,
         context: (owner)::ptr,
@@ -414,8 +647,6 @@ pub fun make(
         ret false;
     }
     owner.channel.initialized = false;
-    if (!transport.init(?owner.channel, owner.adapter, ?owner.operation_root,
-        ?owner.control_scope, ?owner.channel_slots[0], TRANSPORT_SLOTS)) { ret false; }
     var i: usize = 0;
     for (i < PIPELINE_DEPTH) {
         owner.engine_memories[i] = connection.SlotMemory{
@@ -433,14 +664,225 @@ pub fun make(
         i = i + 1;
     }
     owner.engine.initialized = false;
-    if (!connection.init(?owner.engine, connection.SERVER, ?owner.channel, ?owner.engine_scope,
-        ?owner.engine_slots[0], ?owner.engine_memories[0], PIPELINE_DEPTH,
-        ?owner.read_buffer[0], READ_BYTES, ?owner.write_buffer[0], WRITE_BYTES,
-        configured.engine, now)) { ret false; }
     if (!call.make_memory(?owner.memory, ?owner.arena[0], ARENA_BYTES)) { ret false; }
-    owner.state = ACTIVE;
+    # the engine is not started here: which engine to start is what the prologue
+    # decides, and starting one first would mean guessing
     owner.initialized = true;
     ret true;
+}
+
+fun release_prologue_scope(owner: *Connection) {
+    if (!owner.prologue_scope_live) { ret; }
+    cancel.destroy(?owner.prologue_scope);
+    owner.prologue_scope_live = false;
+}
+
+fun refuse(owner: *Connection, reason: prologue.Refusal) Step {
+    owner.refusal = reason;
+    owner.state = FAILED;
+    ret STEP_ERROR;
+}
+
+fun start_engine(owner: *Connection, now: time.Time) Step {
+    var adapter: transport.Adapter = owner.adapter;
+    if (owner.session != secure.NO_SESSION) { adapter = secure.adapter(owner.session); }
+    if (!transport.adapter_valid(?adapter)) {
+        ret refuse(owner, prologue.REFUSED_TRANSPORT);
+    }
+    owner.channel.initialized = false;
+    if (!transport.init(?owner.channel, adapter, ?owner.operation_root,
+        ?owner.control_scope, ?owner.channel_slots[0], TRANSPORT_SLOTS)) {
+        ret refuse(owner, prologue.REFUSED_TRANSPORT);
+    }
+    if (owner.protocol == selection.HTTP1) {
+        owner.engine.initialized = false;
+        if (!connection.init(?owner.engine, connection.SERVER, ?owner.channel,
+            ?owner.engine_scope, ?owner.engine_slots[0], ?owner.engine_memories[0],
+            PIPELINE_DEPTH, ?owner.read_buffer[0], READ_BYTES,
+            ?owner.write_buffer[0], WRITE_BYTES, owner.configured.engine, now)) {
+            ret refuse(owner, prologue.REFUSED_UNBOUND);
+        }
+        owner.engine_live = true;
+        owner.state = ACTIVE;
+        release_prologue_scope(owner);
+        ret STEP_PROGRESS;
+    }
+    if (owner.protocol == selection.HTTP2) {
+        owner.h2_session = h2.acquire();
+        if (owner.h2_session == h2.NO_SESSION) {
+            ret refuse(owner, prologue.REFUSED_EXHAUSTED);
+        }
+        if (!h2.begin(owner.h2_session, ?owner.channel, ?owner.engine_scope,
+            owner.plan, owner.limits, owner.listener_name, owner.secure,
+            endpoint_metadata(owner.peer_kind, ?owner.peer_text[0], owner.peer_len,
+                owner.peer_port),
+            endpoint_metadata(owner.local_kind, ?owner.local_text[0],
+                owner.local_len, owner.local_port),
+            owner.configured.request_timeout_ns)) {
+            ret refuse(owner, prologue.REFUSED_UNBOUND);
+        }
+        owner.engine_live = true;
+        owner.state = ACTIVE;
+        release_prologue_scope(owner);
+        ret STEP_PROGRESS;
+    }
+    ret refuse(owner, prologue.REFUSED_UNBOUND);
+}
+
+fun from_h2(progress: h2.Step) Step {
+    if (progress == h2.STEP_PROGRESS) { ret STEP_PROGRESS; }
+    if (progress == h2.STEP_BLOCKED) { ret STEP_BLOCKED; }
+    if (progress == h2.STEP_DONE) { ret STEP_DONE; }
+    if (progress == h2.STEP_ERROR) { ret STEP_ERROR; }
+    ret STEP_IDLE;
+}
+
+# the bytes the prologue read past the PROXY header are TLS records, and the
+# record layer must see them before the socket is read again
+fun staged_bytes(context: ptr, buffer: *u8, length: usize) usize {
+    val owner: *Connection = context::*Connection;
+    if (owner == nil || buffer == nil || length == 0) { ret 0; }
+    var count: usize = owner.prologue_len - owner.prologue_read;
+    if (count == 0) { ret 0; }
+    if (count > length) { count = length; }
+    var i: usize = 0;
+    for (i < count) {
+        buffer[i] = owner.prologue_buffer[owner.prologue_read + i];
+        i = i + 1;
+    }
+    owner.prologue_read = owner.prologue_read + count;
+    ret count;
+}
+
+fun settle_secure(context: ptr, token_context: usize,
+    completion: io_runtime.Completion) {
+    val owner: *Connection = context::*Connection;
+    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) {
+        ret;
+    }
+    var settled: io_runtime.Completion = completion;
+    secure.accept(owner.session, ?settled);
+    advance(owner, time.now());
+}
+
+fun begin_secure(owner: *Connection, now: time.Time) Step {
+    owner.session = secure.acquire();
+    if (owner.session == secure.NO_SESSION) {
+        ret refuse(owner, prologue.REFUSED_EXHAUSTED);
+    }
+    val channel: *secure.Channel = secure.channel(owner.session);
+    if (channel == nil
+     || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
+        staged_bytes)
+     || !bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
+        settle_secure, 0)
+     || !secure.begin(owner.session, hedge_tls.policy_at(owner.tls_policy),
+        time.time_unix_sec(time.now()))) {
+        ret refuse(owner, prologue.REFUSED_TLS);
+    }
+    owner.handshaking = true;
+    ret STEP_BLOCKED;
+}
+
+# mach-tls chose the protocol from the listener's own ALPN list, and this checks
+# the answer back against listener policy rather than trusting it. a selection
+# that is not one this listener serves is a refusal, never a fallback.
+fun protocol_from_alpn(owner: *Connection, negotiated: contracts.Bytes) selection.Decision {
+    var offered: [1]view.View;
+    var count: usize = 0;
+    if (negotiated.len != 0 && negotiated.data != nil) {
+        offered[0] = view.view(negotiated.data, negotiated.len);
+        count = 1;
+    }
+    ret selection.select_alpn(owner.prologue_policy.selection, ?offered[0], count);
+}
+
+fun refuse_handshake(owner: *Connection) Step {
+    val failure: tls_error.Error = secure.handshake_error(owner.session);
+    if (failure == tls_error.UNRECOGNIZED_NAME) {
+        ret refuse(owner, prologue.REFUSED_UNKNOWN_NAME);
+    }
+    if (failure == tls_error.NO_APPLICATION_PROTOCOL) {
+        ret refuse(owner, prologue.REFUSED_ALPN);
+    }
+    ret refuse(owner, prologue.REFUSED_TLS);
+}
+
+fun advance_handshake(owner: *Connection, now: time.Time) Step {
+    secure.drive(owner.session, true);
+    if (!secure.handshake_settled(owner.session)) { ret STEP_BLOCKED; }
+    owner.handshaking = false;
+    if (!secure.open(owner.session)) { ret refuse_handshake(owner); }
+    val negotiated: tls_engine.Snapshot = secure.negotiated(owner.session);
+    val chosen: selection.Decision = protocol_from_alpn(owner, negotiated.selected_alpn);
+    if (chosen.outcome != selection.SELECTED) {
+        ret refuse(owner, prologue.REFUSED_ALPN);
+    }
+    owner.protocol = chosen.protocol;
+    ret start_engine(owner, now);
+}
+
+fun submit_prologue_read(owner: *Connection) Step {
+    if (owner.prologue_len >= PROLOGUE_BYTES) {
+        ret refuse(owner, prologue.REFUSED_OVERFLOW);
+    }
+    if (!bind_operation(?owner.prologue_operation, ?owner.prologue_context,
+        (owner)::ptr, settle_prologue, 0)) {
+        ret refuse(owner, prologue.REFUSED_TRANSPORT);
+    }
+    val submitted: Result[io_runtime.Token, io_error.Error] = net_async.submit_read(
+        owner.driver, ?owner.prologue_scope, ?owner.stream,
+        ?owner.prologue_buffer[owner.prologue_len],
+        PROLOGUE_BYTES - owner.prologue_len,
+        (?owner.prologue_context)::usize);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) {
+        ret refuse(owner, prologue.REFUSED_TRANSPORT);
+    }
+    owner.prologue_pending = true;
+    ret STEP_BLOCKED;
+}
+
+# read the prefix until policy can decide what this connection is
+fun advance_prologue(owner: *Connection, now: time.Time) Step {
+    if (owner.prologue_pending) { ret STEP_BLOCKED; }
+    val decided: prologue.Result = prologue.evaluate(owner.prologue_policy,
+        ?owner.prologue_buffer[0], owner.prologue_len, owner.prologue_ended,
+        ?owner.proxy_scratch[0], PROXY_SCRATCH_BYTES);
+    if (decided.outcome == prologue.REFUSE) {
+        # a refused connection still records who was refused, when the header
+        # that named them was itself trustworthy
+        if (decided.has_peer) { record_decoded(owner, decided); }
+        ret refuse(owner, decided.refusal);
+    }
+    if (decided.outcome == prologue.NEED_MORE) { ret submit_prologue_read(owner); }
+    if (decided.has_peer) { record_decoded(owner, decided); }
+    owner.prologue_read = decided.consumed;
+    # a TLS listener has decided nothing yet: its handshake names the protocol
+    if (owner.prologue_policy.secure) { ret begin_secure(owner, now); }
+    owner.protocol = decided.protocol;
+    ret start_engine(owner, now);
+}
+
+fun settle_prologue(context: ptr, token_context: usize,
+    completion: io_runtime.Completion) {
+    val owner: *Connection = context::*Connection;
+    if (owner == nil || !owner.initialized || !owner.prologue_pending) { ret; }
+    owner.prologue_pending = false;
+    if (completion.has_error) {
+        val reason: cancel.Reason = cancel.reason(?owner.prologue_scope);
+        if (reason == cancel.TIMED_OUT) { refuse(owner, prologue.REFUSED_TIMEOUT); }
+        or { refuse(owner, prologue.REFUSED_TRANSPORT); }
+        ret;
+    }
+    if (owner.prologue_len + completion.bytes > PROLOGUE_BYTES) {
+        refuse(owner, prologue.REFUSED_OVERFLOW);
+        ret;
+    }
+    owner.prologue_len = owner.prologue_len + completion.bytes;
+    if (completion.end_of_stream || completion.bytes == 0) {
+        owner.prologue_ended = true;
+    }
+    advance(owner, time.now());
 }
 
 # --- request body: engine-held bytes surfaced through the exchange contract ---
@@ -548,13 +990,14 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
         ?owner.request_scope,
     );
     if (!owner.request_body.reader.valid) { ret SETUP_BODY; }
-    val peer_length: usize = format_endpoint(owner.peer, ?owner.peer_text[0], PEER_BYTES);
     val metadata: message.Metadata = message.Metadata{
         version: parsed.version,
-        secure: false,
+        secure: owner.secure,
         early_data: false,
-        peer: endpoint_metadata(?owner.peer_text[0], peer_length, owner.peer.port),
-        local: message.unspecified_endpoint(),
+        peer: endpoint_metadata(owner.peer_kind, ?owner.peer_text[0], owner.peer_len,
+            owner.peer_port),
+        local: endpoint_metadata(owner.local_kind, ?owner.local_text[0],
+            owner.local_len, owner.local_port),
         received_at: now,
         has_deadline: has_deadline,
         deadline: deadline,
@@ -764,7 +1207,9 @@ fun pump_response(owner: *Connection, now: time.Time) Step {
 }
 
 fun runnable(owner: *Connection) bool {
-    if (owner == nil || !owner.initialized || owner.state != ACTIVE) { ret false; }
+    if (owner == nil || !owner.initialized || !owner.engine_live
+     || owner.state != ACTIVE) { ret false; }
+    if (owner.h2_session != h2.NO_SESSION) { ret true; }
     ret owner.engine.state != connection.CLOSED && owner.engine.state != connection.FAILED;
 }
 
@@ -856,7 +1301,46 @@ fun pump_inbound(owner: *Connection, now: time.Time) Step {
 # one step: response work first, then whatever the protocol has next
 pub fun step(owner: *Connection, now: time.Time) Step {
     if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
+    if (owner.state == NEW) {
+        var opened: Step = STEP_BLOCKED;
+        if (owner.handshaking) { opened = advance_handshake(owner, now); }
+        or { opened = advance_prologue(owner, now); }
+        owner.last_step = opened;
+        ret opened;
+    }
+    # a secure connection's transport work is driven by this loop rather than by
+    # the engine, because exactly one TLS operation may run at a time
+    if (owner.session != secure.NO_SESSION && owner.engine_live) {
+        var settled: transport.Completion;
+        if (secure.take(owner.session, ?settled)) {
+            if (owner.h2_session != h2.NO_SESSION) {
+                val stepped: Step = from_h2(h2.complete_io(owner.h2_session,
+                    ?settled, now));
+                if (stepped == STEP_DONE || stepped == STEP_ERROR) {
+                    owner.state = CLOSING;
+                }
+            } or {
+                val event: connection.Event = connection.complete_io(?owner.engine,
+                    ?settled, now);
+                if (runnable(owner)) { apply(owner, event, now); }
+            }
+            secure.drive(owner.session, false);
+            owner.last_step = STEP_PROGRESS;
+            ret STEP_PROGRESS;
+        }
+    }
     if (owner.state != ACTIVE) { ret STEP_DONE; }
+    if (owner.h2_session != h2.NO_SESSION) {
+        val stepped: Step = from_h2(h2.step(owner.h2_session, now));
+        # whatever the engine queued in this step has to start now. leaving it
+        # for the next completion strands the last frame of a response behind a
+        # read the peer will never satisfy, because the peer is waiting for it.
+        if (owner.session != secure.NO_SESSION) { secure.drive(owner.session, false); }
+        owner.last_step = stepped;
+        if (stepped == STEP_DONE || stepped == STEP_ERROR) { owner.state = CLOSING; }
+        ret stepped;
+    }
+    if (owner.session != secure.NO_SESSION) { secure.drive(owner.session, false); }
     if (owner.engine.state == connection.CLOSED || owner.engine.state == connection.FAILED) {
         owner.state = CLOSING;
         ret STEP_DONE;
@@ -900,16 +1384,30 @@ pub fun step(owner: *Connection, now: time.Time) Step {
 pub fun advance(owner: *Connection, now: time.Time) Step {
     if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
     var steps: usize = 0;
+    var settled: Step = STEP_BLOCKED;
     for (steps < MAX_STEPS) {
         val progress: Step = step(owner, now);
-        if (progress != STEP_PROGRESS) { ret progress; }
+        if (progress != STEP_PROGRESS) { settled = progress; brk; }
         steps = steps + 1;
     }
-    ret STEP_BLOCKED;
+    # the engines have nothing more to send, so a read may start without a
+    # response ever having to wait behind it
+    if (owner.session != secure.NO_SESSION && owner.engine_live
+     && owner.state == ACTIVE && secure.drive(owner.session, true)) {
+        ret STEP_PROGRESS;
+    }
+    ret settled;
 }
 
 pub fun begin_graceful(owner: *Connection) bool {
     if (owner == nil || !owner.initialized) { ret false; }
+    # a connection still in its prologue has no engine to signal, so it is
+    # simply not admitted any further
+    if (!owner.engine_live) {
+        owner.state = CLOSING;
+        ret true;
+    }
+    if (owner.h2_session != h2.NO_SESSION) { ret h2.begin_graceful(owner.h2_session); }
     ret connection.begin_graceful(?owner.engine);
 }
 
@@ -923,7 +1421,20 @@ pub fun close(owner: *Connection) bool {
         call.release(?owner.active_call);
         owner.exchange_live = false;
     }
-    connection.cancel_connection(?owner.engine);
+    if (owner.h2_session != h2.NO_SESSION) {
+        owner.requests = h2.requests(owner.h2_session);
+        h2.release(owner.h2_session);
+        owner.h2_session = h2.NO_SESSION;
+    } or (owner.engine_live) {
+        connection.cancel_connection(?owner.engine);
+    }
+    owner.engine_live = false;
+    if (owner.session != secure.NO_SESSION) {
+        secure.release(owner.session);
+        owner.session = secure.NO_SESSION;
+    }
+    owner.handshaking = false;
+    release_prologue_scope(owner);
     if (owner.request_scope_live) {
         cancel.destroy(?owner.request_scope);
         owner.request_scope_live = false;
@@ -940,6 +1451,10 @@ pub fun close(owner: *Connection) bool {
 # the operational view of one connection, for tests and telemetry alike
 pub rec Snapshot {
     state: State;
+    protocol: selection.Protocol;
+    refusal: prologue.Refusal;
+    secure: bool;
+    forwarded_peer: bool;
     engine_state: connection.State;
     engine_error: connection.Error;
     last_event: connection.EventKind;
@@ -956,13 +1471,19 @@ pub rec Snapshot {
 
 pub fun snapshot(owner: *Connection) Snapshot {
     if (owner == nil) {
-        ret Snapshot{state: CLOSED, engine_state: 0, engine_error: 0,
+        ret Snapshot{state: CLOSED, protocol: selection.NONE,
+            refusal: prologue.REFUSED_NONE, secure: false, forwarded_peer: false,
+            engine_state: 0, engine_error: 0,
             last_event: connection.EVENT_NONE, last_step: STEP_IDLE, setup_failure: SETUP_OK, request_failure: 0, body_chunks: 0, requests: 0,
             exchange_live: false, response_started: false, service_pending: false,
             response_status: 0};
     }
     ret Snapshot{
         state: owner.state,
+        protocol: owner.protocol,
+        refusal: owner.refusal,
+        secure: owner.secure,
+        forwarded_peer: owner.peer_kind == message.ENDPOINT_FORWARDED,
         engine_state: owner.engine.state,
         engine_error: owner.engine.error,
         last_event: owner.last_event,
