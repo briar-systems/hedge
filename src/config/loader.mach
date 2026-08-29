@@ -577,6 +577,48 @@ fun parse_cache(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver,
     graph.cache.heuristic_percent = optional_u64(section, "heuristic_percent", graph.cache.heuristic_percent, true, diagnostics, source);
 }
 
+fun parse_challenge(value: str, diagnostics: *schema.Diagnostics, source: str) u8 {
+    if (value == nil) { ret schema.CHALLENGE_HTTP_01; }
+    if (str_equals(value, "http-01")) { ret schema.CHALLENGE_HTTP_01; }
+    if (str_equals(value, "dns-01")) { ret schema.CHALLENGE_DNS_01; }
+    if (str_equals(value, "tls-alpn-01")) { ret schema.CHALLENGE_TLS_ALPN_01; }
+    diagnose(diagnostics, schema.INVALID_VALUE, source, "acme.challenge", "challenge must be http-01, dns-01, or tls-alpn-01");
+    ret 0;
+}
+
+fun parse_acme(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var allowed: [8]str = [8]str{"enabled", "directory", "contact", "storage", "origin", "terms_agreed", "challenge", "names"};
+    validate_fields(section, diagnostics, source, ?allowed[0], 8);
+    graph.acme.enabled = optional_bool(section, "enabled", true, diagnostics, source);
+    resolve_text(?graph.acme.directory, optional_string(section, "directory", diagnostics, source), resolver, diagnostics, source, "acme.directory");
+    resolve_text(?graph.acme.contact, optional_string(section, "contact", diagnostics, source), resolver, diagnostics, source, "acme.contact");
+    resolve_text(?graph.acme.storage, optional_string(section, "storage", diagnostics, source), resolver, diagnostics, source, "acme.storage");
+    resolve_text(?graph.acme.origin, optional_string(section, "origin", diagnostics, source), resolver, diagnostics, source, "acme.origin");
+    graph.acme.terms_agreed = optional_bool(section, "terms_agreed", false, diagnostics, source);
+    graph.acme.challenge = parse_challenge(optional_string(section, "challenge", diagnostics, source), diagnostics, source);
+    graph.acme.name_count = 0;
+    val names: *toml.Value = value(section, "names");
+    if (names == nil) { ret; }
+    if (names.tag != toml.TYPE_ARRAY || toml.array_len(?names.data.array) == 0) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "acme.names", "acme names must be a non-empty string array");
+        ret;
+    }
+    var i: usize = 0;
+    for (i < toml.array_len(?names.data.array)) {
+        val entry: *toml.Value = toml.array_get(?names.data.array, i);
+        if (graph.acme.name_count >= schema.MAX_ACME_NAMES) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "acme.names", "acme name count exceeds the configured bound");
+        } or (entry == nil || entry.tag != toml.TYPE_STRING) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "acme.names", "acme name entries must be strings");
+        } or {
+            resolve_text(?graph.acme.names[graph.acme.name_count], entry.data.string, resolver, diagnostics, source, "acme.names");
+            graph.acme.name_count = graph.acme.name_count + 1;
+        }
+        i = i + 1;
+    }
+}
+
 fun parse_admin(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
     if (section == nil) { ret; }
     var allowed: [4]str = [4]str{"enabled", "listener", "auth_secret", "max_response_bytes"};
@@ -592,7 +634,7 @@ fun parse_table(graph: *schema.Graph, table: *toml.Table, resolver: *Resolver, d
     for (i < toml.table_len(table)) {
         val key: str = toml.table_key(table, i);
         if (!key_allowed(key, "include", "server", "listener", "tls", "host", "route", "routes", "service")
-            && !key_allowed(key, "budget", "secret", "telemetry", "admin", "cache", "", "", "")) {
+            && !key_allowed(key, "budget", "secret", "telemetry", "admin", "cache", "acme", "", "")) {
             diagnose(diagnostics, schema.UNKNOWN_FIELD, source, key, "unknown top-level configuration field");
         }
         i = i + 1;
@@ -609,6 +651,7 @@ fun parse_table(graph: *schema.Graph, table: *toml.Table, resolver: *Resolver, d
     parse_telemetry(graph, optional_table(table, "telemetry", diagnostics, source), resolver, diagnostics, source);
     parse_cache(graph, optional_table(table, "cache", diagnostics, source), resolver, diagnostics, source);
     parse_admin(graph, optional_table(table, "admin", diagnostics, source), resolver, diagnostics, source);
+    parse_acme(graph, optional_table(table, "acme", diagnostics, source), resolver, diagnostics, source);
 }
 
 fun stack_contains(workspace: *Workspace, name: str) bool {
@@ -764,8 +807,77 @@ fun duplicate_names(graph: *schema.Graph, diagnostics: *schema.Diagnostics) {
     }
 }
 
+# the native service kind is a family, and its target names the member. an
+# acme deployment needs the challenge responder specifically, so that is what
+# is checked rather than "some native service exists".
+fun has_challenge_service(graph: *schema.Graph) bool {
+    var i: usize = 0;
+    for (i < graph.service_count) {
+        if (graph.services[i].kind == schema.SERVICE_NATIVE
+         && schema.text_equals(?graph.services[i].target, schema.NATIVE_ACME_CHALLENGE)) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun starts_with(value: *schema.Text, prefix: str) bool {
+    var i: usize = 0;
+    for (prefix[i] != 0) {
+        if (i >= value.len || value.data[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a certificate hedge cannot obtain is a certificate hedge does not have, so
+# every reason it could not is refused here rather than discovered on the
+# first renewal
+fun validate_acme(graph: *schema.Graph, diagnostics: *schema.Diagnostics) {
+    if (!graph.acme.enabled) {
+        if (graph.features.acme) {
+            diagnose(diagnostics, schema.CONFLICT, "validation", "acme", "acme is enabled as a feature but no acme section is configured");
+        }
+        ret;
+    }
+    if (!graph.features.acme) {
+        diagnose(diagnostics, schema.UNSUPPORTED, "validation", "acme", "acme requires server.features.acme");
+    }
+    if (graph.acme.directory.len == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.directory", "acme requires a directory url");
+    } or (!starts_with(?graph.acme.directory, "https://")) {
+        # rfc 8555 section 6.1: every acme url is https. an authority named
+        # any other way is refused rather than reached.
+        diagnose(diagnostics, schema.INVALID_VALUE, "validation", "acme.directory", "acme directory url must be https");
+    }
+    if (graph.acme.storage.len == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.storage", "acme requires a storage directory");
+    }
+    if (graph.acme.name_count == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.names", "acme requires at least one name");
+    }
+    var i: usize = 0;
+    for (i < graph.acme.name_count) {
+        if (graph.acme.names[i].len == 0) {
+            diagnose(diagnostics, schema.INVALID_VALUE, "validation", "acme.names", "an acme name is empty");
+        }
+        i = i + 1;
+    }
+    if (graph.acme.challenge == schema.CHALLENGE_HTTP_01 && !has_challenge_service(graph)) {
+        diagnose(diagnostics, schema.UNREACHABLE, "validation", "acme.challenge", "http-01 requires a native acme-challenge service route to answer the challenge");
+    }
+    if (graph.acme.challenge == schema.CHALLENGE_DNS_01) {
+        diagnose(diagnostics, schema.UNSUPPORTED, "validation", "acme.challenge", "dns-01 requires a configured record publisher, which this build does not provide");
+    }
+    if (graph.acme.challenge == schema.CHALLENGE_TLS_ALPN_01) {
+        diagnose(diagnostics, schema.UNSUPPORTED, "validation", "acme.challenge", "tls-alpn-01 requires a tls listener, which this build does not provide");
+    }
+}
+
 pub fun validate(graph: *schema.Graph, capabilities: Capabilities, diagnostics: *schema.Diagnostics) bool {
     duplicate_names(graph, diagnostics);
+    validate_acme(graph, diagnostics);
     if (graph.server_name.len == 0) {
         diagnose(diagnostics, schema.MISSING_FIELD, "validation", "server.name", "server name is required");
     }
@@ -1115,5 +1227,77 @@ test "config loader: telemetry dimensions are finite and nonzero when enabled" {
         i = i + 1;
     }
     if (!saw_resource_limit) { ret 2; }
+    ret 0;
+}
+
+fun acme_source(extra: str) str {
+    ret extra;
+}
+
+fun saw_code(diagnostics: *schema.Diagnostics, code: schema.DiagnosticCode) bool {
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == code) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+val ACME_VALID: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/.well-known/acme-challenge/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/var/lib/hedge/acme\"\ncontact = \"mailto:ops@example.com\"\nterms_agreed = true\nchallenge = \"http-01\"\nnames = [\"site.example\", \"www.site.example\"]\n";
+
+test "config loader: an acme section is parsed and bounded" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (!build(?graph, ?diagnostics, ?a, "hedge.toml", ACME_VALID, nil, capabilities)) { ret 1; }
+    if (!graph.acme.enabled || !graph.features.acme) { ret 2; }
+    if (!schema.text_equals(?graph.acme.directory, "https://acme.example/dir")) { ret 3; }
+    if (!schema.text_equals(?graph.acme.storage, "/var/lib/hedge/acme")) { ret 4; }
+    if (graph.acme.challenge != schema.CHALLENGE_HTTP_01) { ret 5; }
+    if (!graph.acme.terms_agreed) { ret 6; }
+    if (graph.acme.name_count != 2
+     || !schema.text_equals(?graph.acme.names[0], "site.example")
+     || !schema.text_equals(?graph.acme.names[1], "www.site.example")) { ret 7; }
+    if (graph.acme.renew_before_seconds != 2592000) { ret 8; }
+    ret 0;
+}
+
+test "config loader: acme that cannot obtain a certificate fails to load" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    # a cleartext directory is refused: rfc 8555 urls are https
+    val cleartext: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"http://acme.example/dir\"\nstorage = \"/tmp/acme\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", cleartext, nil, capabilities)) { ret 1; }
+    if (!saw_code(?diagnostics, schema.INVALID_VALUE)) { ret 2; }
+
+    # http-01 with nothing configured to answer it is unreachable
+    val unanswerable: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"all\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/tmp/acme\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", unanswerable, nil, capabilities)) { ret 3; }
+    if (!saw_code(?diagnostics, schema.UNREACHABLE)) { ret 4; }
+
+    # a challenge type this build cannot answer is refused before listeners
+    val unsupported: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/tmp/acme\"\nchallenge = \"dns-01\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", unsupported, nil, capabilities)) { ret 5; }
+    if (!saw_code(?diagnostics, schema.UNSUPPORTED)) { ret 6; }
+
+    # the feature flag and the section must agree in both directions
+    val featureless: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/tmp/acme\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", featureless, nil, capabilities)) { ret 7; }
+    if (!saw_code(?diagnostics, schema.UNSUPPORTED)) { ret 8; }
+
+    # an enabled feature with no section is a configuration that silently
+    # renews nothing
+    val sectionless: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"all\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", sectionless, nil, capabilities)) { ret 9; }
+    if (!saw_code(?diagnostics, schema.CONFLICT)) { ret 10; }
     ret 0;
 }
