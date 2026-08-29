@@ -36,6 +36,7 @@ use hedge.dispatch;
 use call: hedge.dispatch.call;
 use plan: hedge.dispatch.plan;
 use telemetry_trace: hedge.telemetry.trace;
+use std.print;
 
 # this build's concurrent HTTP/2 connection bound
 pub val MAX_SESSIONS: usize = 16;
@@ -253,6 +254,15 @@ pub fun release(index: usize) bool {
     val session: *Session = ?sessions[index];
     var j: usize = 0;
     for (j < MAX_STREAMS) { retire_slot(session, ?session.slots[j]); j = j + 1; }
+    # mach-http has no destroy for an HTTP/2 engine, and every one of its
+    # sub-initialisers refuses to run twice. a pooled session therefore has to
+    # clear those flags itself or the slot is usable exactly once.
+    # briar-systems/mach-http: `http.h2.connection` needs a `destroy`.
+    session.engine.initialized = false;
+    session.engine.inbound_table.valid = false;
+    session.engine.outbound_table.valid = false;
+    session.engine.parser.initialized = false;
+    session.engine.writer.initialized = false;
     session.engine_started = false;
     session.state = CLOSED;
     session.live = false;
@@ -368,6 +378,10 @@ fun body_read(context: ptr, output: *u8, capacity: usize,
     if (session.held_stream == slot.id && session.held_length != 0) {
         var count: usize = session.held_length;
         if (count > capacity) { count = capacity; }
+        # a zero-capacity read is the completion signalling that bytes are
+        # ready, not a consumption. the engine rejects a zero-byte consume, and
+        # calling one here would fail the body rather than hand it over.
+        if (count == 0) { ret body.data(0); }
         var i: usize = 0;
         for (i < count) { output[i] = session.held_data[i]; i = i + 1; }
         if (!engine_h2.consume_data(?session.engine, slot.id, count)) {
@@ -409,6 +423,9 @@ fun body_finish(context: ptr, mode: body.Mode,
     ret body.pending(state.pending_token);
 }
 
+# a completion resolves whichever operation was outstanding, and a finish must
+# resolve to a terminal status carrying no bytes. resolving one as the other is
+# what makes an unread request body hang instead of draining.
 fun body_complete(context: ptr, token: u64,
     trailers: *field.Fields) body.Progress {
     val state: *Body = context::*Body;
@@ -416,10 +433,26 @@ fun body_complete(context: ptr, token: u64,
      || token != state.pending_token) {
         ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
     }
+    val kind: body.Operation = state.reader.pending_kind;
+    val mode: body.Mode = state.reader.pending_mode;
     state.pending_token = 0;
     val session: *Session = ?sessions[state.session];
-    if (session.slots[state.slot].inbound_complete
-     && session.held_stream != session.slots[state.slot].id) {
+    val slot: *Slot = ?session.slots[state.slot];
+    if (kind == body.OP_FINISH) {
+        if (session.held_stream == slot.id && session.held_length != 0) {
+            engine_h2.consume_data(?session.engine, slot.id, session.held_length);
+            session.held_length = 0;
+            session.held_stream = engine_h2.NO_STREAM;
+        }
+        if (!slot.inbound_complete) {
+            state.next_token = state.next_token + 1;
+            state.pending_token = state.next_token;
+            ret body.pending(state.pending_token);
+        }
+        if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    if (slot.inbound_complete && session.held_stream != slot.id) {
         ret body.complete(body.REUSE_ALLOWED);
     }
     ret body_read(context, nil, 0, trailers);
@@ -669,8 +702,11 @@ fun advance_response(index: usize, slot: *Slot) Step {
     # offered, so a response with more to send has to say so again. without this
     # the scheduler never picks the stream a second time and the response stops
     # after its first frame.
-    engine_h2.set_writable(?session.engine, slot.id, true);
-    if (engine_h2.writable_stream(?session.engine) != slot.id) { ret STEP_BLOCKED; }
+    val armed: bool = engine_h2.set_writable(?session.engine, slot.id, true);
+    if (engine_h2.writable_stream(?session.engine) != slot.id) {
+        if (!armed) { print.eprintln("h2 not-armed"); } or { print.eprintln("h2 not-sched"); }
+        ret STEP_BLOCKED;
+    }
     if (slot.stage_offset >= slot.stage_length) {
         slot.stage_offset = 0;
         slot.stage_length = 0;
@@ -679,9 +715,9 @@ fun advance_response(index: usize, slot: *Slot) Step {
                 val progress: body.Progress = body.read(slot.response.body_reader,
                     ?slot.stage[0], STAGE_BYTES);
                 if (progress.status == body.DATA) { slot.stage_length = progress.count; }
-                or (progress.status == body.PENDING) { ret STEP_BLOCKED; }
+                or (progress.status == body.PENDING) { print.eprintln("h2 body-pending"); ret STEP_BLOCKED; }
                 or (progress.status == body.COMPLETE) { slot.body_done = true; }
-                or { ret STEP_ERROR; }
+                or { print.eprintln("h2 body-error"); ret STEP_ERROR; }
             } or {
                 slot.body_done = true;
             }
@@ -818,11 +854,22 @@ fun apply(index: usize, event: engine_h2.Event, now: time.Time) Step {
         session.held_data = event.data;
         session.held_length = event.data_length;
         val slot: *Slot = slot_for(session, event.stream_id);
-        if (slot != nil) {
-            if (event.end_stream) { slot.inbound_complete = true; }
-            if (slot.exchange_live && slot.body.pending_token != 0) {
-                body.complete_reader(slot.request.body, slot.body.pending_token);
-            }
+        if (slot != nil && event.end_stream) { slot.inbound_complete = true; }
+        # bytes nobody will read still owe the peer its flow-control window. a
+        # rejected body, a settled exchange and a stream we no longer hold all
+        # reach this: leaving the frame held would stall the whole connection,
+        # because the engine reads nothing more while it holds an event.
+        if (slot == nil || !slot.exchange_live
+         || body.reader_terminal_state(slot.request.body)) {
+            if (!engine_h2.consume_data(?session.engine, event.stream_id,
+                event.data_length)) { print.eprintln("h2 consume-refused"); }
+            or { print.eprintln("h2 consume-ok"); }
+            session.held_stream = engine_h2.NO_STREAM;
+            session.held_length = 0;
+            ret STEP_PROGRESS;
+        }
+        if (slot.body.pending_token != 0) {
+            body.complete_reader(slot.request.body, slot.body.pending_token);
         }
         ret STEP_PROGRESS;
     }
@@ -931,7 +978,9 @@ pub fun step(index: usize, now: time.Time) Step {
         session.last_step = STEP_PROGRESS;
         ret STEP_PROGRESS;
     }
-    val taken: Step = apply(index, engine_h2.process(?session.engine), now);
+    val next: engine_h2.Event = engine_h2.process(?session.engine);
+    if (next.kind == engine_h2.EVENT_NEED_READ) { print.eprintln("h2 need-read"); }
+    val taken: Step = apply(index, next, now);
     session.last_step = taken;
     ret taken;
 }
