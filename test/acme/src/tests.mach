@@ -44,6 +44,14 @@ use router: http.router.router;
 use challenge: hedge.acme.challenge;
 use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
+use protocol: hedge.protocol.credentials;
+use credentials: tls.cert.credentials;
+use tls_cert: tls.cert;
+use load: tls.cert.load;
+use crypto_keys: crypto.encoding.keys;
+use secret: crypto.secret;
+use contracts: crypto.contracts;
+use ct: std.crypto.ct;
 use issue: hedge.acme.issue;
 use keys: hedge.acme.keys;
 use session: hedge.acme.session;
@@ -935,6 +943,225 @@ test "live: dns-01 issues a certificate through a publisher" {
     }
     acme.installed(?deployment.manager, T.now());
     acme.close(?deployment.manager);
+    serve.stop(?server.runtime);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+# one installed credential: the chain and key copied out of the manager, in
+# the shape mach-tls serves and hedge's credential generation holds
+rec Installed {
+    der:          [16384]u8;
+    certificates: [8]tls_cert.Certificate;
+    chain:        tls_cert.Chain;
+    key:          keys.Key;
+    private:      crypto_keys.PrivateKey;
+    name:         [64]u8;
+    live:         bool;
+}
+
+fun install(target: *Installed, manager: *acme.Manager, name: view.View,
+    owner: *secret.Allocator) bool {
+    val count: usize = acme.chain_count(manager);
+    if (count == 0 || count > 8) { ret false; }
+    var at: usize = 0;
+    var i: usize = 0;
+    for (i < count) {
+        var entry: view.View;
+        if (!acme.chain_entry(manager, i, ?entry)) { ret false; }
+        if (at + entry.len > 16384) { ret false; }
+        var j: usize = 0;
+        for (j < entry.len) {
+            target.der[at + j] = entry.data[j];
+            j = j + 1;
+        }
+        target.certificates[i] = tls_cert.Certificate{der: ?target.der[at],
+            der_len: entry.len};
+        at = at + entry.len;
+        i = i + 1;
+    }
+    target.chain = tls_cert.Chain{certificates: ?target.certificates[0],
+        len: count};
+    if (!keys.adopt(?target.key, keys.material(
+        acme.certificate_key(manager)).data)) { ret false; }
+    var scratch: [keys.PKCS8_BYTES]^u8;
+    target.private = crypto_keys.empty_private();
+    val loaded: contracts.Error = load.private_der(
+        keys.private_der(?target.key, ?scratch[0]), tls_cert.PKCS8_DER, owner,
+        ?target.private);
+    ct.zeroize(?scratch[0], keys.PKCS8_BYTES);
+    if (loaded != contracts.OK) { ret false; }
+    i = 0;
+    for (i < name.len && i < 63) {
+        target.name[i] = name.data[i];
+        i = i + 1;
+    }
+    target.name[i] = 0;
+    target.live = true;
+    ret true;
+}
+
+fun installed_identity(target: *Installed) credentials.Identity {
+    ret protocol.identity((?target.name[0])::str, target.chain,
+        ?target.private);
+}
+
+test "live: a renewed certificate rotates without disturbing a live connection" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 262144))) { ret 1; }
+    val directory: str = "out/acme-rotation";
+    fs.remove_all(?a, directory::Path);
+    var owner: secret.Allocator = secret.system_allocator();
+
+    var client: Client;
+    val name_len: usize = unique_name(?client, "rotate");
+    var deployment: Deployment;
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    configure_acme(?deployment, directory, name_len);
+    if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.OK) {
+        ret 2;
+    }
+    var server: Server;
+    if (!boot(?server, acme.challenge_table(?deployment.manager))) {
+        acme.close(?deployment.manager);
+        ret 3;
+    }
+    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 4;
+    }
+    val served: view.View = acme.name(?deployment.manager, 0);
+    var first: Installed;
+    if (!install(?first, ?deployment.manager, served, ?owner)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 5;
+    }
+    acme.installed(?deployment.manager, T.now());
+
+    # a connection established on the first certificate holds its lease for
+    # its whole life
+    var identities: [1]credentials.Identity;
+    identities[0] = installed_identity(?first);
+    var generation: credentials.Generation = credentials.empty_generation();
+    var bindings: protocol.Bindings;
+    if (protocol.publish(?bindings, ?generation, ?identities[0], 1,
+        protocol.NO_DEFAULT, nil, false) != protocol.OK) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 6;
+    }
+    var established: protocol.Held;
+    if (protocol.acquire(?bindings, (?first.name[0])::str, ?established)
+        != protocol.OK) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 7;
+    }
+    val original: *u8 = established.lease.identity.chain.certificates.der;
+
+    # the certificate is renewed while that connection is still open
+    acme.close(?deployment.manager);
+    var renewing: Deployment;
+    i = 0;
+    for (i < name_len) {
+        renewing.name[i] = deployment.name[i];
+        i = i + 1;
+    }
+    configure_acme(?renewing, directory, name_len);
+    renewing.graph.acme.renew_before_seconds = 31536000;
+    if (acme.open(?renewing.manager, ?a, ?renewing.graph) != acme.OK) {
+        serve.stop(?server.runtime);
+        ret 8;
+    }
+    if (!handler.bind(?server.binding,
+        acme.challenge_table(?renewing.manager))) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 9;
+    }
+    if (!drive_manager(?server, ?renewing, acme.INSTALLING)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 10;
+    }
+    var second: Installed;
+    if (!install(?second, ?renewing.manager, served, ?owner)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 11;
+    }
+    var replacements: [1]credentials.Identity;
+    replacements[0] = installed_identity(?second);
+    var next: credentials.Generation = credentials.empty_generation();
+    if (credentials.initialize(?next, ?replacements[0], 1,
+        protocol.NO_DEFAULT, nil, false) != contracts.OK) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 12;
+    }
+    var retired: *credentials.Generation = nil;
+    if (protocol.rotate(?bindings, ?next, ?retired) != protocol.OK
+     || retired != ?generation) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 13;
+    }
+
+    # the established connection still holds the certificate it handshook on
+    if (established.lease.identity.chain.certificates.der != original) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 14;
+    }
+    if (original != ?first.der[0]) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 15;
+    }
+    # a connection that arrives after the rotation gets the renewed one
+    var arriving: protocol.Held;
+    if (protocol.acquire(?bindings, (?first.name[0])::str, ?arriving)
+        != protocol.OK) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 16;
+    }
+    if (arriving.lease.identity.chain.certificates.der != ?second.der[0]) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 17;
+    }
+    # and the old generation stays alive until its last lease is gone
+    if (protocol.reclaimable(?generation)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 18;
+    }
+    if (protocol.release(?established) != protocol.OK) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 19;
+    }
+    if (!protocol.reclaimable(?generation)) {
+        acme.close(?renewing.manager);
+        serve.stop(?server.runtime);
+        ret 20;
+    }
+    protocol.release(?arriving);
+    crypto_keys.destroy_private(?first.private);
+    crypto_keys.destroy_private(?second.private);
+    keys.destroy(?first.key);
+    keys.destroy(?second.key);
+    acme.installed(?renewing.manager, T.now());
+    acme.close(?renewing.manager);
     serve.stop(?server.runtime);
     fs.remove_all(?a, directory::Path);
     ret 0;
