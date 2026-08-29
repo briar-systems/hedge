@@ -127,6 +127,8 @@ pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Comp
 pub rec Config {
     engine: connection.Config;
     request_timeout_ns: u64;
+    # bounds the prologue and, on a TLS listener, the handshake behind it
+    prologue_timeout_ns: u64;
 }
 
 pub fun config_from(graph: *schema.Graph) Config {
@@ -146,7 +148,8 @@ pub fun config_from(graph: *schema.Graph) Config {
     if (engine.parser.max_trailer_bytes > STORAGE_BYTES) { engine.parser.max_trailer_bytes = STORAGE_BYTES; }
     if (engine.parser.max_trailers > TRAILER_SLOTS) { engine.parser.max_trailers = TRAILER_SLOTS; }
     if (engine.parser.max_chunk_line > LINE_BYTES) { engine.parser.max_chunk_line = LINE_BYTES; }
-    ret Config{engine: engine, request_timeout_ns: graph.timeouts.request_ms * 1000000};
+    ret Config{engine: engine, request_timeout_ns: graph.timeouts.request_ms * 1000000,
+        prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000};
 }
 
 # the exchange limits a service sees must admit everything the parser will accept,
@@ -261,6 +264,8 @@ pub rec Connection {
     prologue_ended: bool;
     prologue_operation: Operation;
     prologue_context: listener.ConnectionContext;
+    prologue_scope: cancel.Scope;
+    prologue_scope_live: bool;
     proxy_scratch: [PROXY_SCRATCH_BYTES]u8;
 }
 
@@ -584,6 +589,23 @@ pub fun make(
      || !cancel.make_child(?owner.engine_scope, ?owner.operation_root, false, time.Time{sec: 0, nsec: 0})) {
         ret false;
     }
+    # a peer that opens a connection and then says nothing must not hold a slot
+    # until something else notices. the prologue owns its own deadline because
+    # no protocol engine exists yet to apply one.
+    owner.prologue_scope_live = false;
+    val bounded: bool = configured.prologue_timeout_ns != 0;
+    var prologue_deadline: time.Time = now;
+    if (bounded) {
+        prologue_deadline.sec = now.sec + (configured.prologue_timeout_ns / 1000000000)::i64;
+        prologue_deadline.nsec = now.nsec + (configured.prologue_timeout_ns % 1000000000)::i64;
+        if (prologue_deadline.nsec >= 1000000000) {
+            prologue_deadline.nsec = prologue_deadline.nsec - 1000000000;
+            prologue_deadline.sec = prologue_deadline.sec + 1;
+        }
+    }
+    if (!cancel.make_child(?owner.prologue_scope, ?owner.operation_root, bounded,
+        prologue_deadline)) { ret false; }
+    owner.prologue_scope_live = true;
     owner.runtime_stream = transport.RuntimeStream{
         runtime: net_driver.runtime,
         context: (owner)::ptr,
@@ -622,6 +644,12 @@ pub fun make(
     ret true;
 }
 
+fun release_prologue_scope(owner: *Connection) {
+    if (!owner.prologue_scope_live) { ret; }
+    cancel.destroy(?owner.prologue_scope);
+    owner.prologue_scope_live = false;
+}
+
 fun refuse(owner: *Connection, reason: prologue.Refusal) Step {
     owner.refusal = reason;
     owner.state = FAILED;
@@ -639,6 +667,7 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
         }
         owner.engine_live = true;
         owner.state = ACTIVE;
+        release_prologue_scope(owner);
         ret STEP_PROGRESS;
     }
     ret refuse(owner, prologue.REFUSED_UNBOUND);
@@ -653,7 +682,7 @@ fun submit_prologue_read(owner: *Connection) Step {
         ret refuse(owner, prologue.REFUSED_TRANSPORT);
     }
     val submitted: Result[io_runtime.Token, io_error.Error] = net_async.submit_read(
-        owner.driver, ?owner.operation_root, ?owner.stream,
+        owner.driver, ?owner.prologue_scope, ?owner.stream,
         ?owner.prologue_buffer[owner.prologue_len],
         PROLOGUE_BYTES - owner.prologue_len,
         (?owner.prologue_context)::usize);
@@ -689,7 +718,9 @@ fun settle_prologue(context: ptr, token_context: usize,
     if (owner == nil || !owner.initialized || !owner.prologue_pending) { ret; }
     owner.prologue_pending = false;
     if (completion.has_error) {
-        refuse(owner, prologue.REFUSED_TRANSPORT);
+        val reason: cancel.Reason = cancel.reason(?owner.prologue_scope);
+        if (reason == cancel.TIMED_OUT) { refuse(owner, prologue.REFUSED_TIMEOUT); }
+        or { refuse(owner, prologue.REFUSED_TRANSPORT); }
         ret;
     }
     if (owner.prologue_len + completion.bytes > PROLOGUE_BYTES) {
@@ -1193,6 +1224,7 @@ pub fun close(owner: *Connection) bool {
     }
     if (owner.engine_live) { connection.cancel_connection(?owner.engine); }
     owner.engine_live = false;
+    release_prologue_scope(owner);
     if (owner.request_scope_live) {
         cancel.destroy(?owner.request_scope);
         owner.request_scope_live = false;

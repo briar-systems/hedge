@@ -1,0 +1,488 @@
+# protocol selection over real sockets: PROXY decoding, peer propagation, and
+# the refusals policy is supposed to produce
+#
+# the peer identity is asserted from the response body a service produced, not
+# from a connection snapshot. that is the only way to prove the decoded peer
+# actually reached request metadata rather than stopping at the decoder.
+
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.allocator;
+use std.net.ip;
+use std.net.tcp;
+use io_error: std.io.error;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.status;
+use http.router.router;
+use hedge.config.schema;
+use hedge.listener;
+use hedge.connection;
+use hedge.serve;
+use hedge.service;
+use call: hedge.dispatch.call;
+use plan: hedge.dispatch.plan;
+use middleware: hedge.dispatch.middleware;
+use prologue: hedge.protocol.prologue;
+use wire: hedgetest.wire;
+
+val MAX_ROUTES: usize = 8;
+val MAX_SEGMENTS: usize = 64;
+val MAX_SERVICES: usize = 8;
+val PLAN_TEXT: usize = 2048;
+val POOL: usize = 4;
+val RESPONSE_BYTES: usize = 4096;
+val IDENTITY_BYTES: usize = 256;
+
+# --- a native service that reports the identity the connection plane gave it ---
+
+fun write_text(output: *u8, at: usize, capacity: usize, value: str) usize {
+    var i: usize = 0;
+    for (value[i] != 0) {
+        if (at + i >= capacity) { ret capacity; }
+        output[at + i] = value[i];
+        i = i + 1;
+    }
+    ret at + i;
+}
+
+fun write_endpoint(output: *u8, at: usize, capacity: usize,
+    endpoint: message.Endpoint) usize {
+    var cursor: usize = at;
+    var i: usize = 0;
+    for (i < endpoint.address.len) {
+        if (cursor >= capacity) { ret capacity; }
+        output[cursor] = endpoint.address.data[i];
+        cursor = cursor + 1;
+        i = i + 1;
+    }
+    ret cursor;
+}
+
+fun write_number(output: *u8, at: usize, capacity: usize, value: usize) usize {
+    var digits: [24]u8;
+    var count: usize = 0;
+    var remaining: usize = value;
+    if (remaining == 0) { digits[0] = '0'; count = 1; }
+    for (remaining != 0) {
+        digits[count] = '0' + (remaining % 10)::u8;
+        remaining = remaining / 10;
+        count = count + 1;
+    }
+    if (at + count > capacity) { ret capacity; }
+    var i: usize = 0;
+    for (i < count) {
+        output[at + i] = digits[count - 1 - i];
+        i = i + 1;
+    }
+    ret at + count;
+}
+
+fun serve_identity(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    val request: *message.Request = call.request(active);
+    val response: *message.Response = call.response(active);
+    if (request == nil || response == nil) { ret exchange.SERVICE_FAILED; }
+    if (message.set_status(response, status.OK) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!service.add_field(active, field.CONTENT_TYPE, "text/plain")) {
+        ret exchange.SERVICE_FAILED;
+    }
+    val a: *allocator.Allocator = call.allocator_of(active);
+    if (a == nil) { ret exchange.SERVICE_FAILED; }
+    val allocated: Result[*u8, *u8] = allocator.allocate[u8](a, IDENTITY_BYTES);
+    if (is_err[*u8, *u8](allocated)) { ret exchange.SERVICE_FAILED; }
+    val output: *u8 = unwrap_ok[*u8, *u8](allocated);
+    var at: usize = 0;
+    at = write_text(output, at, IDENTITY_BYTES, "peer=");
+    at = write_endpoint(output, at, IDENTITY_BYTES, request.metadata.peer);
+    at = write_text(output, at, IDENTITY_BYTES, " kind=");
+    at = write_number(output, at, IDENTITY_BYTES, request.metadata.peer.kind::usize);
+    at = write_text(output, at, IDENTITY_BYTES, " port=");
+    at = write_number(output, at, IDENTITY_BYTES, request.metadata.peer.port::usize);
+    at = write_text(output, at, IDENTITY_BYTES, " local=");
+    at = write_endpoint(output, at, IDENTITY_BYTES, request.metadata.local);
+    at = write_text(output, at, IDENTITY_BYTES, " secure=");
+    if (request.metadata.secure) {
+        at = write_text(output, at, IDENTITY_BYTES, "1");
+    } or {
+        at = write_text(output, at, IDENTITY_BYTES, "0");
+    }
+    at = write_text(output, at, IDENTITY_BYTES, ";");
+    if (at >= IDENTITY_BYTES) { ret exchange.SERVICE_FAILED; }
+    ret service.respond_with_bytes(active, output, at);
+}
+
+fun build_identity(context: ptr, configured: *schema.Service,
+    handler: *service.Handler) bool {
+    @handler = service.Handler{ctx: nil, serve: serve_identity};
+    ret true;
+}
+
+# --- harness ---
+
+rec Harness {
+    graph: schema.Graph;
+    diagnostics: schema.Diagnostics;
+    routes: [MAX_ROUTES]router.CompiledRoute;
+    segments: [MAX_SEGMENTS]router.Segment;
+    specs: [MAX_ROUTES]router.Route;
+    entries: [MAX_ROUTES]plan.Entry;
+    services: [MAX_SERVICES]service.Descriptor;
+    middlewares: [4]middleware.Middleware;
+    text: [PLAN_TEXT]u8;
+    storage: plan.Storage;
+    plan: plan.Plan;
+    slots: [POOL]serve.Slot;
+    connections: [POOL]connection.Connection;
+    runtime: serve.Runtime;
+    applications: service.Applications;
+    application_slots: [4]service.Application;
+    resolver: service.Resolver;
+    endpoint: ip.Endpoint;
+}
+
+fun base_graph(graph: *schema.Graph, protocols: u8, proxy: u8) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "protocol-test");
+    graph.limits.max_connections = POOL;
+    graph.limits.max_connections_per_peer = POOL;
+    graph.listener_count = 1;
+    val configured: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?configured.name, "public");
+    schema.set_text(?configured.address, "127.0.0.1:0");
+    schema.clear_text(?configured.tls_policy);
+    schema.clear_text(?configured.budget);
+    configured.transport = schema.TRANSPORT_TCP;
+    configured.protocols = protocols;
+    configured.backlog = 16;
+    configured.accept_depth = 2;
+    configured.proxy_protocol = proxy;
+    configured.trusted_peer_count = 0;
+    graph.host_count = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    schema.set_text(?graph.hosts[0].listener, "public");
+    graph.hosts[0].server_name_count = 1;
+    schema.set_text(?graph.hosts[0].server_names[0], "localhost");
+    graph.service_count = 1;
+    val identity: *schema.Service = ?graph.services[0];
+    schema.set_text(?identity.name, "identity");
+    identity.kind = schema.SERVICE_NATIVE;
+    schema.set_text(?identity.target, "identity");
+    schema.clear_text(?identity.budget);
+    schema.clear_text(?identity.secret);
+    identity.status = 200;
+    schema.clear_text(?identity.content_type);
+    graph.route_count = 1;
+    val route: *schema.Route = ?graph.routes[0];
+    schema.set_text(?route.name, "root");
+    schema.set_text(?route.host, "site");
+    schema.set_text(?route.path, "/**");
+    schema.set_text(?route.service, "identity");
+    schema.clear_text(?route.budget);
+}
+
+fun trust_peer(graph: *schema.Graph, value: str) {
+    val configured: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?configured.trusted_peers[configured.trusted_peer_count], value);
+    configured.trusted_peer_count = configured.trusted_peer_count + 1;
+}
+
+fun compile(harness: *Harness, generation: u64) bool {
+    service.make_applications(?harness.applications, ?harness.application_slots[0], 4);
+    harness.resolver = service.no_resolver();
+    harness.resolver.applications = ?harness.applications;
+    harness.resolver.native = service.Factory{ctx: nil, build: build_identity};
+    if (!plan.make_storage(?harness.storage,
+        ?harness.routes[0], MAX_ROUTES,
+        ?harness.segments[0], MAX_SEGMENTS,
+        ?harness.specs[0], MAX_ROUTES,
+        ?harness.entries[0], MAX_ROUTES,
+        ?harness.services[0], MAX_SERVICES,
+        ?harness.middlewares[0], 4,
+        ?harness.text[0], PLAN_TEXT)) { ret false; }
+    ret plan.compile(?harness.plan, generation, ?harness.graph, harness.storage,
+        ?harness.resolver, nil).status == plan.PLAN_OK;
+}
+
+fun boot(harness: *Harness, generation: u64) bool {
+    if (!serve.make(?harness.runtime, ?harness.slots[0], ?harness.connections[0], POOL,
+        ?harness.plan, ?harness.graph)) { ret false; }
+    schema.reset_diagnostics(?harness.diagnostics);
+    if (!serve.start(?harness.runtime, generation, ?harness.graph, ?harness.diagnostics)) {
+        ret false;
+    }
+    val owned: *listener.OwnedListener = listener.active_listener(?harness.runtime.owner, 0);
+    if (owned == nil || !owned.has_bound_endpoint) { ret false; }
+    harness.endpoint = owned.bound_endpoint;
+    ret true;
+}
+
+fun start(harness: *Harness, generation: u64, protocols: u8, proxy: u8) bool {
+    ret compile(harness, generation) && boot(harness, generation);
+}
+
+fun send_bytes(client: *tcp.Stream, data: *u8, length: usize) bool {
+    val written: Result[usize, io_error.Error] = tcp.stream_write(client, data, length);
+    if (is_err[usize, io_error.Error](written)) { ret false; }
+    ret unwrap_ok[usize, io_error.Error](written) == length;
+}
+
+# the v2 binary form of `203.0.113.9:5000 -> 198.51.100.2:443`
+fun v2_header(output: *u8) usize {
+    val signature: [12]u8 = [12]u8{0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d,
+        0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a};
+    var i: usize = 0;
+    for (i < 12) { output[i] = signature[i]; i = i + 1; }
+    output[12] = 0x21;
+    output[13] = 0x11;
+    output[14] = 0x00;
+    output[15] = 12;
+    output[16] = 203; output[17] = 0; output[18] = 113; output[19] = 9;
+    output[20] = 198; output[21] = 51; output[22] = 100; output[23] = 2;
+    output[24] = 0x13; output[25] = 0x88;
+    output[26] = 0x01; output[27] = 0xbb;
+    ret 28;
+}
+
+val REQUEST: str = "GET /id HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+test "protocol: a cleartext listener reports the observed peer" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_OFF);
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_OFF)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, ";");
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
+        ret 4;
+    }
+    # kind 1 is ENDPOINT_IP: the address was observed, not asserted
+    if (!wire.contains(?response[0], length, "peer=127.0.0.1:")) { ret 5; }
+    if (!wire.contains(?response[0], length, " kind=1 ")) { ret 6; }
+    if (!wire.contains(?response[0], length, " local=127.0.0.1:")) { ret 7; }
+    if (!wire.contains(?response[0], length, " secure=0;")) { ret 8; }
+    ret 0;
+}
+
+test "protocol: a trusted v1 header replaces the peer every reader sees" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED);
+    trust_peer(?harness.graph, "127.0.0.1");
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, "PROXY TCP4 203.0.113.9 198.51.100.2 5000 443\r\n")
+     || !wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, ";");
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
+        ret 4;
+    }
+    # the decoded peer, not the socket peer, is what the service was handed
+    if (!wire.contains(?response[0], length, "peer=203.0.113.9:5000")) { ret 5; }
+    if (wire.contains(?response[0], length, "peer=127.0.0.1")) { ret 6; }
+    # kind 3 is ENDPOINT_FORWARDED, so a reader can tell the two apart
+    if (!wire.contains(?response[0], length, " kind=3 ")) { ret 7; }
+    if (!wire.contains(?response[0], length, " port=5000 ")) { ret 8; }
+    if (!wire.contains(?response[0], length, " local=198.51.100.2:443 ")) { ret 9; }
+    ret 0;
+}
+
+test "protocol: a trusted v2 header is decoded the same as the text form" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED);
+    trust_peer(?harness.graph, "127.0.0.0/8");
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    var header: [64]u8;
+    val header_length: usize = v2_header(?header[0]);
+    if (!send_bytes(?client, ?header[0], header_length) || !wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, ";");
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
+        ret 4;
+    }
+    if (!wire.contains(?response[0], length, "peer=203.0.113.9:5000")) { ret 5; }
+    if (!wire.contains(?response[0], length, " kind=3 ")) { ret 6; }
+    if (!wire.contains(?response[0], length, " local=198.51.100.2:443 ")) { ret 7; }
+    ret 0;
+}
+
+test "protocol: an untrusted peer's header is refused, not believed" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_OPTIONAL);
+    # the loopback client is deliberately outside the trusted set
+    trust_peer(?harness.graph, "10.0.0.0/8");
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_OPTIONAL)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, "PROXY TCP4 203.0.113.9 198.51.100.2 5000 443\r\n")
+     || !wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.drain(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES);
+    val refusal: prologue.Refusal = harness.connections[0].refusal;
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    # nothing is served, and in particular the asserted address is never used
+    if (length != 0) { ret 4; }
+    if (wire.contains(?response[0], length, "203.0.113.9")) { ret 5; }
+    if (refusal != prologue.REFUSED_PROXY_UNTRUSTED) { ret (100 + refusal::usize)::i32; }
+    ret 0;
+}
+
+test "protocol: a required header that never arrives closes the connection" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED);
+    trust_peer(?harness.graph, "127.0.0.1");
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.drain(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES);
+    val refusal: prologue.Refusal = harness.connections[0].refusal;
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (length != 0) { ret 4; }
+    if (refusal != prologue.REFUSED_PROXY_MISSING) { ret (100 + refusal::usize)::i32; }
+    ret 0;
+}
+
+test "protocol: a malformed header is refused rather than read as a request" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_OPTIONAL);
+    trust_peer(?harness.graph, "127.0.0.1");
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_OPTIONAL)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, "PROXY TCP4 203.0.113.999 198.51.100.2 5000 443\r\n")
+     || !wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.drain(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES);
+    val refusal: prologue.Refusal = harness.connections[0].refusal;
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (length != 0) { ret 4; }
+    if (refusal != prologue.REFUSED_PROXY_MALFORMED) { ret (100 + refusal::usize)::i32; }
+    ret 0;
+}
+
+test "protocol: prior knowledge on an HTTP/1 listener is refused" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_OFF);
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_OFF)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.drain(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES);
+    val refusal: prologue.Refusal = harness.connections[0].refusal;
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    # a listener that does not serve HTTP/2 must not answer the preface as if it
+    # were an HTTP/1 request line
+    if (length != 0) { ret 4; }
+    if (refusal != prologue.REFUSED_PROTOCOL) { ret (100 + refusal::usize)::i32; }
+    ret 0;
+}
+
+test "protocol: a header split across writes is still decoded" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED);
+    trust_peer(?harness.graph, "127.0.0.1");
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    # the prologue has to accumulate across reads rather than decide on the first
+    if (!wire.send(?client, "PROXY TCP4 203.0")) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    serve.poll(?harness.runtime, 2);
+    serve.poll(?harness.runtime, 2);
+    if (!wire.send(?client, ".113.9 198.51.100.2 5000 443\r\nGET /id HTT")) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4;
+    }
+    serve.poll(?harness.runtime, 2);
+    if (!wire.send(?client, "P/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 5;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, ";");
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
+        ret 6;
+    }
+    if (!wire.contains(?response[0], length, "peer=203.0.113.9:5000")) { ret 7; }
+    ret 0;
+}
+
+test "protocol: a decoded peer survives keep-alive onto the next request" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED);
+    trust_peer(?harness.graph, "127.0.0.1");
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP1, schema.PROXY_REQUIRED)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, "PROXY TCP4 203.0.113.9 198.51.100.2 5000 443\r\n")
+     || !wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var first: [RESPONSE_BYTES]u8;
+    val first_length: usize = wire.collect(?harness.runtime, ?client, ?first[0],
+        RESPONSE_BYTES, ";");
+    if (first_length == 0 || !wire.contains(?first[0], first_length, "peer=203.0.113.9:5000")) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4;
+    }
+    # the header is sent once per connection, so the second request must still
+    # be attributed to the same client
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 5;
+    }
+    var second: [RESPONSE_BYTES]u8;
+    val second_length: usize = wire.collect(?harness.runtime, ?client, ?second[0],
+        RESPONSE_BYTES, ";");
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (second_length == 0) { ret 6; }
+    if (!wire.contains(?second[0], second_length, "peer=203.0.113.9:5000")) { ret 7; }
+    if (wire.contains(?second[0], second_length, "peer=127.0.0.1")) { ret 8; }
+    ret 0;
+}
