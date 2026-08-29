@@ -229,6 +229,61 @@ check "an unmatched server name is refused with unrecognized_name" 112 \
 
 stop_server
 
+# --- shutdown ------------------------------------------------------------------
+#
+# these legs assert the exit status, because that is the only place the outcome
+# of a shutdown is visible to whoever supervises the process. a drain that
+# abandoned live exchanges must not look like a clean one.
+
+shutdown_exit() {
+    # $1 "idle" or "held": whether a peer holds a request open across the signal
+    local log="$work/shutdown.log"
+    "$binary" test/interop/shutdown.toml > "$log" 2>&1 &
+    local pid=$!
+    local ready=1
+    for _ in $(seq 60); do
+        if grep -q '^hedge: ready' "$log" 2>/dev/null; then ready=0; break; fi
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+    if [ "$ready" -ne 0 ]; then
+        kill -9 "$pid" 2>/dev/null
+        echo "not-ready"
+        return
+    fi
+    local holder=""
+    if [ "$1" = "held" ]; then
+        python3 -c '
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", 9085), timeout=5)
+# a request head that is never terminated: the connection is live and the
+# exchange can never complete on its own
+s.sendall(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n")
+sys.stderr.write("held\n")
+sys.stderr.flush()
+time.sleep(30)
+' 2>"$work/holder.log" &
+        holder=$!
+        for _ in $(seq 60); do
+            if grep -q held "$work/holder.log" 2>/dev/null; then break; fi
+            sleep 0.1
+        done
+    else
+        # a client that completes and goes away before the signal
+        curl -sS -o /dev/null --max-time 10 -H 'Host: localhost' \
+            http://127.0.0.1:9085/hello 2>/dev/null
+    fi
+    kill -TERM "$pid" 2>/dev/null
+    local code=0
+    wait "$pid"; code=$?
+    if [ -n "$holder" ]; then kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; fi
+    echo "$code"
+}
+
+check "a stop with no work in flight drains cleanly" 0 "$(shutdown_exit idle)"
+check "a stop with a peer mid-request reports the abandoned exchange" 75 \
+    "$(shutdown_exit held)"
+
 echo
 echo "$passed passed, $failed failed"
 if [ "$failed" -ne 0 ]; then exit 1; fi
