@@ -1,0 +1,509 @@
+# the TLS listener runtime: one credential generation per configured policy
+#
+# a policy names certificate and key files; this loads them once, publishes them
+# as one immutable mach-tls credential generation, and holds the listener
+# configuration every connection on that listener borrows. nothing here is
+# per-connection: the generation is shared, and a connection pins it with a
+# lease for exactly as long as it lives.
+#
+# every field the configuration points at lives inside the policy record, so the
+# borrowed ALPN list, version list, suite list and entropy source outlive every
+# connection that reads them.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.filesystem;
+use std.crypto.ct;
+use file: std.io.file;
+use io_error: std.io.error;
+use contracts: crypto.contracts;
+use keys: crypto.encoding.keys;
+use secret: crypto.secret;
+use cert: tls.cert;
+use credentials: tls.cert.credentials;
+use load: tls.cert.load;
+use tls_config: tls.config;
+use tls_server: tls.server;
+use session: tls.session;
+use tls13: tls.tls13;
+use schema: hedge.config.schema;
+use hedge_credentials: hedge.protocol.credentials;
+
+pub val MAX_IDENTITIES: usize = schema.MAX_TLS_IDENTITIES;
+pub val MAX_CHAIN: usize = 4;
+pub val MAX_ANCHORS: usize = 4;
+# one PEM chain file, and the DER it decodes to
+pub val MAX_PEM_BYTES: usize = 8192;
+pub val MAX_KEY_BYTES: usize = 4096;
+pub val MAX_ALPN: usize = 3;
+
+pub def Status: u8;
+pub val OK: Status = 1;
+pub val INVALID: Status = 2;
+# a certificate or key file could not be read
+pub val UNREADABLE: Status = 3;
+# a file was read and is not a certificate chain or a private key
+pub val UNDECODABLE: Status = 4;
+# the policy is well formed and mach-tls refuses the listener configuration
+pub val UNSUPPORTED: Status = 5;
+pub val EXHAUSTED: Status = 6;
+
+# the exact storage one server handshake needs, checked against mach-tls at load
+# time so an unusable listener fails before it becomes ready
+pub val HANDSHAKE_INPUT_BYTES: usize = 16384;
+pub val HANDSHAKE_OUTPUT_BYTES: usize = 16384;
+pub val HELLO_BYTES: usize = 8192;
+pub val PEER_CERTIFICATES: usize = 8;
+
+pub fun listener_limits() tls_config.Limits {
+    var limits: tls_config.Limits = tls_config.production_limits();
+    limits.max_peer_handshake_bytes = HANDSHAKE_INPUT_BYTES;
+    limits.max_client_hello_bytes = HELLO_BYTES;
+    limits.max_client_flight_bytes = HANDSHAKE_INPUT_BYTES;
+    limits.max_server_flight_bytes = HANDSHAKE_OUTPUT_BYTES;
+    limits.max_chain_bytes = MAX_PEM_BYTES;
+    limits.max_ticket_bytes = 4096;
+    ret limits;
+}
+
+rec Identity {
+    der: [MAX_PEM_BYTES]u8;
+    certificates: [MAX_CHAIN]cert.Certificate;
+    private_key: keys.PrivateKey;
+    name: [schema.TEXT_CAP]u8;
+    name_len: usize;
+    live: bool;
+}
+
+pub rec Policy {
+    name: [schema.TEXT_CAP]u8;
+    name_len: usize;
+    identity_count: usize;
+    identities: [MAX_IDENTITIES]Identity;
+    published: [MAX_IDENTITIES]credentials.Identity;
+    generation: credentials.Generation;
+    bindings: hedge_credentials.Bindings;
+    anchor_der: [MAX_PEM_BYTES]u8;
+    anchor_certificates: [MAX_ANCHORS]cert.Certificate;
+    client_trust: cert.TrustStore;
+    require_client_auth: bool;
+    alpn_storage: [MAX_ALPN][8]u8;
+    alpn: [MAX_ALPN]tls_config.ProtocolName;
+    alpn_len: usize;
+    require_alpn: bool;
+    versions: [1]u16;
+    suites: [3]tls13.CipherSuite;
+    groups: [2]tls13.NamedGroup;
+    signatures: [4]tls13.SignatureScheme;
+    entropy: secret.Entropy;
+    configuration: tls_config.ServerConfig;
+    live: bool;
+}
+
+# a policy is secret-welded through its credential store and private keys, so no
+# public record may hold a pointer to one. they live in one bounded table and are
+# named by index, exactly as TLS sessions are.
+pub val MAX_POLICIES: usize = schema.MAX_TLS_POLICIES;
+pub val NO_POLICY: usize = MAX_POLICIES;
+
+var policies: [MAX_POLICIES]Policy;
+var policy_count: usize;
+var scratch: [MAX_PEM_BYTES]u8;
+var key_scratch: [MAX_KEY_BYTES]^u8;
+
+pub fun reset() {
+    var i: usize = 0;
+    for (i < MAX_POLICIES) {
+        policies[i].live = false;
+        policies[i].identity_count = 0;
+        policies[i].name_len = 0;
+        i = i + 1;
+    }
+    policy_count = 0;
+}
+
+pub fun count() usize { ret policy_count; }
+
+pub fun policy_at(index: usize) *Policy {
+    if (index >= policy_count || !policies[index].live) { ret nil; }
+    ret ?policies[index];
+}
+
+pub fun find(name: str) usize {
+    if (name == nil) { ret NO_POLICY; }
+    val length: usize = str_len(name);
+    var i: usize = 0;
+    for (i < policy_count) {
+        val policy: *Policy = ?policies[i];
+        if (policy.live && policy.name_len == length) {
+            var j: usize = 0;
+            for (j < length && policy.name[j] == name[j]) { j = j + 1; }
+            if (j == length) { ret i; }
+        }
+        i = i + 1;
+    }
+    ret NO_POLICY;
+}
+
+fun copy_name(output: *u8, length: *usize, value: str) bool {
+    val n: usize = str_len(value);
+    if (n >= schema.TEXT_CAP) { ret false; }
+    var i: usize = 0;
+    for (i < n) { output[i] = value[i]; i = i + 1; }
+    output[n] = 0;
+    @length = n;
+    ret true;
+}
+
+fun read_file(path: str, buffer: *u8, capacity: usize, length: *usize) bool {
+    if (path == nil || path[0] == 0) { ret false; }
+    val opened: Result[filesystem.File, io_error.Error] = filesystem.open(path);
+    if (is_err[filesystem.File, io_error.Error](opened)) { ret false; }
+    var handle: filesystem.File = unwrap_ok[filesystem.File, io_error.Error](opened);
+    val read: Result[usize, io_error.Error] = file.read_at(handle, buffer, capacity, 0);
+    filesystem.close(?handle);
+    if (is_err[usize, io_error.Error](read)) { ret false; }
+    @length = unwrap_ok[usize, io_error.Error](read);
+    # a file that exactly fills the buffer may have been truncated, and a
+    # truncated chain would be published as if it were the whole one
+    ret @length != 0 && @length < capacity;
+}
+
+# the key never stays in shared public storage: it is copied up into secret
+# storage and the staging bytes are overwritten before the parse runs
+#[oblivious]
+fun copy_secret(destination: *^u8, source: *u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        destination[i] = source[i];
+        i = i + 1;
+    }
+}
+
+#[oblivious]
+fun wipe(buffer: *u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        buffer[i] = 0;
+        i = i + 1;
+    }
+}
+
+fun load_identity(policy: *Policy, configured: *schema.TlsIdentity,
+    owner: *secret.Allocator) Status {
+    if (policy.identity_count >= MAX_IDENTITIES) { ret EXHAUSTED; }
+    val slot: usize = policy.identity_count;
+    val identity: *Identity = ?policy.identities[slot];
+    identity.live = false;
+    if (!copy_name(?identity.name[0], ?identity.name_len,
+        schema.text(?configured.server_name))) { ret INVALID; }
+    var pem_length: usize = 0;
+    if (!read_file(schema.text(?configured.certificate), ?scratch[0],
+        MAX_PEM_BYTES, ?pem_length)) { ret UNREADABLE; }
+    var chain: cert.Chain;
+    val decoded: contracts.Operation = load.chain_pem(
+        contracts.Bytes{data: ?scratch[0], len: pem_length},
+        contracts.Buffer{data: ?identity.der[0], capacity: MAX_PEM_BYTES},
+        ?identity.certificates[0], MAX_CHAIN, ?chain);
+    if (decoded.error != contracts.OK || chain.len == 0) { ret UNDECODABLE; }
+    var key_length: usize = 0;
+    if (!read_file(schema.text(?configured.key), ?scratch[0], MAX_PEM_BYTES,
+        ?key_length)) { ret UNREADABLE; }
+    if (key_length > MAX_KEY_BYTES) {
+        wipe(?scratch[0], MAX_PEM_BYTES);
+        ret UNDECODABLE;
+    }
+    copy_secret(?key_scratch[0], ?scratch[0], key_length);
+    wipe(?scratch[0], MAX_PEM_BYTES);
+    identity.private_key = keys.empty_private();
+    val parsed: contracts.Error = load.private_pem(
+        contracts.SecretBytes{data: ?key_scratch[0], len: key_length}, owner,
+        ?identity.private_key);
+    ct.zeroize(?key_scratch[0], MAX_KEY_BYTES);
+    if (parsed != contracts.OK) { ret UNDECODABLE; }
+    var name: contracts.Bytes;
+    name.data = nil;
+    name.len = 0;
+    if (identity.name_len != 0) {
+        name.data = ?identity.name[0];
+        name.len = identity.name_len;
+    }
+    var published: credentials.Identity;
+    published.server_name = name;
+    published.chain = chain;
+    published.private_key = ?identity.private_key;
+    policy.published[slot] = published;
+    identity.live = true;
+    policy.identity_count = slot + 1;
+    ret OK;
+}
+
+fun load_anchor(policy: *Policy, path: str) Status {
+    var pem_length: usize = 0;
+    if (!read_file(path, ?scratch[0], MAX_PEM_BYTES, ?pem_length)) {
+        ret UNREADABLE;
+    }
+    var chain: cert.Chain;
+    val decoded: contracts.Operation = load.chain_pem(
+        contracts.Bytes{data: ?scratch[0], len: pem_length},
+        contracts.Buffer{data: ?policy.anchor_der[0], capacity: MAX_PEM_BYTES},
+        ?policy.anchor_certificates[0], MAX_ANCHORS, ?chain);
+    if (decoded.error != contracts.OK || chain.len == 0) { ret UNDECODABLE; }
+    policy.client_trust.anchors = chain.certificates;
+    policy.client_trust.len = chain.len;
+    ret OK;
+}
+
+fun offer_protocol(policy: *Policy, value: str) {
+    if (policy.alpn_len >= MAX_ALPN) { ret; }
+    val slot: usize = policy.alpn_len;
+    val length: usize = str_len(value);
+    if (length == 0 || length > 8) { ret; }
+    var i: usize = 0;
+    for (i < length) { policy.alpn_storage[slot][i] = value[i]; i = i + 1; }
+    policy.alpn[slot] = tls_config.ProtocolName{
+        data: ?policy.alpn_storage[slot][0], len: length};
+    policy.alpn_len = slot + 1;
+}
+
+# the listener's preference order, not the client's. mach-tls walks this list in
+# order, so putting h2 first is what makes a client offering both get h2.
+fun offer_protocols(policy: *Policy, protocols: u8) {
+    policy.alpn_len = 0;
+    # parenthesised: `!=` binds tighter than `&`. see briar-systems/laurel#32.
+    if ((protocols & schema.PROTOCOL_HTTP2) != 0) { offer_protocol(policy, "h2"); }
+    if ((protocols & schema.PROTOCOL_HTTP1) != 0) {
+        offer_protocol(policy, "http/1.1");
+    }
+}
+
+fun default_index(policy: *Policy, configured: *schema.TlsPolicy) usize {
+    if (!configured.has_default) { ret credentials.NO_DEFAULT; }
+    val wanted: str = schema.text(?configured.default_name);
+    var i: usize = 0;
+    for (i < policy.identity_count) {
+        val identity: *Identity = ?policy.identities[i];
+        if (identity.name_len == str_len(wanted)) {
+            var j: usize = 0;
+            for (j < identity.name_len && identity.name[j] == wanted[j]) {
+                j = j + 1;
+            }
+            if (j == identity.name_len) { ret i; }
+        }
+        i = i + 1;
+    }
+    ret credentials.NO_DEFAULT;
+}
+
+fun build_configuration(policy: *Policy) Status {
+    policy.versions[0] = tls13.VERSION;
+    policy.suites[0] = tls13.AES_128_GCM_SHA256;
+    policy.suites[1] = tls13.AES_256_GCM_SHA384;
+    policy.suites[2] = tls13.CHACHA20_POLY1305_SHA256;
+    policy.groups[0] = tls13.X25519;
+    policy.groups[1] = tls13.SECP256R1;
+    policy.signatures[0] = tls13.ED25519;
+    policy.signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
+    policy.signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
+    policy.signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
+    policy.entropy = secret.system_entropy();
+    var configuration: tls_config.ServerConfig;
+    configuration.credentials = ?policy.bindings.store;
+    configuration.alpn = ?policy.alpn[0];
+    configuration.alpn_len = policy.alpn_len;
+    configuration.require_alpn = policy.require_alpn;
+    configuration.versions = ?policy.versions[0];
+    configuration.version_len = 1;
+    configuration.suites = ?policy.suites[0];
+    configuration.suite_len = 3;
+    configuration.groups = ?policy.groups[0];
+    configuration.group_len = 2;
+    configuration.signatures = ?policy.signatures[0];
+    configuration.signature_len = 4;
+    configuration.entropy = ?policy.entropy;
+    configuration.entropy_context_size = 0;
+    configuration.tickets = nil;
+    configuration.replay = nil;
+    configuration.replay_policy = session.REPLAY_PERMISSIVE;
+    configuration.tickets_per_connection = 0;
+    configuration.limits = listener_limits();
+    policy.configuration = configuration;
+
+    var extra: tls_server.ExtraExtension;
+    extra.kind = 0;
+    extra.data.data = nil;
+    extra.data.len = 0;
+    var hello_required: usize = 0;
+    var flight_required: usize = 0;
+    if (!tls_server.storage_requirements(?policy.configuration, extra,
+        ?hello_required, ?flight_required)) { ret UNSUPPORTED; }
+    # the per-connection buffers are fixed, so a configuration that needs more
+    # than they hold must fail here rather than at the first handshake
+    if (hello_required > HANDSHAKE_OUTPUT_BYTES
+     || flight_required > HANDSHAKE_OUTPUT_BYTES) { ret UNSUPPORTED; }
+    ret OK;
+}
+
+# published once per secure listener rather than once per configured policy, and
+# named by that listener. the ALPN offer is the listener's protocol set, so two
+# listeners sharing one certificate but serving different protocols must not
+# share one published generation.
+pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status {
+    if (configured == nil || name == nil) { ret INVALID; }
+    if (policy_count >= MAX_POLICIES) { ret EXHAUSTED; }
+    var owner: secret.Allocator = secret.system_allocator();
+    val policy: *Policy = ?policies[policy_count];
+    policy.live = false;
+    policy.identity_count = 0;
+    policy.alpn_len = 0;
+    policy.require_client_auth = configured.client_auth;
+    policy.client_trust.anchors = nil;
+    policy.client_trust.len = 0;
+    if (!copy_name(?policy.name[0], ?policy.name_len, name)) { ret INVALID; }
+    if (configured.identity_count == 0) { ret INVALID; }
+    var i: usize = 0;
+    for (i < configured.identity_count) {
+        val loaded: Status = load_identity(policy, ?configured.identities[i],
+            ?owner);
+        if (loaded != OK) { ret loaded; }
+        i = i + 1;
+    }
+    var trust: *cert.TrustStore = nil;
+    if (configured.client_auth) {
+        val anchored: Status = load_anchor(policy,
+            schema.text(?configured.client_trust));
+        if (anchored != OK) { ret anchored; }
+        trust = ?policy.client_trust;
+    }
+    offer_protocols(policy, protocols);
+    # a listener that serves nothing over TLS has nothing to negotiate, and a
+    # client that offers nothing we serve is refused rather than defaulted
+    policy.require_alpn = policy.alpn_len != 0;
+    policy.generation = credentials.empty_generation();
+    if (hedge_credentials.publish(?policy.bindings, ?policy.generation,
+        ?policy.published[0], policy.identity_count,
+        default_index(policy, configured), trust,
+        configured.client_auth) != hedge_credentials.OK) { ret UNSUPPORTED; }
+    val built: Status = build_configuration(policy);
+    if (built != OK) { ret built; }
+    policy.live = true;
+    policy_count = policy_count + 1;
+    ret OK;
+}
+
+# whether a server name resolves to a credential in this policy's generation
+#
+# a virtual host configured on a TLS listener with no certificate for its name
+# would negotiate nothing and refuse every client that asked for it. asking the
+# published generation at startup turns that into a configuration failure, which
+# is the only point at which an operator can still act on it.
+pub fun servable(index: usize, name: str) bool {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil) { ret false; }
+    var held: hedge_credentials.Held;
+    held.held = false;
+    val status: hedge_credentials.Status = hedge_credentials.acquire(?policy.bindings,
+        name, ?held);
+    if (status != hedge_credentials.OK) { ret false; }
+    hedge_credentials.release(?held);
+    ret true;
+}
+
+pub fun destroy() bool {
+    var success: bool = true;
+    var i: usize = 0;
+    for (i < policy_count) {
+        val policy: *Policy = ?policies[i];
+        var j: usize = 0;
+        for (j < policy.identity_count) {
+            if (policy.identities[j].live
+             && keys.destroy_private(?policy.identities[j].private_key) != contracts.OK) {
+                success = false;
+            }
+            policy.identities[j].live = false;
+            j = j + 1;
+        }
+        policy.live = false;
+        i = i + 1;
+    }
+    policy_count = 0;
+    ret success;
+}
+
+test "tls: a policy offers the listener's protocols in the listener's order" {
+    var policy: Policy;
+    policy.alpn_len = 0;
+    offer_protocols(?policy, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2);
+    if (policy.alpn_len != 2) { ret 1; }
+    # h2 is offered first, so a client listing http/1.1 first still gets h2
+    if (policy.alpn[0].len != 2 || policy.alpn[0].data[0] != 'h'
+     || policy.alpn[0].data[1] != '2') { ret 2; }
+    if (policy.alpn[1].len != 8 || policy.alpn[1].data[0] != 'h') { ret 3; }
+
+    offer_protocols(?policy, schema.PROTOCOL_HTTP1);
+    if (policy.alpn_len != 1 || policy.alpn[0].len != 8) { ret 4; }
+
+    offer_protocols(?policy, schema.PROTOCOL_HTTP2);
+    if (policy.alpn_len != 1 || policy.alpn[0].len != 2) { ret 5; }
+
+    # HTTP/3 is never offered over TLS on TCP
+    offer_protocols(?policy, schema.PROTOCOL_HTTP3);
+    if (policy.alpn_len != 0) { ret 6; }
+    ret 0;
+}
+
+test "tls: the handshake storage a listener configuration needs is bounded" {
+    var policy: Policy;
+    policy.alpn_len = 0;
+    # the widest offer this listener can make, which is what sizes the flight
+    offer_protocols(?policy, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2);
+    policy.require_alpn = true;
+    policy.bindings.store = credentials.empty_store();
+    policy.bindings.live = false;
+    # the same call the listener makes, so an oversized configuration is caught
+    # here rather than at the first handshake
+    if (build_configuration(?policy) != OK) { ret 1; }
+    if (policy.configuration.limits.max_peer_handshake_bytes != HANDSHAKE_INPUT_BYTES) {
+        ret 2;
+    }
+    if (policy.configuration.limits.max_client_hello_bytes != HELLO_BYTES) { ret 3; }
+    if (!policy.configuration.require_alpn || policy.configuration.alpn_len != 2) {
+        ret 4;
+    }
+    # TLS 1.3 only: a listener configured here cannot be talked down a version
+    if (policy.configuration.version_len != 1
+     || policy.configuration.versions[0] != tls13.VERSION) { ret 5; }
+    ret 0;
+}
+
+test "tls: a policy naming a certificate that cannot be read is refused" {
+    reset();
+    var configured: schema.TlsPolicy;
+    schema.set_text(?configured.name, "public");
+    configured.identity_count = 1;
+    schema.clear_text(?configured.identities[0].server_name);
+    schema.set_text(?configured.identities[0].certificate, "no/such/file.pem");
+    schema.set_text(?configured.identities[0].key, "no/such/file.key");
+    configured.has_default = true;
+    schema.clear_text(?configured.default_name);
+    configured.client_auth = false;
+    schema.clear_text(?configured.client_trust);
+    # nothing is published, so a listener referencing this policy cannot start
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != UNREADABLE) {
+        ret 1;
+    }
+    if (count() != 0 || find("secure") != NO_POLICY) { ret 2; }
+    if (policy_at(0) != nil) { ret 3; }
+    # and a policy with no identity at all is not a policy
+    configured.identity_count = 0;
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != INVALID) { ret 4; }
+    if (count() != 0) { ret 5; }
+    ret 0;
+}
