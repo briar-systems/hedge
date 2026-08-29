@@ -1,0 +1,1112 @@
+# the bounded cache store
+#
+# Memory and disk have separate, exact byte budgets. An entry is admitted only
+# when its whole representation fits, and a partially written entry is never
+# visible: a reader can only ever see an entry that was completed. Eviction is
+# least-recently-used and runs before admission, so the budget is a bound rather
+# than a target the store drifts above.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.option;
+use std.types.view;
+use std.allocator;
+use page: std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.chrono.time;
+use std.filesystem;
+use std.io.file;
+use io_error: std.io.error;
+use http.core.field;
+use http.core.status;
+use policy: hedge.cache.policy;
+use key: hedge.cache.key;
+
+pub val MAX_ENTRIES: usize = 256;
+pub val MAX_STORED_FIELDS: usize = 32;
+pub val MAX_FIELD_BYTES: usize = 4096;
+pub val NO_ENTRY: usize = 0xffffffffffffffff;
+
+pub def Placement: u8;
+pub val IN_MEMORY: Placement = 1;
+pub val ON_DISK: Placement = 2;
+
+pub def State: u8;
+pub val EMPTY: State = 0;
+pub val WRITING: State = 1;
+pub val READY: State = 2;
+
+pub rec Limits {
+    memory_bytes: usize;
+    disk_bytes: usize;
+    max_entry_bytes: usize;
+    entries: usize;
+}
+
+pub fun default_limits() Limits {
+    ret Limits{
+        memory_bytes: 8388608,
+        disk_bytes: 0,
+        max_entry_bytes: 1048576,
+        entries: MAX_ENTRIES,
+    };
+}
+
+# one stored representation
+pub rec Entry {
+    state: State;
+    placement: Placement;
+    identity: key.Key;
+    dimensions: key.Dimensions;
+    metadata: policy.Metadata;
+    status: status.Status;
+    field_names: [MAX_STORED_FIELDS]usize;
+    field_name_lengths: [MAX_STORED_FIELDS]usize;
+    field_values: [MAX_STORED_FIELDS]usize;
+    field_value_lengths: [MAX_STORED_FIELDS]usize;
+    field_count: usize;
+    field_bytes: [MAX_FIELD_BYTES]u8;
+    field_length: usize;
+    body_offset: usize;
+    body_length: usize;
+    reserved: usize;
+    disk_name: [64]u8;
+    disk_name_length: usize;
+    used_at: u64;
+    revalidating: bool;
+}
+
+pub rec Store {
+    entries: *Entry;
+    capacity: usize;
+    body: *u8;
+    body_capacity: usize;
+    body_used: usize;
+    disk_used: usize;
+    limits: Limits;
+    root: file.Root;
+    root_path: [256]u8;
+    root_path_length: usize;
+    has_root: bool;
+    clock: u64;
+    hits: u64;
+    misses: u64;
+    stores: u64;
+    evictions: u64;
+    rejections: u64;
+    partial_discards: u64;
+    live: bool;
+}
+
+# a store that was never enabled owns nothing: no arrays, no root, no counters in
+# motion. `live` is the single fact every entry point checks first.
+pub fun disabled() Store {
+    var store: Store;
+    store.entries = nil;
+    store.capacity = 0;
+    store.body = nil;
+    store.body_capacity = 0;
+    store.body_used = 0;
+    store.disk_used = 0;
+    store.limits = Limits{memory_bytes: 0, disk_bytes: 0, max_entry_bytes: 0, entries: 0};
+    store.has_root = false;
+    store.root_path[0] = 0;
+    store.root_path_length = 0;
+    store.clock = 0;
+    store.hits = 0;
+    store.misses = 0;
+    store.stores = 0;
+    store.evictions = 0;
+    store.rejections = 0;
+    store.partial_discards = 0;
+    store.live = false;
+    ret store;
+}
+
+pub fun enabled(store: *Store) bool {
+    ret store != nil && store.live;
+}
+
+pub fun make(store: *Store, entries: *Entry, capacity: usize, body: *u8,
+    body_capacity: usize, limits: Limits) bool {
+    if (store == nil || entries == nil || capacity == 0 || capacity > MAX_ENTRIES
+     || body == nil || body_capacity == 0 || limits.max_entry_bytes == 0
+     || limits.memory_bytes > body_capacity) { ret false; }
+    @store = disabled();
+    store.entries = entries;
+    store.capacity = capacity;
+    if (limits.entries != 0 && limits.entries < capacity) { store.capacity = limits.entries; }
+    store.body = body;
+    store.body_capacity = body_capacity;
+    store.limits = limits;
+    var i: usize = 0;
+    for (i < capacity) {
+        entries[i].state = EMPTY;
+        entries[i].body_length = 0;
+        entries[i].reserved = 0;
+        entries[i].used_at = 0;
+        entries[i].revalidating = false;
+        i = i + 1;
+    }
+    store.live = true;
+    ret true;
+}
+
+# a name this store could have written: `e` and then decimal digits, nothing else
+fun own_file_name(name: str) bool {
+    if (name == nil || name[0] != 'e' || name[1] == 0) { ret false; }
+    var i: usize = 1;
+    for (name[i] != 0) {
+        if (name[i] < '0' || name[i] > '9') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# discard whatever a previous process left behind in the cache root
+#
+# `close` removes the files this store wrote, but a process that was killed never
+# reaches it. Those files are charged to no budget and described by no entry, so
+# after a crash the disk bound would not hold and an orphan could only ever be
+# dead weight. Only names this store's own counter could have produced are
+# removed, so a misconfigured root costs nothing that hedge did not write.
+fun purge_root(store: *Store, scratch: *allocator.Allocator) bool {
+    val listed: Result[Vector[str], str] = filesystem.read_dir(scratch,
+        (?store.root_path[0])::str);
+    if (is_err[Vector[str], str](listed)) { ret false; }
+    var names: Vector[str] = unwrap_ok[Vector[str], str](listed);
+    var i: usize = 0;
+    for (i < names.len) {
+        val held: Result[*str, str] = vector.get[str](?names, i);
+        if (!is_err[*str, str](held)) {
+            val name: str = @unwrap_ok[*str, str](held);
+            if (own_file_name(name)) { remove_named(store, name); }
+        }
+        i = i + 1;
+    }
+    vector.dnit[str](?names);
+    ret true;
+}
+
+# a disk-backed store keeps large representations outside the memory budget
+pub fun attach_disk(store: *Store, root_path: str, scratch: *allocator.Allocator) bool {
+    if (store == nil || !store.live || store.has_root || root_path == nil) { ret false; }
+    if (store.limits.disk_bytes == 0 || scratch == nil) { ret false; }
+    val length: usize = str_len(root_path);
+    if (length == 0 || length + 66 >= 256) { ret false; }
+    val opened: Result[file.Root, io_error.Error] = file.root_open(root_path);
+    if (is_err[file.Root, io_error.Error](opened)) { ret false; }
+    store.root = unwrap_ok[file.Root, io_error.Error](opened);
+    var i: usize = 0;
+    for (i < length) { store.root_path[i] = root_path[i]; i = i + 1; }
+    store.root_path[length] = 0;
+    store.root_path_length = length;
+    store.has_root = true;
+    if (!purge_root(store, scratch)) {
+        file.root_close(?store.root);
+        store.has_root = false;
+        store.root_path_length = 0;
+        ret false;
+    }
+    ret true;
+}
+
+pub fun close(store: *Store) bool {
+    if (store == nil || !store.live) { ret false; }
+    var i: usize = 0;
+    for (i < store.capacity) {
+        if (store.entries[i].state != EMPTY && store.entries[i].placement == ON_DISK) {
+            remove_file(store, ?store.entries[i]);
+        }
+        store.entries[i].state = EMPTY;
+        i = i + 1;
+    }
+    if (store.has_root) {
+        file.root_close(?store.root);
+        store.has_root = false;
+    }
+    store.body_used = 0;
+    store.disk_used = 0;
+    store.live = false;
+    ret true;
+}
+
+fun tick(store: *Store) u64 {
+    store.clock = store.clock + 1;
+    ret store.clock;
+}
+
+fun name_for(entry: *Entry, sequence: u64) {
+    var digits: usize = 1;
+    var scale: u64 = sequence;
+    for (scale >= 10) { scale = scale / 10; digits = digits + 1; }
+    val prefix: str = "e";
+    entry.disk_name[0] = prefix[0];
+    var i: usize = digits;
+    var remaining: u64 = sequence;
+    for (i > 0) {
+        i = i - 1;
+        entry.disk_name[1 + i] = ('0' + (remaining % 10)::u8);
+        remaining = remaining / 10;
+    }
+    entry.disk_name[1 + digits] = 0;
+    entry.disk_name_length = 1 + digits;
+}
+
+# the file name is derived from a counter, never from request data, so no path
+# here is ever chosen by a client
+fun remove_named(store: *Store, name: str) {
+    if (!store.has_root || store.root_path_length == 0 || name == nil) { ret; }
+    var path: [320]u8;
+    var at: usize = 0;
+    for (at < store.root_path_length) { path[at] = store.root_path[at]; at = at + 1; }
+    path[at] = '/';
+    at = at + 1;
+    var i: usize = 0;
+    for (name[i] != 0) {
+        if (at + i + 1 >= 320) { ret; }
+        path[at + i] = name[i];
+        i = i + 1;
+    }
+    path[at + i] = 0;
+    filesystem.remove_file((?path[0])::str);
+}
+
+fun remove_file(store: *Store, entry: *Entry) {
+    if (entry.disk_name_length == 0) { ret; }
+    remove_named(store, (?entry.disk_name[0])::str);
+}
+
+# reclaim exactly what was reserved for this entry, not what was written into it:
+# an abandoned partial write reserved the whole declared length
+fun discard(store: *Store, index: usize) {
+    val entry: *Entry = ?store.entries[index];
+    if (entry.state == EMPTY) { ret; }
+    if (entry.placement == IN_MEMORY) {
+        compact(store, entry.body_offset, entry.reserved);
+    } or {
+        remove_file(store, entry);
+        if (store.disk_used >= entry.reserved) {
+            store.disk_used = store.disk_used - entry.reserved;
+        } or { store.disk_used = 0; }
+    }
+    entry.state = EMPTY;
+    entry.body_length = 0;
+    entry.reserved = 0;
+    entry.revalidating = false;
+}
+
+# the memory arena is compacted on release, so the budget is exact rather than
+# a high-water mark that fragmentation would push past
+fun compact(store: *Store, offset: usize, length: usize) {
+    if (length == 0) { ret; }
+    val tail: usize = offset + length;
+    var i: usize = tail;
+    for (i < store.body_used) {
+        store.body[i - length] = store.body[i];
+        i = i + 1;
+    }
+    store.body_used = store.body_used - length;
+    var e: usize = 0;
+    for (e < store.capacity) {
+        val other: *Entry = ?store.entries[e];
+        if (other.state != EMPTY && other.placement == IN_MEMORY && other.body_offset >= tail) {
+            other.body_offset = other.body_offset - length;
+        }
+        e = e + 1;
+    }
+}
+
+fun evict_one(store: *Store) bool {
+    var oldest: usize = NO_ENTRY;
+    var i: usize = 0;
+    for (i < store.capacity) {
+        val entry: *Entry = ?store.entries[i];
+        if (entry.state == READY && !entry.revalidating
+         && (oldest == NO_ENTRY || entry.used_at < store.entries[oldest].used_at)) {
+            oldest = i;
+        }
+        i = i + 1;
+    }
+    if (oldest == NO_ENTRY) { ret false; }
+    discard(store, oldest);
+    store.evictions = store.evictions + 1;
+    ret true;
+}
+
+fun free_slot(store: *Store) usize {
+    var i: usize = 0;
+    for (i < store.capacity) {
+        if (store.entries[i].state == EMPTY) { ret i; }
+        i = i + 1;
+    }
+    if (!evict_one(store)) { ret NO_ENTRY; }
+    ret free_slot(store);
+}
+
+# the next entry at or after `from` whose key is this one
+#
+# one key names one target, and a target may hold several representations. the
+# store hands back every candidate rather than the first, because only the caller
+# knows which selecting values the current request negotiates to, and answering
+# with the first is how a client is served someone else's representation.
+pub fun find_from(store: *Store, identity: *key.Key, from: usize) usize {
+    if (!enabled(store) || identity == nil || !identity.valid) { ret NO_ENTRY; }
+    var i: usize = from;
+    for (i < store.capacity) {
+        val entry: *Entry = ?store.entries[i];
+        if (entry.state == READY && key.equal(?entry.identity, identity)) { ret i; }
+        i = i + 1;
+    }
+    ret NO_ENTRY;
+}
+
+pub fun lookup(store: *Store, identity: *key.Key) usize {
+    ret find_from(store, identity, 0);
+}
+
+pub fun entry_at(store: *Store, index: usize) *Entry {
+    if (!enabled(store) || index >= store.capacity
+     || store.entries[index].state != READY) { ret nil; }
+    ret ?store.entries[index];
+}
+
+pub fun touch(store: *Store, index: usize) bool {
+    val entry: *Entry = entry_at(store, index);
+    if (entry == nil) { ret false; }
+    entry.used_at = tick(store);
+    ret true;
+}
+
+pub fun record_hit(store: *Store) {
+    if (enabled(store)) { store.hits = store.hits + 1; }
+}
+
+pub fun record_miss(store: *Store) {
+    if (enabled(store)) { store.misses = store.misses + 1; }
+}
+
+# --- writing an entry ---
+
+pub rec Writer {
+    store: *Store;
+    index: usize;
+    active: bool;
+}
+
+fun no_writer() Writer {
+    ret Writer{store: nil, index: NO_ENTRY, active: false};
+}
+
+fun fits_memory(store: *Store, length: usize) bool {
+    ret store.body_used + length <= store.limits.memory_bytes;
+}
+
+# open an entry for writing, evicting until it fits or refusing outright
+pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
+    metadata: policy.Metadata, code: status.Status, declared_length: usize,
+    placement: Placement) Writer {
+    if (!enabled(store) || identity == nil || !identity.valid || dimensions == nil
+     || !dimensions.valid) { ret no_writer(); }
+    if (declared_length > store.limits.max_entry_bytes) {
+        store.rejections = store.rejections + 1;
+        ret no_writer();
+    }
+    var chosen: Placement = placement;
+    if (chosen == ON_DISK && (!store.has_root || store.limits.disk_bytes == 0)) {
+        chosen = IN_MEMORY;
+    }
+    if (chosen == IN_MEMORY) {
+        if (declared_length > store.limits.memory_bytes) {
+            store.rejections = store.rejections + 1;
+            ret no_writer();
+        }
+        for (!fits_memory(store, declared_length)) {
+            if (!evict_one(store)) {
+                store.rejections = store.rejections + 1;
+                ret no_writer();
+            }
+        }
+    } or {
+        if (declared_length > store.limits.disk_bytes) {
+            store.rejections = store.rejections + 1;
+            ret no_writer();
+        }
+        for (store.disk_used + declared_length > store.limits.disk_bytes) {
+            if (!evict_one(store)) {
+                store.rejections = store.rejections + 1;
+                ret no_writer();
+            }
+        }
+    }
+    val index: usize = free_slot(store);
+    if (index == NO_ENTRY) {
+        store.rejections = store.rejections + 1;
+        ret no_writer();
+    }
+    val entry: *Entry = ?store.entries[index];
+    entry.state = WRITING;
+    entry.placement = chosen;
+    entry.identity = @identity;
+    entry.dimensions = @dimensions;
+    entry.metadata = metadata;
+    entry.status = code;
+    entry.field_count = 0;
+    entry.field_length = 0;
+    entry.body_length = 0;
+    entry.disk_name_length = 0;
+    entry.revalidating = false;
+    entry.used_at = tick(store);
+    entry.reserved = declared_length;
+    if (chosen == IN_MEMORY) {
+        entry.body_offset = store.body_used;
+        store.body_used = store.body_used + declared_length;
+    } or {
+        entry.body_offset = 0;
+        name_for(entry, entry.used_at);
+        store.disk_used = store.disk_used + declared_length;
+    }
+    entry.body_length = 0;
+    ret Writer{store: store, index: index, active: true};
+}
+
+pub fun add_field(writer: *Writer, name: view.View, value: view.View) bool {
+    if (writer == nil || !writer.active) { ret false; }
+    val entry: *Entry = ?writer.store.entries[writer.index];
+    if (entry.field_count >= MAX_STORED_FIELDS
+     || entry.field_length + name.len + value.len > MAX_FIELD_BYTES) { ret false; }
+    entry.field_names[entry.field_count] = entry.field_length;
+    entry.field_name_lengths[entry.field_count] = name.len;
+    var i: usize = 0;
+    for (i < name.len) {
+        entry.field_bytes[entry.field_length + i] = name.data[i];
+        i = i + 1;
+    }
+    entry.field_length = entry.field_length + name.len;
+    entry.field_values[entry.field_count] = entry.field_length;
+    entry.field_value_lengths[entry.field_count] = value.len;
+    i = 0;
+    for (i < value.len) {
+        entry.field_bytes[entry.field_length + i] = value.data[i];
+        i = i + 1;
+    }
+    entry.field_length = entry.field_length + value.len;
+    entry.field_count = entry.field_count + 1;
+    ret true;
+}
+
+pub fun write_body(writer: *Writer, data: *u8, length: usize) bool {
+    if (writer == nil || !writer.active || (length != 0 && data == nil)) { ret false; }
+    if (length == 0) { ret true; }
+    val store: *Store = writer.store;
+    val entry: *Entry = ?store.entries[writer.index];
+    # the arena belongs to the store, so the store enforces the reservation: a
+    # writer that ran past its declared length would otherwise write over the
+    # bytes of whichever entry was admitted after it
+    if (length > entry.reserved - entry.body_length) { ret false; }
+    if (entry.placement == IN_MEMORY) {
+        if (entry.body_offset + entry.body_length + length > store.body_capacity) { ret false; }
+        var i: usize = 0;
+        for (i < length) {
+            store.body[entry.body_offset + entry.body_length + i] = data[i];
+            i = i + 1;
+        }
+        entry.body_length = entry.body_length + length;
+        ret true;
+    }
+    var options: file.OpenOptions = file.write_options(420);
+    if (entry.body_length == 0) { options.truncate = true; }
+    val opened: Result[filesystem.File, io_error.Error] = file.open_confined(
+        ?store.root, (?entry.disk_name[0])::str, options);
+    if (is_err[filesystem.File, io_error.Error](opened)) { ret false; }
+    var handle: filesystem.File = unwrap_ok[filesystem.File, io_error.Error](opened);
+    val written: Result[usize, io_error.Error] = file.write_at(handle, data, length,
+        entry.body_length::u64);
+    filesystem.close(?handle);
+    if (is_err[usize, io_error.Error](written)) { ret false; }
+    if (unwrap_ok[usize, io_error.Error](written) != length) { ret false; }
+    entry.body_length = entry.body_length + length;
+    ret true;
+}
+
+# drop every other stored entry that is the same representation of the same
+# target, because this one replaces it
+#
+# without this a revalidation leaves the response it refreshed in place, and a
+# later lookup can still find and serve the superseded copy.
+fun supersede(store: *Store, keep: usize) {
+    val fresh: *Entry = ?store.entries[keep];
+    var i: usize = 0;
+    for (i < store.capacity) {
+        if (i != keep) {
+            val other: *Entry = ?store.entries[i];
+            if (other.state == READY && !other.revalidating
+             && key.equal(?other.identity, ?fresh.identity)
+             && key.dimensions_equal(?other.dimensions, ?fresh.dimensions)) {
+                discard(store, i);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# an entry becomes visible only here, and only when its length is exactly what
+# was declared: a partial write is discarded rather than published short
+pub fun commit(writer: *Writer) bool {
+    if (writer == nil || !writer.active) { ret false; }
+    val store: *Store = writer.store;
+    val entry: *Entry = ?store.entries[writer.index];
+    writer.active = false;
+    if (entry.body_length != entry.reserved) {
+        discard(store, writer.index);
+        store.partial_discards = store.partial_discards + 1;
+        ret false;
+    }
+    entry.state = READY;
+    supersede(store, writer.index);
+    store.stores = store.stores + 1;
+    ret true;
+}
+
+pub fun abandon(writer: *Writer) bool {
+    if (writer == nil || !writer.active) { ret false; }
+    val store: *Store = writer.store;
+    writer.active = false;
+    discard(store, writer.index);
+    store.partial_discards = store.partial_discards + 1;
+    ret true;
+}
+
+pub fun read_body(store: *Store, index: usize, offset: usize, output: *u8,
+    capacity: usize, produced: *usize) bool {
+    if (produced == nil) { ret false; }
+    @produced = 0;
+    val entry: *Entry = entry_at(store, index);
+    if (entry == nil || offset > entry.body_length) { ret false; }
+    var count: usize = entry.body_length - offset;
+    if (count > capacity) { count = capacity; }
+    if (count == 0) { ret true; }
+    if (entry.placement == IN_MEMORY) {
+        var i: usize = 0;
+        for (i < count) {
+            output[i] = store.body[entry.body_offset + offset + i];
+            i = i + 1;
+        }
+        @produced = count;
+        ret true;
+    }
+    if (!store.has_root) { ret false; }
+    val opened: Result[filesystem.File, io_error.Error] = file.open_confined(
+        ?store.root, (?entry.disk_name[0])::str, file.read_options());
+    if (is_err[filesystem.File, io_error.Error](opened)) { ret false; }
+    var handle: filesystem.File = unwrap_ok[filesystem.File, io_error.Error](opened);
+    val read: Result[usize, io_error.Error] = file.read_at(handle, output, count, offset::u64);
+    filesystem.close(?handle);
+    if (is_err[usize, io_error.Error](read)) { ret false; }
+    @produced = unwrap_ok[usize, io_error.Error](read);
+    ret true;
+}
+
+pub fun invalidate(store: *Store, identity: *key.Key) usize {
+    if (!enabled(store) || identity == nil || !identity.valid) { ret 0; }
+    var removed: usize = 0;
+    var i: usize = 0;
+    for (i < store.capacity) {
+        val entry: *Entry = ?store.entries[i];
+        if (entry.state == READY && key.equal(?entry.identity, identity)) {
+            discard(store, i);
+            removed = removed + 1;
+        }
+        i = i + 1;
+    }
+    ret removed;
+}
+
+pub fun live_entries(store: *Store) usize {
+    if (!enabled(store)) { ret 0; }
+    var total: usize = 0;
+    var i: usize = 0;
+    for (i < store.capacity) {
+        if (store.entries[i].state == READY) { total = total + 1; }
+        i = i + 1;
+    }
+    ret total;
+}
+
+pub fun memory_used(store: *Store) usize {
+    if (!enabled(store)) { ret 0; }
+    ret store.body_used;
+}
+
+# --- tests ---
+
+val TEST_BODY: usize = 4096;
+
+rec Fixture {
+    entries: [8]Entry;
+    body: [TEST_BODY]u8;
+    store: Store;
+    scratch: allocator.Allocator;
+}
+
+fun open_store(fixture: *Fixture, memory_bytes: usize, entries: usize) bool {
+    var limits: Limits = default_limits();
+    limits.memory_bytes = memory_bytes;
+    limits.max_entry_bytes = memory_bytes;
+    limits.entries = entries;
+    ret make(?fixture.store, ?fixture.entries[0], 8, ?fixture.body[0], TEST_BODY, limits);
+}
+
+fun make_key(identity: *key.Key, text: str) {
+    identity.length = 0;
+    identity.valid = true;
+    var i: usize = 0;
+    for (text[i] != 0) {
+        identity.bytes[i] = text[i];
+        i = i + 1;
+    }
+    identity.length = i;
+}
+
+fun store_entry(fixture: *Fixture, name: str, payload: str, length: usize) bool {
+    var identity: key.Key;
+    make_key(?identity, name);
+    var dimensions: key.Dimensions;
+    dimensions.len = 0;
+    dimensions.any = false;
+    dimensions.valid = true;
+    var metadata: policy.Metadata;
+    metadata.has_lifetime = true;
+    metadata.lifetime_ns = 1000000000;
+    var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, length, IN_MEMORY);
+    if (!writer.active) { ret false; }
+    if (!write_body(?writer, payload::*u8, length)) { ret false; }
+    ret commit(?writer);
+}
+
+test "cache store: a stored entry is found by its key and read back exactly" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 1024, 8)) { ret 1; }
+    if (!store_entry(?fixture, "a", "hello", 5)) { ret 2; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    val index: usize = lookup(?fixture.store, ?identity);
+    if (index == NO_ENTRY) { ret 3; }
+    var output: [16]u8;
+    var produced: usize = 0;
+    if (!read_body(?fixture.store, index, 0, ?output[0], 16, ?produced) || produced != 5) { ret 4; }
+    if (output[0] != 'h' || output[4] != 'o') { ret 5; }
+    var absent: key.Key;
+    make_key(?absent, "b");
+    if (lookup(?fixture.store, ?absent) != NO_ENTRY) { ret 6; }
+    if (memory_used(?fixture.store) != 5) { ret 7; }
+    ret 0;
+}
+
+test "cache store: the memory budget is exact and eviction is least recently used" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 20, 8)) { ret 1; }
+    if (!store_entry(?fixture, "a", "aaaaaaaaaa", 10)) { ret 2; }
+    if (!store_entry(?fixture, "b", "bbbbbbbbbb", 10)) { ret 3; }
+    if (memory_used(?fixture.store) != 20 || live_entries(?fixture.store) != 2) { ret 4; }
+    # touching the first makes the second the least recently used
+    var first: key.Key;
+    make_key(?first, "a");
+    touch(?fixture.store, lookup(?fixture.store, ?first));
+    if (!store_entry(?fixture, "c", "cccccccccc", 10)) { ret 5; }
+    if (memory_used(?fixture.store) != 20 || live_entries(?fixture.store) != 2) { ret 6; }
+    if (fixture.store.evictions != 1) { ret 7; }
+    var second: key.Key;
+    make_key(?second, "b");
+    if (lookup(?fixture.store, ?second) != NO_ENTRY) { ret 8; }
+    if (lookup(?fixture.store, ?first) == NO_ENTRY) { ret 9; }
+    # the surviving entry still reads back its own bytes after compaction
+    var output: [16]u8;
+    var produced: usize = 0;
+    read_body(?fixture.store, lookup(?fixture.store, ?first), 0, ?output[0], 16, ?produced);
+    if (produced != 10 || output[0] != 'a' || output[9] != 'a') { ret 10; }
+    ret 0;
+}
+
+test "cache store: an entry larger than the budget is refused, not partly kept" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 8, 8)) { ret 1; }
+    var identity: key.Key;
+    make_key(?identity, "big");
+    var dimensions: key.Dimensions;
+    dimensions.len = 0;
+    dimensions.any = false;
+    dimensions.valid = true;
+    var metadata: policy.Metadata;
+    val writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, 64, IN_MEMORY);
+    if (writer.active) { ret 2; }
+    if (fixture.store.rejections != 1) { ret 3; }
+    if (memory_used(?fixture.store) != 0 || live_entries(?fixture.store) != 0) { ret 4; }
+    ret 0;
+}
+
+test "cache store: a partial write is discarded and never becomes visible" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 64, 8)) { ret 1; }
+    var identity: key.Key;
+    make_key(?identity, "short");
+    var dimensions: key.Dimensions;
+    dimensions.len = 0;
+    dimensions.any = false;
+    dimensions.valid = true;
+    var metadata: policy.Metadata;
+    var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, 10, IN_MEMORY);
+    if (!writer.active) { ret 2; }
+    if (!write_body(?writer, "abc"::*u8, 3)) { ret 3; }
+    # committing short must fail rather than publish a truncated representation
+    if (commit(?writer)) { ret 4; }
+    if (lookup(?fixture.store, ?identity) != NO_ENTRY) { ret 5; }
+    if (fixture.store.partial_discards != 1) { ret 6; }
+    # and the reservation it held is returned in full
+    if (memory_used(?fixture.store) != 0) { ret 7; }
+    var again: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, 64, IN_MEMORY);
+    if (!again.active) { ret 8; }
+    abandon(?again);
+    if (memory_used(?fixture.store) != 0 || fixture.store.partial_discards != 2) { ret 9; }
+    ret 0;
+}
+
+test "cache store: an entry count bound evicts even when bytes remain" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 1024, 2)) { ret 1; }
+    if (!store_entry(?fixture, "a", "a", 1)) { ret 2; }
+    if (!store_entry(?fixture, "b", "b", 1)) { ret 3; }
+    if (!store_entry(?fixture, "c", "c", 1)) { ret 4; }
+    if (live_entries(?fixture.store) != 2 || fixture.store.evictions != 1) { ret 5; }
+    ret 0;
+}
+
+test "cache store: invalidation removes the entry and its charge" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 64, 8)) { ret 1; }
+    if (!store_entry(?fixture, "a", "aaaa", 4)) { ret 2; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    if (invalidate(?fixture.store, ?identity) != 1) { ret 3; }
+    if (lookup(?fixture.store, ?identity) != NO_ENTRY) { ret 4; }
+    if (memory_used(?fixture.store) != 0 || live_entries(?fixture.store) != 0) { ret 5; }
+    ret 0;
+}
+
+fun set_dimension(dimensions: *key.Dimensions, name: str, value: str) {
+    dimensions.any = false;
+    dimensions.valid = true;
+    dimensions.len = 1;
+    val slot: *key.Dimension = ?dimensions.items[0];
+    var i: usize = 0;
+    for (name[i] != 0) { slot.name[i] = name[i]; i = i + 1; }
+    slot.name_length = i;
+    var j: usize = 0;
+    for (value[j] != 0) { slot.value[j] = value[j]; j = j + 1; }
+    slot.value_length = j;
+    slot.absent = false;
+}
+
+fun store_variant(fixture: *Fixture, name: str, dimension_value: str, payload: str,
+    length: usize) bool {
+    var identity: key.Key;
+    make_key(?identity, name);
+    var dimensions: key.Dimensions;
+    set_dimension(?dimensions, "accept-encoding", dimension_value);
+    var metadata: policy.Metadata;
+    metadata.has_lifetime = true;
+    metadata.lifetime_ns = 1000000000;
+    var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, length, IN_MEMORY);
+    if (!writer.active) { ret false; }
+    if (!write_body(?writer, payload::*u8, length)) { ret false; }
+    ret commit(?writer);
+}
+
+test "cache store: every representation filed under one key is reachable" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 1024, 8)) { ret 1; }
+    if (!store_variant(?fixture, "a", "gzip", "gz", 2)) { ret 2; }
+    if (!store_variant(?fixture, "a", "br", "br", 2)) { ret 3; }
+    if (live_entries(?fixture.store) != 2) { ret 4; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    # both are found by walking, not just whichever the scan reaches first
+    val first: usize = find_from(?fixture.store, ?identity, 0);
+    if (first == NO_ENTRY) { ret 5; }
+    val second: usize = find_from(?fixture.store, ?identity, first + 1);
+    if (second == NO_ENTRY || second == first) { ret 6; }
+    if (find_from(?fixture.store, ?identity, second + 1) != NO_ENTRY) { ret 7; }
+    # and they really are different representations, not one entry counted twice
+    val left: *Entry = entry_at(?fixture.store, first);
+    val right: *Entry = entry_at(?fixture.store, second);
+    if (key.dimensions_equal(?left.dimensions, ?right.dimensions)) { ret 8; }
+    ret 0;
+}
+
+test "cache store: a stored representation replaces the one it supersedes" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 1024, 8)) { ret 1; }
+    if (!store_variant(?fixture, "a", "gzip", "old", 3)) { ret 2; }
+    if (!store_variant(?fixture, "a", "br", "other", 5)) { ret 3; }
+    # the same target and the same selecting values: this one takes the other's place
+    if (!store_variant(?fixture, "a", "gzip", "new", 3)) { ret 4; }
+    if (live_entries(?fixture.store) != 2) { ret 5; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    var found: usize = find_from(?fixture.store, ?identity, 0);
+    var seen: usize = 0;
+    for (found != NO_ENTRY) {
+        val entry: *Entry = entry_at(?fixture.store, found);
+        var output: [8]u8;
+        var produced: usize = 0;
+        read_body(?fixture.store, found, 0, ?output[0], 8, ?produced);
+        if (entry.dimensions.items[0].value[0] == 'g') {
+            # the superseded copy is gone, so no stale representation survives
+            if (produced != 3 || output[0] != 'n') { ret 6; }
+        }
+        seen = seen + 1;
+        found = find_from(?fixture.store, ?identity, found + 1);
+    }
+    if (seen != 2) { ret 7; }
+    # and the replaced entry's bytes were returned to the budget
+    if (memory_used(?fixture.store) != 8) { ret 8; }
+    ret 0;
+}
+
+test "cache store: a disabled store owns nothing and admits nothing" {
+    var store: Store = disabled();
+    if (enabled(?store)) { ret 1; }
+    if (store.entries != nil || store.body != nil || store.capacity != 0
+     || store.body_capacity != 0 || store.has_root) { ret 2; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    if (lookup(?store, ?identity) != NO_ENTRY) { ret 3; }
+    if (entry_at(?store, 0) != nil) { ret 4; }
+    if (touch(?store, 0)) { ret 5; }
+    if (invalidate(?store, ?identity) != 0) { ret 6; }
+    if (live_entries(?store) != 0 || memory_used(?store) != 0) { ret 7; }
+    var dimensions: key.Dimensions;
+    dimensions.len = 0;
+    dimensions.any = false;
+    dimensions.valid = true;
+    var metadata: policy.Metadata;
+    val writer: Writer = begin(?store, ?identity, ?dimensions, metadata, status.OK, 1, IN_MEMORY);
+    if (writer.active) { ret 8; }
+    # nothing was counted either, so a disabled store does no bookkeeping at all
+    if (store.hits != 0 || store.misses != 0 || store.stores != 0 || store.rejections != 0) { ret 9; }
+    ret 0;
+}
+
+fun ensure_dir(path: str) bool {
+    if (filesystem.is_dir(path)) { ret true; }
+    ret !option.is_some[str](filesystem.create_dir(path, 493));
+}
+
+fun disk_fixture(fixture: *Fixture, root: str, disk_bytes: usize) bool {
+    if (!ensure_dir("out") || !ensure_dir(root)) { ret false; }
+    if (option.is_some[*u8](page.make(?fixture.scratch))) { ret false; }
+    var limits: Limits = default_limits();
+    limits.memory_bytes = 64;
+    limits.disk_bytes = disk_bytes;
+    limits.max_entry_bytes = 1024;
+    limits.entries = 8;
+    if (!make(?fixture.store, ?fixture.entries[0], 8, ?fixture.body[0], TEST_BODY, limits)) {
+        ret false;
+    }
+    ret attach_disk(?fixture.store, root, ?fixture.scratch);
+}
+
+fun store_disk_entry(fixture: *Fixture, name: str, payload: str, length: usize) bool {
+    var identity: key.Key;
+    make_key(?identity, name);
+    var dimensions: key.Dimensions;
+    dimensions.len = 0;
+    dimensions.any = false;
+    dimensions.valid = true;
+    var metadata: policy.Metadata;
+    var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, length, ON_DISK);
+    if (!writer.active) { ret false; }
+    if (!write_body(?writer, payload::*u8, length)) { ret false; }
+    ret commit(?writer);
+}
+
+fun disk_file_exists(root: str, name: str) bool {
+    var path: [320]u8;
+    var at: usize = 0;
+    for (root[at] != 0) { path[at] = root[at]; at = at + 1; }
+    path[at] = '/';
+    at = at + 1;
+    var i: usize = 0;
+    for (name[i] != 0) { path[at + i] = name[i]; i = i + 1; }
+    path[at + i] = 0;
+    ret filesystem.is_file((?path[0])::str);
+}
+
+test "cache store: a disk entry is written to a real file and read back exactly" {
+    var fixture: Fixture;
+    if (!disk_fixture(?fixture, "out/cache-disk-basic", 1024)) { ret 1; }
+    if (!store_disk_entry(?fixture, "a", "disk payload", 12)) { close(?fixture.store); ret 2; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    val index: usize = lookup(?fixture.store, ?identity);
+    if (index == NO_ENTRY) { close(?fixture.store); ret 3; }
+    val entry: *Entry = entry_at(?fixture.store, index);
+    if (entry == nil || entry.placement != ON_DISK) { close(?fixture.store); ret 4; }
+    if (!disk_file_exists("out/cache-disk-basic", (?entry.disk_name[0])::str)) {
+        close(?fixture.store); ret 5;
+    }
+    var output: [32]u8;
+    var produced: usize = 0;
+    if (!read_body(?fixture.store, index, 0, ?output[0], 32, ?produced) || produced != 12) {
+        close(?fixture.store); ret 6;
+    }
+    if (output[0] != 'd' || output[11] != 'd') { close(?fixture.store); ret 7; }
+    # the memory budget was untouched: a disk entry costs disk, not memory
+    if (memory_used(?fixture.store) != 0 || fixture.store.disk_used != 12) {
+        close(?fixture.store); ret 8;
+    }
+    close(?fixture.store);
+    ret 0;
+}
+
+test "cache store: the disk budget evicts and removes the evicted file" {
+    var fixture: Fixture;
+    if (!disk_fixture(?fixture, "out/cache-disk-budget", 20)) { ret 1; }
+    if (!store_disk_entry(?fixture, "a", "aaaaaaaaaa", 10)) { close(?fixture.store); ret 2; }
+    var first: key.Key;
+    make_key(?first, "a");
+    val first_entry: *Entry = entry_at(?fixture.store, lookup(?fixture.store, ?first));
+    var first_name: [64]u8;
+    var i: usize = 0;
+    for (i < first_entry.disk_name_length) { first_name[i] = first_entry.disk_name[i]; i = i + 1; }
+    first_name[i] = 0;
+    if (!store_disk_entry(?fixture, "b", "bbbbbbbbbb", 10)) { close(?fixture.store); ret 3; }
+    if (fixture.store.disk_used != 20) { close(?fixture.store); ret 4; }
+    if (!store_disk_entry(?fixture, "c", "cccccccccc", 10)) { close(?fixture.store); ret 5; }
+    # the budget held, so the least recently used entry went
+    if (fixture.store.disk_used != 20 || live_entries(?fixture.store) != 2) {
+        close(?fixture.store); ret 6;
+    }
+    if (fixture.store.evictions != 1) { close(?fixture.store); ret 7; }
+    if (lookup(?fixture.store, ?first) != NO_ENTRY) { close(?fixture.store); ret 8; }
+    # and its file went with it, rather than being left for a later process to find
+    if (disk_file_exists("out/cache-disk-budget", (?first_name[0])::str)) {
+        close(?fixture.store); ret 9;
+    }
+    close(?fixture.store);
+    ret 0;
+}
+
+test "cache store: closing removes every disk file it wrote" {
+    var fixture: Fixture;
+    if (!disk_fixture(?fixture, "out/cache-disk-close", 1024)) { ret 1; }
+    if (!store_disk_entry(?fixture, "a", "kept", 4)) { close(?fixture.store); ret 2; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    val entry: *Entry = entry_at(?fixture.store, lookup(?fixture.store, ?identity));
+    var name: [64]u8;
+    var i: usize = 0;
+    for (i < entry.disk_name_length) { name[i] = entry.disk_name[i]; i = i + 1; }
+    name[i] = 0;
+    if (!disk_file_exists("out/cache-disk-close", (?name[0])::str)) { close(?fixture.store); ret 3; }
+    if (!close(?fixture.store)) { ret 4; }
+    # a file the next process could not describe is a poisoning risk, so none is left
+    if (disk_file_exists("out/cache-disk-close", (?name[0])::str)) { ret 5; }
+    ret 0;
+}
+
+fun write_orphan(root: str, name: str) bool {
+    var path: [320]u8;
+    var at: usize = 0;
+    for (root[at] != 0) { path[at] = root[at]; at = at + 1; }
+    path[at] = '/';
+    at = at + 1;
+    var i: usize = 0;
+    for (name[i] != 0) { path[at + i] = name[i]; i = i + 1; }
+    path[at + i] = 0;
+    ret !option.is_some[str](filesystem.write_bytes((?path[0])::str, "x"::*u8, 1, 420));
+}
+
+test "cache store: attaching a root discards what a killed process left in it" {
+    if (!ensure_dir("out") || !ensure_dir("out/cache-disk-orphan")) { ret 1; }
+    # a file this store's counter could have produced, charged to no budget
+    if (!write_orphan("out/cache-disk-orphan", "e7")) { ret 2; }
+    # and one it could not have, which is none of its business
+    if (!write_orphan("out/cache-disk-orphan", "keep.txt")) { ret 3; }
+    var fixture: Fixture;
+    if (!disk_fixture(?fixture, "out/cache-disk-orphan", 1024)) { ret 4; }
+    if (disk_file_exists("out/cache-disk-orphan", "e7")) { close(?fixture.store); ret 5; }
+    if (!disk_file_exists("out/cache-disk-orphan", "keep.txt")) { close(?fixture.store); ret 6; }
+    close(?fixture.store);
+    ret 0;
+}
+
+test "cache store: a writer cannot run past the length it reserved" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 64, 8)) { ret 1; }
+    if (!store_entry(?fixture, "neighbour", "NNNN", 4)) { ret 2; }
+    var identity: key.Key;
+    make_key(?identity, "overrun");
+    var dimensions: key.Dimensions;
+    dimensions.len = 0;
+    dimensions.any = false;
+    dimensions.valid = true;
+    var metadata: policy.Metadata;
+    var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, 4, IN_MEMORY);
+    if (!writer.active) { ret 3; }
+    if (!write_body(?writer, "aaaa"::*u8, 4)) { ret 4; }
+    # one byte past the reservation would land in the next entry's bytes
+    if (write_body(?writer, "X"::*u8, 1)) { ret 5; }
+    if (!commit(?writer)) { ret 6; }
+    var neighbour: key.Key;
+    make_key(?neighbour, "neighbour");
+    var output: [8]u8;
+    var produced: usize = 0;
+    read_body(?fixture.store, lookup(?fixture.store, ?neighbour), 0, ?output[0], 8, ?produced);
+    if (produced != 4 || output[0] != 'N' || output[3] != 'N') { ret 7; }
+    ret 0;
+}
+
+# the disk-full shape: the store asked the filesystem for a write and did not get
+# it, and must publish nothing rather than a short representation
+test "cache store: a refused disk write leaves no visible entry" {
+    if (!ensure_dir("out")) { ret 1; }
+    # a root the process may read and traverse but not write into
+    if (!filesystem.is_dir("out/cache-disk-readonly")
+     && option.is_some[str](filesystem.create_dir("out/cache-disk-readonly", 365))) { ret 2; }
+    var fixture: Fixture;
+    if (!disk_fixture(?fixture, "out/cache-disk-readonly", 1024)) { ret 3; }
+    var identity: key.Key;
+    make_key(?identity, "denied");
+    var dimensions: key.Dimensions;
+    dimensions.len = 0;
+    dimensions.any = false;
+    dimensions.valid = true;
+    var metadata: policy.Metadata;
+    var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, 4, ON_DISK);
+    if (!writer.active) { close(?fixture.store); ret 4; }
+    if (write_body(?writer, "aaaa"::*u8, 4)) { close(?fixture.store); ret 5; }
+    abandon(?writer);
+    if (lookup(?fixture.store, ?identity) != NO_ENTRY) { close(?fixture.store); ret 6; }
+    # and the reservation it held went back to the disk budget in full
+    if (fixture.store.disk_used != 0) { close(?fixture.store); ret 7; }
+    if (live_entries(?fixture.store) != 0) { close(?fixture.store); ret 8; }
+    close(?fixture.store);
+    ret 0;
+}
