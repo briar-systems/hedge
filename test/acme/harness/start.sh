@@ -17,10 +17,17 @@ mkdir -p "$run"
 
 "$0.stop" 2>/dev/null || true
 
+# -http01 "" is load bearing, not tidying: answering http-01 is the thing this
+# suite proves hedge does, so port 5002 must belong to hedge's listener and
+# nothing else may hold it. restoring this responder would make the suite pass
+# whether or not hedge served a byte.
+#
+# -defaultIPv6 "" is load bearing too: challtestsrv answers AAAA with ::1 by
+# default, and the authority follows it to a listener that is not there. the
+# failure looks like hedge not answering.
+#
 # challtestsrv still answers dns for the names under test, and still exposes
 # its management api so a dns-01 provider can publish a record.
-# every name resolves to loopback ipv4 only. hedge's test listener binds
-# 127.0.0.1, and an AAAA answer would send the authority to ::1 instead.
 "$bin/pebble-challtestsrv" \
     -http01 "" -tlsalpn01 ":5001" -https01 "" \
     -defaultIPv6 "" \
