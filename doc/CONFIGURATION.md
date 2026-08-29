@@ -114,7 +114,48 @@ routing, and forwarded headers all name the same client. Both the v1 text and v2
 binary forms are accepted, and a malformed header closes the connection rather
 than being read as the start of a request.
 
-Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. A named listener `budget` limits its accepted connections. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+
+## Budgets
+
+A named `budget` carries four bounds, and a listener that names one is held to
+all of them:
+
+- `concurrency` is how many connections it may serve at once
+- `queue` is how many more may be accepted and made to wait for a turn
+- `timeout_ms` is how long one of those may wait before it is closed
+- `memory_bytes` is how many bytes the work may hold at once
+
+A budget is charged before the work it authorises and released exactly once when
+that work ends, so admitting something and then finding there is no room for it
+cannot happen. A connection holding a place in a queue is accepted but not
+served: that is what makes the queue a queue rather than a label. A charge larger
+than the whole budget is refused rather than queued, because no amount of other
+work finishing would make room for it.
+
+A seam with no budget configured is not a seam with a budget of zero. It is
+admitted without accounting.
+
+Route, service, host, and application budgets parse and validate today and are
+not yet charged.
+
+## Shutdown
+
+Shutdown runs one ordered sequence: readiness goes false, the listeners stop
+accepting, each protocol engine is asked to close gracefully — HTTP/2 sends
+GOAWAY, HTTP/1 marks its responses for close and stops reading — exchanges
+already in flight are given until the `drain_ms` deadline to finish, whatever
+remains is cancelled, telemetry is flushed, and the resources are released last.
+
+The exit status reports which of those happened. A clean drain exits 0. A drain
+whose deadline passed with exchanges still running exits 75 and names how many
+were abandoned, because that is not a clean shutdown even though it is a
+complete one. A step of the sequence failing exits 70 and names the step.
+
+A reload publishes new listeners and a new plan for the connections accepted
+after it. Connections accepted before it keep the plan and generation they began
+under and are asked to finish, so a superseded generation drains independently of
+the one that replaced it.
 
 A host names itself with either `server_name` for a single name or `names` for several; declaring both is a conflict, and declaring neither uses the host block's own key as its name. Every name a host declares is a name it answers to, and each is compiled into its own routing pattern, so a host with three names serves all three rather than only the first. A name may be an exact host, a `*.suffix` wildcard, or carry an explicit port.
 
