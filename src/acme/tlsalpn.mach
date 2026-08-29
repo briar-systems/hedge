@@ -1,0 +1,562 @@
+# tls-alpn-01: the certificate hedge presents to prove control of a name
+#
+# rfc 8737 answers a challenge with a self-signed certificate carrying the
+# acmeIdentifier extension, presented on the `acme-tls/1` alpn protocol for
+# exactly the name being validated. mach-acme derives the extension value from
+# the account key; this module builds the certificate around it.
+#
+# the certificate is deliberately unusable as a server certificate: it has an
+# empty subject and issuer, a one-hour validity, an ephemeral key, and a
+# critical extension no ordinary client understands. presenting it outside the
+# `acme-tls/1` protocol would be refused by anything that reads it.
+#
+# the presentation slot is filled here and read by the tls listener. this build
+# has no tls termination, so nothing reads it yet; the slot is the seam, and
+# the certificate it holds is complete and verifiable today.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use R: std.types.result;
+use T: std.chrono.time;
+use std.chrono.date;
+use std.crypto.rand;
+use ct: std.crypto.ct;
+use contracts: crypto.contracts;
+use signature: crypto.signature;
+use ch: acme.challenge;
+use x509: tls.cert.x509;
+use der: crypto.encoding.der;
+use identifier: acme.identifier;
+use problem: acme.problem;
+use keys: hedge.acme.keys;
+
+pub val ALPN_PROTOCOL: str = "acme-tls/1";
+pub val MAX_CERTIFICATE_BYTES: usize = 1024;
+pub val MAX_SUBJECT_BYTES: usize = identifier.MAX_DNS_BYTES;
+# rfc 8737 section 3: the challenge is answered within one validation, so the
+# certificate outlives the attempt by an hour and no longer
+pub val VALIDITY_SECONDS: i64 = 3600;
+val SERIAL_BYTES: usize = 16;
+
+fun emit(tag: u8, content: *u8, length: usize, output: *u8,
+    capacity: usize) usize {
+    var header: usize = 2;
+    if (length >= 128) {
+        var value: usize = length;
+        var width: usize = 0;
+        for (value > 0) {
+            width = width + 1;
+            value = value >> 8;
+        }
+        header = 2 + width;
+    }
+    if (length > capacity || header > capacity - length) { ret 0; }
+    output[0] = tag;
+    if (length < 128) {
+        output[1] = length::u8;
+    } or {
+        val width: usize = header - 2;
+        output[1] = (0x80 | width)::u8;
+        var i: usize = 0;
+        for (i < width) {
+            output[2 + i] = (length >> ((width - 1 - i) << 3))::u8;
+            i = i + 1;
+        }
+    }
+    var i: usize = 0;
+    for (i < length) {
+        output[header + i] = content[i];
+        i = i + 1;
+    }
+    ret header + length;
+}
+
+fun put(output: *u8, at: usize, capacity: usize, data: *u8,
+    length: usize) usize {
+    if (at + length > capacity) { ret capacity + 1; }
+    var i: usize = 0;
+    for (i < length) {
+        output[at + i] = data[i];
+        i = i + 1;
+    }
+    ret at + length;
+}
+
+fun two_digits(output: *u8, at: usize, value: i64) {
+    output[at] = ('0' + (value / 10 % 10)::u8);
+    output[at + 1] = ('0' + (value % 10)::u8);
+}
+
+# rfc 5280 requires utctime for years before 2050, which is every certificate
+# this presentation will ever build
+fun utc_time(seconds: i64, output: *u8) bool {
+    val moment: date.Datetime = date.datetime_from_time(T.unix(seconds, 0));
+    if (moment.year < 1950 || moment.year >= 2050) { ret false; }
+    two_digits(output, 0, moment.year % 100);
+    two_digits(output, 2, moment.month);
+    two_digits(output, 4, moment.day);
+    two_digits(output, 6, moment.hour);
+    two_digits(output, 8, moment.minute);
+    two_digits(output, 10, moment.second);
+    output[12] = 'Z';
+    ret true;
+}
+
+pub rec Alpn {
+    key:        keys.Key;
+    der:        [MAX_CERTIFICATE_BYTES]u8;
+    der_len:    usize;
+    subject:    [MAX_SUBJECT_BYTES]u8;
+    subject_len: usize;
+    presented:  usize;
+    withdrawn:  usize;
+    live:       bool;
+    held:       bool;
+}
+
+pub fun reset(state: *Alpn) bool {
+    if (state == nil) { ret false; }
+    if (state.held) { keys.destroy(?state.key); }
+    state.der_len = 0;
+    state.subject_len = 0;
+    state.presented = 0;
+    state.withdrawn = 0;
+    state.held = false;
+    state.live = true;
+    ret true;
+}
+
+pub fun certificate(state: *Alpn) view.View {
+    if (state == nil || state.der_len == 0) { ret view.view(nil, 0); }
+    ret view.view(?state.der[0], state.der_len);
+}
+
+pub fun subject(state: *Alpn) view.View {
+    if (state == nil || state.subject_len == 0) { ret view.view(nil, 0); }
+    ret view.view(?state.subject[0], state.subject_len);
+}
+
+pub fun presenting(state: *Alpn) bool {
+    ret state != nil && state.held && state.der_len != 0;
+}
+
+pub fun key_of(state: *Alpn) *keys.Key {
+    ret ?state.key;
+}
+
+# builds the rfc 8737 certificate for one identifier and one key authorization
+pub fun build(state: *Alpn, subject_name: view.View,
+    key_authorization: view.View, now: T.Time) bool {
+    if (state == nil || subject_name.data == nil || subject_name.len == 0
+     || subject_name.len > MAX_SUBJECT_BYTES) { ret false; }
+    var extension_value: [ch.TLS_ALPN_EXTENSION_BYTES]u8;
+    val derived: ch.Operation = ch.tls_alpn_extension(key_authorization,
+        contracts.Buffer{data: ?extension_value[0],
+            capacity: ch.TLS_ALPN_EXTENSION_BYTES});
+    if (problem.failed(derived.error)) { ret false; }
+    if (!keys.generate(?state.key)) { ret false; }
+    state.held = true;
+
+    var scratch: [512]u8;
+    var body: [768]u8;
+    var at: usize = 0;
+
+    # version [0] EXPLICIT INTEGER 2
+    val version: [5]u8 = [5]u8{0xa0, 0x03, 0x02, 0x01, 0x02};
+    at = put(?body[0], at, 768, ?version[0], 5);
+
+    # a random positive serial with the high bit clear, so no padding is needed
+    var serial: [SERIAL_BYTES]u8;
+    if (rand.fill(?serial[0], SERIAL_BYTES) != 0) { ret false; }
+    serial[0] = serial[0] & 0x7f;
+    if (serial[0] == 0) { serial[0] = 1; }
+    var written: usize = emit(0x02, ?serial[0], SERIAL_BYTES, ?scratch[0], 512);
+    if (written == 0) { ret false; }
+    at = put(?body[0], at, 768, ?scratch[0], written);
+
+    # ecdsa-with-SHA256, stated identically in the tbs and on the certificate
+    val algorithm: [12]u8 = [12]u8{0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48,
+        0xce, 0x3d, 0x04, 0x03, 0x02};
+    at = put(?body[0], at, 768, ?algorithm[0], 12);
+
+    # an empty issuer and subject: this certificate names nobody
+    val empty_name: [2]u8 = [2]u8{0x30, 0x00};
+    at = put(?body[0], at, 768, ?empty_name[0], 2);
+
+    var validity: [32]u8;
+    var not_before: [13]u8;
+    var not_after: [13]u8;
+    if (!utc_time(now.sec, ?not_before[0])
+     || !utc_time(now.sec + VALIDITY_SECONDS, ?not_after[0])) { ret false; }
+    var inner: usize = emit(0x17, ?not_before[0], 13, ?validity[0], 32);
+    if (inner == 0) { ret false; }
+    val second: usize = emit(0x17, ?not_after[0], 13, ?validity[inner],
+        32 - inner);
+    if (second == 0) { ret false; }
+    inner = inner + second;
+    written = emit(0x30, ?validity[0], inner, ?scratch[0], 512);
+    if (written == 0) { ret false; }
+    at = put(?body[0], at, 768, ?scratch[0], written);
+
+    # the ephemeral key this presentation was built around
+    val spki: view.View = keys.public_der(?state.key);
+    at = put(?body[0], at, 768, spki.data, spki.len);
+
+    # extensions: the identifier being validated, and the acme identifier the
+    # authority checks. both are critical, because an empty subject makes the
+    # name authoritative and rfc 8737 requires the second.
+    var extensions: [256]u8;
+    var extension_at: usize = 0;
+    var name_entry: [260]u8;
+    written = emit(0x82, subject_name.data, subject_name.len, ?name_entry[0],
+        260);
+    if (written == 0) { ret false; }
+    var alt_names: [264]u8;
+    val names_len: usize = emit(0x30, ?name_entry[0], written, ?alt_names[0],
+        264);
+    if (names_len == 0) { ret false; }
+    var alt_octets: [272]u8;
+    val alt_octets_len: usize = emit(0x04, ?alt_names[0], names_len,
+        ?alt_octets[0], 272);
+    if (alt_octets_len == 0) { ret false; }
+    var alt_body: [288]u8;
+    var alt_at: usize = 0;
+    val san_oid: [5]u8 = [5]u8{0x06, 0x03, 0x55, 0x1d, 0x11};
+    alt_at = put(?alt_body[0], alt_at, 288, ?san_oid[0], 5);
+    val critical: [3]u8 = [3]u8{0x01, 0x01, 0xff};
+    alt_at = put(?alt_body[0], alt_at, 288, ?critical[0], 3);
+    alt_at = put(?alt_body[0], alt_at, 288, ?alt_octets[0], alt_octets_len);
+    if (alt_at > 288) { ret false; }
+    written = emit(0x30, ?alt_body[0], alt_at, ?extensions[0], 256);
+    if (written == 0) { ret false; }
+    extension_at = written;
+
+    var acme_octets: [64]u8;
+    val acme_octets_len: usize = emit(0x04, ?extension_value[0],
+        derived.value.len, ?acme_octets[0], 64);
+    if (acme_octets_len == 0) { ret false; }
+    var acme_body: [96]u8;
+    var acme_at: usize = 0;
+    # 1.3.6.1.5.5.7.1.31
+    val acme_oid: [10]u8 = [10]u8{0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05,
+        0x07, 0x01, 0x1f};
+    acme_at = put(?acme_body[0], acme_at, 96, ?acme_oid[0], 10);
+    acme_at = put(?acme_body[0], acme_at, 96, ?critical[0], 3);
+    acme_at = put(?acme_body[0], acme_at, 96, ?acme_octets[0],
+        acme_octets_len);
+    if (acme_at > 96) { ret false; }
+    written = emit(0x30, ?acme_body[0], acme_at, ?extensions[extension_at],
+        256 - extension_at);
+    if (written == 0) { ret false; }
+    extension_at = extension_at + written;
+
+    var extension_sequence: [288]u8;
+    written = emit(0x30, ?extensions[0], extension_at,
+        ?extension_sequence[0], 288);
+    if (written == 0) { ret false; }
+    var tagged: [296]u8;
+    written = emit(0xa3, ?extension_sequence[0], written, ?tagged[0], 296);
+    if (written == 0) { ret false; }
+    at = put(?body[0], at, 768, ?tagged[0], written);
+    if (at > 768) { ret false; }
+
+    var tbs: [800]u8;
+    val tbs_len: usize = emit(0x30, ?body[0], at, ?tbs[0], 800);
+    if (tbs_len == 0) { ret false; }
+
+    var raw_signature: [keys.MAX_SIGNATURE_BYTES]u8;
+    val csr: usize = 0;
+    var scalar: [keys.SCALAR_BYTES]^u8;
+    keys.private_key(?state.key, ?scalar[0]);
+    val signed: contracts.Operation = signature.sign_ecdsa_p256_sha256(
+        contracts.SecretBytes{data: ?scalar[0], len: keys.SCALAR_BYTES},
+        contracts.Bytes{data: ?tbs[0], len: tbs_len},
+        contracts.Buffer{data: ?raw_signature[0],
+            capacity: keys.MAX_SIGNATURE_BYTES});
+    ct.zeroize(?scalar[0], keys.SCALAR_BYTES);
+    if (signed.error != contracts.OK || signed.written == 0) { ret false; }
+
+    var bit_string: [96]u8;
+    bit_string[0] = 0;
+    var i: usize = 0;
+    for (i < signed.written) {
+        bit_string[1 + i] = raw_signature[i];
+        i = i + 1;
+    }
+    var wrapped: [104]u8;
+    written = emit(0x03, ?bit_string[0], signed.written + 1, ?wrapped[0], 104);
+    if (written == 0) { ret false; }
+
+    var certificate_body: [900]u8;
+    var certificate_at: usize = 0;
+    certificate_at = put(?certificate_body[0], certificate_at, 900, ?tbs[0],
+        tbs_len);
+    certificate_at = put(?certificate_body[0], certificate_at, 900,
+        ?algorithm[0], 12);
+    certificate_at = put(?certificate_body[0], certificate_at, 900,
+        ?wrapped[0], written);
+    if (certificate_at > 900) { ret false; }
+    val total: usize = emit(0x30, ?certificate_body[0], certificate_at,
+        ?state.der[0], MAX_CERTIFICATE_BYTES);
+    if (total == 0) { ret false; }
+    state.der_len = total;
+    i = 0;
+    for (i < subject_name.len) {
+        state.subject[i] = subject_name.data[i];
+        i = i + 1;
+    }
+    state.subject_len = subject_name.len;
+    ret true;
+}
+
+fun supports(context: ptr, subject_name: identifier.Identifier,
+    kind: u8) bool {
+    val state: *Alpn = context::*Alpn;
+    ret state != nil && state.live && kind == ch.TLS_ALPN_01
+        && subject_name.kind == identifier.DNS
+        && !identifier.is_wildcard(subject_name);
+}
+
+fun present(context: ptr, subject_name: identifier.Identifier,
+    value: ch.Challenge, key_authorization: view.View)
+    R.Result[ch.Presentation, problem.Error] {
+    val state: *Alpn = context::*Alpn;
+    if (state == nil || !state.live || state.der_len != 0) {
+        ret R.err[ch.Presentation, problem.Error](problem.local(
+            problem.CHALLENGE, "tls-alpn-01 already holds a presentation"));
+    }
+    if (!build(state, subject_name.value, key_authorization, T.now())) {
+        ret R.err[ch.Presentation, problem.Error](problem.local(
+            problem.CHALLENGE,
+            "the tls-alpn-01 certificate could not be built"));
+    }
+    state.presented = state.presented + 1;
+    ret R.ok[ch.Presentation, problem.Error](ch.Presentation{ctx: (1)::ptr});
+}
+
+fun cleanup(context: ptr,
+    presentation: ch.Presentation) R.Result[bool, problem.Error] {
+    val state: *Alpn = context::*Alpn;
+    if (state == nil || presentation.ctx::usize != 1) {
+        ret R.err[bool, problem.Error](problem.local(problem.CHALLENGE,
+            "tls-alpn-01 cleanup does not name a presentation"));
+    }
+    state.der_len = 0;
+    state.subject_len = 0;
+    if (state.held) {
+        keys.destroy(?state.key);
+        state.held = false;
+    }
+    state.withdrawn = state.withdrawn + 1;
+    ret R.ok[bool, problem.Error](true);
+}
+
+pub fun provider(state: *Alpn) ch.Provider {
+    var value: ch.Provider;
+    value.ctx = state::ptr;
+    value.supports = supports;
+    value.present = present;
+    value.cleanup = cleanup;
+    ret value;
+}
+
+val TEST_TOKEN: str = "tokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+val TEST_AUTHORIZATION: str = "tokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.thumbBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+fun test_length(value: str) usize {
+    var i: usize = 0;
+    for (value[i] != 0) { i = i + 1; }
+    ret i;
+}
+
+fun test_view(value: str) view.View {
+    ret view.view(value, test_length(value));
+}
+
+fun test_subject() identifier.Identifier {
+    ret identifier.Identifier{kind: identifier.DNS,
+        value: test_view("hedge.example")};
+}
+
+fun test_challenge() ch.Challenge {
+    var value: ch.Challenge;
+    value.typ = ch.TLS_ALPN_01;
+    value.url = test_view("https://acme.example/challenge/1");
+    value.token = test_view(TEST_TOKEN);
+    value.status = ch.PENDING;
+    value.validated = view.view(nil, 0);
+    ret value;
+}
+
+fun contains(data: *u8, len: usize, needle: *u8, wanted: usize) bool {
+    if (wanted == 0 || len < wanted) { ret false; }
+    var at: usize = 0;
+    for (at + wanted <= len) {
+        var i: usize = 0;
+        for (i < wanted && data[at + i] == needle[i]) { i = i + 1; }
+        if (i == wanted) { ret true; }
+        at = at + 1;
+    }
+    ret false;
+}
+
+test "acme tls-alpn: the presented certificate is a valid rfc 8737 answer" {
+    var state: Alpn;
+    reset(?state);
+    if (!build(?state, test_view("hedge.example"),
+        test_view(TEST_AUTHORIZATION), T.now())) { ret 1; }
+    val encoded: view.View = certificate(?state);
+    if (encoded.len == 0 || encoded.data[0] != 0x30) { ret 2; }
+
+    # a validating x.509 parser refuses this certificate, which is the point:
+    # rfc 5280 requires an unknown critical extension to be rejected, so an
+    # acme-tls/1 answer can never be mistaken for a server certificate
+    var refused: x509.Certificate;
+    if (x509.parse(contracts.Bytes{data: encoded.data, len: encoded.len},
+        ?refused) == contracts.OK) { ret 3; }
+
+    # its der structure is still exactly a certificate
+    var walk: der.Cursor = der.cursor(contracts.Bytes{data: encoded.data,
+        len: encoded.len});
+    var top: der.Element;
+    if (der.next(?walk, ?top) != contracts.OK || top.tag != der.SEQUENCE) {
+        ret 4;
+    }
+    var inside: der.Cursor;
+    if (der.enter(?walk, ?top, ?inside) != contracts.OK) { ret 5; }
+    var tbs_element: der.Element;
+    var algorithm_element: der.Element;
+    var signature_element: der.Element;
+    if (der.next(?inside, ?tbs_element) != contracts.OK
+     || tbs_element.tag != der.SEQUENCE) { ret 6; }
+    if (der.next(?inside, ?algorithm_element) != contracts.OK
+     || algorithm_element.tag != der.SEQUENCE) { ret 7; }
+    if (der.next(?inside, ?signature_element) != contracts.OK
+     || signature_element.tag != der.BIT_STRING
+     || signature_element.content.len < 2
+     || signature_element.content.data[0] != 0) { ret 8; }
+
+    # the validity window is one hour of utctime
+    var fields: der.Cursor;
+    if (der.enter(?inside, ?tbs_element, ?fields) != contracts.OK) { ret 9; }
+    var element: der.Element;
+    var seen: usize = 0;
+    var not_before_seen: bool = false;
+    var not_after_seen: bool = false;
+    for (seen < 8) {
+        if (der.next(?fields, ?element) != contracts.OK) { brk; }
+        if (element.tag == der.SEQUENCE && seen == 4) {
+            var window: der.Cursor;
+            if (der.enter(?fields, ?element, ?window) != contracts.OK) {
+                ret 10;
+            }
+            var moment: der.Element;
+            if (der.next(?window, ?moment) != contracts.OK
+             || moment.tag != 0x17 || moment.content.len != 13
+             || moment.content.data[12] != 'Z') { ret 11; }
+            not_before_seen = true;
+            if (der.next(?window, ?moment) != contracts.OK
+             || moment.tag != 0x17 || moment.content.len != 13) { ret 12; }
+            not_after_seen = true;
+        }
+        seen = seen + 1;
+    }
+    if (!not_before_seen || !not_after_seen) { ret 13; }
+    if (!contains(encoded.data, encoded.len, "hedge.example"::*u8, 13)) {
+        ret 14;
+    }
+
+    # the acmeIdentifier extension carries exactly the digest mach-acme
+    # derived from the account key, and the authority checks that byte for byte
+    var digest: [ch.DIGEST_BYTES]u8;
+    val derived: ch.Operation = ch.tls_alpn_digest(
+        test_view(TEST_AUTHORIZATION),
+        contracts.Buffer{data: ?digest[0], capacity: ch.DIGEST_BYTES});
+    if (problem.failed(derived.error)) { ret 15; }
+    if (!contains(encoded.data, encoded.len, ?digest[0], ch.DIGEST_BYTES)) {
+        ret 16;
+    }
+    # the oid, marked critical, precedes it
+    val oid: [13]u8 = [13]u8{0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07,
+        0x01, 0x1f, 0x01, 0x01, 0xff};
+    if (!contains(encoded.data, encoded.len, ?oid[0], 13)) { ret 17; }
+
+    # the signature is the ephemeral key's, over the exact tbs
+    if (signature.verify_ecdsa_p256_sha256(
+        contracts.Bytes{data: ?state.key.point[0], len: keys.POINT_BYTES},
+        tbs_element.encoded,
+        contracts.Bytes{data: ?signature_element.content.data[1],
+            len: signature_element.content.len - 1}) != contracts.OK) {
+        ret 18;
+    }
+    reset(?state);
+    ret 0;
+}
+
+test "acme tls-alpn: a presentation is retired exactly once" {
+    var state: Alpn;
+    reset(?state);
+    var attempt: ch.Attempt;
+    if (problem.failed(ch.attempt_init(?attempt, provider(?state)))) { ret 1; }
+    if (problem.failed(ch.begin(?attempt, test_subject(), test_challenge(),
+        test_view(TEST_AUTHORIZATION)))) { ret 2; }
+    if (attempt.present_calls != 1 || state.presented != 1
+     || !presenting(?state)) { ret 3; }
+    if (!view.view_eq_str(subject(?state), "hedge.example")) { ret 4; }
+    if (problem.failed(ch.finish(?attempt))) { ret 5; }
+    if (attempt.cleanup_calls != 1 || state.withdrawn != 1
+     || presenting(?state)) { ret 6; }
+    ch.finish(?attempt);
+    if (state.withdrawn != 1) { ret 7; }
+    ret 0;
+}
+
+test "acme tls-alpn: a wildcard and the wrong challenge type are declined" {
+    var state: Alpn;
+    reset(?state);
+    var attempt: ch.Attempt;
+    ch.attempt_init(?attempt, provider(?state));
+    val wildcard: identifier.Identifier = identifier.Identifier{
+        kind: identifier.DNS, value: test_view("*.hedge.example")};
+    if (!problem.failed(ch.begin(?attempt, wildcard, test_challenge(),
+        test_view(TEST_AUTHORIZATION)))) { ret 1; }
+    if (state.presented != 0) { ret 2; }
+    var other: ch.Attempt;
+    ch.attempt_init(?other, provider(?state));
+    var http: ch.Challenge = test_challenge();
+    http.typ = ch.HTTP_01;
+    if (!problem.failed(ch.begin(?other, test_subject(), http,
+        test_view(TEST_AUTHORIZATION)))) { ret 3; }
+    if (state.presented != 0) { ret 4; }
+    ret 0;
+}
+
+test "acme tls-alpn: two presentations produce different keys" {
+    var state: Alpn;
+    reset(?state);
+    if (!build(?state, test_view("hedge.example"),
+        test_view(TEST_AUTHORIZATION), T.now())) { ret 1; }
+    var first: [keys.POINT_BYTES]u8;
+    var i: usize = 0;
+    for (i < keys.POINT_BYTES) {
+        first[i] = state.key.point[i];
+        i = i + 1;
+    }
+    val first_len: usize = state.der_len;
+    reset(?state);
+    if (!build(?state, test_view("hedge.example"),
+        test_view(TEST_AUTHORIZATION), T.now())) { ret 2; }
+    var same: bool = true;
+    i = 0;
+    for (i < keys.POINT_BYTES) {
+        if (first[i] != state.key.point[i]) { same = false; }
+        i = i + 1;
+    }
+    if (same) { ret 3; }
+    reset(?state);
+    ret 0;
+}
