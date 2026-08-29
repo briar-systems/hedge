@@ -155,6 +155,36 @@ Trace propagation accepts strict W3C `traceparent` version 00 and bounded `trace
 
 The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. It exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
 
+## Caching
+
+```toml
+[cache]
+enabled = true
+memory_bytes = 8388608
+disk_bytes = 268435456
+disk_root = "/var/cache/hedge"
+max_entry_bytes = 1048576
+entries = 256
+heuristic_percent = 0
+
+[service.assets]
+kind = "static"
+root = "./public"
+cache = true
+```
+
+Caching is off by default and is opted into twice: once for the process with `cache.enabled`, and once for each service with `service.<name>.cache`. A service that does not ask for it is never wrapped, so it does not carry so much as a branch per request. With `cache.enabled` false nothing is constructed at all: no entry table, no body arena, no cache root handle, no worker, and no timer.
+
+`memory_bytes` and `disk_bytes` are exact bounds, not targets. Admission reserves an entry's whole declared length before a byte is written and evicts least-recently-used entries until it fits, so the budget holds at every instant rather than on average. An entry longer than `max_entry_bytes` is refused outright. `entries` bounds the entry count independently of the byte budgets.
+
+A representation larger than a quarter of the memory budget goes to disk when `disk_bytes` and `disk_root` are set. Cache file names come from an internal counter and never from request data. A graceful shutdown removes every file the store wrote; starting up removes any file a killed process left behind, so the disk bound holds across a crash. Only names the store's own counter could have produced are removed.
+
+`heuristic_percent` is the fraction of a representation's age at its `Last-Modified` that a response with no explicit freshness may be assumed fresh for, capped at one day. It defaults to zero, which means a response that states no freshness of its own is not stored.
+
+Hedge is a shared cache. `private`, `no-store`, `Vary: *`, an authorized request without an explicit invitation, and a `206 Partial Content` are all refused. A response carrying `Set-Cookie` is refused unless the origin named that field in a qualified `private="set-cookie"` or `no-cache="set-cookie"`, in which case the field is dropped and the rest of the representation is stored. Fields a qualified directive names are never stored, and hop-by-hop fields never cross into an entry.
+
+A stored entry answers a request only when every field named by the response's `Vary` holds the same value it held for the request that produced the entry. A conditional request and a single byte range are both answered out of the store without reaching the service.
+
 ## Validation
 
 Validation resolves:
