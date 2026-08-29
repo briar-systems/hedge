@@ -17,6 +17,7 @@ use hedge.listener;
 use hedge.connection;
 use hedge.telemetry;
 use lifecycle: hedge.lifecycle;
+use budget: hedge.budget;
 use hedge_tls: hedge.protocol.tls;
 use plan: hedge.dispatch.plan;
 use telemetry_health: hedge.telemetry.health;
@@ -31,8 +32,12 @@ pub val STOPPED: State = 4;
 
 pub rec Slot {
     live: bool;
+    # accepted and holding a place in its budget's queue, not yet being served
+    waiting: bool;
     token: listener.ConnectionToken;
     handle: *connection.Connection;
+    charge: budget.Charge;
+    owned_index: usize;
 }
 
 # a service plane the serving loop must drive alongside connections
@@ -58,6 +63,10 @@ pub rec Runtime {
     rejected: u64;
     shutdown: lifecycle.State;
     drain_timeout_ns: u64;
+    budgets: budget.Set;
+    budget_storage: [schema.MAX_BUDGETS]budget.Budget;
+    queued: u64;
+    expired: u64;
 }
 
 pub fun make(
@@ -88,9 +97,24 @@ pub fun make(
     runtime.rejected = 0;
     runtime.shutdown = lifecycle.make();
     runtime.drain_timeout_ns = graph.timeouts.drain_ms * 1000000;
+    runtime.queued = 0;
+    runtime.expired = 0;
+    if (!budget.make(?runtime.budgets, ?runtime.budget_storage[0],
+        schema.MAX_BUDGETS)) { ret false; }
+    var b: usize = 0;
+    for (b < graph.budget_count) {
+        val configured: *schema.Budget = ?graph.budgets[b];
+        budget.define(?runtime.budgets, schema.text(?configured.name),
+            configured.concurrency, configured.queue,
+            configured.timeout_ms * 1000000, configured.memory_bytes);
+        b = b + 1;
+    }
     var i: usize = 0;
     for (i < capacity) {
         slots[i].live = false;
+        slots[i].waiting = false;
+        slots[i].charge = budget.no_charge();
+        slots[i].owned_index = 0;
         slots[i].handle = ?connections[i];
         i = i + 1;
     }
@@ -225,18 +249,58 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
             cnt;
         }
         slot.live = true;
+        slot.waiting = false;
         slot.token = token;
+        slot.owned_index = source.listener_index;
         runtime.next_id = runtime.next_id + 1;
         runtime.live = runtime.live + 1;
         runtime.accepted = runtime.accepted + 1;
         admitted = admitted + 1;
+        # the budget is charged after the connection exists but before it is
+        # driven, which is the last point at which refusing it costs nothing
+        val allowance: usize = listener_budget(runtime, owned);
+        val outcome: budget.Outcome = budget.charge(?runtime.budgets, allowance, 0,
+            now, ?slot.charge);
+        if (outcome == budget.QUEUED) {
+            slot.waiting = true;
+            runtime.queued = runtime.queued + 1;
+        } or (outcome != budget.ADMITTED) {
+            runtime.rejected = runtime.rejected + 1;
+            retire(runtime, index);
+        }
     }
     ret admitted;
 }
 
+fun listener_budget(runtime: *Runtime, owned: *listener.OwnedListener) usize {
+    if (owned == nil || owned.policy.budget.len == 0) { ret budget.NO_BUDGET; }
+    ret budget.find(?runtime.budgets, schema.text(?owned.policy.budget));
+}
+
+# a connection holding a place in its budget's queue tries again, and is closed
+# when it has waited longer than the budget allows
+fun admit_waiting(runtime: *Runtime, now: time.Time) {
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        val slot: *Slot = ?runtime.slots[i];
+        if (!slot.live || !slot.waiting) { i = i + 1; cnt; }
+        val outcome: budget.Outcome = budget.retry(?runtime.budgets, ?slot.charge,
+            now);
+        if (outcome == budget.ADMITTED) { slot.waiting = false; }
+        or (outcome != budget.QUEUED) {
+            runtime.expired = runtime.expired + 1;
+            retire(runtime, i);
+        }
+        i = i + 1;
+    }
+}
+
 fun retire(runtime: *Runtime, index: usize) {
+    if (index >= runtime.capacity) { ret; }
     val slot: *Slot = ?runtime.slots[index];
     if (!slot.live) { ret; }
+    budget.release(?runtime.budgets, ?slot.charge);
+    slot.waiting = false;
     runtime.served = runtime.served + slot.handle.requests;
     connection.close(slot.handle);
     listener.release_connection(?runtime.owner, slot.token);
@@ -260,10 +324,15 @@ pub fun poll(runtime: *Runtime, timeout_ms: i32) bool {
     val polled: bool = listener.poll(?runtime.owner, timeout_ms);
     val now: time.Time = time.now();
     if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
+    admit_waiting(runtime, now);
     if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
     var i: usize = 0;
     for (i < runtime.capacity) {
-        if (runtime.slots[i].live) { drive(runtime, i, now); }
+        # a connection still waiting for its budget is not driven, which is what
+        # makes the queue a queue rather than a label
+        if (runtime.slots[i].live && !runtime.slots[i].waiting) {
+            drive(runtime, i, now);
+        }
         i = i + 1;
     }
     # a stop the operating system asked for enters the same sequence a
