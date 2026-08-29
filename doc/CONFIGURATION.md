@@ -68,12 +68,73 @@ The implemented schema accepts these top-level sections:
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
+- `cache` policy and `acme` certificate management
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. A named listener `budget` limits its accepted connections. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
 
 Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
+
+## Automatic certificate management
+
+```toml
+[server.features]
+acme = true
+
+[acme]
+directory = "https://acme-v02.api.letsencrypt.org/directory"
+contact = "mailto:ops@example.com"
+terms_agreed = true
+storage = "/var/lib/hedge/acme"
+names = ["example.com", "www.example.com"]
+challenge = "http-01"
+
+[service.acme]
+kind = "native"
+target = "acme-challenge"
+
+[[route]]
+name = "acme"
+host = "example"
+path = "/.well-known/acme-challenge/**"
+service = "acme"
+```
+
+One account and one certificate covering every configured name. Up to eight
+names, which is what the durable record holds. `storage` is a directory the
+process owns: it is created with owner-only permissions and every file in it,
+including both private keys, is written owner-only and replaced atomically.
+
+`challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
+
+`http-01` is the only one a TOML deployment can select, because it is the only
+one a web server can answer by itself. It requires a route to the native
+`acme-challenge` service, and a configuration that enables `http-01` without
+one fails to load rather than discovering it at the first renewal. The route
+must be reachable on port 80 for the names being validated.
+
+`dns-01` needs something that can write a zone. Hedge does not carry provider
+integrations, so an embedder supplies a publisher through
+`acme.open_with_publisher` and gets everything else unchanged. A TOML-only
+deployment that selects it fails to load.
+
+`tls-alpn-01` presentation is implemented, including the RFC 8737 certificate
+and its critical `acmeIdentifier` extension, but it needs a TLS listener to
+present on. Selecting it fails to load until TLS termination exists.
+
+`origin` names where the configured authority is actually reached, as a
+`host:port` that is spoken to in cleartext. It exists so a local authority
+behind a plain-HTTP front end can be driven end to end. Without it, an `https`
+directory needs TLS origination, which this build does not have. It is never a
+silent downgrade: the authority named in the configuration is the only one it
+applies to, and it must be stated explicitly.
+
+Renewal is driven from the serving loop. A certificate inside its renewal lead
+is renewed with jitter so a fleet does not renew in lockstep; a failure backs
+off within a ceiling against a fixed attempt budget; and a clock that moves
+backwards replans rather than firing. With `acme` disabled nothing is
+allocated, no directory is opened, and the serving loop takes no ACME step.
 
 ## Telemetry and administration
 
