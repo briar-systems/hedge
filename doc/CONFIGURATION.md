@@ -137,8 +137,13 @@ work finishing would make room for it.
 A seam with no budget configured is not a seam with a budget of zero. It is
 admitted without accounting.
 
-Route, service, host, and application budgets parse and validate today and are
-not yet charged.
+A route is charged against the most specific budget that names it: its own,
+otherwise the budget of the service it dispatches to, otherwise the budget of its
+virtual host. The charge is taken after the route is selected and before the
+handler runs, and a request refused for want of budget is answered
+`503 Service Unavailable` rather than dropped. A proxy service that names a
+budget also bounds the requests it may have in flight to its upstreams by that
+budget's concurrency.
 
 ## Shutdown
 
@@ -153,10 +158,22 @@ whose deadline passed with exchanges still running exits 75 and names how many
 were abandoned, because that is not a clean shutdown even though it is a
 complete one. A step of the sequence failing exits 70 and names the step.
 
-A reload publishes new listeners and a new plan for the connections accepted
-after it. Connections accepted before it keep the plan and generation they began
-under and are asked to finish, so a superseded generation drains independently of
-the one that replaced it.
+`SIGHUP` reloads the routing graph. The configuration is re-read, validated and
+sealed into a second generation, a new plan is compiled beside the running one,
+and connections accepted after it use the new plan. Connections accepted before
+it keep the plan and generation they began under and are asked to finish, so a
+superseded generation drains independently of the one that replaced it. A second
+reload is deferred until the previous generation has drained, so only one
+superseded generation exists at a time.
+
+A reload changes routes, virtual hosts and budgets. It **refuses a candidate
+whose service set differs** — a service's kind, name, or target — and keeps the
+running configuration, naming the change. Service instances own generation-wide
+state that a superseded plan still points into, so replacing one under a request
+in flight would reuse storage that request is still using. Changing a service
+definition requires a restart. A reload that changes a listener's address,
+transport, protocols or TLS policy rebinds; one that does not leaves the sockets
+untouched.
 
 A host names itself with either `server_name` for a single name or `names` for several; declaring both is a conflict, and declaring neither uses the host block's own key as its name. Every name a host declares is a name it answers to, and each is compiled into its own routing pattern, so a host with three names serves all three rather than only the first. A name may be an exact host, a `*.suffix` wildcard, or carry an explicit port.
 
