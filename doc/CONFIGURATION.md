@@ -38,7 +38,7 @@ certificate = "acme:example"
 
 [host.example]
 listener = "public-tcp"
-server_name = "example.com"
+names = ["example.com", "www.example.com", "*.cdn.example.com"]
 
 [[route]]
 name = "assets"
@@ -72,6 +72,10 @@ The implemented schema accepts these top-level sections:
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. A named listener `budget` limits its accepted connections. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+
+A host names itself with either `server_name` for a single name or `names` for several; declaring both is a conflict, and declaring neither uses the host block's own key as its name. Every name a host declares is a name it answers to, and each is compiled into its own routing pattern, so a host with three names serves all three rather than only the first. A name may be an exact host, a `*.suffix` wildcard, or carry an explicit port.
+
+Precedence between names is by specificity and never by the order they are written: an exact name beats a wildcard suffix, a longer suffix beats a shorter one, and a pattern naming a port beats one that does not. Two hosts that claim the same name for the same path are refused at configuration time rather than one shadowing the other.
 
 Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
 
