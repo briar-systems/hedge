@@ -1,0 +1,724 @@
+# one certificate issuance, from account registration to a verified chain
+#
+# rfc 8555 issuance is a sequence of requests whose every step depends on the
+# last, and mach-acme states each step as a decision rather than a loop. this
+# module is the sequence: one phase per request, advanced by the serving loop,
+# with every waiting period expressed as a wake time rather than a sleep.
+#
+# every string this run depends on later is copied into storage this record
+# owns. mach-acme parses into caller storage, and a later parse into the same
+# storage would otherwise silently move the url a previous phase is still
+# holding.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use T: std.chrono.time;
+use contracts: crypto.contracts;
+use ac: acme.client;
+use acct: acme.account;
+use cert: acme.certificate;
+use ch: acme.challenge;
+use external_account: acme.external_account;
+use identifier: acme.identifier;
+use jose: acme.jose;
+use ord: acme.order;
+use poll_policy: acme.poll;
+use problem: acme.problem;
+use keys: hedge.acme.keys;
+use session: hedge.acme.session;
+use transport: hedge.acme.transport;
+
+pub val MAX_IDENTIFIERS:  usize = 8;
+pub val MAX_URL_BYTES:    usize = 512;
+pub val ORDER_TEXT_BYTES: usize = 8192;
+pub val AUTHZ_TEXT_BYTES: usize = 8192;
+pub val ACCOUNT_TEXT_BYTES: usize = 2048;
+pub val PAYLOAD_BYTES:    usize = 4096;
+pub val CSR_BYTES:        usize = 4096;
+pub val CHAIN_BYTES:      usize = 16384;
+pub val MAX_CHAIN_LENGTH: usize = 8;
+pub val KEY_AUTHORIZATION_BYTES: usize = 256;
+
+pub def Status: u8;
+pub val OK:      Status = 1;
+pub val PENDING: Status = 2;
+pub val FAILED:  Status = 3;
+pub val INVALID: Status = 4;
+
+pub def Phase: u8;
+pub val IDLE:            Phase = 0;
+pub val ACCOUNT:         Phase = 1;
+pub val ORDER:           Phase = 2;
+pub val AUTHORIZATION:   Phase = 3;
+pub val PRESENT:         Phase = 4;
+pub val RESPOND:         Phase = 5;
+pub val VALIDATING:      Phase = 6;
+pub val ORDER_READY:     Phase = 7;
+pub val FINALIZE:        Phase = 8;
+pub val ISSUING:         Phase = 9;
+pub val DOWNLOAD:        Phase = 10;
+pub val DONE:            Phase = 11;
+pub val BROKEN:          Phase = 12;
+
+# what one run needs from its owner. every member is public storage, because
+# this record reaches the run through a `ptr` seam.
+pub rec Context {
+    session:     *session.Session;
+    engine:      *transport.Transport;
+    account_key: *keys.Key;
+    certificate_key: *keys.Key;
+    provider:    ch.Provider;
+    contact:     view.View;
+    agree_terms: bool;
+}
+
+rec Url {
+    data: [MAX_URL_BYTES]u8;
+    len:  usize;
+}
+
+pub rec Issue {
+    names:      [MAX_IDENTIFIERS]identifier.Identifier;
+    name_count: usize;
+    policy:     identifier.Policy;
+
+    account_text:   [ACCOUNT_TEXT_BYTES]u8;
+    contacts:       [8]view.View;
+    account:        acct.Account;
+    account_url:    Url;
+
+    payload:        [PAYLOAD_BYTES]u8;
+    order_text:     [ORDER_TEXT_BYTES]u8;
+    order_names:    [MAX_IDENTIFIERS]identifier.Identifier;
+    order_authorizations: [MAX_IDENTIFIERS]view.View;
+    order:          ord.Order;
+    order_url:      Url;
+    finalize_url:   Url;
+    certificate_url: Url;
+    authorization_urls: [MAX_IDENTIFIERS]Url;
+    authorization_count: usize;
+    cursor:         usize;
+
+    authz_text:     [AUTHZ_TEXT_BYTES]u8;
+    challenges:     [MAX_IDENTIFIERS]ch.Challenge;
+    authorization:  ord.Authorization;
+    challenge_url:  Url;
+    key_authorization: [KEY_AUTHORIZATION_BYTES]u8;
+    key_authorization_len: usize;
+    attempt:        ch.Attempt;
+    presented:      bool;
+
+    csr_work:       [CSR_BYTES]u8;
+    csr_output:     [CSR_BYTES]u8;
+
+    chain_der:      [CHAIN_BYTES]u8;
+    certificates:   [MAX_CHAIN_LENGTH]cert.Certificate;
+    chain:          cert.Chain;
+    leaf_names:     [MAX_IDENTIFIERS]identifier.Identifier;
+    leaf:           cert.Parsed;
+
+    waiting:        poll_policy.State;
+    wake_at_ns:     i64;
+    sleeping:       bool;
+    retry_after:    u64;
+
+    phase:          Phase;
+    exchanging:     bool;
+    failure:        problem.Error;
+    live:           bool;
+}
+
+fun monotonic_ns() i64 {
+    val current: T.Time = T.monotonic();
+    ret current.sec * 1000000000 + current.nsec;
+}
+
+fun copy_url(target: *Url, source: view.View) bool {
+    if (source.data == nil || source.len == 0
+     || source.len > MAX_URL_BYTES) { ret false; }
+    var i: usize = 0;
+    for (i < source.len) {
+        target.data[i] = source.data[i];
+        i = i + 1;
+    }
+    target.len = source.len;
+    ret true;
+}
+
+fun url_view(value: *Url) view.View {
+    ret view.view(?value.data[0], value.len);
+}
+
+fun empty_url(target: *Url) {
+    target.len = 0;
+}
+
+fun retire(issue: *Issue) {
+    if (!issue.presented) { ret; }
+    ch.finish(?issue.attempt);
+    issue.presented = false;
+}
+
+fun fail(issue: *Issue, cause: problem.Error) Status {
+    retire(issue);
+    issue.failure = cause;
+    issue.phase = BROKEN;
+    issue.exchanging = false;
+    ret FAILED;
+}
+
+fun fail_local(issue: *Issue, detail: str) Status {
+    ret fail(issue, problem.local(problem.STATE, detail));
+}
+
+pub fun make(issue: *Issue, names: *identifier.Identifier,
+    count: usize, policy: identifier.Policy) bool {
+    if (issue == nil || names == nil || count == 0
+     || count > MAX_IDENTIFIERS) { ret false; }
+    var i: usize = 0;
+    for (i < count) {
+        if (!identifier.valid(names[i], policy)) { ret false; }
+        issue.names[i] = names[i];
+        i = i + 1;
+    }
+    issue.name_count = count;
+    issue.policy = policy;
+    issue.phase = IDLE;
+    issue.exchanging = false;
+    issue.presented = false;
+    issue.sleeping = false;
+    issue.failure = problem.none();
+    empty_url(?issue.account_url);
+    empty_url(?issue.order_url);
+    empty_url(?issue.finalize_url);
+    empty_url(?issue.certificate_url);
+    empty_url(?issue.challenge_url);
+    issue.authorization_count = 0;
+    issue.cursor = 0;
+    issue.chain.len = 0;
+    issue.live = true;
+    ret true;
+}
+
+# begins one run. an account the authority already knows is returned by
+# newAccount rather than created, so a restart re-learns its own url instead
+# of needing one on disk.
+pub fun begin(issue: *Issue) Status {
+    if (issue == nil || !issue.live) { ret INVALID; }
+    if (issue.phase != IDLE && issue.phase != DONE
+     && issue.phase != BROKEN) { ret INVALID; }
+    issue.phase = ACCOUNT;
+    issue.exchanging = false;
+    issue.sleeping = false;
+    issue.cursor = 0;
+    issue.chain.len = 0;
+    issue.failure = problem.none();
+    ret PENDING;
+}
+
+pub fun phase(issue: *Issue) Phase {
+    if (issue == nil) { ret BROKEN; }
+    ret issue.phase;
+}
+
+pub fun failure(issue: *Issue) problem.Error {
+    ret issue.failure;
+}
+
+pub fun chain(issue: *Issue) cert.Chain {
+    ret issue.chain;
+}
+
+pub fun leaf(issue: *Issue) cert.Parsed {
+    ret issue.leaf;
+}
+
+pub fun certificate_url(issue: *Issue) view.View {
+    ret url_view(?issue.certificate_url);
+}
+
+pub fun account_url(issue: *Issue) view.View {
+    ret url_view(?issue.account_url);
+}
+
+pub fun account_record(issue: *Issue) acct.Account {
+    ret issue.account;
+}
+
+fun account_limits() acct.Limits {
+    var value: acct.Limits;
+    value.max_response_bytes = 65536;
+    value.max_json_scratch = 16384;
+    value.max_json_depth = 16;
+    value.max_json_values = 1024;
+    value.max_json_key_bytes = 64;
+    value.max_json_key_comparisons = 16384;
+    value.max_url_bytes = MAX_URL_BYTES;
+    value.max_contacts = 8;
+    value.max_contact_bytes = 512;
+    value.response_fields = session.limits().response_fields;
+    ret value;
+}
+
+fun order_limits() ord.Limits {
+    var value: ord.Limits = ord.limits_default();
+    value.max_response_bytes = 65536;
+    value.max_json_scratch = 16384;
+    value.max_url_bytes = MAX_URL_BYTES;
+    ret value;
+}
+
+fun order_storage(issue: *Issue) ord.Storage {
+    ret ord.Storage{data: ?issue.order_text[0], capacity: ORDER_TEXT_BYTES,
+        identifiers: ?issue.order_names[0],
+        identifier_capacity: MAX_IDENTIFIERS,
+        authorizations: ?issue.order_authorizations[0],
+        authorization_capacity: MAX_IDENTIFIERS};
+}
+
+fun authorization_storage(issue: *Issue) ord.AuthorizationStorage {
+    ret ord.AuthorizationStorage{data: ?issue.authz_text[0],
+        capacity: AUTHZ_TEXT_BYTES, challenges: ?issue.challenges[0],
+        challenge_capacity: MAX_IDENTIFIERS};
+}
+
+fun scratch_of(context: *Context) *u8 {
+    ret session.scratch(context.session);
+}
+
+fun start_account(issue: *Issue, context: *Context) Status {
+    var wanted: acct.Request;
+    wanted.contacts = nil;
+    wanted.contact_len = 0;
+    if (context.contact.len != 0) {
+        issue.contacts[0] = context.contact;
+        wanted.contacts = ?issue.contacts[0];
+        wanted.contact_len = 1;
+    }
+    wanted.terms_of_service_agreed = context.agree_terms;
+    wanted.only_return_existing = false;
+    wanted.external_account_binding = external_account.none();
+    val encoded: acct.Operation = acct.encode(acct.CREATE, wanted,
+        contracts.Buffer{data: ?issue.payload[0], capacity: PAYLOAD_BYTES});
+    if (problem.failed(encoded.error)) { ret fail(issue, encoded.error); }
+    val begun: problem.Error = acct.begin(session.protocol(context.session),
+        session.request(context.session), acct.CREATE,
+        session.directory(context.session).new_account_url,
+        view.view(nil, 0), encoded.payload, encoded,
+        keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun finish_account(issue: *Issue, context: *Context) Status {
+    val parsed: problem.Error = acct.parse(acct.CREATE,
+        session.response(context.session), view.view(nil, 0),
+        account_limits(), scratch_of(context), session.SCRATCH_BYTES,
+        acct.Storage{data: ?issue.account_text[0],
+            capacity: ACCOUNT_TEXT_BYTES, contacts: ?issue.contacts[0],
+            contact_capacity: 8}, ?issue.account);
+    if (problem.failed(parsed)) { ret fail(issue, parsed); }
+    if (issue.account.status != acct.VALID) {
+        ret fail_local(issue, "the authority did not return a valid account");
+    }
+    if (!copy_url(?issue.account_url, issue.account.url)) {
+        ret fail_local(issue, "account url exceeds the configured bound");
+    }
+    issue.account.url = url_view(?issue.account_url);
+    issue.phase = ORDER;
+    ret PENDING;
+}
+
+fun start_order(issue: *Issue, context: *Context) Status {
+    val encoded: ord.Operation = ord.encode(
+        ord.Request{identifiers: ?issue.names[0], len: issue.name_count,
+            not_before: view.view(nil, 0), not_after: view.view(nil, 0)},
+        issue.policy, order_limits(),
+        contracts.Buffer{data: ?issue.payload[0], capacity: PAYLOAD_BYTES});
+    if (problem.failed(encoded.error)) { ret fail(issue, encoded.error); }
+    val begun: problem.Error = ord.begin_new(session.protocol(context.session),
+        session.request(context.session),
+        session.directory(context.session).new_order_url,
+        url_view(?issue.account_url), encoded.payload, encoded,
+        keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun retain_order(issue: *Issue) Status {
+    if (!copy_url(?issue.order_url, issue.order.url)
+     || !copy_url(?issue.finalize_url, issue.order.finalize_url)) {
+        ret fail_local(issue, "order urls exceed the configured bound");
+    }
+    if (issue.order.authorization_len == 0
+     || issue.order.authorization_len > MAX_IDENTIFIERS) {
+        ret fail_local(issue, "order authorization count is out of bounds");
+    }
+    var i: usize = 0;
+    for (i < issue.order.authorization_len) {
+        if (!copy_url(?issue.authorization_urls[i],
+            issue.order_authorizations[i])) {
+            ret fail_local(issue, "authorization url exceeds the bound");
+        }
+        i = i + 1;
+    }
+    issue.authorization_count = issue.order.authorization_len;
+    ret OK;
+}
+
+fun finish_order(issue: *Issue, context: *Context) Status {
+    val parsed: problem.Error = ord.parse(session.response(context.session),
+        view.view(nil, 0), issue.policy, order_limits(),
+        scratch_of(context), session.SCRATCH_BYTES, order_storage(issue),
+        ?issue.order);
+    if (problem.failed(parsed)) { ret fail(issue, parsed); }
+    if (issue.order.status == ord.INVALID) {
+        ret fail_local(issue, "the authority rejected the order");
+    }
+    val retained: Status = retain_order(issue);
+    if (retained != OK) { ret retained; }
+    issue.cursor = 0;
+    issue.phase = AUTHORIZATION;
+    ret PENDING;
+}
+
+fun start_authorization(issue: *Issue, context: *Context) Status {
+    if (issue.cursor >= issue.authorization_count) {
+        issue.phase = ORDER_READY;
+        ret PENDING;
+    }
+    val begun: problem.Error = ord.begin_fetch(
+        session.protocol(context.session), session.request(context.session),
+        url_view(?issue.authorization_urls[issue.cursor]),
+        url_view(?issue.account_url), keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun parse_authorization(issue: *Issue, context: *Context) problem.Error {
+    ret ord.parse_authorization(session.response(context.session),
+        url_view(?issue.authorization_urls[issue.cursor]), issue.policy,
+        order_limits(), scratch_of(context), session.SCRATCH_BYTES,
+        authorization_storage(issue), ?issue.authorization);
+}
+
+fun finish_authorization(issue: *Issue, context: *Context) Status {
+    val parsed: problem.Error = parse_authorization(issue, context);
+    if (problem.failed(parsed)) { ret fail(issue, parsed); }
+    if (issue.authorization.status == ord.AUTH_VALID) {
+        # an authorization the authority already validated needs no challenge
+        issue.cursor = issue.cursor + 1;
+        issue.phase = AUTHORIZATION;
+        ret PENDING;
+    }
+    if (issue.authorization.status != ord.AUTH_PENDING) {
+        ret fail_local(issue, "authorization is not usable");
+    }
+    issue.phase = PRESENT;
+    ret PENDING;
+}
+
+# selects a challenge the configured provider can answer and presents it
+fun present(issue: *Issue, context: *Context) Status {
+    var kind: u8 = 0;
+    if (ord.challenge_admissible(issue.authorization, ch.HTTP_01)
+     && context.provider.supports(context.provider.ctx,
+            issue.authorization.identifier, ch.HTTP_01)) {
+        kind = ch.HTTP_01;
+    } or (ord.challenge_admissible(issue.authorization, ch.DNS_01)
+     && context.provider.supports(context.provider.ctx,
+            issue.authorization.identifier, ch.DNS_01)) {
+        kind = ch.DNS_01;
+    } or (ord.challenge_admissible(issue.authorization, ch.TLS_ALPN_01)
+     && context.provider.supports(context.provider.ctx,
+            issue.authorization.identifier, ch.TLS_ALPN_01)) {
+        kind = ch.TLS_ALPN_01;
+    } or {
+        ret fail_local(issue,
+            "no offered challenge can be answered by this deployment");
+    }
+    val selected: *ch.Challenge = ord.select_challenge(issue.authorization,
+        kind);
+    if (selected == nil || selected.status == ch.INVALID) {
+        ret fail_local(issue, "the selected challenge is not usable");
+    }
+    val derived: ch.Operation = ch.key_authorization(@selected,
+        keys.signer(context.account_key),
+        contracts.Buffer{data: ?issue.key_authorization[0],
+            capacity: KEY_AUTHORIZATION_BYTES});
+    if (problem.failed(derived.error)) { ret fail(issue, derived.error); }
+    issue.key_authorization_len = derived.value.len;
+    if (!copy_url(?issue.challenge_url, selected.url)) {
+        ret fail_local(issue, "challenge url exceeds the configured bound");
+    }
+    val started: problem.Error = ch.attempt_init(?issue.attempt,
+        context.provider);
+    if (problem.failed(started)) { ret fail(issue, started); }
+    val begun: problem.Error = ch.begin(?issue.attempt,
+        issue.authorization.identifier, @selected, derived.value);
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.presented = true;
+    issue.phase = RESPOND;
+    ret PENDING;
+}
+
+fun start_respond(issue: *Issue, context: *Context) Status {
+    val begun: problem.Error = ch.begin_respond(
+        session.protocol(context.session), session.request(context.session),
+        url_view(?issue.challenge_url), url_view(?issue.account_url),
+        view.view(ch.RESPOND_PAYLOAD, 2), keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun wait_policy() poll_policy.Policy {
+    var value: poll_policy.Policy = poll_policy.policy_default();
+    value.min_delay_ns = 500000000;
+    value.max_delay_ns = 8000000000;
+    value.max_attempts = 60;
+    ret value;
+}
+
+fun begin_wait(issue: *Issue, deadline_seconds: i64) bool {
+    ret !problem.failed(poll_policy.begin(?issue.waiting, wait_policy(),
+        monotonic_ns() + deadline_seconds * 1000000000));
+}
+
+fun finish_respond(issue: *Issue, context: *Context) Status {
+    issue.retry_after = session.response(context.session).retry_after_seconds;
+    if (!begin_wait(issue, 300)) {
+        ret fail_local(issue, "challenge poll could not start");
+    }
+    issue.phase = VALIDATING;
+    issue.sleeping = false;
+    ret PENDING;
+}
+
+fun step_wait(issue: *Issue, reached: bool, terminal: bool) Status {
+    val decision: poll_policy.Decision = poll_policy.next(?issue.waiting,
+        reached, terminal, issue.retry_after, monotonic_ns());
+    issue.retry_after = 0;
+    if (decision.action == poll_policy.READY) { ret OK; }
+    if (decision.action == poll_policy.WAIT) {
+        issue.wake_at_ns = monotonic_ns() + decision.delay_ns::i64;
+        issue.sleeping = true;
+        ret PENDING;
+    }
+    if (decision.action == poll_policy.TERMINAL) {
+        ret fail_local(issue, "the authority reported a terminal status");
+    }
+    if (decision.action == poll_policy.DEADLINE) {
+        ret fail_local(issue, "the authority did not settle before the deadline");
+    }
+    if (decision.action == poll_policy.LIMIT) {
+        ret fail_local(issue, "the authority did not settle within the attempt budget");
+    }
+    ret fail_local(issue, "polling was cancelled");
+}
+
+fun finish_validating(issue: *Issue, context: *Context) Status {
+    val parsed: problem.Error = parse_authorization(issue, context);
+    if (problem.failed(parsed)) { ret fail(issue, parsed); }
+    issue.retry_after = session.response(context.session).retry_after_seconds;
+    val settled: Status = step_wait(issue,
+        issue.authorization.status == ord.AUTH_VALID,
+        issue.authorization.status == ord.AUTH_INVALID);
+    if (settled != OK) { ret settled; }
+    # the challenge is answered, so the provider's state is retired here on
+    # the success path exactly as it is on every failure path
+    retire(issue);
+    issue.cursor = issue.cursor + 1;
+    issue.phase = AUTHORIZATION;
+    ret PENDING;
+}
+
+fun start_order_fetch(issue: *Issue, context: *Context) Status {
+    val begun: problem.Error = ord.begin_fetch(
+        session.protocol(context.session), session.request(context.session),
+        url_view(?issue.order_url), url_view(?issue.account_url),
+        keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun parse_order(issue: *Issue, context: *Context) problem.Error {
+    ret ord.parse(session.response(context.session), url_view(?issue.order_url),
+        issue.policy, order_limits(), scratch_of(context),
+        session.SCRATCH_BYTES, order_storage(issue), ?issue.order);
+}
+
+fun finish_order_ready(issue: *Issue, context: *Context) Status {
+    val parsed: problem.Error = parse_order(issue, context);
+    if (problem.failed(parsed)) { ret fail(issue, parsed); }
+    if (issue.order.status != ord.READY) {
+        ret fail_local(issue, "the order is not ready to finalize");
+    }
+    if (!copy_url(?issue.finalize_url, issue.order.finalize_url)) {
+        ret fail_local(issue, "finalize url exceeds the configured bound");
+    }
+    issue.phase = FINALIZE;
+    ret PENDING;
+}
+
+fun start_finalize(issue: *Issue, context: *Context) Status {
+    val csr: cert.Operation = cert.encode_csr(?issue.names[0],
+        issue.name_count, issue.policy,
+        keys.csr_signer(context.certificate_key),
+        contracts.Buffer{data: ?issue.csr_work[0], capacity: CSR_BYTES},
+        contracts.Buffer{data: ?issue.csr_output[0], capacity: CSR_BYTES});
+    if (problem.failed(csr.error)) { ret fail(issue, csr.error); }
+    val encoded: cert.Operation = cert.encode_finalize(csr.value,
+        contracts.Buffer{data: ?issue.payload[0], capacity: PAYLOAD_BYTES});
+    if (problem.failed(encoded.error)) { ret fail(issue, encoded.error); }
+    val begun: problem.Error = cert.begin_finalize(
+        session.protocol(context.session), session.request(context.session),
+        url_view(?issue.finalize_url), url_view(?issue.account_url),
+        encoded.value, encoded, keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun finish_finalize(issue: *Issue, context: *Context) Status {
+    issue.retry_after = session.response(context.session).retry_after_seconds;
+    if (!begin_wait(issue, 300)) {
+        ret fail_local(issue, "order poll could not start");
+    }
+    issue.phase = ISSUING;
+    issue.sleeping = false;
+    ret PENDING;
+}
+
+fun finish_issuing(issue: *Issue, context: *Context) Status {
+    val parsed: problem.Error = parse_order(issue, context);
+    if (problem.failed(parsed)) { ret fail(issue, parsed); }
+    issue.retry_after = session.response(context.session).retry_after_seconds;
+    val settled: Status = step_wait(issue, issue.order.status == ord.VALID,
+        issue.order.status == ord.INVALID);
+    if (settled != OK) { ret settled; }
+    if (!copy_url(?issue.certificate_url, issue.order.certificate_url)) {
+        ret fail_local(issue, "certificate url exceeds the configured bound");
+    }
+    issue.phase = DOWNLOAD;
+    ret PENDING;
+}
+
+fun start_download(issue: *Issue, context: *Context) Status {
+    val begun: problem.Error = cert.begin_download(
+        session.protocol(context.session), session.request(context.session),
+        url_view(?issue.certificate_url), url_view(?issue.account_url),
+        keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun finish_download(issue: *Issue, context: *Context) Status {
+    val body: view.View = session.response(context.session).body;
+    val parsed: problem.Error = cert.parse_chain(body, ?issue.certificates[0],
+        MAX_CHAIN_LENGTH, ?issue.chain_der[0], CHAIN_BYTES, ?issue.chain);
+    if (problem.failed(parsed)) { ret fail(issue, parsed); }
+    # a certificate that covers more or less than was ordered is not the
+    # certificate that was ordered, and this runs before anything is stored
+    val verified: problem.Error = cert.verify_issued(issue.chain,
+        ?issue.names[0], issue.name_count, ?issue.leaf_names[0],
+        MAX_IDENTIFIERS, ?issue.leaf);
+    if (problem.failed(verified)) { ret fail(issue, verified); }
+    issue.phase = DONE;
+    ret OK;
+}
+
+fun start_phase(issue: *Issue, context: *Context) Status {
+    if (issue.phase == ACCOUNT) { ret start_account(issue, context); }
+    if (issue.phase == ORDER) { ret start_order(issue, context); }
+    if (issue.phase == AUTHORIZATION) {
+        ret start_authorization(issue, context);
+    }
+    if (issue.phase == PRESENT) { ret present(issue, context); }
+    if (issue.phase == RESPOND) { ret start_respond(issue, context); }
+    if (issue.phase == VALIDATING) {
+        ret start_authorization_poll(issue, context);
+    }
+    if (issue.phase == ORDER_READY || issue.phase == ISSUING) {
+        ret start_order_fetch(issue, context);
+    }
+    if (issue.phase == FINALIZE) { ret start_finalize(issue, context); }
+    if (issue.phase == DOWNLOAD) { ret start_download(issue, context); }
+    ret INVALID;
+}
+
+fun start_authorization_poll(issue: *Issue, context: *Context) Status {
+    val begun: problem.Error = ord.begin_fetch(
+        session.protocol(context.session), session.request(context.session),
+        url_view(?issue.authorization_urls[issue.cursor]),
+        url_view(?issue.account_url), keys.signer(context.account_key));
+    if (problem.failed(begun)) { ret fail(issue, begun); }
+    issue.exchanging = true;
+    ret session.begin_prepared(context.session);
+}
+
+fun finish_phase(issue: *Issue, context: *Context) Status {
+    if (issue.phase == ACCOUNT) { ret finish_account(issue, context); }
+    if (issue.phase == ORDER) { ret finish_order(issue, context); }
+    if (issue.phase == AUTHORIZATION) {
+        ret finish_authorization(issue, context);
+    }
+    if (issue.phase == RESPOND) { ret finish_respond(issue, context); }
+    if (issue.phase == VALIDATING) { ret finish_validating(issue, context); }
+    if (issue.phase == ORDER_READY) { ret finish_order_ready(issue, context); }
+    if (issue.phase == FINALIZE) { ret finish_finalize(issue, context); }
+    if (issue.phase == ISSUING) { ret finish_issuing(issue, context); }
+    if (issue.phase == DOWNLOAD) { ret finish_download(issue, context); }
+    ret INVALID;
+}
+
+# advances the run. one step per call: at most one request is started, one
+# response is consumed, or one wait is observed.
+pub fun poll(issue: *Issue, context: *Context, now: T.Time) Status {
+    if (issue == nil || !issue.live || context == nil
+     || context.session == nil || context.engine == nil
+     || context.account_key == nil || context.certificate_key == nil) {
+        ret INVALID;
+    }
+    if (issue.phase == DONE) { ret OK; }
+    if (issue.phase == BROKEN) { ret FAILED; }
+    if (issue.phase == IDLE) { ret INVALID; }
+
+    if (issue.exchanging) {
+        val progress: session.Status = session.poll(context.session,
+            context.engine, context.account_key, now);
+        if (progress == session.PENDING) { ret PENDING; }
+        if (progress != session.OK) {
+            ret fail(issue, session.failure(context.session));
+        }
+        val handled: Status = finish_phase(issue, context);
+        session.complete(context.session, context.engine);
+        issue.exchanging = false;
+        ret handled;
+    }
+    if (issue.sleeping) {
+        if (monotonic_ns() < issue.wake_at_ns) { ret PENDING; }
+        issue.sleeping = false;
+    }
+    ret start_phase(issue, context);
+}
+
+# abandons a run in flight. the challenge provider's state is retired here,
+# so cancellation retires it exactly as success and failure do.
+pub fun cancel(issue: *Issue) bool {
+    if (issue == nil || !issue.live) { ret false; }
+    retire(issue);
+    issue.exchanging = false;
+    issue.sleeping = false;
+    issue.phase = IDLE;
+    ret true;
+}
