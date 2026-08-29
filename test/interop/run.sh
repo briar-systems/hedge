@@ -280,6 +280,38 @@ time.sleep(30)
     echo "$code"
 }
 
+# --- reload -------------------------------------------------------------------
+
+reload_widens_route() {
+    local config="$work/reload.toml"
+    sed 's|^path = "/hello"|path = "/**"|' test/interop/reload.toml > "$work/wide.toml"
+    cp test/interop/reload.toml "$config"
+    "$binary" "$config" > "$work/reload.log" 2>&1 &
+    local pid=$!
+    for _ in $(seq 60); do
+        grep -q '^hedge: ready' "$work/reload.log" 2>/dev/null && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    local before
+    before="$(curl_code -H 'Host: localhost' http://127.0.0.1:9086/other)"
+    # widen the route and ask the running process to take it
+    cp "$work/wide.toml" "$config"
+    kill -HUP "$pid" 2>/dev/null
+    local after="000"
+    for _ in $(seq 40); do
+        after="$(curl_code -H 'Host: localhost' http://127.0.0.1:9086/other)"
+        [ "$after" = "200" ] && break
+        sleep 0.1
+    done
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    echo "$before/$after"
+}
+
+check "a reload widens a route in the running process" "404/200" \
+    "$(reload_widens_route)"
+
 check "a stop with no work in flight drains cleanly" 0 "$(shutdown_exit idle)"
 check "a stop with a peer mid-request reports the abandoned exchange" 75 \
     "$(shutdown_exit held)"

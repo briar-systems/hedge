@@ -38,6 +38,7 @@ use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
 use hedge_tls: hedge.protocol.tls;
 use lifecycle: hedge.lifecycle;
+use hedge.listener;
 use hedge.serve;
 use hedge.connection;
 use plan: hedge.dispatch.plan;
@@ -161,6 +162,105 @@ fun configuration_path(argc: i64, argv: **u8) str {
     ret "hedge.toml";
 }
 
+# a reload republishes the routing graph, not the services
+#
+# compiling a plan calls the service factories, and their caller-owned storage is
+# not generation-scoped: `proxy.Runtime.route_count` only grows, and a plan entry
+# from a superseded generation still points into the slot it was given. reusing
+# those slots under an in-flight request would be a use-after-reuse rather than a
+# leak, so a candidate whose service set differs is refused and the running
+# configuration is kept.
+fun services_match(active: *schema.Graph, candidate: *schema.Graph) bool {
+    if (active.service_count != candidate.service_count) { ret false; }
+    var i: usize = 0;
+    for (i < active.service_count) {
+        val a: *schema.Service = ?active.services[i];
+        val b: *schema.Service = ?candidate.services[i];
+        if (a.kind != b.kind
+         || !schema.text_equals(?a.name, schema.text(?b.name))
+         || !schema.text_equals(?a.target, schema.text(?b.target))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+rec Reloader {
+    heap: *allocator.Allocator;
+    path: str;
+    resolver: *loader.Resolver;
+    diagnostics: *schema.Diagnostics;
+    generations: *generation.Generation;
+    storages: *PlanStorage;
+    allocators: *allocator.Allocator;
+    states: *fixed.FixedState;
+    plans: *plan.Plan;
+    services: *service.Resolver;
+    runtime: *serve.Runtime;
+    slot: usize;
+    next_id: u64;
+}
+
+fun reload(state: *Reloader) bool {
+    # only one superseded generation may exist at a time: the spare slot is
+    # still holding the last one until its connections finish
+    if (serve.superseded(state.runtime) != 0) { ret false; }
+    val target: usize = 1 - state.slot;
+    val loaded: Result[str, str] = filesystem.read_string(state.heap, state.path);
+    if (is_err[str, str](loaded)) {
+        print.eprintln("hedge: reload cannot read the configuration");
+        ret false;
+    }
+    val source: str = unwrap_ok[str, str](loaded);
+    val active: *generation.Generation = ?state.generations[state.slot];
+    val candidate: *generation.Generation = ?state.generations[target];
+    fixed.reset(?state.states[target]);
+    schema.reset_diagnostics(state.diagnostics);
+    if (!generation.make_candidate(candidate, state.next_id)) { ret false; }
+    if (!loader.build(?candidate.graph, state.diagnostics, ?state.allocators[target],
+        state.path, source, state.resolver, capabilities())) {
+        report_diagnostics(state.diagnostics);
+        print.eprintln("hedge: reload rejected, configuration is not valid");
+        ret false;
+    }
+    if (!services_match(?active.graph, ?candidate.graph)) {
+        print.eprintln("hedge: reload rejected, a service definition changed; restart to apply it");
+        ret false;
+    }
+    if (!generation.seal(candidate, state.diagnostics, nil,
+        (0::usize)::generation.ConstructFun)) {
+        report_diagnostics(state.diagnostics);
+        print.eprintln("hedge: reload rejected, generation did not seal");
+        ret false;
+    }
+    val storage: *PlanStorage = ?state.storages[target];
+    var layout: plan.Storage;
+    if (!plan.make_storage(?layout,
+        ?storage.routes[0], MAX_ROUTES,
+        ?storage.segments[0], MAX_SEGMENTS,
+        ?storage.specs[0], MAX_ROUTES,
+        ?storage.entries[0], MAX_ROUTES,
+        ?storage.services[0], MAX_SERVICES,
+        ?storage.middleware[0], MAX_MIDDLEWARE,
+        ?storage.text[0], PLAN_TEXT_BYTES)) { ret false; }
+    val built: plan.Report = plan.compile(?state.plans[target], candidate.id,
+        ?candidate.graph, layout, state.services, nil);
+    if (built.status != plan.PLAN_OK) {
+        print.eprint("hedge: reload rejected, route plan failed: ");
+        print.eprintln(built.detail);
+        ret false;
+    }
+    if (!serve.reload(state.runtime, candidate.id, ?state.plans[target],
+        ?candidate.graph, state.diagnostics)) {
+        report_diagnostics(state.diagnostics);
+        print.eprintln("hedge: reload rejected, listeners did not republish");
+        ret false;
+    }
+    state.slot = target;
+    state.next_id = state.next_id + 1;
+    print.eprintln("hedge: reloaded");
+    ret true;
+}
+
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var heap: allocator.Allocator;
@@ -177,22 +277,33 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     val source: str = unwrap_ok[str, str](loaded);
 
-    val arena: Result[*u8, *u8] = allocator.allocate[u8](?heap, CONFIG_ARENA_BYTES);
-    val generations: Result[*generation.Generation, *u8] = allocator.allocate[generation.Generation](?heap, 1);
+    # two of each, alternating. a reload builds into the slot the active
+    # generation is not using, so connections still holding the previous plan
+    # keep a graph and a route table nothing is writing to.
+    val arena: Result[*u8, *u8] = allocator.allocate[u8](?heap, CONFIG_ARENA_BYTES * 2);
+    val generations: Result[*generation.Generation, *u8] = allocator.allocate[generation.Generation](?heap, 2);
     val diagnostics_storage: Result[*schema.Diagnostics, *u8] = allocator.allocate[schema.Diagnostics](?heap, 1);
-    val plan_storage: Result[*PlanStorage, *u8] = allocator.allocate[PlanStorage](?heap, 1);
+    val plan_storage: Result[*PlanStorage, *u8] = allocator.allocate[PlanStorage](?heap, 2);
     if (is_err[*u8, *u8](arena) || is_err[*generation.Generation, *u8](generations)
      || is_err[*schema.Diagnostics, *u8](diagnostics_storage)
      || is_err[*PlanStorage, *u8](plan_storage)) {
         print.eprintln("hedge: startup allocation failed");
         ret EXIT_RUNTIME;
     }
-    var config_allocator: allocator.Allocator;
-    var config_state: fixed.FixedState;
-    fixed.make(?config_allocator, ?config_state, unwrap_ok[*u8, *u8](arena), CONFIG_ARENA_BYTES);
-    val candidate: *generation.Generation = unwrap_ok[*generation.Generation, *u8](generations);
+    val arena_base: *u8 = unwrap_ok[*u8, *u8](arena);
+    val generation_base: *generation.Generation =
+        unwrap_ok[*generation.Generation, *u8](generations);
+    val storage_base: *PlanStorage = unwrap_ok[*PlanStorage, *u8](plan_storage);
+    var config_allocators: [2]allocator.Allocator;
+    var config_states: [2]fixed.FixedState;
+    fixed.make(?config_allocators[0], ?config_states[0], arena_base, CONFIG_ARENA_BYTES);
+    fixed.make(?config_allocators[1], ?config_states[1], ?arena_base[CONFIG_ARENA_BYTES],
+        CONFIG_ARENA_BYTES);
+    var slot: usize = 0;
+    var config_allocator: allocator.Allocator = config_allocators[0];
+    val candidate: *generation.Generation = ?generation_base[0];
     val diagnostics: *schema.Diagnostics = unwrap_ok[*schema.Diagnostics, *u8](diagnostics_storage);
-    val storage: *PlanStorage = unwrap_ok[*PlanStorage, *u8](plan_storage);
+    val storage: *PlanStorage = ?storage_base[0];
 
     var resolver: loader.Resolver = loader.Resolver{
         context: nil,
@@ -324,8 +435,8 @@ fun main(argc: i64, argv: **u8) i64 {
         print.eprintln("hedge: plan storage layout is invalid");
         ret EXIT_RUNTIME;
     }
-    var compiled: plan.Plan;
-    val built: plan.Report = plan.compile(?compiled, candidate.id, ?candidate.graph,
+    var compiled: [2]plan.Plan;
+    val built: plan.Report = plan.compile(?compiled[0], candidate.id, ?candidate.graph,
         compiled_storage, ?services, nil);
     if (built.status != plan.PLAN_OK) {
         print.eprint("hedge: route plan failed: ");
@@ -368,7 +479,7 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     var runtime: serve.Runtime;
     if (!serve.make(?runtime, unwrap_ok[*serve.Slot, *u8](slots),
-        unwrap_ok[*connection.Connection, *u8](connections), pool_size, ?compiled,
+        unwrap_ok[*connection.Connection, *u8](connections), pool_size, ?compiled[0],
         ?candidate.graph)) {
         print.eprintln("hedge: serving runtime initialization failed");
         ret EXIT_RUNTIME;
@@ -392,8 +503,28 @@ fun main(argc: i64, argv: **u8) i64 {
     # that never finishes ends the process rather than holding it open. `poll`
     # stops short of releasing the resources it is polling on, so the loop ends
     # when everything but that is done and `stop` performs the close.
+    var reloader: Reloader;
+    reloader.heap = ?heap;
+    reloader.path = path;
+    reloader.resolver = ?resolver;
+    reloader.diagnostics = diagnostics;
+    reloader.generations = generation_base;
+    reloader.storages = storage_base;
+    reloader.allocators = ?config_allocators[0];
+    reloader.states = ?config_states[0];
+    reloader.plans = ?compiled[0];
+    reloader.services = ?services;
+    reloader.runtime = ?runtime;
+    reloader.slot = 0;
+    reloader.next_id = candidate.id + 1;
     for (true) {
         serve.poll(?runtime, serve.DEFAULT_POLL_MS);
+        # a reload request is taken once the previous generation has finished
+        # draining, so the spare slot is free to build into
+        if (runtime.owner.reload_requested && serve.superseded(?runtime) == 0) {
+            listener.clear_reload_request(?runtime.owner);
+            reload(?reloader);
+        }
         # a renewed certificate is installed by whoever owns the credential
         # generation. tls termination does not exist in this build, so the
         # certificate is obtained, verified, and stored, and the installation
