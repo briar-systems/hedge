@@ -50,6 +50,7 @@ use prologue: hedge.protocol.prologue;
 use proxy_protocol: hedge.protocol.proxy_protocol;
 use hedge_tls: hedge.protocol.tls;
 use secure: hedge.protocol.secure;
+use h2: hedge.protocol.h2;
 use tls_engine: tls.engine;
 use tls_error: tls.error;
 use contracts: crypto.contracts;
@@ -273,6 +274,7 @@ pub rec Connection {
     prologue_scope_live: bool;
     tls_policy: usize;
     session: usize;
+    h2_session: usize;
     handshaking: bool;
     secure_operation: Operation;
     proxy_scratch: [PROXY_SCRATCH_BYTES]u8;
@@ -412,6 +414,15 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
     var settled: transport.Completion;
     if (!translate(?settled, completion, token_context)) { ret; }
     val now: time.Time = time.now();
+    if (owner.h2_session != h2.NO_SESSION) {
+        val stepped: Step = from_h2(h2.complete_io(owner.h2_session, ?settled, now));
+        if (stepped == STEP_DONE || stepped == STEP_ERROR) {
+            owner.state = CLOSING;
+            ret;
+        }
+        advance(owner, now);
+        ret;
+    }
     # complete_io settles the transport slot and advances the engine, so the event
     # it returns is the next event this connection will ever produce. dropping it
     # would silently skip a request.
@@ -567,6 +578,7 @@ pub fun make(
     if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
     owner.tls_policy = policy;
     owner.session = secure.NO_SESSION;
+    owner.h2_session = h2.NO_SESSION;
     owner.handshaking = false;
     owner.state = NEW;
     owner.id = id;
@@ -695,7 +707,34 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
         release_prologue_scope(owner);
         ret STEP_PROGRESS;
     }
+    if (owner.protocol == selection.HTTP2) {
+        owner.h2_session = h2.acquire();
+        if (owner.h2_session == h2.NO_SESSION) {
+            ret refuse(owner, prologue.REFUSED_EXHAUSTED);
+        }
+        if (!h2.begin(owner.h2_session, ?owner.channel, ?owner.engine_scope,
+            owner.plan, owner.limits, owner.listener_name, owner.secure,
+            endpoint_metadata(owner.peer_kind, ?owner.peer_text[0], owner.peer_len,
+                owner.peer_port),
+            endpoint_metadata(owner.local_kind, ?owner.local_text[0],
+                owner.local_len, owner.local_port),
+            owner.configured.request_timeout_ns)) {
+            ret refuse(owner, prologue.REFUSED_UNBOUND);
+        }
+        owner.engine_live = true;
+        owner.state = ACTIVE;
+        release_prologue_scope(owner);
+        ret STEP_PROGRESS;
+    }
     ret refuse(owner, prologue.REFUSED_UNBOUND);
+}
+
+fun from_h2(progress: h2.Step) Step {
+    if (progress == h2.STEP_PROGRESS) { ret STEP_PROGRESS; }
+    if (progress == h2.STEP_BLOCKED) { ret STEP_BLOCKED; }
+    if (progress == h2.STEP_DONE) { ret STEP_DONE; }
+    if (progress == h2.STEP_ERROR) { ret STEP_ERROR; }
+    ret STEP_IDLE;
 }
 
 # the bytes the prologue read past the PROXY header are TLS records, and the
@@ -1166,6 +1205,7 @@ fun pump_response(owner: *Connection, now: time.Time) Step {
 fun runnable(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || !owner.engine_live
      || owner.state != ACTIVE) { ret false; }
+    if (owner.h2_session != h2.NO_SESSION) { ret true; }
     ret owner.engine.state != connection.CLOSED && owner.engine.state != connection.FAILED;
 }
 
@@ -1269,15 +1309,29 @@ pub fun step(owner: *Connection, now: time.Time) Step {
     if (owner.session != secure.NO_SESSION && owner.engine_live) {
         var settled: transport.Completion;
         if (secure.take(owner.session, ?settled)) {
-            val event: connection.Event = connection.complete_io(?owner.engine,
-                ?settled, now);
-            if (runnable(owner)) { apply(owner, event, now); }
+            if (owner.h2_session != h2.NO_SESSION) {
+                val stepped: Step = from_h2(h2.complete_io(owner.h2_session,
+                    ?settled, now));
+                if (stepped == STEP_DONE || stepped == STEP_ERROR) {
+                    owner.state = CLOSING;
+                }
+            } or {
+                val event: connection.Event = connection.complete_io(?owner.engine,
+                    ?settled, now);
+                if (runnable(owner)) { apply(owner, event, now); }
+            }
             owner.last_step = STEP_PROGRESS;
             ret STEP_PROGRESS;
         }
         secure.drive(owner.session);
     }
     if (owner.state != ACTIVE) { ret STEP_DONE; }
+    if (owner.h2_session != h2.NO_SESSION) {
+        val stepped: Step = from_h2(h2.step(owner.h2_session, now));
+        owner.last_step = stepped;
+        if (stepped == STEP_DONE || stepped == STEP_ERROR) { owner.state = CLOSING; }
+        ret stepped;
+    }
     if (owner.engine.state == connection.CLOSED || owner.engine.state == connection.FAILED) {
         owner.state = CLOSING;
         ret STEP_DONE;
@@ -1337,6 +1391,7 @@ pub fun begin_graceful(owner: *Connection) bool {
         owner.state = CLOSING;
         ret true;
     }
+    if (owner.h2_session != h2.NO_SESSION) { ret h2.begin_graceful(owner.h2_session); }
     ret connection.begin_graceful(?owner.engine);
 }
 
@@ -1349,7 +1404,13 @@ pub fun close(owner: *Connection) bool {
         call.release(?owner.active_call);
         owner.exchange_live = false;
     }
-    if (owner.engine_live) { connection.cancel_connection(?owner.engine); }
+    if (owner.h2_session != h2.NO_SESSION) {
+        owner.requests = h2.requests(owner.h2_session);
+        h2.release(owner.h2_session);
+        owner.h2_session = h2.NO_SESSION;
+    } or (owner.engine_live) {
+        connection.cancel_connection(?owner.engine);
+    }
     owner.engine_live = false;
     if (owner.session != secure.NO_SESSION) {
         secure.release(owner.session);

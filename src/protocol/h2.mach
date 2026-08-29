@@ -1,0 +1,1083 @@
+# the HTTP/2 connection plane
+#
+# an HTTP/1 connection owns one exchange at a time; an HTTP/2 connection owns as
+# many as its stream table allows, and each one carries its own request arena,
+# response storage, cancellation scope, and dispatch call. that is the whole
+# difference, so this module mirrors the HTTP/1 plane stream for stream rather
+# than generalising it: the two engines have different framing, different
+# backpressure, and different close handshakes, and one shared abstraction over
+# them would have to lie about at least one.
+#
+# sessions live in one bounded table addressed by index, for the same reason the
+# TLS sessions do: an HTTP/2 connection needs a quarter of a megabyte of stream
+# and compression storage, and a listener that never negotiates it must not pay
+# for that on every connection slot.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use std.chrono.time;
+use std.sync.cancel;
+use http.core.body;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use http.core.transport;
+use engine_h2: http.h2.connection;
+use hpack: http.h2.hpack;
+use router: http.router.router;
+use hedge.dispatch;
+use call: hedge.dispatch.call;
+use plan: hedge.dispatch.plan;
+use telemetry_trace: hedge.telemetry.trace;
+
+# this build's concurrent HTTP/2 connection bound
+pub val MAX_SESSIONS: usize = 16;
+pub val NO_SESSION: usize = MAX_SESSIONS;
+# concurrent request streams on one connection. the engine's own table is one
+# wider, because it validates its stream limit as strictly below its capacity.
+pub val MAX_STREAMS: usize = 8;
+pub val STREAM_CAPACITY: usize = MAX_STREAMS + 1;
+
+pub val READ_BYTES: usize = 8192;
+pub val WRITE_BYTES: usize = 8192;
+pub val FRAME_PAYLOAD_BYTES: usize = 16384;
+pub val HEADER_OUTPUT_BYTES: usize = 4096;
+pub val CONTROL_SLOTS: usize = 16;
+pub val TABLE_ENTRIES: usize = 64;
+pub val TABLE_STORAGE_BYTES: usize = 4096;
+
+pub val STREAM_ENCODED_BYTES: usize = 4096;
+pub val STREAM_FIELD_SLOTS: usize = 32;
+pub val STREAM_STRING_BYTES: usize = 4096;
+pub val STREAM_PENDING_ENTRIES: usize = 32;
+
+pub val ARENA_BYTES: usize = 4096;
+pub val STAGE_BYTES: usize = 8192;
+pub val REQUEST_FIELD_SLOTS: usize = 40;
+pub val RESPONSE_FIELD_SLOTS: usize = 32;
+pub val RESPONSE_TRAILER_SLOTS: usize = 8;
+pub val INFORMATIONAL_SLOTS: usize = 4;
+pub val CAPTURE_SLOTS: usize = 8;
+pub val HEADER_ITEM_SLOTS: usize = RESPONSE_FIELD_SLOTS + 1;
+pub val MAX_STEPS: usize = 64;
+
+pub def State: u8;
+pub val IDLE: State = 0;
+pub val ACTIVE: State = 1;
+pub val CLOSING: State = 2;
+pub val CLOSED: State = 3;
+pub val FAILED: State = 4;
+
+pub def Step: u8;
+pub val STEP_IDLE: Step = 1;
+pub val STEP_PROGRESS: Step = 2;
+pub val STEP_BLOCKED: Step = 3;
+pub val STEP_DONE: Step = 4;
+pub val STEP_ERROR: Step = 5;
+
+# the request body reader pulls the bytes the engine is holding for one stream
+# and reports pending when none have arrived, so flow control reaches the
+# service instead of being buffered behind its back
+rec Body {
+    session: usize;
+    slot: usize;
+    reader: body.Reader;
+    pending_token: u64;
+    next_token: u64;
+}
+
+rec Slot {
+    live: bool;
+    id: u32;
+    generation: u64;
+    scope: cancel.Scope;
+    scope_live: bool;
+    body: Body;
+    request: message.Request;
+    response: message.Response;
+    request_items: [REQUEST_FIELD_SLOTS]field.Field;
+    request_fields: field.Fields;
+    request_trailers: field.Fields;
+    response_fields: [RESPONSE_FIELD_SLOTS]field.Field;
+    response_trailers: [RESPONSE_TRAILER_SLOTS]field.Field;
+    informationals: [INFORMATIONAL_SLOTS]message.Informational;
+    captures: [CAPTURE_SLOTS]router.Capture;
+    header_items: [HEADER_ITEM_SLOTS]field.Field;
+    status_text: [3]u8;
+    arena: [ARENA_BYTES]u8;
+    memory: call.Memory;
+    trace: telemetry_trace.Context;
+    exchange: exchange.Exchange;
+    active_call: call.Call;
+    stage: [STAGE_BYTES]u8;
+    stage_length: usize;
+    stage_offset: usize;
+    body_done: bool;
+    inbound_complete: bool;
+    headers_sent: bool;
+    trailers_sent: bool;
+    response_complete: bool;
+    service_pending: bool;
+    exchange_live: bool;
+    bound: bool;
+}
+
+rec Session {
+    live: bool;
+    state: State;
+    engine: engine_h2.Engine;
+    streams: [STREAM_CAPACITY]engine_h2.Stream;
+    memories: [STREAM_CAPACITY]engine_h2.StreamMemory;
+    encoded: [STREAM_CAPACITY][STREAM_ENCODED_BYTES]u8;
+    header_fields: [STREAM_CAPACITY][STREAM_FIELD_SLOTS]field.Field;
+    strings: [STREAM_CAPACITY][STREAM_STRING_BYTES]u8;
+    pending: [STREAM_CAPACITY][STREAM_PENDING_ENTRIES]hpack.Entry;
+    read_buffer: [READ_BYTES]u8;
+    write_buffer: [WRITE_BYTES]u8;
+    frame_payload: [FRAME_PAYLOAD_BYTES]u8;
+    header_output: [HEADER_OUTPUT_BYTES]u8;
+    controls: [CONTROL_SLOTS]engine_h2.Control;
+    inbound_entries: [TABLE_ENTRIES]hpack.Entry;
+    inbound_storage: [TABLE_STORAGE_BYTES]u8;
+    outbound_entries: [TABLE_ENTRIES]hpack.Entry;
+    outbound_storage: [TABLE_STORAGE_BYTES]u8;
+    encoder_pending: [TABLE_ENTRIES]hpack.Entry;
+    slots: [MAX_STREAMS]Slot;
+    held_stream: u32;
+    held_data: *u8;
+    held_length: usize;
+    plan: *plan.Plan;
+    limits: message.Limits;
+    listener_name: str;
+    secure: bool;
+    peer: message.Endpoint;
+    local: message.Endpoint;
+    request_timeout_ns: u64;
+    engine_scope: *cancel.Scope;
+    requests: u64;
+    last_event: engine_h2.EventKind;
+    last_step: Step;
+    engine_started: bool;
+}
+
+var sessions: [MAX_SESSIONS]Session;
+var prepared: bool;
+var live_count: usize;
+
+fun reset_slot(slot: *Slot) {
+    slot.live = false;
+    slot.id = 0;
+    slot.generation = 0;
+    slot.scope_live = false;
+    slot.stage_length = 0;
+    slot.stage_offset = 0;
+    slot.body_done = false;
+    slot.inbound_complete = false;
+    slot.headers_sent = false;
+    slot.trailers_sent = false;
+    slot.response_complete = false;
+    slot.service_pending = false;
+    slot.exchange_live = false;
+    slot.bound = false;
+}
+
+fun prepare() {
+    if (prepared) { ret; }
+    var i: usize = 0;
+    for (i < MAX_SESSIONS) {
+        sessions[i].live = false;
+        sessions[i].state = IDLE;
+        sessions[i].engine_started = false;
+        var j: usize = 0;
+        for (j < MAX_STREAMS) { reset_slot(?sessions[i].slots[j]); j = j + 1; }
+        i = i + 1;
+    }
+    live_count = 0;
+    prepared = true;
+}
+
+pub fun capacity() usize { ret MAX_SESSIONS; }
+
+pub fun live() usize {
+    prepare();
+    ret live_count;
+}
+
+pub fun acquire() usize {
+    prepare();
+    var i: usize = 0;
+    for (i < MAX_SESSIONS) {
+        if (!sessions[i].live) {
+            sessions[i].live = true;
+            sessions[i].state = IDLE;
+            sessions[i].engine_started = false;
+            sessions[i].held_stream = engine_h2.NO_STREAM;
+            sessions[i].held_data = nil;
+            sessions[i].held_length = 0;
+            sessions[i].requests = 0;
+            sessions[i].last_event = engine_h2.EVENT_NONE;
+            sessions[i].last_step = STEP_IDLE;
+            var j: usize = 0;
+            for (j < MAX_STREAMS) { reset_slot(?sessions[i].slots[j]); j = j + 1; }
+            live_count = live_count + 1;
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret NO_SESSION;
+}
+
+fun retire_slot(session: *Session, slot: *Slot) {
+    if (slot.exchange_live) {
+        exchange.cancel_exchange(?slot.exchange);
+        call.release(?slot.active_call);
+        slot.exchange_live = false;
+    }
+    if (slot.scope_live) {
+        cancel.destroy(?slot.scope);
+        slot.scope_live = false;
+    }
+    reset_slot(slot);
+}
+
+pub fun release(index: usize) bool {
+    prepare();
+    if (index >= MAX_SESSIONS || !sessions[index].live) { ret false; }
+    val session: *Session = ?sessions[index];
+    var j: usize = 0;
+    for (j < MAX_STREAMS) { retire_slot(session, ?session.slots[j]); j = j + 1; }
+    session.engine_started = false;
+    session.state = CLOSED;
+    session.live = false;
+    if (live_count > 0) { live_count = live_count - 1; }
+    ret true;
+}
+
+# --- configuration ---
+
+pub fun config_from(limits: message.Limits) engine_h2.Config {
+    var configured: engine_h2.Config = engine_h2.config_default();
+    configured.max_streams = MAX_STREAMS;
+    configured.local.max_concurrent_streams = MAX_STREAMS::u32;
+    configured.local.enable_push = 0;
+    configured.local.max_frame_size = FRAME_PAYLOAD_BYTES::u32;
+    configured.max_frame_payload = FRAME_PAYLOAD_BYTES;
+    configured.hpack.max_header_count = STREAM_FIELD_SLOTS;
+    configured.hpack.max_encoded_block_bytes = HEADER_OUTPUT_BYTES;
+    if (configured.hpack.max_dynamic_table_bytes > TABLE_STORAGE_BYTES) {
+        configured.hpack.max_dynamic_table_bytes = TABLE_STORAGE_BYTES;
+    }
+    if (configured.hpack.max_header_list_bytes > STREAM_STRING_BYTES) {
+        configured.hpack.max_header_list_bytes = STREAM_STRING_BYTES;
+    }
+    configured.local.header_table_size = configured.hpack.max_dynamic_table_bytes::u32;
+    configured.local.max_header_list_size = configured.hpack.max_header_list_bytes::u32;
+    ret configured;
+}
+
+pub fun begin(index: usize, channel: *transport.Transport, scope: *cancel.Scope,
+    active_plan: *plan.Plan, limits: message.Limits, listener_name: str,
+    secure: bool, peer: message.Endpoint, local: message.Endpoint,
+    request_timeout_ns: u64) bool {
+    prepare();
+    if (index >= MAX_SESSIONS || !sessions[index].live || channel == nil
+     || scope == nil || active_plan == nil) { ret false; }
+    val session: *Session = ?sessions[index];
+    session.plan = active_plan;
+    session.limits = limits;
+    session.listener_name = listener_name;
+    session.secure = secure;
+    session.peer = peer;
+    session.local = local;
+    session.request_timeout_ns = request_timeout_ns;
+    session.engine_scope = scope;
+    var i: usize = 0;
+    for (i < STREAM_CAPACITY) {
+        session.memories[i] = engine_h2.StreamMemory{
+            encoded: ?session.encoded[i][0],
+            encoded_capacity: STREAM_ENCODED_BYTES,
+            fields: ?session.header_fields[i][0],
+            field_capacity: STREAM_FIELD_SLOTS,
+            strings: ?session.strings[i][0],
+            string_capacity: STREAM_STRING_BYTES,
+            pending: ?session.pending[i][0],
+            pending_capacity: STREAM_PENDING_ENTRIES,
+        };
+        i = i + 1;
+    }
+    val configured: engine_h2.Config = config_from(limits);
+    session.engine.initialized = false;
+    if (!engine_h2.init(?session.engine, engine_h2.SERVER, channel, scope,
+        ?session.streams[0], ?session.memories[0], STREAM_CAPACITY,
+        ?session.read_buffer[0], READ_BYTES,
+        ?session.write_buffer[0], WRITE_BYTES,
+        ?session.frame_payload[0], FRAME_PAYLOAD_BYTES,
+        ?session.header_output[0], HEADER_OUTPUT_BYTES,
+        ?session.controls[0], CONTROL_SLOTS,
+        ?session.inbound_entries[0], TABLE_ENTRIES,
+        ?session.inbound_storage[0], TABLE_STORAGE_BYTES,
+        ?session.outbound_entries[0], TABLE_ENTRIES,
+        ?session.outbound_storage[0], TABLE_STORAGE_BYTES,
+        ?session.encoder_pending[0], TABLE_ENTRIES, configured)) {
+        ret false;
+    }
+    session.engine_started = true;
+    session.state = ACTIVE;
+    # the configured local settings are queued by `init` itself, so they reach
+    # the peer with the connection preface and a second send would be refused
+    ret true;
+}
+
+# --- request body ---
+
+fun slot_for(session: *Session, id: u32) *Slot {
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        if (session.slots[i].live && session.slots[i].id == id) {
+            ret ?session.slots[i];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun free_slot(session: *Session) *Slot {
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        if (!session.slots[i].live) { ret ?session.slots[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun body_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    val state: *Body = context::*Body;
+    if (state == nil || state.session >= MAX_SESSIONS) {
+        ret body.failed("request body has no owner", body.REUSE_FORBIDDEN);
+    }
+    val session: *Session = ?sessions[state.session];
+    val slot: *Slot = ?session.slots[state.slot];
+    if (session.held_stream == slot.id && session.held_length != 0) {
+        var count: usize = session.held_length;
+        if (count > capacity) { count = capacity; }
+        var i: usize = 0;
+        for (i < count) { output[i] = session.held_data[i]; i = i + 1; }
+        if (!engine_h2.consume_data(?session.engine, slot.id, count)) {
+            ret body.failed("request body consumption was refused",
+                body.REUSE_FORBIDDEN);
+        }
+        session.held_length = session.held_length - count;
+        session.held_data = ?session.held_data[count];
+        if (session.held_length == 0) { session.held_stream = engine_h2.NO_STREAM; }
+        ret body.data(count);
+    }
+    if (slot.inbound_complete) { ret body.complete(body.REUSE_ALLOWED); }
+    state.next_token = state.next_token + 1;
+    state.pending_token = state.next_token;
+    ret body.pending(state.pending_token);
+}
+
+fun body_finish(context: ptr, mode: body.Mode,
+    trailers: *field.Fields) body.Progress {
+    val state: *Body = context::*Body;
+    if (state == nil || state.session >= MAX_SESSIONS) {
+        ret body.failed("request body has no owner", body.REUSE_FORBIDDEN);
+    }
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    val session: *Session = ?sessions[state.session];
+    val slot: *Slot = ?session.slots[state.slot];
+    # an unread request body still owes the peer its flow-control window, so it
+    # is consumed rather than abandoned
+    if (session.held_stream == slot.id && session.held_length != 0) {
+        engine_h2.consume_data(?session.engine, slot.id, session.held_length);
+        session.held_length = 0;
+        session.held_stream = engine_h2.NO_STREAM;
+    }
+    if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
+    if (slot.inbound_complete) { ret body.complete(body.REUSE_ALLOWED); }
+    state.next_token = state.next_token + 1;
+    state.pending_token = state.next_token;
+    ret body.pending(state.pending_token);
+}
+
+fun body_complete(context: ptr, token: u64,
+    trailers: *field.Fields) body.Progress {
+    val state: *Body = context::*Body;
+    if (state == nil || state.session >= MAX_SESSIONS
+     || token != state.pending_token) {
+        ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
+    }
+    state.pending_token = 0;
+    val session: *Session = ?sessions[state.session];
+    if (session.slots[state.slot].inbound_complete
+     && session.held_stream != session.slots[state.slot].id) {
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    ret body_read(context, nil, 0, trailers);
+}
+
+fun body_release(context: ptr) {
+}
+
+# --- exchange construction ---
+
+# HTTP/2 method names are exact tokens, so this compares them exactly. a
+# case-insensitive match here would accept `get` as GET, which HTTP/1 does not.
+fun token_is(name: view.View, expected: str, length: usize) bool {
+    if (name.len != length || name.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (name.data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun method_of(name: view.View) method.Method {
+    if (token_is(name, "GET", 3)) { ret method.from_kind(method.GET); }
+    if (token_is(name, "HEAD", 4)) { ret method.from_kind(method.HEAD); }
+    if (token_is(name, "POST", 4)) { ret method.from_kind(method.POST); }
+    if (token_is(name, "PUT", 3)) { ret method.from_kind(method.PUT); }
+    if (token_is(name, "DELETE", 6)) { ret method.from_kind(method.DELETE); }
+    if (token_is(name, "CONNECT", 7)) { ret method.from_kind(method.CONNECT); }
+    if (token_is(name, "OPTIONS", 7)) { ret method.from_kind(method.OPTIONS); }
+    if (token_is(name, "TRACE", 5)) { ret method.from_kind(method.TRACE); }
+    if (token_is(name, "PATCH", 5)) { ret method.from_kind(method.PATCH); }
+    ret method.extension(name);
+}
+
+# `:path` carries the origin form, which HTTP/1 splits in its parser. HTTP/2
+# does not, so the split happens once here rather than in every service.
+fun target_of(raw: view.View) target.Target {
+    if (raw.len == 1 && raw.data != nil && raw.data[0] == '*'::u8) {
+        ret target.asterisk();
+    }
+    var cut: usize = raw.len;
+    var i: usize = 0;
+    for (i < raw.len) {
+        if (raw.data[i] == '?'::u8) { cut = i; brk; }
+        i = i + 1;
+    }
+    val path: view.View = view.view(raw.data, cut);
+    var query: view.View = view.view(nil, 0);
+    if (cut < raw.len) {
+        query = view.view(?raw.data[cut + 1], raw.len - cut - 1);
+    }
+    ret target.origin(raw, path, query);
+}
+
+# the regular fields are copied out of the engine's decoding storage into the
+# slot's own, and `:authority` is written back as a Host field.
+#
+# RFC 9113 makes `:authority` the authority of the request, and every part of
+# hedge that asks who a request was addressed to reads a Host field: the router,
+# the proxy's forwarded metadata, the access log. translating once here is what
+# keeps HTTP/2 requests routable by the same virtual-host rules as HTTP/1.
+fun copy_fields(slot: *Slot, block: engine_h2.HeaderBlock,
+    limits: field.Limits) bool {
+    slot.request_fields = field.init(?slot.request_items[0], REQUEST_FIELD_SLOTS,
+        limits);
+    if (!slot.request_fields.valid) { ret false; }
+    var has_host: bool = false;
+    var i: usize = block.regular_offset;
+    for (i < block.count) {
+        if (field.name_equal(block.fields[i].name, view.view("host", 4))) {
+            has_host = true;
+        }
+        if (field.append(?slot.request_fields, block.fields[i]) != field.ADD_OK) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    if (has_host || block.authority.len == 0) { ret true; }
+    ret field.append(?slot.request_fields, field.Field{
+        name: view.view("host", 4), value: block.authority,
+        sensitive: false}) == field.ADD_OK;
+}
+
+fun write_status(slot: *Slot, code: status.Status) view.View {
+    val value: usize = code::usize;
+    slot.status_text[0] = '0'::u8 + (value / 100)::u8;
+    slot.status_text[1] = '0'::u8 + ((value / 10) % 10)::u8;
+    slot.status_text[2] = '0'::u8 + (value % 10)::u8;
+    ret view.view(?slot.status_text[0], 3);
+}
+
+fun deadline_from(now: time.Time, timeout_ns: u64) time.Time {
+    var deadline: time.Time = now;
+    deadline.sec = now.sec + (timeout_ns / 1000000000)::i64;
+    deadline.nsec = now.nsec + (timeout_ns % 1000000000)::i64;
+    if (deadline.nsec >= 1000000000) {
+        deadline.nsec = deadline.nsec - 1000000000;
+        deadline.sec = deadline.sec + 1;
+    }
+    ret deadline;
+}
+
+fun make_exchange(index: usize, slot: *Slot, event: engine_h2.Event,
+    now: time.Time) bool {
+    val session: *Session = ?sessions[index];
+    session.requests = session.requests + 1;
+    val has_deadline: bool = session.request_timeout_ns != 0;
+    var deadline: time.Time = now;
+    if (has_deadline) {
+        deadline = deadline_from(now, session.request_timeout_ns);
+    }
+    if (slot.scope_live) { cancel.destroy(?slot.scope); }
+    slot.scope_live = false;
+    if (!cancel.make_child(?slot.scope, session.engine_scope, has_deadline,
+        deadline)) { ret false; }
+    slot.scope_live = true;
+    slot.body.session = index;
+    slot.body.slot = (slot)::usize - (?session.slots[0])::usize;
+    slot.body.slot = slot.body.slot / $size_of(Slot);
+    slot.body.pending_token = 0;
+    slot.body.next_token = 0;
+    var declared: u64 = 0;
+    var length_known: bool = event.headers.has_content_length;
+    if (length_known) { declared = event.headers.content_length; }
+    if (event.end_stream) {
+        length_known = true;
+        if (!event.headers.has_content_length) { declared = 0; }
+    }
+    slot.body.reader = body.init_reader(
+        (?slot.body)::ptr,
+        body_read,
+        body_finish,
+        body_complete,
+        body_release,
+        body.OWNER_APPLICATION,
+        event.generation,
+        length_known,
+        declared,
+        session.limits.request_body,
+        nil,
+        ?slot.scope,
+    );
+    if (!slot.body.reader.valid) { ret false; }
+    if (!copy_fields(slot, event.headers, session.limits.request_fields)) {
+        ret false;
+    }
+    slot.request_trailers = field.init(nil, 0, session.limits.request_trailers);
+    var metadata: message.Metadata;
+    metadata.version = message.version_h2();
+    metadata.secure = session.secure;
+    metadata.early_data = false;
+    metadata.peer = session.peer;
+    metadata.local = session.local;
+    metadata.received_at = now;
+    metadata.has_deadline = has_deadline;
+    metadata.deadline = deadline;
+    # the engine binds an exchange only when its request index is the stream id
+    metadata.request_index = event.stream_id::u64;
+    if (!message.init_request(?slot.request, method_of(event.headers.method),
+        target_of(event.headers.path), metadata, slot.request_fields,
+        slot.request_trailers, ?slot.body.reader, event.generation,
+        session.limits)) { ret false; }
+    if (!message.init_response(?slot.response, ?slot.response_fields[0],
+        RESPONSE_FIELD_SLOTS, ?slot.response_trailers[0], RESPONSE_TRAILER_SLOTS,
+        event.generation, session.limits)) { ret false; }
+    slot.exchange.valid = false;
+    if (!exchange.init(?slot.exchange, ?slot.request, ?slot.response,
+        ?slot.informationals[0], INFORMATIONAL_SLOTS, ?slot.scope,
+        event.generation, session.limits)) { ret false; }
+    if (!engine_h2.bind_exchange(?session.engine, event.stream_id, ?slot.exchange)) {
+        ret false;
+    }
+    slot.bound = true;
+    if (!exchange.begin(?slot.exchange)) { ret false; }
+    if (!call.make_memory(?slot.memory, ?slot.arena[0], ARENA_BYTES)) { ret false; }
+    if (!telemetry_trace.make_root(?slot.trace, false)) { ret false; }
+    if (!call.bind(?slot.active_call, ?slot.exchange, ?slot.memory, ?slot.trace,
+        session.plan.generation, session.listener_name)) { ret false; }
+    slot.exchange_live = true;
+    ret true;
+}
+
+# --- response emission ---
+
+fun response_headers(slot: *Slot) usize {
+    slot.header_items[0] = field.Field{name: view.view(":status", 7),
+        value: write_status(slot, slot.response.status), sensitive: false};
+    var count: usize = 1;
+    var i: usize = 0;
+    for (i < slot.response.fields.len && count < HEADER_ITEM_SLOTS) {
+        val item: *field.Field = ?slot.response.fields.items[i];
+        # HTTP/2 carries no connection-specific header fields, and a message
+        # that keeps one is malformed rather than merely untidy
+        if (!field.name_equal(item.name, view.view("connection", 10))
+         && !field.name_equal(item.name, view.view("transfer-encoding", 17))
+         && !field.name_equal(item.name, view.view("keep-alive", 10))
+         && !field.name_equal(item.name, view.view("upgrade", 7))
+         && !field.name_equal(item.name, view.view("proxy-connection", 16))) {
+            slot.header_items[count] = @item;
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+fun has_body(slot: *Slot) bool {
+    ret slot.response.body_kind == message.BODY_READER;
+}
+
+fun begin_response(index: usize, slot: *Slot) Step {
+    val session: *Session = ?sessions[index];
+    if (slot.headers_sent) { ret STEP_IDLE; }
+    if (!slot.response.committed) { ret STEP_IDLE; }
+    val count: usize = response_headers(slot);
+    val final: bool = !has_body(slot) && slot.response.trailers.len == 0;
+    val offered: engine_h2.Offer = engine_h2.send_headers(?session.engine, slot.id,
+        ?slot.header_items[0], count, final, true);
+    if (offered.status == engine_h2.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    if (offered.status == engine_h2.OFFER_ERROR) { ret STEP_ERROR; }
+    slot.headers_sent = true;
+    if (final) { slot.response_complete = true; }
+    or { engine_h2.set_writable(?session.engine, slot.id, true); }
+    ret STEP_PROGRESS;
+}
+
+fun send_trailers(index: usize, slot: *Slot) Step {
+    val session: *Session = ?sessions[index];
+    if (slot.trailers_sent || slot.response.trailers.len == 0) { ret STEP_IDLE; }
+    val offered: engine_h2.Offer = engine_h2.send_headers(?session.engine, slot.id,
+        slot.response.trailers.items, slot.response.trailers.len, true, true);
+    if (offered.status == engine_h2.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    if (offered.status == engine_h2.OFFER_ERROR) { ret STEP_ERROR; }
+    slot.trailers_sent = true;
+    slot.response_complete = true;
+    ret STEP_PROGRESS;
+}
+
+# pull from the response body into the staging buffer and offer it to the
+# engine. the engine consumes only what its windows admit, so the unconsumed
+# remainder is offered again before the body is read further.
+fun advance_response(index: usize, slot: *Slot) Step {
+    val session: *Session = ?sessions[index];
+    if (!slot.headers_sent || slot.response_complete) { ret STEP_IDLE; }
+    # the engine clears a stream's writable flag once it has taken everything
+    # offered, so a response with more to send has to say so again. without this
+    # the scheduler never picks the stream a second time and the response stops
+    # after its first frame.
+    engine_h2.set_writable(?session.engine, slot.id, true);
+    if (engine_h2.writable_stream(?session.engine) != slot.id) { ret STEP_BLOCKED; }
+    if (slot.stage_offset >= slot.stage_length) {
+        slot.stage_offset = 0;
+        slot.stage_length = 0;
+        if (!slot.body_done) {
+            if (has_body(slot)) {
+                val progress: body.Progress = body.read(slot.response.body_reader,
+                    ?slot.stage[0], STAGE_BYTES);
+                if (progress.status == body.DATA) { slot.stage_length = progress.count; }
+                or (progress.status == body.PENDING) { ret STEP_BLOCKED; }
+                or (progress.status == body.COMPLETE) { slot.body_done = true; }
+                or { ret STEP_ERROR; }
+            } or {
+                slot.body_done = true;
+            }
+        }
+    }
+    var payload: *u8 = nil;
+    var length: usize = 0;
+    if (slot.stage_offset < slot.stage_length) {
+        payload = ?slot.stage[slot.stage_offset];
+        length = slot.stage_length - slot.stage_offset;
+    }
+    val final: bool = slot.body_done && length == 0
+        && slot.response.trailers.len == 0;
+    if (length == 0 && !final) {
+        # nothing left to frame, and trailers close the stream instead
+        if (slot.body_done) { ret send_trailers(index, slot); }
+        ret STEP_BLOCKED;
+    }
+    val offered: engine_h2.Offer = engine_h2.offer_data(?session.engine, slot.id,
+        payload, length, final);
+    if (offered.status == engine_h2.OFFER_ERROR) { ret STEP_ERROR; }
+    if (offered.status == engine_h2.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    slot.stage_offset = slot.stage_offset + offered.consumed;
+    if (final && offered.status == engine_h2.OFFER_DONE) {
+        slot.response_complete = true;
+        engine_h2.set_writable(?session.engine, slot.id, false);
+    }
+    if (offered.consumed == 0 && offered.produced == 0 && !final) {
+        ret STEP_BLOCKED;
+    }
+    ret STEP_PROGRESS;
+}
+
+fun settle_exchange(index: usize, slot: *Slot) bool {
+    val session: *Session = ?sessions[index];
+    if (!slot.exchange_live) { ret true; }
+    if (exchange.finish(?slot.exchange) != exchange.FINISH_OK) { ret false; }
+    call.release(?slot.active_call);
+    slot.exchange_live = false;
+    engine_h2.release_stream(?session.engine, slot.id, slot.generation);
+    if (slot.scope_live) {
+        cancel.destroy(?slot.scope);
+        slot.scope_live = false;
+    }
+    reset_slot(slot);
+    ret true;
+}
+
+fun fail_exchange(index: usize, slot: *Slot, code: status.Status) Step {
+    if (slot.response.committed) { ret STEP_ERROR; }
+    if (message.set_status(?slot.response, code) != message.RESPONSE_OK) {
+        ret STEP_ERROR;
+    }
+    if (call.disposition(?slot.active_call) == call.BODY_UNRESOLVED
+     && !call.resolve_body(?slot.active_call, call.BODY_CLOSE)) { ret STEP_ERROR; }
+    if (exchange.commit(?slot.exchange, sessions[index].limits) != message.RESPONSE_OK) {
+        ret STEP_ERROR;
+    }
+    ret begin_response(index, slot);
+}
+
+fun start_exchange(index: usize, slot: *Slot) Step {
+    val session: *Session = ?sessions[index];
+    val served: dispatch.Result = dispatch.serve(session.plan, ?slot.active_call,
+        ?slot.captures[0], CAPTURE_SLOTS);
+    if (served.outcome == dispatch.FAILED) {
+        ret fail_exchange(index, slot, status.INTERNAL_SERVER_ERROR);
+    }
+    if (served.outcome == dispatch.PENDING) {
+        slot.service_pending = true;
+        ret STEP_PROGRESS;
+    }
+    ret begin_response(index, slot);
+}
+
+fun resume_exchange(index: usize, slot: *Slot) Step {
+    val session: *Session = ?sessions[index];
+    val served: dispatch.Result = dispatch.resume(session.plan, ?slot.active_call);
+    if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
+    slot.service_pending = false;
+    if (served.outcome == dispatch.FAILED) {
+        ret fail_exchange(index, slot, status.BAD_GATEWAY);
+    }
+    ret begin_response(index, slot);
+}
+
+# --- events ---
+
+fun open_stream(index: usize, event: engine_h2.Event, now: time.Time) Step {
+    val session: *Session = ?sessions[index];
+    val slot: *Slot = free_slot(session);
+    if (slot == nil) {
+        engine_h2.cancel_stream(?session.engine, event.stream_id,
+            engine_h2.H2_REFUSED_STREAM);
+        engine_h2.release_event(?session.engine, event.stream_id, event.generation);
+        ret STEP_PROGRESS;
+    }
+    reset_slot(slot);
+    slot.live = true;
+    slot.id = event.stream_id;
+    slot.generation = event.generation;
+    slot.inbound_complete = event.end_stream;
+    if (!make_exchange(index, slot, event, now)) {
+        engine_h2.release_event(?session.engine, event.stream_id, event.generation);
+        engine_h2.cancel_stream(?session.engine, event.stream_id,
+            engine_h2.H2_INTERNAL_ERROR);
+        retire_slot(session, slot);
+        ret STEP_PROGRESS;
+    }
+    engine_h2.release_event(?session.engine, event.stream_id, event.generation);
+    ret start_exchange(index, slot);
+}
+
+fun apply(index: usize, event: engine_h2.Event, now: time.Time) Step {
+    val session: *Session = ?sessions[index];
+    session.last_event = event.kind;
+    if (event.kind == engine_h2.EVENT_NEED_READ) {
+        engine_h2.submit_read(?session.engine);
+        ret STEP_BLOCKED;
+    }
+    if (event.kind == engine_h2.EVENT_NONE) { ret STEP_BLOCKED; }
+    if (event.kind == engine_h2.EVENT_CLOSED
+     || event.kind == engine_h2.EVENT_PEER_CLOSED
+     || event.kind == engine_h2.EVENT_ERROR
+     || event.kind == engine_h2.EVENT_CANCELLED) {
+        session.state = CLOSING;
+        ret STEP_DONE;
+    }
+    if (event.kind == engine_h2.EVENT_REQUEST_HEADERS) {
+        ret open_stream(index, event, now);
+    }
+    if (event.kind == engine_h2.EVENT_DATA) {
+        session.held_stream = event.stream_id;
+        session.held_data = event.data;
+        session.held_length = event.data_length;
+        val slot: *Slot = slot_for(session, event.stream_id);
+        if (slot != nil) {
+            if (event.end_stream) { slot.inbound_complete = true; }
+            if (slot.exchange_live && slot.body.pending_token != 0) {
+                body.complete_reader(slot.request.body, slot.body.pending_token);
+            }
+        }
+        ret STEP_PROGRESS;
+    }
+    if (event.kind == engine_h2.EVENT_STREAM_END
+     || event.kind == engine_h2.EVENT_TRAILERS) {
+        val slot: *Slot = slot_for(session, event.stream_id);
+        if (slot != nil) {
+            slot.inbound_complete = true;
+            if (slot.exchange_live && slot.body.pending_token != 0) {
+                body.complete_reader(slot.request.body, slot.body.pending_token);
+            }
+        }
+        return_event(index, event);
+        ret STEP_PROGRESS;
+    }
+    if (event.kind == engine_h2.EVENT_STREAM_RESET
+     || event.kind == engine_h2.EVENT_STREAM_ERROR) {
+        val slot: *Slot = slot_for(session, event.stream_id);
+        if (slot != nil) { retire_slot(session, slot); }
+        ret STEP_PROGRESS;
+    }
+    if (event.kind == engine_h2.EVENT_GOAWAY) {
+        session.state = CLOSING;
+        ret STEP_PROGRESS;
+    }
+    ret STEP_PROGRESS;
+}
+
+fun return_event(index: usize, event: engine_h2.Event) {
+    if (event.stream_id == engine_h2.NO_STREAM) { ret; }
+    engine_h2.release_event(?sessions[index].engine, event.stream_id,
+        event.generation);
+}
+
+fun pump_slot(index: usize, slot: *Slot, now: time.Time) Step {
+    if (!slot.live || !slot.exchange_live) { ret STEP_IDLE; }
+    if (slot.service_pending) {
+        val resumed: Step = resume_exchange(index, slot);
+        if (resumed != STEP_BLOCKED) { ret resumed; }
+        ret STEP_BLOCKED;
+    }
+    if (!slot.headers_sent) {
+        val started: Step = begin_response(index, slot);
+        if (started != STEP_IDLE) { ret started; }
+        ret STEP_BLOCKED;
+    }
+    if (!slot.response_complete) { ret advance_response(index, slot); }
+    # an exchange settles only once the request body has reached a terminal
+    # disposition, so a service that ignored the body cannot strand the stream
+    if (!body.reader_terminal_state(slot.request.body)) {
+        if (slot.request.body.pending_kind != body.OP_NONE) { ret STEP_BLOCKED; }
+        val settled: body.Progress = body.drain(slot.request.body);
+        if (settled.status == body.PENDING) { ret STEP_BLOCKED; }
+        if (!body.reader_terminal_state(slot.request.body)) { ret STEP_ERROR; }
+    }
+    if (!settle_exchange(index, slot)) { ret STEP_ERROR; }
+    ret STEP_PROGRESS;
+}
+
+fun pump_streams(index: usize, now: time.Time) Step {
+    val session: *Session = ?sessions[index];
+    var progressed: bool = false;
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        val stepped: Step = pump_slot(index, ?session.slots[i], now);
+        if (stepped == STEP_ERROR) { ret STEP_ERROR; }
+        if (stepped == STEP_PROGRESS) { progressed = true; }
+        i = i + 1;
+    }
+    if (progressed) { ret STEP_PROGRESS; }
+    ret STEP_BLOCKED;
+}
+
+fun runnable(index: usize) bool {
+    if (index >= MAX_SESSIONS || !sessions[index].live
+     || !sessions[index].engine_started) { ret false; }
+    ret sessions[index].engine.state != engine_h2.CLOSED
+        && sessions[index].engine.state != engine_h2.FAILED;
+}
+
+pub fun step(index: usize, now: time.Time) Step {
+    prepare();
+    if (!runnable(index)) { ret STEP_DONE; }
+    val session: *Session = ?sessions[index];
+    if (session.state != ACTIVE && session.state != CLOSING) { ret STEP_DONE; }
+    # the engine frames its own preface, settings, acknowledgements and window
+    # updates, and only `submit_write` discovers there is something to frame.
+    # leaving that to a queued-byte check would never send the preface at all.
+    if (!session.engine.write_pending
+     && engine_h2.submit_write(?session.engine)) {
+        session.last_step = STEP_PROGRESS;
+        ret STEP_PROGRESS;
+    }
+    val pumped: Step = pump_streams(index, now);
+    if (pumped == STEP_ERROR) {
+        session.state = FAILED;
+        session.last_step = STEP_ERROR;
+        ret STEP_ERROR;
+    }
+    if (pumped == STEP_PROGRESS) {
+        session.last_step = STEP_PROGRESS;
+        ret STEP_PROGRESS;
+    }
+    if (session.state == CLOSING
+     && engine_h2.progress_close(?session.engine)) {
+        session.last_step = STEP_PROGRESS;
+        ret STEP_PROGRESS;
+    }
+    val taken: Step = apply(index, engine_h2.process(?session.engine), now);
+    session.last_step = taken;
+    ret taken;
+}
+
+pub fun advance(index: usize, now: time.Time) Step {
+    prepare();
+    if (index >= MAX_SESSIONS || !sessions[index].live) { ret STEP_ERROR; }
+    var steps: usize = 0;
+    for (steps < MAX_STEPS) {
+        val progress: Step = step(index, now);
+        if (progress != STEP_PROGRESS) { ret progress; }
+        steps = steps + 1;
+    }
+    ret STEP_BLOCKED;
+}
+
+# one transport completion settles the engine and the event it returns is the
+# next event this connection will ever produce, so it is applied rather than
+# dropped
+pub fun complete_io(index: usize, settled: *transport.Completion,
+    now: time.Time) Step {
+    prepare();
+    if (!runnable(index)) { ret STEP_DONE; }
+    val event: engine_h2.Event = engine_h2.complete_io(?sessions[index].engine,
+        settled);
+    if (!runnable(index)) { ret STEP_DONE; }
+    ret apply(index, event, now);
+}
+
+pub fun begin_graceful(index: usize) bool {
+    prepare();
+    if (index >= MAX_SESSIONS || !sessions[index].live
+     || !sessions[index].engine_started) { ret false; }
+    sessions[index].state = CLOSING;
+    ret engine_h2.begin_graceful(?sessions[index].engine);
+}
+
+pub fun requests(index: usize) u64 {
+    prepare();
+    if (index >= MAX_SESSIONS) { ret 0; }
+    ret sessions[index].requests;
+}
+
+pub rec Snapshot {
+    state: State;
+    engine_state: engine_h2.State;
+    last_event: engine_h2.EventKind;
+    last_step: Step;
+    requests: u64;
+    active_streams: usize;
+}
+
+pub fun snapshot(index: usize) Snapshot {
+    prepare();
+    var value: Snapshot;
+    if (index >= MAX_SESSIONS || !sessions[index].live) {
+        value.state = CLOSED;
+        value.engine_state = 0;
+        value.last_event = engine_h2.EVENT_NONE;
+        value.last_step = STEP_IDLE;
+        value.requests = 0;
+        value.active_streams = 0;
+        ret value;
+    }
+    val session: *Session = ?sessions[index];
+    value.state = session.state;
+    value.engine_state = session.engine.state;
+    value.last_event = session.last_event;
+    value.last_step = session.last_step;
+    value.requests = session.requests;
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        if (session.slots[i].live) { count = count + 1; }
+        i = i + 1;
+    }
+    value.active_streams = count;
+    ret value;
+}
+
+test "h2: the session table is bounded and reusable" {
+    val before: usize = live();
+    val first: usize = acquire();
+    val second: usize = acquire();
+    if (first == NO_SESSION || second == NO_SESSION || first == second) { ret 1; }
+    if (live() != before + 2) { ret 2; }
+    if (!release(first) || live() != before + 1) { ret 3; }
+    if (acquire() != first) { ret 4; }
+    if (!release(first) || !release(second) || live() != before) { ret 5; }
+    if (release(NO_SESSION)) { ret 6; }
+    ret 0;
+}
+
+test "h2: an origin-form path splits into path and query exactly once" {
+    val plain: target.Target = target_of(view.view("/hello", 6));
+    if (plain.path.len != 6 || plain.query.len != 0) { ret 1; }
+    val queried: target.Target = target_of(view.view("/hello?a=1", 10));
+    if (queried.path.len != 6) { ret 2; }
+    if (queried.query.len != 3 || queried.query.data[0] != 'a'::u8) { ret 3; }
+    # a trailing marker is an empty query, not a missing one
+    val empty: target.Target = target_of(view.view("/hello?", 7));
+    if (empty.path.len != 6 || empty.query.len != 0) { ret 4; }
+    # and the raw form keeps everything the peer sent
+    if (queried.raw.len != 10) { ret 5; }
+    val star: target.Target = target_of(view.view("*", 1));
+    if (star.form != target.ASTERISK) { ret 6; }
+    ret 0;
+}
+
+test "h2: methods map to their kinds and unknown ones stay extensions" {
+    if (method_of(view.view("GET", 3)).kind != method.GET) { ret 1; }
+    if (method_of(view.view("POST", 4)).kind != method.POST) { ret 2; }
+    if (method_of(view.view("PATCH", 5)).kind != method.PATCH) { ret 3; }
+    if (method_of(view.view("CONNECT", 7)).kind != method.CONNECT) { ret 4; }
+    val custom: method.Method = method_of(view.view("PURGE", 5));
+    if (custom.kind != method.EXTENSION || custom.token.len != 5) { ret 5; }
+    # case matters: HTTP/2 method names are exact tokens
+    if (method_of(view.view("get", 3)).kind != method.EXTENSION) { ret 6; }
+    ret 0;
+}
+
+test "h2: connection-specific header fields never reach the wire" {
+    var slot: Slot;
+    reset_slot(?slot);
+    var storage: [4]field.Field;
+    val configured: message.Limits = message.limits_default();
+    if (!message.init_response(?slot.response, ?storage[0], 4,
+        ?slot.response_trailers[0], RESPONSE_TRAILER_SLOTS, 1, configured)) {
+        ret 1;
+    }
+    if (message.set_status(?slot.response, status.OK) != message.RESPONSE_OK) {
+        ret 2;
+    }
+    if (message.add_field(?slot.response, field.Field{name: view.view("server", 6),
+        value: view.view("hedge", 5), sensitive: false}) != field.ADD_OK) { ret 3; }
+    if (message.add_field(?slot.response, field.Field{
+        name: view.view("connection", 10), value: view.view("close", 5),
+        sensitive: false}) != field.ADD_OK) { ret 4; }
+    val count: usize = response_headers(?slot);
+    # :status, server. the hop-by-hop field is dropped rather than framed.
+    if (count != 2) { ret 5; }
+    if (slot.header_items[0].name.len != 7
+     || slot.header_items[0].value.len != 3
+     || slot.header_items[0].value.data[0] != '2'::u8) { ret 6; }
+    if (!field.name_equal(slot.header_items[1].name, view.view("server", 6))) {
+        ret 7;
+    }
+    ret 0;
+}
