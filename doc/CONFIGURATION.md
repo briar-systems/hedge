@@ -106,6 +106,10 @@ names, which is what the durable record holds. `storage` is a directory the
 process owns: it is created with owner-only permissions and every file in it,
 including both private keys, is written owner-only and replaced atomically.
 
+`renew_before` is the lead, in seconds, before expiry at which a certificate is
+renewed. It defaults to thirty days, which suits the ninety-day certificates
+public authorities issue, and is bounded at one year.
+
 `challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
 
 `http-01` is the only one a TOML deployment can select, because it is the only
