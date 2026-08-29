@@ -27,14 +27,19 @@ backlog = 512
 accept_depth = 16
 
 [[listener]]
-name = "public-quic"
-address = "[::]:443"
-transport = "quic"
-protocols = ["h3"]
+name = "edge"
+address = "[::]:8443"
+protocols = ["http/1.1", "h2"]
 tls = "public"
+proxy_protocol = "required"
+trusted_peers = ["10.0.0.0/8"]
 
 [tls.public]
-certificate = "acme:example"
+identity = [
+  { server_name = "example.com", certificate = "certs/example.pem", key = "certs/example.key" },
+  { server_name = "*.example.com", certificate = "certs/wild.pem", key = "certs/wild.key" },
+]
+default = "example.com"
 
 [host.example]
 listener = "public-tcp"
@@ -64,13 +69,51 @@ application = "site"
 The implemented schema accepts these top-level sections:
 
 - `server` with bounded `limits`, `timeouts`, and feature selection
-- `listener` arrays with `tcp`, `quic`, or `local` transport and explicit protocol sets
+- `listener` arrays with `tcp` or `local` transport and explicit protocol sets.
+  `quic` parses, and is refused before listeners become ready because this build
+  composes no QUIC connection driver: a datagram listener would bind and then
+  answer nothing
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
 - `cache` policy and `acme` certificate management
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
+
+## TLS policies
+
+A `tls` policy names the credentials one listener serves. The single-pair form
+sets `certificate` and `key` to PEM paths, with an optional `server_name`; the
+`identity` form is a table array of the same three keys and is what a listener
+serving several names uses. `default` names the identity a client reaches when
+its server name matches none of them. Omitting `default` is a policy decision,
+not an oversight: an unmatched server name is then refused with
+`unrecognized_name` rather than served somebody else's certificate.
+
+`client_auth` requires and verifies a client certificate against `client_trust`.
+
+Each secure listener publishes its own immutable credential generation, and its
+ALPN offer is that listener's protocol set in the listener's own order, so two
+listeners sharing one certificate but serving different protocols do not share
+one published generation. A connection pins the generation it handshook under
+for its whole life, so rotation reaches new connections without disturbing
+established ones.
+
+Certificate material comes from files. Credentials obtained at runtime are not
+expressible in this schema yet.
+
+## The PROXY protocol
+
+`proxy_protocol` is `off`, `optional`, or `required`. Decoding is only ever
+believed from a peer named in `trusted_peers`, which takes IP addresses or CIDR
+prefixes; a header from any other peer is refused rather than believed, because
+believing it would let any client assert an arbitrary source address to every
+policy downstream. Decoding without a trusted peer is a configuration error.
+
+A decoded peer replaces the observed one for request metadata, so logging,
+routing, and forwarded headers all name the same client. Both the v1 text and v2
+binary forms are accepted, and a malformed header closes the connection rather
+than being read as the start of a request.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. A named listener `budget` limits its accepted connections. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
 

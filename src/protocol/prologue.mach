@@ -1,0 +1,435 @@
+# everything a connection decides before its protocol engine exists
+#
+# a TCP connection may open with a PROXY header, and a cleartext one then has to
+# be told apart from an HTTP/2 prior-knowledge preface. both decisions read the
+# same accumulated prefix, so they are taken together here, as a pure function of
+# the bytes so far and the listener's policy. the connection plane supplies bytes
+# and acts on the answer; it does not restate any of these rules.
+#
+# every refusal is named. a connection that is dropped because a header was
+# malformed and one that is dropped because the peer was not trusted to send it
+# are different operational facts, and collapsing them would hide the second.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.view;
+use std.types.string.str;
+use schema: hedge.config.schema;
+use proxy_protocol: hedge.protocol.proxy_protocol;
+use selection: hedge.protocol.selection;
+
+pub def Outcome: u8;
+# more bytes are needed before the prefix is decidable
+pub val NEED_MORE: Outcome = 1;
+# the connection may proceed to its protocol engine or its TLS handshake
+pub val READY: Outcome = 2;
+# policy refuses this connection and it is closed without a response
+pub val REFUSE: Outcome = 3;
+
+pub def Refusal: u8;
+pub val REFUSED_NONE: Refusal = 0;
+# the bytes began a PROXY header and were not a valid one
+pub val REFUSED_PROXY_MALFORMED: Refusal = 1;
+# a valid header from a peer the listener does not trust to send one
+pub val REFUSED_PROXY_UNTRUSTED: Refusal = 2;
+# the listener requires a header and the peer sent none
+pub val REFUSED_PROXY_MISSING: Refusal = 3;
+# the peer's cleartext form is not one this listener serves
+pub val REFUSED_PROTOCOL: Refusal = 4;
+# the prefix grew past what any valid prologue can occupy
+pub val REFUSED_OVERFLOW: Refusal = 5;
+# the peer stopped sending before the prologue was decidable
+pub val REFUSED_TRUNCATED: Refusal = 6;
+# the transport failed while the prologue was still being read
+pub val REFUSED_TRANSPORT: Refusal = 7;
+# the TLS handshake did not complete
+pub val REFUSED_TLS: Refusal = 8;
+# no configured credential matches the server name the client asked for
+pub val REFUSED_UNKNOWN_NAME: Refusal = 9;
+# the client offered no application protocol this listener serves
+pub val REFUSED_ALPN: Refusal = 10;
+# the protocol the peer selected has no engine bound in this build
+pub val REFUSED_UNBOUND: Refusal = 11;
+# the prologue deadline passed before the prefix was decidable
+pub val REFUSED_TIMEOUT: Refusal = 12;
+# the listener has no TLS session left to give this connection
+pub val REFUSED_EXHAUSTED: Refusal = 13;
+
+pub rec Policy {
+    # schema.PROXY_OFF / PROXY_OPTIONAL / PROXY_REQUIRED
+    proxy: u8;
+    # whether the observed peer is trusted to speak for another, decided from
+    # the socket address before any header byte is read
+    trusted: bool;
+    # a TLS listener stops here: its ALPN, not these bytes, names the protocol
+    secure: bool;
+    selection: selection.Policy;
+}
+
+pub rec Result {
+    outcome: Outcome;
+    refusal: Refusal;
+    # bytes of PROXY header the next layer must not see
+    consumed: usize;
+    protocol: selection.Protocol;
+    has_peer: bool;
+    peer: proxy_protocol.Peer;
+    local: proxy_protocol.Peer;
+}
+
+# the largest prefix any prologue can occupy: one PROXY v2 header with a full
+# IPv6 address block and type-length-value extensions, then the HTTP/2 preface
+pub val MAX_BYTES: usize = proxy_protocol.V2_HEADER_BYTES +
+    proxy_protocol.MAX_ADDRESS_BYTES + selection.PREFACE_BYTES;
+
+pub fun policy(proxy: u8, trusted: bool, secure: bool,
+    rules: selection.Policy) Policy {
+    var value: Policy;
+    value.proxy = proxy;
+    value.trusted = trusted;
+    value.secure = secure;
+    value.selection = rules;
+    ret value;
+}
+
+# assigned by name: an empty record literal does not reliably clear its
+# members. see briar-systems/mach#3108.
+fun empty_peer() proxy_protocol.Peer {
+    var value: proxy_protocol.Peer;
+    value.family = proxy_protocol.FAMILY_UNSPEC;
+    value.address = view.view(nil, 0);
+    value.port = 0;
+    ret value;
+}
+
+fun result(outcome: Outcome, refusal: Refusal, consumed: usize) Result {
+    var value: Result;
+    value.outcome = outcome;
+    value.refusal = refusal;
+    value.consumed = consumed;
+    value.protocol = selection.NONE;
+    value.has_peer = false;
+    value.peer = empty_peer();
+    value.local = empty_peer();
+    ret value;
+}
+
+# what remains after the PROXY header decides the application protocol
+fun after_header(value: Policy, data: *u8, len: usize, consumed: usize,
+    decoded: proxy_protocol.Result, has_peer: bool) Result {
+    var answer: Result = result(READY, REFUSED_NONE, consumed);
+    answer.has_peer = has_peer;
+    if (has_peer) {
+        answer.peer = decoded.peer;
+        answer.local = decoded.local;
+    }
+    if (value.secure) { ret answer; }
+    val chosen: selection.Decision = selection.select_cleartext(value.selection,
+        ?data[consumed], len - consumed);
+    if (chosen.outcome == selection.PENDING) {
+        answer.outcome = NEED_MORE;
+        ret answer;
+    }
+    if (chosen.outcome != selection.SELECTED) {
+        # a refusal keeps the decoded peer, because the operator still wants to
+        # know which client was turned away
+        answer.outcome = REFUSE;
+        answer.refusal = REFUSED_PROTOCOL;
+        ret answer;
+    }
+    answer.protocol = chosen.protocol;
+    ret answer;
+}
+
+# `len` is every byte read so far, and the same buffer is presented again as it
+# grows. `ended` says the peer will send no more, which turns a wait into a
+# refusal rather than letting a half-open connection sit until its timeout.
+pub fun evaluate(value: Policy, data: *u8, len: usize, ended: bool,
+    scratch: *u8, scratch_capacity: usize) Result {
+    if (len > MAX_BYTES) { ret result(REFUSE, REFUSED_OVERFLOW, 0); }
+    # nothing is decidable from no bytes. an HTTP/1-only listener would look
+    # decidable here, and would then answer an HTTP/2 preface as a malformed
+    # HTTP/1 request instead of refusing it by policy. the wait costs no extra
+    # read, because the bytes the prologue takes are handed to the engine.
+    if (len == 0) {
+        if (ended) { ret result(REFUSE, REFUSED_TRUNCATED, 0); }
+        ret result(NEED_MORE, REFUSED_NONE, 0);
+    }
+    if (value.proxy == schema.PROXY_OFF) {
+        val plain: Result = after_header(value, data, len, 0,
+            proxy_protocol_absent(), false);
+        if (plain.outcome == NEED_MORE && ended) {
+            ret result(REFUSE, REFUSED_TRUNCATED, 0);
+        }
+        ret plain;
+    }
+    val decoded: proxy_protocol.Result = proxy_protocol.decode(data, len,
+        value.trusted, scratch, scratch_capacity);
+    if (decoded.status == proxy_protocol.INCOMPLETE) {
+        if (ended) { ret result(REFUSE, REFUSED_TRUNCATED, 0); }
+        if (len >= MAX_BYTES) { ret result(REFUSE, REFUSED_OVERFLOW, 0); }
+        ret result(NEED_MORE, REFUSED_NONE, 0);
+    }
+    if (decoded.status == proxy_protocol.MALFORMED) {
+        ret result(REFUSE, REFUSED_PROXY_MALFORMED, 0);
+    }
+    if (decoded.status == proxy_protocol.UNTRUSTED) {
+        ret result(REFUSE, REFUSED_PROXY_UNTRUSTED, 0);
+    }
+    if (decoded.status == proxy_protocol.ABSENT) {
+        if (value.proxy == schema.PROXY_REQUIRED) {
+            ret result(REFUSE, REFUSED_PROXY_MISSING, 0);
+        }
+        val plain: Result = after_header(value, data, len, 0, decoded, false);
+        if (plain.outcome == NEED_MORE && ended) {
+            ret result(REFUSE, REFUSED_TRUNCATED, 0);
+        }
+        ret plain;
+    }
+    # LOCAL framed a valid header without naming a source, so the observed peer
+    # stands and is not replaced by an unspecified one
+    val has_peer: bool = decoded.status == proxy_protocol.DECODED;
+    val answered: Result = after_header(value, data, len, decoded.consumed,
+        decoded, has_peer);
+    if (answered.outcome == NEED_MORE && ended) {
+        ret result(REFUSE, REFUSED_TRUNCATED, 0);
+    }
+    ret answered;
+}
+
+fun proxy_protocol_absent() proxy_protocol.Result {
+    var value: proxy_protocol.Result;
+    value.status = proxy_protocol.ABSENT;
+    value.consumed = 0;
+    value.peer = empty_peer();
+    value.local = empty_peer();
+    ret value;
+}
+
+val H1_H2: u8 = schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2;
+
+fun feed(value: str, buffer: *u8, at: usize) usize {
+    var i: usize = 0;
+    for (value[i] != 0) { buffer[at + i] = value[i]::u8; i = i + 1; }
+    ret at + i;
+}
+
+fun view_equals(value: view.View, expected: str) bool {
+    var i: usize = 0;
+    for (expected[i] != 0) {
+        if (i >= value.len || value.data[i] != expected[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret value.len == i;
+}
+
+fun cleartext(proxy: u8, trusted: bool) Policy {
+    ret policy(proxy, trusted, false,
+        selection.policy(H1_H2, false, false));
+}
+
+test "prologue: nothing is decided before the first byte arrives" {
+    var buffer: [256]u8;
+    var scratch: [64]u8;
+    buffer[0] = 0;
+    val empty: Result = evaluate(cleartext(schema.PROXY_OFF, false),
+        ?buffer[0], 0, false, ?scratch[0], 64);
+    if (empty.outcome != NEED_MORE) { ret 1; }
+    # a client that opens a connection and sends nothing is refused rather than
+    # being answered as whatever the listener happens to offer first
+    val silent: Result = evaluate(cleartext(schema.PROXY_OFF, false),
+        ?buffer[0], 0, true, ?scratch[0], 64);
+    if (silent.outcome != REFUSE || silent.refusal != REFUSED_TRUNCATED) { ret 2; }
+    # and an HTTP/1-only listener still refuses the preface by policy
+    val h1_only: Policy = policy(schema.PROXY_OFF, false, false,
+        selection.policy(schema.PROTOCOL_HTTP1, false, false));
+    val preface: usize = feed("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", ?buffer[0], 0);
+    val refused: Result = evaluate(h1_only, ?buffer[0], preface, false,
+        ?scratch[0], 64);
+    if (refused.outcome != REFUSE || refused.refusal != REFUSED_PROTOCOL) { ret 3; }
+    ret 0;
+}
+
+test "prologue: a listener without PROXY decoding reads the request directly" {
+    var buffer: [256]u8;
+    var scratch: [64]u8;
+    val length: usize = feed("GET / HTTP/1.1\r\n", ?buffer[0], 0);
+    val plain: Result = evaluate(cleartext(schema.PROXY_OFF, false),
+        ?buffer[0], length, false, ?scratch[0], 64);
+    if (plain.outcome != READY || plain.protocol != selection.HTTP1) { ret 1; }
+    if (plain.consumed != 0 || plain.has_peer) { ret 2; }
+
+    # a header sent to a listener that does not decode them is request bytes,
+    # and PROXY is not an HTTP method, so it is refused as HTTP/1 rather than
+    # silently believed
+    val header: usize = feed("PROXY TCP4 192.168.0.1 10.0.0.1 5000 443\r\n",
+        ?buffer[0], 0);
+    val ignored: Result = evaluate(cleartext(schema.PROXY_OFF, true),
+        ?buffer[0], header, false, ?scratch[0], 64);
+    if (ignored.outcome != READY || ignored.protocol != selection.HTTP1) { ret 3; }
+    if (ignored.has_peer || ignored.consumed != 0) { ret 4; }
+    ret 0;
+}
+
+test "prologue: a trusted header names the peer and is removed from the stream" {
+    var buffer: [256]u8;
+    var scratch: [64]u8;
+    var length: usize = feed("PROXY TCP4 192.168.0.1 10.0.0.1 5000 443\r\n",
+        ?buffer[0], 0);
+    length = feed("GET / HTTP/1.1\r\n", ?buffer[0], length);
+    val decoded: Result = evaluate(cleartext(schema.PROXY_OPTIONAL, true),
+        ?buffer[0], length, false, ?scratch[0], 64);
+    if (decoded.outcome != READY || decoded.refusal != REFUSED_NONE) { ret 1; }
+    if (!decoded.has_peer) { ret 2; }
+    if (!view_equals(decoded.peer.address, "192.168.0.1")
+     || decoded.peer.port != 5000) { ret 3; }
+    if (!view_equals(decoded.local.address, "10.0.0.1")
+     || decoded.local.port != 443) { ret 4; }
+    if (decoded.consumed != 42) { ret 5; }
+    # the request behind the header is what selects the protocol
+    if (decoded.protocol != selection.HTTP1) { ret 6; }
+    ret 0;
+}
+
+test "prologue: an untrusted peer is refused rather than believed" {
+    var buffer: [256]u8;
+    var scratch: [64]u8;
+    val length: usize = feed("PROXY TCP4 192.168.0.1 10.0.0.1 5000 443\r\n",
+        ?buffer[0], 0);
+    val refused: Result = evaluate(cleartext(schema.PROXY_OPTIONAL, false),
+        ?buffer[0], length, false, ?scratch[0], 64);
+    if (refused.outcome != REFUSE) { ret 1; }
+    if (refused.refusal != REFUSED_PROXY_UNTRUSTED) { ret 2; }
+    # nothing about the asserted peer survives the refusal
+    if (refused.has_peer || refused.peer.address.data != nil
+     || refused.peer.port != 0) { ret 3; }
+    ret 0;
+}
+
+test "prologue: a malformed header fails instead of falling through" {
+    var buffer: [256]u8;
+    var scratch: [64]u8;
+    # a v1 header whose source address is not an address
+    val bad: usize = feed("PROXY TCP4 192.168.0.999 10.0.0.1 5000 443\r\n",
+        ?buffer[0], 0);
+    val malformed: Result = evaluate(cleartext(schema.PROXY_OPTIONAL, true),
+        ?buffer[0], bad, false, ?scratch[0], 64);
+    if (malformed.outcome != REFUSE
+     || malformed.refusal != REFUSED_PROXY_MALFORMED) { ret 1; }
+    if (malformed.has_peer) { ret 2; }
+
+    # the same bytes must not be reinterpreted as an HTTP/1 request line, which
+    # is what "fall through to the default" would do
+    if (malformed.protocol != selection.NONE) { ret 3; }
+
+    # a required header that never arrives is refused, not defaulted
+    val request: usize = feed("GET / HTTP/1.1\r\n", ?buffer[0], 0);
+    val missing: Result = evaluate(cleartext(schema.PROXY_REQUIRED, true),
+        ?buffer[0], request, false, ?scratch[0], 64);
+    if (missing.outcome != REFUSE || missing.refusal != REFUSED_PROXY_MISSING) {
+        ret 4;
+    }
+    ret 0;
+}
+
+test "prologue: a partial prefix waits and a truncated one is refused" {
+    var buffer: [256]u8;
+    var scratch: [64]u8;
+    val partial: usize = feed("PROXY TCP4 192.168.0.1 10.0", ?buffer[0], 0);
+    val waiting: Result = evaluate(cleartext(schema.PROXY_OPTIONAL, true),
+        ?buffer[0], partial, false, ?scratch[0], 64);
+    if (waiting.outcome != NEED_MORE) { ret 1; }
+
+    # the same bytes with the peer gone are a refusal rather than a wait
+    val truncated: Result = evaluate(cleartext(schema.PROXY_OPTIONAL, true),
+        ?buffer[0], partial, true, ?scratch[0], 64);
+    if (truncated.outcome != REFUSE
+     || truncated.refusal != REFUSED_TRUNCATED) { ret 2; }
+
+    # a proper prefix of the HTTP/2 preface likewise waits, then refuses
+    var preface: usize = feed("PRI * HTTP/2.0\r\n", ?buffer[0], 0);
+    val pending: Result = evaluate(cleartext(schema.PROXY_OFF, false),
+        ?buffer[0], preface, false, ?scratch[0], 64);
+    if (pending.outcome != NEED_MORE) { ret 3; }
+    val stopped: Result = evaluate(cleartext(schema.PROXY_OFF, false),
+        ?buffer[0], preface, true, ?scratch[0], 64);
+    if (stopped.outcome != REFUSE || stopped.refusal != REFUSED_TRUNCATED) {
+        ret 4;
+    }
+    ret 0;
+}
+
+test "prologue: prior knowledge behind a header still selects HTTP/2" {
+    var buffer: [512]u8;
+    var scratch: [64]u8;
+    var length: usize = feed("PROXY TCP6 2001:db8::1 2001:db8::2 5000 443\r\n",
+        ?buffer[0], 0);
+    length = feed("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", ?buffer[0], length);
+    val decoded: Result = evaluate(cleartext(schema.PROXY_OPTIONAL, true),
+        ?buffer[0], length, false, ?scratch[0], 64);
+    if (decoded.outcome != READY || decoded.protocol != selection.HTTP2) { ret 1; }
+    if (!decoded.has_peer || !view_equals(decoded.peer.address, "2001:db8::1")) {
+        ret 2;
+    }
+    if (decoded.peer.family != proxy_protocol.FAMILY_INET6) { ret 3; }
+
+    # an HTTP/1-only listener refuses the same connection rather than
+    # mis-parsing the preface, and still names the peer it turned away
+    val h1_only: Policy = policy(schema.PROXY_OPTIONAL, true, false,
+        selection.policy(schema.PROTOCOL_HTTP1, false, false));
+    val refused: Result = evaluate(h1_only, ?buffer[0], length, false,
+        ?scratch[0], 64);
+    if (refused.outcome != REFUSE || refused.refusal != REFUSED_PROTOCOL) {
+        ret 4;
+    }
+    if (!refused.has_peer || !view_equals(refused.peer.address, "2001:db8::1")) {
+        ret 5;
+    }
+    ret 0;
+}
+
+test "prologue: a TLS listener stops at the header and lets ALPN decide" {
+    var buffer: [256]u8;
+    var scratch: [64]u8;
+    var length: usize = feed("PROXY TCP4 192.168.0.1 10.0.0.1 5000 443\r\n",
+        ?buffer[0], 0);
+    # a ClientHello record header, which is not an HTTP/1 request line
+    buffer[length] = 0x16;
+    buffer[length + 1] = 0x03;
+    buffer[length + 2] = 0x01;
+    length = length + 3;
+    val secure: Policy = policy(schema.PROXY_OPTIONAL, true, true,
+        selection.policy(H1_H2, true, true));
+    val decoded: Result = evaluate(secure, ?buffer[0], length, false,
+        ?scratch[0], 64);
+    if (decoded.outcome != READY) { ret 1; }
+    # nothing here names a protocol: the handshake does that
+    if (decoded.protocol != selection.NONE) { ret 2; }
+    if (!decoded.has_peer || decoded.consumed != 42) { ret 3; }
+    ret 0;
+}
+
+test "prologue: a prefix that never resolves is bounded" {
+    var buffer: [MAX_BYTES + 8]u8;
+    var scratch: [proxy_protocol.MAX_TEXT_BYTES]u8;
+    # a v2 signature followed by a length that will never be satisfied
+    var i: usize = 0;
+    for (i < MAX_BYTES + 8) { buffer[i] = 'x'::u8; i = i + 1; }
+    val signature: [12]u8 = [12]u8{0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d,
+        0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a};
+    i = 0;
+    for (i < 12) { buffer[i] = signature[i]; i = i + 1; }
+    buffer[12] = 0x21;
+    buffer[13] = 0x11;
+    buffer[14] = 0xff;
+    buffer[15] = 0xff;
+    val overflowing: Result = evaluate(cleartext(schema.PROXY_OPTIONAL, true),
+        ?buffer[0], MAX_BYTES + 8, false, ?scratch[0],
+        proxy_protocol.MAX_TEXT_BYTES);
+    if (overflowing.outcome != REFUSE || overflowing.refusal != REFUSED_OVERFLOW) {
+        ret 1;
+    }
+    ret 0;
+}
