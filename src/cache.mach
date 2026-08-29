@@ -1,0 +1,503 @@
+# the optional cache layer
+#
+# The layer sits between dispatch and one service. When it is absent the route
+# holds a nil pointer and no code here runs at all: no store, no arena, no file,
+# no counter. That is the reason every entry point begins by asking whether the
+# layer exists rather than whether it is switched on.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.view;
+use std.allocator;
+use std.chrono.time;
+use http.core.body;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use hedge.config.schema;
+use hedge.service;
+use call: hedge.dispatch.call;
+use policy: hedge.cache.policy;
+use key: hedge.cache.key;
+use store: hedge.cache.store;
+use directives: hedge.http.cache_control;
+use http_date: hedge.http.date;
+use forward: hedge.proxy.forward;
+
+pub val MAX_RECORDERS: usize = 16;
+
+pub rec Layer {
+    backing: store.Store;
+    limits: policy.Limits;
+    recorders: [MAX_RECORDERS]Recording;
+    live: bool;
+}
+
+# what one in-flight response is teeing into the store
+rec Recording {
+    layer: *Layer;
+    active: bool;
+    owner: *call.Call;
+    generation: u64;
+    writer: store.Writer;
+    declared: usize;
+    written: usize;
+    revalidating_index: usize;
+}
+
+# the body reader that serves a hit out of the store
+rec StoredBody {
+    layer: *Layer;
+    index: usize;
+    offset: usize;
+    length: usize;
+    reader: body.Reader;
+}
+
+pub fun make(layer: *Layer, entries: *store.Entry, capacity: usize, body_storage: *u8,
+    body_capacity: usize, limits: store.Limits, freshness: policy.Limits) bool {
+    if (layer == nil) { ret false; }
+    layer.limits = freshness;
+    var i: usize = 0;
+    for (i < MAX_RECORDERS) {
+        layer.recorders[i].active = false;
+        i = i + 1;
+    }
+    if (!store.make(?layer.backing, entries, capacity, body_storage, body_capacity, limits)) {
+        layer.live = false;
+        ret false;
+    }
+    layer.live = true;
+    ret true;
+}
+
+pub fun attach_disk(layer: *Layer, root_path: str) bool {
+    if (layer == nil || !layer.live) { ret false; }
+    ret store.attach_disk(?layer.backing, root_path);
+}
+
+pub fun close(layer: *Layer) bool {
+    if (layer == nil || !layer.live) { ret false; }
+    layer.live = false;
+    ret store.close(?layer.backing);
+}
+
+pub fun enabled(layer: *Layer) bool {
+    ret layer != nil && layer.live;
+}
+
+pub rec Report {
+    hits: u64;
+    misses: u64;
+    stores: u64;
+    evictions: u64;
+    rejections: u64;
+    partial_discards: u64;
+    entries: usize;
+    memory_bytes: usize;
+    disk_bytes: usize;
+}
+
+pub fun report(layer: *Layer) Report {
+    if (!enabled(layer)) {
+        ret Report{hits: 0, misses: 0, stores: 0, evictions: 0, rejections: 0,
+            partial_discards: 0, entries: 0, memory_bytes: 0, disk_bytes: 0};
+    }
+    ret Report{
+        hits: layer.backing.hits,
+        misses: layer.backing.misses,
+        stores: layer.backing.stores,
+        evictions: layer.backing.evictions,
+        rejections: layer.backing.rejections,
+        partial_discards: layer.backing.partial_discards,
+        entries: store.live_entries(?layer.backing),
+        memory_bytes: store.memory_used(?layer.backing),
+        disk_bytes: layer.backing.disk_used,
+    };
+}
+
+# --- serving a stored representation ---
+
+fun stored_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
+    val state: *StoredBody = context::*StoredBody;
+    if (state == nil) { ret body.failed("stored body has no state", body.REUSE_FORBIDDEN); }
+    if (state.offset >= state.length) { ret body.complete(body.REUSE_ALLOWED); }
+    var produced: usize = 0;
+    if (!store.read_body(?state.layer.backing, state.index, state.offset, output, capacity,
+        ?produced)) {
+        ret body.failed("stored body could not be read", body.REUSE_FORBIDDEN);
+    }
+    if (produced == 0) { ret body.failed("stored body ended early", body.REUSE_FORBIDDEN); }
+    state.offset = state.offset + produced;
+    ret body.data(produced);
+}
+
+fun stored_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
+    val state: *StoredBody = context::*StoredBody;
+    if (state == nil) { ret body.failed("stored body has no state", body.REUSE_FORBIDDEN); }
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
+    state.offset = state.length;
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+fun stored_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+fun stored_release(context: ptr) {
+}
+
+fun field_name(entry: *store.Entry, index: usize) view.View {
+    ret view.view(?entry.field_bytes[entry.field_names[index]], entry.field_name_lengths[index]);
+}
+
+fun field_value(entry: *store.Entry, index: usize) view.View {
+    ret view.view(?entry.field_bytes[entry.field_values[index]], entry.field_value_lengths[index]);
+}
+
+# emit a stored representation, including the Age it has accumulated
+fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
+    now: time.Time) exchange.ServiceStatus {
+    val entry: *store.Entry = store.entry_at(?layer.backing, index);
+    val response: *message.Response = call.response(active);
+    val configured: message.Limits = call.limits(active);
+    if (entry == nil || response == nil) { ret exchange.SERVICE_FAILED; }
+    if (message.set_status(response, entry.status) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    var i: usize = 0;
+    for (i < entry.field_count) {
+        if (message.add_field(response, field.Field{
+            name: field_name(entry, i),
+            value: field_value(entry, i),
+            sensitive: false,
+        }) != field.ADD_OK) { ret exchange.SERVICE_FAILED; }
+        i = i + 1;
+    }
+    val age_seconds: u64 = policy.current_age(entry.metadata, now) / 1000000000;
+    val age_text: str = service.arena_number(active, age_seconds);
+    if (age_text == nil || !service.add_field(active, "age", age_text)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    store.touch(?layer.backing, index);
+    store.record_hit(?layer.backing);
+    if (!status.permits_content(call.request(active).method.kind, entry.status)
+     || entry.body_length == 0) {
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+    val a: *allocator.Allocator = call.allocator_of(active);
+    if (a == nil) { ret exchange.SERVICE_FAILED; }
+    val allocated: Result[*StoredBody, *u8] = allocator.allocate[StoredBody](a, 1);
+    if (is_err[*StoredBody, *u8](allocated)) { ret exchange.SERVICE_FAILED; }
+    val state: *StoredBody = unwrap_ok[*StoredBody, *u8](allocated);
+    state.layer = layer;
+    state.index = index;
+    state.offset = 0;
+    state.length = entry.body_length;
+    val measured: str = service.arena_number(active, entry.body_length::u64);
+    if (measured == nil) { ret exchange.SERVICE_FAILED; }
+    if (field.find_first(?response.fields, service.text_view(field.CONTENT_LENGTH)) == nil
+     && !service.add_field(active, field.CONTENT_LENGTH, measured)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    state.reader = body.init_reader(
+        (state)::ptr,
+        stored_read,
+        stored_finish,
+        stored_complete,
+        stored_release,
+        body.OWNER_APPLICATION,
+        response.generation,
+        true,
+        entry.body_length::u64,
+        configured.response_body,
+        nil,
+        call.scope(active),
+    );
+    if (!state.reader.valid) { ret exchange.SERVICE_FAILED; }
+    if (message.set_body_reader(response, ?state.reader, configured) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!call.resolve_body(active, call.BODY_DRAIN)) { ret exchange.SERVICE_FAILED; }
+    if (service.commit(active) != message.RESPONSE_OK) { ret exchange.SERVICE_FAILED; }
+    ret exchange.SERVICE_COMPLETE;
+}
+
+# --- recording a response into the store ---
+
+fun free_recording(layer: *Layer) *Recording {
+    var i: usize = 0;
+    for (i < MAX_RECORDERS) {
+        if (!layer.recorders[i].active) { ret ?layer.recorders[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun finish_recording(state: *Recording, keep: bool) {
+    if (!state.active) { ret; }
+    if (state.revalidating_index != store.NO_ENTRY) {
+        val entry: *store.Entry = store.entry_at(?state.layer.backing,
+            state.revalidating_index);
+        if (entry != nil) { entry.revalidating = false; }
+        state.revalidating_index = store.NO_ENTRY;
+    }
+    if (state.writer.active) {
+        if (keep && state.written == state.declared) { store.commit(?state.writer); }
+        or { store.abandon(?state.writer); }
+    }
+    state.active = false;
+    state.owner = nil;
+}
+
+fun on_head(context: ptr, active: *call.Call) bool {
+    val state: *Recording = context::*Recording;
+    if (state == nil || !state.active) { ret false; }
+    val layer: *Layer = state.layer;
+    val request: *message.Request = call.request(active);
+    val response: *message.Response = call.response(active);
+    if (request == nil || response == nil) { ret false; }
+    val response_directives: directives.Directives = directives.parse(?response.fields);
+    val request_directives: directives.Directives = directives.parse(?request.fields);
+    if (policy.storable(request, ?response.fields, response.status, request_directives,
+        response_directives, layer.limits) != policy.STORE) { ret false; }
+    if (response.body_kind == message.BODY_READER && !response.body_reader.has_length) {
+        ret false;
+    }
+    var declared: u64 = 0;
+    if (response.body_kind == message.BODY_READER) {
+        declared = response.body_reader.declared_length;
+    }
+    var identity: key.Key;
+    if (!key.make(request, active.secure, ?identity)) { ret false; }
+    var dimensions: key.Dimensions;
+    if (!key.select(request, ?response.fields, ?dimensions) || !dimensions.valid) { ret false; }
+    val now: time.Time = time.now();
+    val metadata: policy.Metadata = policy.describe(?response.fields, response.status,
+        response_directives, now, now, layer.limits);
+    var placement: store.Placement = store.IN_MEMORY;
+    if (layer.backing.has_root && declared::usize > layer.backing.limits.memory_bytes / 4) {
+        placement = store.ON_DISK;
+    }
+    state.writer = store.begin(?layer.backing, ?identity, ?dimensions, metadata,
+        response.status, declared::usize, placement);
+    if (!state.writer.active) { ret false; }
+    state.declared = declared::usize;
+    state.written = 0;
+    var i: usize = 0;
+    for (i < response.fields.len) {
+        val item: *field.Field = ?response.fields.items[i];
+        # hop-by-hop fields belong to the connection that carried them, not to the
+        # representation, so a stored entry must not replay them at the next client
+        if (forward.forwardable(?response.fields, item.name)) {
+            if (!store.add_field(?state.writer, item.name, item.value)) {
+                store.abandon(?state.writer);
+                ret false;
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun on_body(context: ptr, data: *u8, length: usize) bool {
+    val state: *Recording = context::*Recording;
+    if (state == nil || !state.active || !state.writer.active) { ret false; }
+    if (state.written + length > state.declared) {
+        store.abandon(?state.writer);
+        ret false;
+    }
+    if (!store.write_body(?state.writer, data, length)) {
+        store.abandon(?state.writer);
+        ret false;
+    }
+    state.written = state.written + length;
+    ret true;
+}
+
+fun on_end(context: ptr, complete: bool) {
+    val state: *Recording = context::*Recording;
+    if (state == nil) { ret; }
+    finish_recording(state, complete);
+}
+
+# --- the handler ---
+
+pub rec Binding {
+    layer: *Layer;
+    inner: service.Handler;
+}
+
+fun forward_to_inner(binding: *Binding, active: *call.Call) exchange.ServiceStatus {
+    ret binding.inner.serve(binding.inner.ctx, active);
+}
+
+pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    val binding: *Binding = context::*Binding;
+    if (binding == nil || !service.has_handler(binding.inner)) {
+        ret service.respond(active, status.INTERNAL_SERVER_ERROR);
+    }
+    val layer: *Layer = binding.layer;
+    # a route with no cache runs the service and nothing else
+    if (!enabled(layer)) { ret forward_to_inner(binding, active); }
+    val request: *message.Request = call.request(active);
+    if (request == nil) { ret forward_to_inner(binding, active); }
+    val now: time.Time = time.now();
+    var identity: key.Key;
+    val keyed: bool = key.make(request, active.secure, ?identity);
+    val request_directives: directives.Directives = directives.parse(?request.fields);
+
+    # an unsafe method invalidates what this cache holds for the target, under
+    # every method key a stored representation could be filed against
+    if (policy.invalidates(request.method.kind, status.OK)) {
+        var target_key: key.Key;
+        if (key.make_with_method(request, active.secure, method.GET, ?target_key)) {
+            store.invalidate(?layer.backing, ?target_key);
+        }
+        if (key.make_with_method(request, active.secure, method.HEAD, ?target_key)) {
+            store.invalidate(?layer.backing, ?target_key);
+        }
+        ret forward_to_inner(binding, active);
+    }
+    if (!keyed) { ret forward_to_inner(binding, active); }
+
+    var revalidating_index: usize = store.NO_ENTRY;
+    val index: usize = store.lookup(?layer.backing, ?identity);
+    if (index != store.NO_ENTRY) {
+        val entry: *store.Entry = store.entry_at(?layer.backing, index);
+        if (entry != nil && key.matches(?entry.dimensions, request)) {
+            val decision: policy.Reuse = policy.reuse(entry.metadata, request_directives, now);
+            if (decision == policy.FRESH || decision == policy.STALE_SERVABLE) {
+                ret serve_stored(layer, active, index, now);
+            }
+            if (decision == policy.REVALIDATE) {
+                # one revalidation at a time: a second request for the same stale
+                # entry is served stale rather than starting its own fetch
+                if (entry.revalidating && policy.servable_on_error(entry.metadata, now)) {
+                    ret serve_stored(layer, active, index, now);
+                }
+                if (!entry.revalidating) {
+                    entry.revalidating = true;
+                    revalidating_index = index;
+                }
+            }
+        } or {
+            # the stored representation was negotiated for a different request
+            store.record_miss(?layer.backing);
+        }
+    }
+    store.record_miss(?layer.backing);
+    val state: *Recording = free_recording(layer);
+    if (state != nil) {
+        state.layer = layer;
+        state.active = true;
+        state.owner = active;
+        state.generation = active.exchange.generation;
+        state.declared = 0;
+        state.written = 0;
+        state.revalidating_index = revalidating_index;
+        state.writer = store.Writer{store: nil, index: store.NO_ENTRY, active: false};
+        if (!call.attach_recorder(active, call.Recorder{
+            ctx: (state)::ptr,
+            on_head: on_head,
+            on_body: on_body,
+            on_end: on_end,
+        })) {
+            state.active = false;
+        }
+    } or (revalidating_index != store.NO_ENTRY) {
+        val entry: *store.Entry = store.entry_at(?layer.backing, revalidating_index);
+        if (entry != nil) { entry.revalidating = false; }
+    }
+    ret forward_to_inner(binding, active);
+}
+
+# wrap one service handler in this layer; a disabled layer returns the handler
+# unchanged, so a route with caching off does not even hold a binding
+pub fun wrap(binding: *Binding, layer: *Layer, inner: service.Handler) service.Handler {
+    if (binding == nil || !service.has_handler(inner)) { ret service.no_handler(); }
+    if (!enabled(layer)) { ret inner; }
+    binding.layer = layer;
+    binding.inner = inner;
+    ret service.Handler{ctx: (binding)::ptr, serve: serve};
+}
+
+# the generation-owned bindings a plan draws from while it is being constructed
+pub rec Bindings {
+    items: *Binding;
+    capacity: usize;
+    len: usize;
+    layer: *Layer;
+}
+
+pub fun make_bindings(bindings: *Bindings, items: *Binding, capacity: usize,
+    layer: *Layer) bool {
+    if (bindings == nil || (capacity != 0 && items == nil)) { ret false; }
+    bindings.items = items;
+    bindings.capacity = capacity;
+    bindings.len = 0;
+    bindings.layer = layer;
+    ret true;
+}
+
+# the wrapper the service resolver installs
+#
+# a service that did not ask to be cached is returned untouched, so the layer
+# costs it nothing at all: not a binding, not a pointer, not a branch per request.
+pub fun wrapper(context: ptr, configured: *schema.Service, inner: service.Handler,
+    output: *service.Handler) bool {
+    val bindings: *Bindings = context::*Bindings;
+    if (bindings == nil || configured == nil || output == nil) { ret false; }
+    if (!configured.cache || !enabled(bindings.layer)) {
+        @output = inner;
+        ret true;
+    }
+    if (bindings.len >= bindings.capacity) { ret false; }
+    val binding: *Binding = ?bindings.items[bindings.len];
+    val wrapped: service.Handler = wrap(binding, bindings.layer, inner);
+    if (!service.has_handler(wrapped)) { ret false; }
+    bindings.len = bindings.len + 1;
+    @output = wrapped;
+    ret true;
+}
+
+# build a layer from configuration; a configuration with caching off constructs
+# nothing and reports that plainly
+pub fun from_config(layer: *Layer, configured: *schema.Cache, entries: *store.Entry,
+    capacity: usize, body_storage: *u8, body_capacity: usize) bool {
+    if (layer == nil || configured == nil) { ret false; }
+    if (!configured.enabled) {
+        layer.live = false;
+        layer.backing = store.disabled();
+        ret false;
+    }
+    var limits: store.Limits = store.default_limits();
+    limits.memory_bytes = configured.memory_bytes;
+    limits.disk_bytes = configured.disk_bytes;
+    limits.max_entry_bytes = configured.max_entry_bytes;
+    limits.entries = configured.entries;
+    if (limits.memory_bytes > body_capacity) { limits.memory_bytes = body_capacity; }
+    var freshness: policy.Limits = policy.default_limits();
+    freshness.heuristic_percent = configured.heuristic_percent;
+    if (!make(layer, entries, capacity, body_storage, body_capacity, limits, freshness)) {
+        ret false;
+    }
+    if (configured.disk_bytes != 0 && configured.disk_root.len != 0) {
+        if (!attach_disk(layer, schema.text(?configured.disk_root))) {
+            close(layer);
+            ret false;
+        }
+    }
+    ret true;
+}
