@@ -16,6 +16,7 @@ use hedge.config.schema;
 use hedge.listener;
 use hedge.connection;
 use hedge.telemetry;
+use lifecycle: hedge.lifecycle;
 use hedge_tls: hedge.protocol.tls;
 use plan: hedge.dispatch.plan;
 use telemetry_health: hedge.telemetry.health;
@@ -55,6 +56,8 @@ pub rec Runtime {
     served: u64;
     accepted: u64;
     rejected: u64;
+    shutdown: lifecycle.State;
+    drain_timeout_ns: u64;
 }
 
 pub fun make(
@@ -83,6 +86,8 @@ pub fun make(
     runtime.served = 0;
     runtime.accepted = 0;
     runtime.rejected = 0;
+    runtime.shutdown = lifecycle.make();
+    runtime.drain_timeout_ns = graph.timeouts.drain_ms * 1000000;
     var i: usize = 0;
     for (i < capacity) {
         slots[i].live = false;
@@ -251,50 +256,146 @@ fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
 }
 
 pub fun poll(runtime: *Runtime, timeout_ms: i32) bool {
-    if (runtime == nil || (runtime.state != READY && runtime.state != DRAINING)) { ret false; }
+    if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) { ret false; }
     val polled: bool = listener.poll(?runtime.owner, timeout_ms);
     val now: time.Time = time.now();
-    if (runtime.state == READY) { admit(runtime, now); }
+    if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
     if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
     var i: usize = 0;
     for (i < runtime.capacity) {
         if (runtime.slots[i].live) { drive(runtime, i, now); }
         i = i + 1;
     }
-    if (runtime.owner.state == listener.OWNER_DRAINING && runtime.state == READY) {
-        runtime.state = DRAINING;
-        if (runtime.observability != nil) { telemetry.begin_drain(runtime.observability); }
-        var j: usize = 0;
-        for (j < runtime.capacity) {
-            if (runtime.slots[j].live) { connection.begin_graceful(runtime.slots[j].handle); }
-            j = j + 1;
-        }
+    # a stop the operating system asked for enters the same sequence a
+    # programmatic one does, so there is one ordering rather than two
+    if (runtime.owner.state == listener.OWNER_DRAINING
+     && lifecycle.serving(?runtime.shutdown)) {
+        begin_shutdown(runtime, now);
     }
+    advance_shutdown(runtime, now);
     ret polled;
 }
 
+# --- the shutdown sequence ---
+#
+# ARCHITECTURE.md's seven steps, in order, executed once each. `lifecycle` owns
+# the ordering and the clock; this owns what each step means to a serving
+# runtime.
+
+# step 1 readiness false, step 2 stop accepting, step 3 protocol-specific signals
+fun run_signal(runtime: *Runtime) bool {
+    var ok: bool = true;
+    if (runtime.observability != nil
+     && !telemetry.begin_drain(runtime.observability)) { ok = false; }
+    if (!listener.begin_drain(?runtime.owner)) { ok = false; }
+    runtime.state = DRAINING;
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        # HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
+        # reading. the engine decides which; the runtime only asks.
+        if (runtime.slots[i].live) { connection.begin_graceful(runtime.slots[i].handle); }
+        i = i + 1;
+    }
+    ret ok;
+}
+
+# step 5 cancel whatever the deadline did not let finish
+fun run_cancel(runtime: *Runtime) bool {
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (runtime.slots[i].live) { retire(runtime, i); }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun run_action(runtime: *Runtime, action: lifecycle.Action) {
+    if (action == lifecycle.NOTHING) { ret; }
+    var ok: bool = true;
+    if (action == lifecycle.SIGNAL) { ok = run_signal(runtime); }
+    or (action == lifecycle.CANCEL) { ok = run_cancel(runtime); }
+    or (action == lifecycle.FLUSH) {
+        if (runtime.observability != nil) {
+            ok = telemetry.shutdown(runtime.observability);
+        }
+    }
+    or {
+        ok = listener.stop(?runtime.owner);
+        runtime.state = STOPPED;
+    }
+    if (!ok) { lifecycle.fail(?runtime.shutdown); }
+}
+
+# step 4: let the sequence advance as far as the clock and the live count allow
+fun advance_shutdown(runtime: *Runtime, now: time.Time) {
+    var guard: usize = 0;
+    for (guard < 8) {
+        val action: lifecycle.Action = lifecycle.step(?runtime.shutdown,
+            runtime.live, now);
+        if (action == lifecycle.NOTHING) { ret; }
+        run_action(runtime, action);
+        guard = guard + 1;
+    }
+}
+
+# begin the sequence and let active exchanges finish within the drain deadline
+pub fun begin_shutdown(runtime: *Runtime, now: time.Time) bool {
+    if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) {
+        ret false;
+    }
+    run_action(runtime, lifecycle.begin(?runtime.shutdown, now,
+        runtime.drain_timeout_ns));
+    advance_shutdown(runtime, now);
+    ret true;
+}
+
 pub fun draining(runtime: *Runtime) bool {
-    ret runtime != nil && runtime.state == DRAINING;
+    ret runtime != nil && lifecycle.draining(?runtime.shutdown);
 }
 
 pub fun idle(runtime: *Runtime) bool {
     ret runtime != nil && runtime.live == 0;
 }
 
+# the sequence has run to its end, resources included
+pub fun finished(runtime: *Runtime) bool {
+    ret runtime != nil && lifecycle.closed(?runtime.shutdown);
+}
+
+pub fun shutdown_reason(runtime: *Runtime) lifecycle.Reason {
+    if (runtime == nil) { ret lifecycle.FAILED; }
+    ret lifecycle.reason(?runtime.shutdown);
+}
+
+pub fun shutdown_cancelled(runtime: *Runtime) usize {
+    if (runtime == nil) { ret 0; }
+    ret lifecycle.cancelled(?runtime.shutdown);
+}
+
+# stop without waiting
+#
+# every caller of this wants the process or the test to end now, so it enters
+# the sequence with no deadline: signal, cancel, flush, close. the outcome is
+# reported as IMMEDIATE rather than as a clean drain, because it is not one.
+# calling it after a graceful drain has already begun finishes that sequence
+# instead of restarting it, so a stop is idempotent.
 pub fun stop(runtime: *Runtime) bool {
-    if (runtime == nil || (runtime.state != READY && runtime.state != DRAINING)) { ret false; }
-    runtime.state = DRAINING;
-    if (runtime.observability != nil) { telemetry.begin_drain(runtime.observability); }
-    var i: usize = 0;
-    for (i < runtime.capacity) {
-        if (runtime.slots[i].live) { retire(runtime, i); }
-        i = i + 1;
+    if (runtime == nil || runtime.state == NEW) { ret false; }
+    if (lifecycle.closed(?runtime.shutdown)) { ret runtime.state == STOPPED; }
+    val now: time.Time = time.now();
+    if (lifecycle.serving(?runtime.shutdown)) {
+        run_action(runtime, lifecycle.begin(?runtime.shutdown, now, 0));
     }
-    val stopped: bool = listener.stop(?runtime.owner);
-    var flushed: bool = true;
-    if (runtime.observability != nil) { flushed = telemetry.shutdown(runtime.observability); }
-    runtime.state = STOPPED;
-    ret stopped && flushed;
+    var guard: usize = 0;
+    for (guard < 8 && !lifecycle.closed(?runtime.shutdown)) {
+        val action: lifecycle.Action = lifecycle.step(?runtime.shutdown,
+            runtime.live, now);
+        # a drain still inside its deadline would otherwise wait here forever
+        if (action == lifecycle.NOTHING) { run_action(runtime, lifecycle.CANCEL); }
+        or { run_action(runtime, action); }
+        guard = guard + 1;
+    }
+    ret lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED;
 }
 
 pub fun bound_endpoint_text(runtime: *Runtime, index: usize, output: *u8, capacity: usize) usize {
