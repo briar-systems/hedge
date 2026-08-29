@@ -126,7 +126,20 @@ HTTP/1.1 processes ordered exchanges while respecting pipeline bounds. HTTP/2 an
 
 ## Service dispatch
 
-Virtual-host selection precedes route selection. A route resolves to one of:
+Virtual-host selection precedes route selection.
+
+A host declares a set of names, and every one of them is a name that host answers to. A route on a host is compiled once per name, so the set is the contract rather than the first entry in it. Names within a host block are unordered: position confers no precedence, because every name of a host produces an equally specific pattern for the same route.
+
+Precedence between patterns is by specificity, never by declaration order:
+
+1. an exact name outranks a wildcard suffix, which outranks the any-host pattern
+2. between two wildcard suffixes, the longer suffix wins
+3. a pattern naming a port outranks one that does not
+4. then path specificity, then method specificity, then configuration order
+
+Only the last of those is positional, and it is reached only when two patterns are equally specific in every other respect. Two routes that compile to the same host pattern, path, and method are a configuration conflict and are refused before the generation is published, rather than one silently shadowing the other.
+
+A route resolves to one of:
 
 - static file service
 - reverse proxy service

@@ -10,8 +10,11 @@ use std.types.string.str_equals;
 use std.types.view;
 use std.types.result.Result;
 use std.types.result.err;
+use http.core.field;
 use http.core.message;
+use http.core.method;
 use http.core.status;
+use http.core.target;
 use http.router.router;
 use hedge.config.schema;
 use hedge.service;
@@ -231,10 +234,60 @@ fun compile_service(plan: *Plan, configured: *schema.Service, resolver: *service
     ret report(PLAN_OK, NO_INDEX, index, nil);
 }
 
-fun host_pattern(plan: *Plan, graph: *schema.Graph, route: *schema.Route) str {
+# how many router patterns one configured route becomes
+#
+# a host block declares a set of names and every one of them is a name the host
+# answers to, so a route on that host is a route under each. taking only the
+# first left every other name resolving to no host at all, which is a 404 after a
+# handshake the same configuration negotiated successfully.
+fun host_name_count(graph: *schema.Graph, route: *schema.Route) usize {
+    val host: *schema.Host = schema.find_host(graph, schema.text(?route.host));
+    if (host == nil || host.server_name_count == 0) { ret 1; }
+    ret host.server_name_count;
+}
+
+# the `index`th name of this route's host, or the any-host pattern when the route
+# names no host
+#
+# these are independent patterns, not an ordered list. Position within a host
+# block confers no precedence: every name of a host produces an equally ranked
+# pattern for the same route, and which one answers a request is decided by the
+# router's specificity rule, not by which was written first.
+fun host_pattern(plan: *Plan, graph: *schema.Graph, route: *schema.Route,
+    index: usize) str {
     val host: *schema.Host = schema.find_host(graph, schema.text(?route.host));
     if (host == nil || host.server_name_count == 0) { ret intern(plan, "*"); }
-    ret intern(plan, schema.text(?host.server_names[0]));
+    ret intern(plan, schema.text(?host.server_names[index]));
+}
+
+# what the whole configuration expands to, so exhaustion is reported before any
+# of it is written rather than partway through
+fun expanded_route_count(graph: *schema.Graph) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    for (i < graph.route_count) {
+        total = total + host_name_count(graph, ?graph.routes[i]);
+        i = i + 1;
+    }
+    ret total;
+}
+
+# why the router refused
+#
+# expanding a host's names makes a conflict reachable from ordinary configuration
+# — two host blocks that share a name, each with a route on the same path — so
+# these can no longer all report as a malformed pattern.
+fun route_failure(status: router.CompileStatus) str {
+    if (status == router.COMPILE_CONFLICT) {
+        ret "two routes match the same host, path, and method";
+    }
+    if (status == router.COMPILE_HOST) { ret "a host name is not a valid pattern"; }
+    if (status == router.COMPILE_UNREACHABLE) { ret "a route can never be reached"; }
+    if (status == router.COMPILE_ROUTE_CAPACITY) { ret "compiled route storage is exhausted"; }
+    if (status == router.COMPILE_SEGMENT_CAPACITY) { ret "route segment storage is exhausted"; }
+    if (status == router.COMPILE_PARAMETER) { ret "a route parameter is not valid"; }
+    if (status == router.COMPILE_METHOD) { ret "a route method is not a valid token"; }
+    ret "route pattern did not compile";
 }
 
 # compile a configuration graph into an immutable route graph and service set
@@ -258,7 +311,8 @@ pub fun compile(
     plan.sealed = false;
     plan.graph.generation = 0;
     plan.graph.initialized = false;
-    if (graph.route_count > storage.spec_capacity || graph.route_count > storage.entry_capacity) {
+    val expanded: usize = expanded_route_count(graph);
+    if (expanded > storage.spec_capacity || expanded > storage.entry_capacity) {
         ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX, "route storage is exhausted");
     }
     var i: usize = 0;
@@ -270,37 +324,55 @@ pub fun compile(
     if (plans != nil && !middleware.install(plans, plan.storage.middleware, plan.storage.middleware_capacity, ?plan.middleware_count)) {
         ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX, "middleware storage is exhausted");
     }
+    # one entry per emitted pattern, because the router reports a match by the
+    # index of the spec it compiled and dispatch reads the entry at that index
+    var emitted: usize = 0;
     i = 0;
     for (i < graph.route_count) {
         val configured: *schema.Route = ?graph.routes[i];
-        val entry: *Entry = ?plan.storage.entries[i];
-        val spec: *router.Route = ?plan.storage.specs[i];
         val service_name: str = schema.text(?configured.service);
         val resolved: usize = find_service(plan, service_name);
         if (resolved == NO_INDEX) {
             ret report(PLAN_UNRESOLVED, i, NO_INDEX, "route references an unknown service");
         }
-        entry.name = intern(plan, schema.text(?configured.name));
-        entry.host = host_pattern(plan, graph, configured);
-        entry.service = plan.storage.services[resolved].name;
-        entry.service_index = resolved;
-        entry.budget_index = NO_INDEX;
-        if (!middleware.select(plans, entry.name, ?entry.middleware_start, ?entry.middleware_count)) {
-            entry.middleware_start = 0;
-            entry.middleware_count = 0;
-        }
+        # the route's own text is interned once and shared by its patterns
+        val route_name: str = intern(plan, schema.text(?configured.name));
         val pattern: str = translate_pattern(plan, schema.text(?configured.path));
-        if (entry.name == nil || entry.host == nil || pattern == nil) {
+        if (route_name == nil || pattern == nil) {
             ret report(PLAN_CAPACITY, i, NO_INDEX, "route text storage is exhausted");
         }
-        spec.method = view.view(nil, 0);
-        spec.host = service.text_view(entry.host);
-        spec.pattern = service.text_view(pattern);
-        spec.handler_ctx = (entry)::ptr;
-        spec.handler = matched_route;
+        var start: usize = 0;
+        var count: usize = 0;
+        if (!middleware.select(plans, route_name, ?start, ?count)) {
+            start = 0;
+            count = 0;
+        }
+        val names: usize = host_name_count(graph, configured);
+        var n: usize = 0;
+        for (n < names) {
+            val entry: *Entry = ?plan.storage.entries[emitted];
+            val spec: *router.Route = ?plan.storage.specs[emitted];
+            entry.name = route_name;
+            entry.host = host_pattern(plan, graph, configured, n);
+            entry.service = plan.storage.services[resolved].name;
+            entry.service_index = resolved;
+            entry.budget_index = NO_INDEX;
+            entry.middleware_start = start;
+            entry.middleware_count = count;
+            if (entry.host == nil) {
+                ret report(PLAN_CAPACITY, i, NO_INDEX, "route text storage is exhausted");
+            }
+            spec.method = view.view(nil, 0);
+            spec.host = service.text_view(entry.host);
+            spec.pattern = service.text_view(pattern);
+            spec.handler_ctx = (entry)::ptr;
+            spec.handler = matched_route;
+            emitted = emitted + 1;
+            n = n + 1;
+        }
         i = i + 1;
     }
-    plan.entry_count = graph.route_count;
+    plan.entry_count = emitted;
     var configured_limits: router.Limits = router.limits_default();
     configured_limits.max_routes = storage.route_capacity;
     configured_limits.max_segments = storage.segment_capacity;
@@ -315,7 +387,7 @@ pub fun compile(
         configured_limits,
     );
     if (compiled.status != router.COMPILE_OK) {
-        ret report(PLAN_ROUTE, compiled.route, NO_INDEX, "route pattern did not compile");
+        ret report(PLAN_ROUTE, compiled.route, NO_INDEX, route_failure(compiled.status));
     }
     plan.sealed = true;
     ret report(PLAN_OK, NO_INDEX, NO_INDEX, nil);
@@ -469,6 +541,174 @@ test "plan: a route naming an absent service fails before the plan seals" {
     var fixture: Fixture;
     var resolver: service.Resolver = service.no_resolver();
     if (build(?fixture, 2, ?graph, ?resolver, nil).status != PLAN_UNRESOLVED) { ret 1; }
+    if (sealed(?fixture.plan)) { ret 2; }
+    ret 0;
+}
+
+fun host_request(request: *message.Request, items: *field.Field, path: str, host: str) {
+    request.generation = 1;
+    request.method = method.from_kind(method.GET);
+    request.fields = field.init(items, 2, field.limits(2, 512, 64, 256));
+    field.append(?request.fields, field.Field{
+        name: view.view("host", 4),
+        value: view.view(host, str_len(host)),
+        sensitive: false,
+    });
+    request.target.form = target.ORIGIN;
+    request.target.path = view.view(path, str_len(path));
+    request.target.query = view.view(nil, 0);
+    request.target.authority = view.view(nil, 0);
+}
+
+# which route answers this host, by name, or nil when none does
+fun routed(fixture: *Fixture, path: str, host: str) *Entry {
+    var items: [2]field.Field;
+    var request: message.Request;
+    host_request(?request, ?items[0], path, host);
+    var captures: [4]router.Capture;
+    val matched: router.Dispatch = match(?fixture.plan, ?request, ?captures[0], 4);
+    if (matched.status != router.DISPATCH_MATCH) { ret nil; }
+    ret entry(?fixture.plan, matched.source_index);
+}
+
+fun named_host(graph: *schema.Graph, index: usize, name: str, first: str, second: str) {
+    val host: *schema.Host = ?graph.hosts[index];
+    schema.set_text(?host.name, name);
+    schema.set_text(?host.server_names[0], first);
+    host.server_name_count = 1;
+    if (second != nil) {
+        schema.set_text(?host.server_names[1], second);
+        host.server_name_count = 2;
+    }
+}
+
+fun route_on(graph: *schema.Graph, index: usize, name: str, host: str, path: str,
+    service_name: str) {
+    val configured: *schema.Route = ?graph.routes[index];
+    schema.set_text(?configured.name, name);
+    schema.set_text(?configured.host, host);
+    schema.set_text(?configured.path, path);
+    schema.set_text(?configured.service, service_name);
+}
+
+fun fixed_service(graph: *schema.Graph, index: usize, name: str, body: str) {
+    schema.set_text(?graph.services[index].name, name);
+    graph.services[index].kind = schema.SERVICE_FIXED;
+    schema.set_text(?graph.services[index].target, body);
+    graph.services[index].status = 200;
+}
+
+test "plan: every name a host declares routes to that host's services" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    schema.set_text(?graph.server_name, "plan-test");
+    graph.host_count = 1;
+    named_host(?graph, 0, "site", "a.example.test", "b.example.test");
+    graph.service_count = 1;
+    fixed_service(?graph, 0, "svc", "body");
+    graph.route_count = 1;
+    route_on(?graph, 0, "root", "site", "/a/**", "svc");
+    var fixture: Fixture;
+    var resolver: service.Resolver = service.no_resolver();
+    if (build(?fixture, 3, ?graph, ?resolver, nil).status != PLAN_OK) { ret 1; }
+    # one configured route became one pattern per name
+    if (fixture.plan.entry_count != 2) { ret 2; }
+    val first: *Entry = routed(?fixture, "/a/x", "a.example.test");
+    if (first == nil || !str_equals(first.name, "root")
+     || !str_equals(first.service, "svc")) { ret 3; }
+    # the defect: this name completed a handshake and then matched no host at all
+    val second: *Entry = routed(?fixture, "/a/x", "b.example.test");
+    if (second == nil || !str_equals(second.name, "root")
+     || !str_equals(second.service, "svc")) { ret 4; }
+    if (!str_equals(first.host, "a.example.test")
+     || !str_equals(second.host, "b.example.test")) { ret 5; }
+    # and a name no host declares is still refused, which is what proves the
+    # patterns above are those two names rather than a catch-all
+    if (routed(?fixture, "/a/x", "c.example.test") != nil) { ret 6; }
+    ret 0;
+}
+
+# precedence comes from the router's specificity rule, not from the order names
+# or hosts are written in
+test "plan: an exact host name outranks a wildcard declared before it" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    schema.set_text(?graph.server_name, "plan-test");
+    graph.host_count = 2;
+    # the wildcard is declared first, so source order would answer wrongly, and the
+    # exact name that must win is the host's *second*, so it exists only if every
+    # name is compiled
+    named_host(?graph, 0, "wild", "*.example.test", nil);
+    named_host(?graph, 1, "exact", "other.example.test", "api.example.test");
+    graph.service_count = 2;
+    fixed_service(?graph, 0, "wildsvc", "wild");
+    fixed_service(?graph, 1, "apisvc", "api");
+    graph.route_count = 2;
+    route_on(?graph, 0, "wildroute", "wild", "/**", "wildsvc");
+    route_on(?graph, 1, "apiroute", "exact", "/**", "apisvc");
+    var fixture: Fixture;
+    var resolver: service.Resolver = service.no_resolver();
+    if (build(?fixture, 4, ?graph, ?resolver, nil).status != PLAN_OK) { ret 1; }
+    val second_name: *Entry = routed(?fixture, "/x", "api.example.test");
+    if (second_name == nil || !str_equals(second_name.service, "apisvc")) { ret 2; }
+    val first_name: *Entry = routed(?fixture, "/x", "other.example.test");
+    if (first_name == nil || !str_equals(first_name.service, "apisvc")) { ret 3; }
+    # a name the exact host does not claim falls to the wildcard, not the reverse
+    val suffix: *Entry = routed(?fixture, "/x", "anything.example.test");
+    if (suffix == nil || !str_equals(suffix.service, "wildsvc")) { ret 4; }
+    # and a name outside the wildcard's suffix belongs to neither
+    if (routed(?fixture, "/x", "api.example.org") != nil) { ret 5; }
+    ret 0;
+}
+
+test "plan: two hosts claiming one name on one path is a reported conflict" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    schema.set_text(?graph.server_name, "plan-test");
+    graph.host_count = 2;
+    # the two hosts collide on the second name of the first, so the conflict exists
+    # only once every name is compiled
+    named_host(?graph, 0, "one", "first.example.test", "shared.example.test");
+    named_host(?graph, 1, "two", "shared.example.test", nil);
+    graph.service_count = 2;
+    fixed_service(?graph, 0, "first", "one");
+    fixed_service(?graph, 1, "second", "two");
+    graph.route_count = 2;
+    route_on(?graph, 0, "a", "one", "/**", "first");
+    route_on(?graph, 1, "b", "two", "/**", "second");
+    var fixture: Fixture;
+    var resolver: service.Resolver = service.no_resolver();
+    val built: Report = build(?fixture, 5, ?graph, ?resolver, nil);
+    if (built.status != PLAN_ROUTE) { ret 1; }
+    # and it says which kind of failure it is, not just that something did not compile
+    if (!str_equals(built.detail, "two routes match the same host, path, and method")) { ret 2; }
+    if (sealed(?fixture.plan)) { ret 3; }
+    ret 0;
+}
+
+test "plan: expansion across names is bounded by the storage it was given" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    schema.set_text(?graph.server_name, "plan-test");
+    graph.host_count = 1;
+    val host: *schema.Host = ?graph.hosts[0];
+    schema.set_text(?host.name, "site");
+    host.server_name_count = 5;
+    schema.set_text(?host.server_names[0], "a.example.test");
+    schema.set_text(?host.server_names[1], "b.example.test");
+    schema.set_text(?host.server_names[2], "c.example.test");
+    schema.set_text(?host.server_names[3], "d.example.test");
+    schema.set_text(?host.server_names[4], "e.example.test");
+    graph.service_count = 1;
+    fixed_service(?graph, 0, "svc", "body");
+    graph.route_count = 1;
+    route_on(?graph, 0, "root", "site", "/**", "svc");
+    var fixture: Fixture;
+    var resolver: service.Resolver = service.no_resolver();
+    # the fixture holds four specs, so five names must be refused rather than
+    # written past the end of the storage the caller owns
+    val built: Report = build(?fixture, 6, ?graph, ?resolver, nil);
+    if (built.status != PLAN_CAPACITY) { ret 1; }
     if (sealed(?fixture.plan)) { ret 2; }
     ret 0;
 }
