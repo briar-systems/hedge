@@ -76,6 +76,7 @@ The implemented schema accepts these top-level sections:
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
+- `cache` policy and `acme` certificate management
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
@@ -163,6 +164,78 @@ Precedence between names is by specificity and never by the order they are writt
 
 Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
 
+## Automatic certificate management
+
+```toml
+[server.features]
+acme = true
+
+[acme]
+directory = "https://acme-v02.api.letsencrypt.org/directory"
+contact = "mailto:ops@example.com"
+terms_agreed = true
+storage = "/var/lib/hedge/acme"
+names = ["example.com", "www.example.com"]
+challenge = "http-01"
+
+[service.acme]
+kind = "native"
+target = "acme-challenge"
+
+[[route]]
+name = "acme"
+host = "example"
+path = "/.well-known/acme-challenge/**"
+service = "acme"
+```
+
+One account and one certificate covering every configured name. Up to eight
+names, which is what the durable record holds. `storage` is a directory the
+process owns: it is created with owner-only permissions and every file in it,
+including both private keys, is written owner-only and replaced atomically.
+
+`renew_before` is the lead, in seconds, before expiry at which a certificate is
+renewed. It defaults to thirty days, which suits the ninety-day certificates
+public authorities issue, and is bounded at one year.
+
+`challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
+
+`http-01` is the only one a TOML deployment can select, because it is the only
+one a web server can answer by itself. It requires a route to the native
+`acme-challenge` service, and a configuration that enables `http-01` without
+one fails to load rather than discovering it at the first renewal. The route
+must be reachable on port 80 for the names being validated.
+
+`dns-01` needs something that can write a zone. Hedge does not carry provider
+integrations, so an embedder supplies a publisher through
+`acme.open_with_publisher` and gets everything else unchanged. A TOML-only
+deployment that selects it fails to load.
+
+`tls-alpn-01` presentation is implemented, including the RFC 8737 certificate
+and its critical `acmeIdentifier` extension, but it needs a TLS listener to
+present on. Selecting it fails to load until TLS termination exists.
+
+**Hedge cannot obtain a certificate from a public authority yet.** RFC 8555
+URLs are `https`, and nothing in this build can originate a TLS connection —
+`mach-tls` is wired for termination, so Hedge can serve TLS but not speak it as
+a client. Certificate management therefore works end to end against a local
+authority reached in cleartext, and not against Let's Encrypt or any other
+public CA. This is a client-transport limit rather than an ACME one, and it is
+the one thing between this feature and production use.
+
+`origin` is how a local authority is reached: a `host:port` spoken to in
+cleartext, for an authority whose URLs still say `https` because the protocol
+requires it. It applies to the one configured authority and nothing else, and
+without it an `https` directory is refused rather than silently reached in
+cleartext. A conformance stack that terminates TLS in front of the authority
+and passes every ACME byte through unchanged is exactly what it is for.
+
+Renewal is driven from the serving loop. A certificate inside its renewal lead
+is renewed with jitter so a fleet does not renew in lockstep; a failure backs
+off within a ceiling against a fixed attempt budget; and a clock that moves
+backwards replans rather than firing. With `acme` disabled nothing is
+allocated, no directory is opened, and the serving loop takes no ACME step.
+
 ## Telemetry and administration
 
 ```toml
@@ -221,6 +294,8 @@ cache = true
 Caching is off by default and is opted into twice: once for the process with `cache.enabled`, and once for each service with `service.<name>.cache`. A service that does not ask for it is never wrapped, so it does not carry so much as a branch per request. With `cache.enabled` false nothing is constructed at all: no entry table, no body arena, no cache root handle, no worker, and no timer.
 
 `memory_bytes` and `disk_bytes` are exact bounds, not targets. Admission reserves an entry's whole declared length before a byte is written and evicts least-recently-used entries until it fits, so the budget holds at every instant rather than on average. An entry longer than `max_entry_bytes` is refused outright. `entries` bounds the entry count independently of the byte budgets.
+
+Size `entries` against the authorities clients actually use, not against the number of routes. A cache key includes the scheme and the authority the request carried, so one representation is stored once per name it is reached by. A host declaring three names holds three entries for the same file if clients use all three, and a `*.example.com` host holds one entry per distinct subdomain requested rather than one for the wildcard. `Vary` multiplies again on top of that, once per distinct combination of selecting values. None of this is visible from the route count, and running out of entries evicts rather than fails, so an undersized `entries` shows up as a hit rate that quietly falls instead of an error.
 
 A representation larger than a quarter of the memory budget goes to disk when `disk_bytes` and `disk_root` are set. Cache file names come from an internal counter and never from request data. A graceful shutdown removes every file the store wrote; starting up removes any file a killed process left behind, so the disk bound holds across a crash. Only names the store's own counter could have produced are removed.
 

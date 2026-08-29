@@ -32,6 +32,10 @@ use http_cache: hedge.cache;
 use cache_store: hedge.cache.store;
 use upstream: hedge.proxy.upstream;
 use engine_h1: http.h1.connection;
+use std.chrono.time;
+use std.types.view;
+use acme: hedge.acme.manager;
+use handler: hedge.acme.handler;
 use hedge_tls: hedge.protocol.tls;
 use lifecycle: hedge.lifecycle;
 use hedge.serve;
@@ -117,6 +121,39 @@ fun capabilities() loader.Capabilities {
 
 fun resolve_environment(context: ptr, name: str, output: *u8, capacity: usize) i64 {
     ret env.get(name, output, capacity);
+}
+
+# the serving loop drives one plane, and hedge has two things that need
+# driving. composition belongs here, where both are already owned.
+rec Planes {
+    proxying:     *proxy.Runtime;
+    certificates: *acme.Manager;
+}
+
+fun drive_planes(context: ptr, now: time.Time) bool {
+    val planes: *Planes = context::*Planes;
+    if (planes == nil) { ret false; }
+    var advanced: bool = true;
+    if (planes.proxying != nil) {
+        advanced = proxy.poll((planes.proxying)::ptr, now) && advanced;
+    }
+    if (planes.certificates != nil) {
+        advanced = acme.poll((planes.certificates)::ptr, now) && advanced;
+    }
+    ret advanced;
+}
+
+fun announce_certificate(certificates: *acme.Manager) {
+    val first: view.View = acme.name(certificates, 0);
+    var rendered: [256]u8;
+    var i: usize = 0;
+    for (i < first.len && i < 255) {
+        rendered[i] = first.data[i];
+        i = i + 1;
+    }
+    rendered[i] = 0;
+    print.printlnf("hedge: certificate ready for {} until {}",
+        (?rendered[0])::str, acme.not_after(certificates)::u64);
 }
 
 fun configuration_path(argc: i64, argv: **u8) str {
@@ -226,13 +263,42 @@ fun main(argc: i64, argv: **u8) i64 {
             ret EXIT_CONFIG;
         }
     }
+    # certificate management is constructed only when configuration asks for
+    # it: with acme off nothing below is allocated, no state directory is
+    # opened, and the plane has no acme step to take
+    var certificates: *acme.Manager = nil;
+    var challenge_binding: handler.Binding;
+    if (candidate.graph.acme.enabled) {
+        val manager_memory: Result[*acme.Manager, *u8] =
+            allocator.allocate[acme.Manager](?heap, 1);
+        if (is_err[*acme.Manager, *u8](manager_memory)) {
+            print.eprintln("hedge: certificate manager allocation failed");
+            ret EXIT_RUNTIME;
+        }
+        certificates = unwrap_ok[*acme.Manager, *u8](manager_memory);
+        if (acme.open(certificates, ?heap, ?candidate.graph) != acme.OK) {
+            print.eprintln("hedge: certificate manager could not open its state");
+            ret EXIT_CONFIG;
+        }
+        if (!handler.bind(?challenge_binding, acme.challenge_table(certificates))) {
+            print.eprintln("hedge: challenge route could not be bound");
+            ret EXIT_RUNTIME;
+        }
+    }
     http_cache.make_bindings(?cache_bindings, ?cache_binding_storage[0], MAX_SERVICES, caching);
     var services: service.Resolver = service.no_resolver();
     services.applications = ?applications;
-    services.caching = service.Wrapper{
-        ctx: (?cache_bindings)::ptr,
-        wrap: http_cache.wrapper,
-    };
+    # only a process that built a cache installs the wrapper, so with caching off
+    # the plan never calls it and `cache_bindings` is never read. Installing it
+    # unconditionally made the disabled path depend on an initialisation it does
+    # not need, and that dependency spanned two statements with nothing in either
+    # recording that the other mattered.
+    if (caching != nil) {
+        services.caching = service.Wrapper{
+            ctx: (?cache_bindings)::ptr,
+            wrap: http_cache.wrapper,
+        };
+    }
     services.static_files = service.Factory{
         ctx: (?static_registry)::ptr,
         build: static_files.factory,
@@ -241,6 +307,9 @@ fun main(argc: i64, argv: **u8) i64 {
         ctx: (?proxy_bindings)::ptr,
         build: proxy.factory,
     };
+    if (certificates != nil) {
+        services.native = handler.factory(?challenge_binding);
+    }
 
     var compiled_storage: plan.Storage;
     if (!plan.make_storage(?compiled_storage,
@@ -310,7 +379,13 @@ fun main(argc: i64, argv: **u8) i64 {
         ret EXIT_RUNTIME;
     }
     proxy.attach_driver(proxying, ?runtime.owner.network);
-    serve.attach_plane(?runtime, (proxying)::ptr, proxy.poll);
+    var planes: Planes;
+    planes.proxying = proxying;
+    planes.certificates = certificates;
+    serve.attach_plane(?runtime, (?planes)::ptr, drive_planes);
+    if (certificates != nil) {
+        acme.attach_telemetry(certificates, runtime.observability);
+    }
     announce(?runtime, ?candidate.graph);
     # the shutdown sequence runs inside `poll`, deadline included, so a handler
     # that never finishes ends the process rather than holding it open. `poll`
@@ -318,11 +393,20 @@ fun main(argc: i64, argv: **u8) i64 {
     # when everything but that is done and `stop` performs the close.
     for (true) {
         serve.poll(?runtime, serve.DEFAULT_POLL_MS);
+        # a renewed certificate is installed by whoever owns the credential
+        # generation. tls termination does not exist in this build, so the
+        # certificate is obtained, verified, and stored, and the installation
+        # is acknowledged with nothing to install it into yet.
+        if (certificates != nil && acme.installation_ready(certificates)) {
+            announce_certificate(certificates);
+            acme.installed(certificates, time.now());
+        }
         if (serve.drained(?runtime)) { brk; }
     }
     val stopped: bool = serve.stop(?runtime);
     val reason: lifecycle.Reason = serve.shutdown_reason(?runtime);
     val abandoned: usize = serve.shutdown_cancelled(?runtime);
+    if (certificates != nil) { acme.close(certificates); }
     hedge_tls.destroy();
     proxy.close_runtime(proxying);
     if (caching != nil) { http_cache.close(caching); }
