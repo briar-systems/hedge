@@ -17,3 +17,10 @@ only one test at a time can own the listener that answers it.
 The harness runs pebble's challenge test server with its own HTTP-01 responder
 disabled and with AAAA answers turned off, so the authority resolves every name
 to loopback IPv4 and the only process that can answer a validation is hedge.
+Both flags are load bearing and are commented as such in `start.sh`.
+
+Pebble picks between its `default` (90-day) and `shortlived` (6-day)
+certificate profile when an order names neither, so the issued lifetime varies
+between runs. A test that compares a renewal lead against the issued lifetime
+is a coin toss, and it presents as flakiness rather than as a configuration
+problem. State the lead in the test instead.

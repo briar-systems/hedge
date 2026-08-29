@@ -174,12 +174,20 @@ deployment that selects it fails to load.
 and its critical `acmeIdentifier` extension, but it needs a TLS listener to
 present on. Selecting it fails to load until TLS termination exists.
 
-`origin` names where the configured authority is actually reached, as a
-`host:port` that is spoken to in cleartext. It exists so a local authority
-behind a plain-HTTP front end can be driven end to end. Without it, an `https`
-directory needs TLS origination, which this build does not have. It is never a
-silent downgrade: the authority named in the configuration is the only one it
-applies to, and it must be stated explicitly.
+**Hedge cannot obtain a certificate from a public authority yet.** RFC 8555
+URLs are `https`, and nothing in this build can originate a TLS connection —
+`mach-tls` is wired for termination, so Hedge can serve TLS but not speak it as
+a client. Certificate management therefore works end to end against a local
+authority reached in cleartext, and not against Let's Encrypt or any other
+public CA. This is a client-transport limit rather than an ACME one, and it is
+the one thing between this feature and production use.
+
+`origin` is how a local authority is reached: a `host:port` spoken to in
+cleartext, for an authority whose URLs still say `https` because the protocol
+requires it. It applies to the one configured authority and nothing else, and
+without it an `https` directory is refused rather than silently reached in
+cleartext. A conformance stack that terminates TLS in front of the authority
+and passes every ACME byte through unchanged is exactly what it is for.
 
 Renewal is driven from the serving loop. A certificate inside its renewal lead
 is renewed with jitter so a fleet does not renew in lockstep; a failure backs
