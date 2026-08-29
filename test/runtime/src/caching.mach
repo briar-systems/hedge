@@ -15,8 +15,11 @@ use std.chrono.time;
 use std.net.ip;
 use std.net.tcp;
 use std.filesystem;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.allocator;
 use std.allocator.fixed;
+use page: std.allocator.page;
 use io_error: std.io.error;
 use http.core.exchange;
 use http.core.field;
@@ -51,6 +54,8 @@ rec Origin {
     payload: str;
     cache_control: str;
     vary: str;
+    etag: str;
+    set_cookie: str;
 }
 
 fun origin_serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
@@ -67,6 +72,13 @@ fun origin_serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
         ret exchange.SERVICE_FAILED;
     }
     if (state.vary != nil && !service.add_field(active, field.VARY, state.vary)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (state.etag != nil && !service.add_field(active, field.ETAG, state.etag)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (state.set_cookie != nil
+     && !service.add_field(active, field.SET_COOKIE, state.set_cookie)) {
         ret exchange.SERVICE_FAILED;
     }
     ret service.respond_with_text(active, state.payload);
@@ -97,6 +109,9 @@ rec Harness {
     cache_body: [CACHE_BODY]u8;
     bindings: http_cache.Bindings;
     binding_storage: [MAX_SERVICES]http_cache.Binding;
+    scratch: allocator.Allocator;
+    disk_root: str;
+    disk_bytes: usize;
 }
 
 fun native_factory(context: ptr, configured: *schema.Service,
@@ -151,7 +166,10 @@ fun base_graph(harness: *Harness, cache_enabled: bool, per_service_cache: bool) 
     graph.cache.memory_bytes = CACHE_BODY;
     graph.cache.max_entry_bytes = 1024;
     graph.cache.entries = CACHE_ENTRIES;
-    graph.cache.disk_bytes = 0;
+    graph.cache.disk_bytes = harness.disk_bytes;
+    if (harness.disk_root != nil) {
+        schema.set_text(?graph.cache.disk_root, harness.disk_root);
+    } or { schema.clear_text(?graph.cache.disk_root); }
 }
 
 fun boot(harness: *Harness, generation: u64, cache_enabled: bool, per_service_cache: bool,
@@ -161,10 +179,14 @@ fun boot(harness: *Harness, generation: u64, cache_enabled: bool, per_service_ca
     harness.origin.payload = payload;
     harness.origin.cache_control = cache_control;
     harness.origin.vary = vary;
+    harness.origin.etag = nil;
+    harness.origin.set_cookie = nil;
+    if (option.is_some[*u8](page.make(?harness.scratch))) { ret false; }
     service.make_applications(?harness.applications, ?harness.application_slots[0], 2);
     if (cache_enabled) {
         if (!http_cache.from_config(?harness.layer, ?harness.graph.cache,
-            ?harness.cache_entries[0], CACHE_ENTRIES, ?harness.cache_body[0], CACHE_BODY)) {
+            ?harness.cache_entries[0], CACHE_ENTRIES, ?harness.cache_body[0], CACHE_BODY,
+            ?harness.scratch)) {
             ret false;
         }
         http_cache.make_bindings(?harness.bindings, ?harness.binding_storage[0],
@@ -212,6 +234,17 @@ fun shutdown(harness: *Harness) {
     http_cache.close(?harness.layer);
 }
 
+# the store is written when the exchange settles, which is after the client has
+# its bytes. Sampling a report before then reads a half-finished cache, so every
+# exchange here returns only once the server has nothing left in flight.
+fun settle(harness: *Harness) {
+    var rounds: usize = 0;
+    for (rounds < 64 && !serve.idle(?harness.runtime)) {
+        serve.poll(?harness.runtime, 2);
+        rounds = rounds + 1;
+    }
+}
+
 fun exchange_once(harness: *Harness, request: str, marker: str, response: *u8,
     capacity: usize, output: *usize) bool {
     var client: tcp.Stream;
@@ -219,6 +252,7 @@ fun exchange_once(harness: *Harness, request: str, marker: str, response: *u8,
     if (!wire.send(?client, request)) { tcp.stream_close(?client); ret false; }
     @output = wire.collect(?harness.runtime, ?client, response, capacity, marker);
     tcp.stream_close(?client);
+    settle(harness);
     ret true;
 }
 
@@ -432,5 +466,236 @@ test "cache: an entry larger than the budget is refused and the service still an
     # both requests were answered correctly, and nothing was kept
     if (calls != 2 || view.entries != 0 || view.stores != 0) { ret 4; }
     if (view.rejections == 0) { ret 5; }
+    ret 0;
+}
+
+
+# the defect this test exists for: a target may hold more than one representation,
+# and taking the first entry filed under the key made every other one unreachable
+test "cache: each stored representation answers its own negotiation" {
+    var harness: Harness;
+    if (!boot(?harness, 10, true, true, "varied", "max-age=60", "accept-encoding")) {
+        shutdown(?harness); ret 1;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n",
+        "varied", ?response[0], RESPONSE_BYTES, ?length);
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\n\r\n",
+        "varied", ?response[0], RESPONSE_BYTES, ?length);
+    if (harness.origin.calls != 2) { shutdown(?harness); ret 2; }
+    if (http_cache.report(?harness.layer).entries != 2) { shutdown(?harness); ret 3; }
+    # both are now stored, and each negotiation must find its own
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n",
+        "varied", ?response[0], RESPONSE_BYTES, ?length);
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\n\r\n",
+        "varied", ?response[0], RESPONSE_BYTES, ?length);
+    val view: http_cache.Report = http_cache.report(?harness.layer);
+    val calls: usize = harness.origin.calls;
+    shutdown(?harness);
+    if (calls != 2) { ret 4; }
+    if (view.hits != 2 || view.entries != 2) { ret 5; }
+    ret 0;
+}
+
+test "cache: a conditional request is answered from the store without an origin call" {
+    var harness: Harness;
+    if (!boot(?harness, 11, true, true, "conditional", "max-age=60", nil)) {
+        shutdown(?harness); ret 1;
+    }
+    harness.origin.etag = "\"v1\"";
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "conditional", ?response[0], RESPONSE_BYTES, ?length);
+    if (harness.origin.calls != 1) { shutdown(?harness); ret 2; }
+    if (!exchange_once(?harness,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"v1\"\r\n\r\n",
+        "\r\n\r\n", ?response[0], RESPONSE_BYTES, ?length)) { shutdown(?harness); ret 3; }
+    val calls: usize = harness.origin.calls;
+    val hits: u64 = http_cache.report(?harness.layer).hits;
+    shutdown(?harness);
+    # the cache validated against its own stored tag, so the origin was never reached
+    if (calls != 1 || hits != 1) { ret 4; }
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 304 ")) { ret 5; }
+    if (!wire.contains(?response[0], length, "etag:")) { ret 6; }
+    # a 304 describes no body, so it must not claim one
+    if (wire.contains(?response[0], length, "conditional")) { ret 7; }
+    ret 0;
+}
+
+test "cache: a byte range is served out of the stored representation" {
+    var harness: Harness;
+    if (!boot(?harness, 12, true, true, "0123456789", "max-age=60", nil)) {
+        shutdown(?harness); ret 1;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0123456789", ?response[0], RESPONSE_BYTES, ?length);
+    if (harness.origin.calls != 1) { shutdown(?harness); ret 2; }
+    if (!exchange_once(?harness,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nRange: bytes=2-5\r\n\r\n",
+        "2345", ?response[0], RESPONSE_BYTES, ?length)) { shutdown(?harness); ret 3; }
+    val calls: usize = harness.origin.calls;
+    shutdown(?harness);
+    if (calls != 1) { ret 4; }
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 206 ")) { ret 5; }
+    if (!wire.contains(?response[0], length, "content-range: bytes 2-5/10")) { ret 6; }
+    if (!wire.contains(?response[0], length, "content-length: 4")) { ret 7; }
+    # exactly the requested window, not the whole representation
+    val body: usize = wire.body_offset(?response[0], length);
+    if (body == 0 || length - body != 4) { ret 8; }
+    if (response[body] != '2' || response[body + 3] != '5') { ret 9; }
+    ret 0;
+}
+
+# the poisoning case: a shared cache that kept a Set-Cookie would give the next
+# client the session the first one was issued
+test "cache: a response that sets a cookie is not stored and never replayed" {
+    var harness: Harness;
+    if (!boot(?harness, 13, true, true, "cookied", "max-age=60", nil)) {
+        shutdown(?harness); ret 1;
+    }
+    harness.origin.set_cookie = "session=first";
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "cookied", ?response[0], RESPONSE_BYTES, ?length);
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "cookied", ?response[0], RESPONSE_BYTES, ?length);
+    val view: http_cache.Report = http_cache.report(?harness.layer);
+    val calls: usize = harness.origin.calls;
+    shutdown(?harness);
+    # every request reached the origin and got its own cookie
+    if (calls != 2) { ret 2; }
+    if (view.stores != 0 || view.entries != 0 || view.hits != 0) { ret 3; }
+    ret 0;
+}
+
+test "cache: an origin that names the cookie gets the rest of its response stored" {
+    var harness: Harness;
+    if (!boot(?harness, 14, true, true, "named",
+        "private=\"set-cookie\", max-age=60", nil)) { shutdown(?harness); ret 1; }
+    harness.origin.set_cookie = "session=first";
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "named", ?response[0], RESPONSE_BYTES, ?length);
+    if (harness.origin.calls != 1) { shutdown(?harness); ret 2; }
+    if (!wire.contains(?response[0], length, "set-cookie:")) { shutdown(?harness); ret 3; }
+    if (!exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "named", ?response[0], RESPONSE_BYTES, ?length)) { shutdown(?harness); ret 4; }
+    val calls: usize = harness.origin.calls;
+    val view: http_cache.Report = http_cache.report(?harness.layer);
+    shutdown(?harness);
+    # the representation was reused, and the cookie was not part of it
+    if (calls != 1 || view.hits != 1 || view.stores != 1) { ret 5; }
+    if (wire.contains(?response[0], length, "set-cookie:")) { ret 6; }
+    ret 0;
+}
+
+test "cache: a byte budget evicts the least recently used entry over real sockets" {
+    var harness: Harness;
+    if (!boot(?harness, 15, true, true, "0123456789", "max-age=60", nil)) {
+        shutdown(?harness); ret 1;
+    }
+    # exactly two ten byte representations fit
+    harness.layer.backing.limits.memory_bytes = 20;
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0123456789", ?response[0], RESPONSE_BYTES, ?length);
+    exchange_once(?harness, "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0123456789", ?response[0], RESPONSE_BYTES, ?length);
+    if (http_cache.report(?harness.layer).memory_bytes != 20) { shutdown(?harness); ret 2; }
+    # touch the first so the second becomes least recently used
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0123456789", ?response[0], RESPONSE_BYTES, ?length);
+    if (harness.origin.calls != 2) { shutdown(?harness); ret 3; }
+    exchange_once(?harness, "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0123456789", ?response[0], RESPONSE_BYTES, ?length);
+    var view: http_cache.Report = http_cache.report(?harness.layer);
+    if (view.memory_bytes != 20 || view.entries != 2 || view.evictions != 1) {
+        shutdown(?harness); ret 4;
+    }
+    # the evicted target reaches the origin again, the retained one does not
+    exchange_once(?harness, "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0123456789", ?response[0], RESPONSE_BYTES, ?length);
+    if (harness.origin.calls != 4) { shutdown(?harness); ret 5; }
+    exchange_once(?harness, "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0123456789", ?response[0], RESPONSE_BYTES, ?length);
+    val calls: usize = harness.origin.calls;
+    view = http_cache.report(?harness.layer);
+    shutdown(?harness);
+    if (calls != 4) { ret 6; }
+    # the budget was a bound throughout, never a target it drifted above
+    if (view.memory_bytes > 20) { ret 7; }
+    ret 0;
+}
+
+fun ensure_dir(path: str) bool {
+    if (filesystem.is_dir(path)) { ret true; }
+    ret !option.is_some[str](filesystem.create_dir(path, 493));
+}
+
+fun e_files(path: str, scratch: *allocator.Allocator) usize {
+    val listed: Result[Vector[str], str] = filesystem.read_dir(scratch, path);
+    if (is_err[Vector[str], str](listed)) { ret 0xffffffffffffffff; }
+    var names: Vector[str] = unwrap_ok[Vector[str], str](listed);
+    var found: usize = 0;
+    var i: usize = 0;
+    for (i < names.len) {
+        val held: Result[*str, str] = vector.get[str](?names, i);
+        if (!is_err[*str, str](held)) {
+            val name: str = @unwrap_ok[*str, str](held);
+            if (name[0] == 'e' && name[1] >= '0' && name[1] <= '9') { found = found + 1; }
+        }
+        i = i + 1;
+    }
+    vector.dnit[str](?names);
+    ret found;
+}
+
+test "cache: a disk entry is served over a socket and does not survive a restart" {
+    if (!ensure_dir("out") || !ensure_dir("out/cache-runtime-disk")) { ret 1; }
+    var harness: Harness;
+    harness.disk_root = "out/cache-runtime-disk";
+    harness.disk_bytes = 4096;
+    if (!boot(?harness, 16, true, true, "on disk", "max-age=60", nil)) {
+        shutdown(?harness); ret 2;
+    }
+    # anything past a quarter of the memory budget goes to disk
+    harness.layer.backing.limits.memory_bytes = 8;
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "on disk", ?response[0], RESPONSE_BYTES, ?length);
+    if (harness.origin.calls != 1) { shutdown(?harness); ret 3; }
+    var view: http_cache.Report = http_cache.report(?harness.layer);
+    if (view.disk_bytes == 0 || view.memory_bytes != 0) { shutdown(?harness); ret 4; }
+    if (e_files("out/cache-runtime-disk", ?harness.scratch) != 1) { shutdown(?harness); ret 5; }
+    # the second answer comes off the disk, over a real socket, byte for byte
+    if (!exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "on disk", ?response[0], RESPONSE_BYTES, ?length)) { shutdown(?harness); ret 6; }
+    if (harness.origin.calls != 1) { shutdown(?harness); ret 7; }
+    if (!wire.contains(?response[0], length, "on disk")) { shutdown(?harness); ret 8; }
+    shutdown(?harness);
+    # shutting down took the files with it, so nothing is left to describe wrongly
+    if (e_files("out/cache-runtime-disk", ?harness.scratch) != 0) { ret 9; }
+
+    var restarted: Harness;
+    restarted.disk_root = "out/cache-runtime-disk";
+    restarted.disk_bytes = 4096;
+    if (!boot(?restarted, 17, true, true, "on disk", "max-age=60", nil)) {
+        shutdown(?restarted); ret 10;
+    }
+    if (http_cache.report(?restarted.layer).entries != 0) { shutdown(?restarted); ret 11; }
+    exchange_once(?restarted, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "on disk", ?response[0], RESPONSE_BYTES, ?length);
+    val calls: usize = restarted.origin.calls;
+    shutdown(?restarted);
+    # the restarted process kept nothing, so it answered from the origin
+    if (calls != 1) { ret 12; }
     ret 0;
 }
