@@ -171,8 +171,12 @@ integrations, so an embedder supplies a publisher through
 deployment that selects it fails to load.
 
 `tls-alpn-01` presentation is implemented, including the RFC 8737 certificate
-and its critical `acmeIdentifier` extension, but it needs a TLS listener to
-present on. Selecting it fails to load until TLS termination exists.
+and its critical `acmeIdentifier` extension. TLS termination exists and is
+qualified against external clients, so that is not the obstacle. What is
+missing is a way to install the challenge certificate into a running listener:
+a listener publishes one immutable credential generation at startup and there
+is no supported way to replace it. Selecting `tls-alpn-01` fails to load until
+that exists. See issue #37.
 
 **Hedge cannot obtain a certificate from a public authority yet.** RFC 8555
 URLs are `https`, and nothing in this build can originate a TLS connection —
