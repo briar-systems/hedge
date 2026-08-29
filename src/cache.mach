@@ -32,6 +32,8 @@ use store: hedge.cache.store;
 use directives: hedge.http.cache_control;
 use http_date: hedge.http.date;
 use forward: hedge.proxy.forward;
+use validator: hedge.http.validator;
+use range: hedge.http.range;
 
 pub val MAX_RECORDERS: usize = 16;
 
@@ -55,11 +57,13 @@ rec Recording {
 }
 
 # the body reader that serves a hit out of the store
+# `offset` and `limit` are absolute positions in the stored representation, so a
+# range response reads a window of the same entry rather than a copy of it
 rec StoredBody {
     layer: *Layer;
     index: usize;
     offset: usize;
-    length: usize;
+    limit: usize;
     reader: body.Reader;
 }
 
@@ -80,9 +84,9 @@ pub fun make(layer: *Layer, entries: *store.Entry, capacity: usize, body_storage
     ret true;
 }
 
-pub fun attach_disk(layer: *Layer, root_path: str) bool {
+pub fun attach_disk(layer: *Layer, root_path: str, scratch: *allocator.Allocator) bool {
     if (layer == nil || !layer.live) { ret false; }
-    ret store.attach_disk(?layer.backing, root_path);
+    ret store.attach_disk(?layer.backing, root_path, scratch);
 }
 
 pub fun close(layer: *Layer) bool {
@@ -130,9 +134,11 @@ pub fun report(layer: *Layer) Report {
 fun stored_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
     val state: *StoredBody = context::*StoredBody;
     if (state == nil) { ret body.failed("stored body has no state", body.REUSE_FORBIDDEN); }
-    if (state.offset >= state.length) { ret body.complete(body.REUSE_ALLOWED); }
+    if (state.offset >= state.limit) { ret body.complete(body.REUSE_ALLOWED); }
     var produced: usize = 0;
-    if (!store.read_body(?state.layer.backing, state.index, state.offset, output, capacity,
+    var room: usize = state.limit - state.offset;
+    if (room > capacity) { room = capacity; }
+    if (!store.read_body(?state.layer.backing, state.index, state.offset, output, room,
         ?produced)) {
         ret body.failed("stored body could not be read", body.REUSE_FORBIDDEN);
     }
@@ -147,7 +153,7 @@ fun stored_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.P
     if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
     if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
     if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
-    state.offset = state.length;
+    state.offset = state.limit;
     ret body.complete(body.REUSE_ALLOWED);
 }
 
@@ -166,51 +172,103 @@ fun field_value(entry: *store.Entry, index: usize) view.View {
     ret view.view(?entry.field_bytes[entry.field_values[index]], entry.field_value_lengths[index]);
 }
 
-# emit a stored representation, including the Age it has accumulated
-fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
-    now: time.Time) exchange.ServiceStatus {
-    val entry: *store.Entry = store.entry_at(?layer.backing, index);
-    val response: *message.Response = call.response(active);
-    val configured: message.Limits = call.limits(active);
-    if (entry == nil || response == nil) { ret exchange.SERVICE_FAILED; }
-    if (message.set_status(response, entry.status) != message.RESPONSE_OK) {
-        ret exchange.SERVICE_FAILED;
-    }
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun name_is(name: view.View, expected: str) bool {
+    val length: usize = str_len(expected);
+    if (name.len != length || name.data == nil) { ret false; }
     var i: usize = 0;
-    for (i < entry.field_count) {
-        if (message.add_field(response, field.Field{
-            name: field_name(entry, i),
-            value: field_value(entry, i),
-            sensitive: false,
-        }) != field.ADD_OK) { ret exchange.SERVICE_FAILED; }
+    for (i < length) {
+        if (lower(name.data[i]) != expected[i]) { ret false; }
         i = i + 1;
     }
+    ret true;
+}
+
+fun stored_field(entry: *store.Entry, name: str) view.View {
+    var i: usize = 0;
+    for (i < entry.field_count) {
+        if (name_is(field_name(entry, i), name)) { ret field_value(entry, i); }
+        i = i + 1;
+    }
+    ret view.view(nil, 0);
+}
+
+# the validators the stored representation carries, so a conditional request can
+# be answered from the store instead of from the origin
+fun stored_validators(entry: *store.Entry) validator.Validators {
+    var current: validator.Validators = validator.none();
+    current.etag = stored_field(entry, field.ETAG);
+    val modified: view.View = stored_field(entry, field.LAST_MODIFIED);
+    if (modified.data != nil && modified.len != 0) {
+        current.has_modified = http_date.parse(modified, ?current.modified);
+    }
+    ret current;
+}
+
+# RFC 9110 section 15.4.5: a 304 carries the metadata a cache would have updated,
+# and nothing that describes a body it is not sending
+fun metadata_field(name: view.View) bool {
+    ret name_is(name, field.CACHE_CONTROL)
+     || name_is(name, "content-location")
+     || name_is(name, field.DATE)
+     || name_is(name, field.ETAG)
+     || name_is(name, "expires")
+     || name_is(name, field.VARY);
+}
+
+fun copy_stored_fields(entry: *store.Entry, response: *message.Response,
+    only_metadata: bool, skip_length: bool) bool {
+    var i: usize = 0;
+    for (i < entry.field_count) {
+        val name: view.View = field_name(entry, i);
+        var wanted: bool = true;
+        if (only_metadata) { wanted = metadata_field(name); }
+        if (skip_length && name_is(name, field.CONTENT_LENGTH)) { wanted = false; }
+        if (wanted && message.add_field(response, field.Field{
+            name: name,
+            value: field_value(entry, i),
+            sensitive: false,
+        }) != field.ADD_OK) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun add_age(layer: *Layer, active: *call.Call, entry: *store.Entry, now: time.Time) bool {
     val age_seconds: u64 = policy.current_age(entry.metadata, now) / 1000000000;
     val age_text: str = service.arena_number(active, age_seconds);
-    if (age_text == nil || !service.add_field(active, "age", age_text)) {
-        ret exchange.SERVICE_FAILED;
-    }
-    store.touch(?layer.backing, index);
-    store.record_hit(?layer.backing);
-    if (!status.permits_content(call.request(active).method.kind, entry.status)
-     || entry.body_length == 0) {
-        ret service.commit_bodyless(active, call.BODY_DRAIN);
-    }
+    if (age_text == nil) { ret false; }
+    ret service.add_field(active, "age", age_text);
+}
+
+fun request_header(request: *message.Request, name: str, length: usize) view.View {
+    val found: *field.Field = field.find_first(?request.fields, view.view(name, length));
+    if (found == nil) { ret view.view(nil, 0); }
+    ret found.value;
+}
+
+# attach a reader over `[first, last]` of the stored representation
+fun attach_stored_body(layer: *Layer, active: *call.Call, index: usize, first: usize,
+    last_exclusive: usize) bool {
     val a: *allocator.Allocator = call.allocator_of(active);
-    if (a == nil) { ret exchange.SERVICE_FAILED; }
+    if (a == nil) { ret false; }
     val allocated: Result[*StoredBody, *u8] = allocator.allocate[StoredBody](a, 1);
-    if (is_err[*StoredBody, *u8](allocated)) { ret exchange.SERVICE_FAILED; }
+    if (is_err[*StoredBody, *u8](allocated)) { ret false; }
     val state: *StoredBody = unwrap_ok[*StoredBody, *u8](allocated);
     state.layer = layer;
     state.index = index;
-    state.offset = 0;
-    state.length = entry.body_length;
-    val measured: str = service.arena_number(active, entry.body_length::u64);
-    if (measured == nil) { ret exchange.SERVICE_FAILED; }
-    if (field.find_first(?response.fields, service.text_view(field.CONTENT_LENGTH)) == nil
-     && !service.add_field(active, field.CONTENT_LENGTH, measured)) {
-        ret exchange.SERVICE_FAILED;
-    }
+    state.offset = first;
+    state.limit = last_exclusive;
+    val response: *message.Response = call.response(active);
+    val configured: message.Limits = call.limits(active);
+    val count: usize = last_exclusive - first;
+    val measured: str = service.arena_number(active, count::u64);
+    if (measured == nil) { ret false; }
+    if (!service.add_field(active, field.CONTENT_LENGTH, measured)) { ret false; }
     state.reader = body.init_reader(
         (state)::ptr,
         stored_read,
@@ -220,13 +278,112 @@ fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
         body.OWNER_APPLICATION,
         response.generation,
         true,
-        entry.body_length::u64,
+        count::u64,
         configured.response_body,
         nil,
         call.scope(active),
     );
-    if (!state.reader.valid) { ret exchange.SERVICE_FAILED; }
+    if (!state.reader.valid) { ret false; }
     if (message.set_body_reader(response, ?state.reader, configured) != message.RESPONSE_OK) {
+        ret false;
+    }
+    ret true;
+}
+
+# emit a stored representation, including the Age it has accumulated
+#
+# a hit is answered here in full: the preconditions the client sent are evaluated
+# against the stored validators, and a byte range is served out of the stored
+# bytes. Going to the origin for either would make a cache hit cost an origin
+# request, which is the one thing a cache exists to avoid.
+fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
+    now: time.Time) exchange.ServiceStatus {
+    val entry: *store.Entry = store.entry_at(?layer.backing, index);
+    val response: *message.Response = call.response(active);
+    val request: *message.Request = call.request(active);
+    if (entry == nil || response == nil || request == nil) { ret exchange.SERVICE_FAILED; }
+    store.touch(?layer.backing, index);
+    store.record_hit(?layer.backing);
+
+    val current: validator.Validators = stored_validators(entry);
+    val precondition: validator.Outcome = validator.evaluate(request, current);
+    if (precondition == validator.PRECONDITION_FAILED) {
+        ret service.respond(active, status.PRECONDITION_FAILED);
+    }
+    if (precondition == validator.NOT_MODIFIED) {
+        if (message.set_status(response, status.NOT_MODIFIED) != message.RESPONSE_OK) {
+            ret exchange.SERVICE_FAILED;
+        }
+        if (!copy_stored_fields(entry, response, true, true)) { ret exchange.SERVICE_FAILED; }
+        if (!add_age(layer, active, entry, now)) { ret exchange.SERVICE_FAILED; }
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+
+    val bodyless: bool = !status.permits_content(request.method.kind, entry.status)
+        || entry.body_length == 0;
+    var span: range.Span = range.Span{outcome: range.NO_RANGE, first: 0, last: 0, length: 0};
+    if (!bodyless && entry.status == status.OK) {
+        val asked: view.View = request_header(request, field.RANGE, 5);
+        if (asked.data != nil && asked.len != 0 && validator.range_allowed(request, current)) {
+            span = range.resolve(asked, entry.body_length::u64);
+        }
+    }
+    if (span.outcome == range.UNSATISFIABLE) {
+        var text: [range.CONTENT_RANGE_CAPACITY]u8;
+        val length: usize = range.format_unsatisfied(entry.body_length::u64, ?text[0],
+            range.CONTENT_RANGE_CAPACITY);
+        if (message.set_status(response, status.RANGE_NOT_SATISFIABLE) != message.RESPONSE_OK) {
+            ret exchange.SERVICE_FAILED;
+        }
+        val stored_text: *u8 = service.arena_bytes(active, length);
+        if (stored_text == nil) { ret exchange.SERVICE_FAILED; }
+        var i: usize = 0;
+        for (i < length) { stored_text[i] = text[i]; i = i + 1; }
+        if (message.add_field(response, field.Field{
+            name: view.view("content-range", 13),
+            value: view.view(stored_text, length),
+            sensitive: false,
+        }) != field.ADD_OK) { ret exchange.SERVICE_FAILED; }
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+
+    val partial: bool = span.outcome == range.SATISFIABLE;
+    var code: status.Status = entry.status;
+    if (partial) { code = status.PARTIAL_CONTENT; }
+    if (message.set_status(response, code) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!copy_stored_fields(entry, response, false, true)) { ret exchange.SERVICE_FAILED; }
+    if (!add_age(layer, active, entry, now)) { ret exchange.SERVICE_FAILED; }
+    if (partial) {
+        var text: [range.CONTENT_RANGE_CAPACITY]u8;
+        val length: usize = range.format_content_range(span, entry.body_length::u64, ?text[0],
+            range.CONTENT_RANGE_CAPACITY);
+        if (length == 0) { ret exchange.SERVICE_FAILED; }
+        val stored_text: *u8 = service.arena_bytes(active, length);
+        if (stored_text == nil) { ret exchange.SERVICE_FAILED; }
+        var i: usize = 0;
+        for (i < length) { stored_text[i] = text[i]; i = i + 1; }
+        if (message.add_field(response, field.Field{
+            name: view.view("content-range", 13),
+            value: view.view(stored_text, length),
+            sensitive: false,
+        }) != field.ADD_OK) { ret exchange.SERVICE_FAILED; }
+    }
+    if (bodyless) {
+        if (!service.add_field(active, field.CONTENT_LENGTH,
+            service.arena_number(active, entry.body_length::u64))) {
+            ret exchange.SERVICE_FAILED;
+        }
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+    var first: usize = 0;
+    var last_exclusive: usize = entry.body_length;
+    if (partial) {
+        first = span.first::usize;
+        last_exclusive = (span.last + 1)::usize;
+    }
+    if (!attach_stored_body(layer, active, index, first, last_exclusive)) {
         ret exchange.SERVICE_FAILED;
     }
     if (!call.resolve_body(active, call.BODY_DRAIN)) { ret exchange.SERVICE_FAILED; }
@@ -299,8 +456,10 @@ fun on_head(context: ptr, active: *call.Call) bool {
     for (i < response.fields.len) {
         val item: *field.Field = ?response.fields.items[i];
         # hop-by-hop fields belong to the connection that carried them, not to the
-        # representation, so a stored entry must not replay them at the next client
-        if (forward.forwardable(?response.fields, item.name)) {
+        # representation, so a stored entry must not replay them at the next client,
+        # and a field the origin named as one user's own is dropped with them
+        if (forward.forwardable(?response.fields, item.name)
+         && !policy.excluded_field(response_directives, item.name)) {
             if (!store.add_field(?state.writer, item.name, item.value)) {
                 store.abandon(?state.writer);
                 ret false;
@@ -373,28 +532,37 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     if (!keyed) { ret forward_to_inner(binding, active); }
 
     var revalidating_index: usize = store.NO_ENTRY;
-    val index: usize = store.lookup(?layer.backing, ?identity);
+    # one key may hold several representations of the same target, so every entry
+    # filed under it is a candidate and the selecting values decide which answers.
+    # taking the first match instead would serve a representation negotiated for
+    # somebody else, and would leave every other variant permanently unreachable.
+    var index: usize = store.NO_ENTRY;
+    var candidate: usize = store.find_from(?layer.backing, ?identity, 0);
+    for (candidate != store.NO_ENTRY) {
+        val held: *store.Entry = store.entry_at(?layer.backing, candidate);
+        if (held != nil && key.matches(?held.dimensions, request)) {
+            index = candidate;
+            candidate = store.NO_ENTRY;
+        } or {
+            candidate = store.find_from(?layer.backing, ?identity, candidate + 1);
+        }
+    }
     if (index != store.NO_ENTRY) {
         val entry: *store.Entry = store.entry_at(?layer.backing, index);
-        if (entry != nil && key.matches(?entry.dimensions, request)) {
-            val decision: policy.Reuse = policy.reuse(entry.metadata, request_directives, now);
-            if (decision == policy.FRESH || decision == policy.STALE_SERVABLE) {
+        val decision: policy.Reuse = policy.reuse(entry.metadata, request_directives, now);
+        if (decision == policy.FRESH || decision == policy.STALE_SERVABLE) {
+            ret serve_stored(layer, active, index, now);
+        }
+        if (decision == policy.REVALIDATE) {
+            # one revalidation at a time: a second request for the same stale
+            # entry is served stale rather than starting its own fetch
+            if (entry.revalidating && policy.servable_on_error(entry.metadata, now)) {
                 ret serve_stored(layer, active, index, now);
             }
-            if (decision == policy.REVALIDATE) {
-                # one revalidation at a time: a second request for the same stale
-                # entry is served stale rather than starting its own fetch
-                if (entry.revalidating && policy.servable_on_error(entry.metadata, now)) {
-                    ret serve_stored(layer, active, index, now);
-                }
-                if (!entry.revalidating) {
-                    entry.revalidating = true;
-                    revalidating_index = index;
-                }
+            if (!entry.revalidating) {
+                entry.revalidating = true;
+                revalidating_index = index;
             }
-        } or {
-            # the stored representation was negotiated for a different request
-            store.record_miss(?layer.backing);
         }
     }
     store.record_miss(?layer.backing);
@@ -475,7 +643,8 @@ pub fun wrapper(context: ptr, configured: *schema.Service, inner: service.Handle
 # build a layer from configuration; a configuration with caching off constructs
 # nothing and reports that plainly
 pub fun from_config(layer: *Layer, configured: *schema.Cache, entries: *store.Entry,
-    capacity: usize, body_storage: *u8, body_capacity: usize) bool {
+    capacity: usize, body_storage: *u8, body_capacity: usize,
+    scratch: *allocator.Allocator) bool {
     if (layer == nil || configured == nil) { ret false; }
     if (!configured.enabled) {
         layer.live = false;
@@ -494,7 +663,7 @@ pub fun from_config(layer: *Layer, configured: *schema.Cache, entries: *store.En
         ret false;
     }
     if (configured.disk_bytes != 0 && configured.disk_root.len != 0) {
-        if (!attach_disk(layer, schema.text(?configured.disk_root))) {
+        if (!attach_disk(layer, schema.text(?configured.disk_root), scratch)) {
             close(layer);
             ret false;
         }
