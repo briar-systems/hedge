@@ -36,8 +36,19 @@ pub rec Slot {
     waiting: bool;
     token: listener.ConnectionToken;
     handle: *connection.Connection;
+    budgets: *budget.Set;
     charge: budget.Charge;
-    owned_index: usize;
+}
+
+rec BudgetGeneration {
+    set: budget.Set;
+    storage: [schema.MAX_BUDGETS]budget.Budget;
+}
+
+fun timeout_nanoseconds(milliseconds: u64, output: *u64) bool {
+    if (output == nil || milliseconds > schema.MAX_TIMEOUT_MS) { ret false; }
+    @output = milliseconds * 1000000;
+    ret true;
 }
 
 # a service plane the serving loop must drive alongside connections
@@ -55,6 +66,7 @@ pub rec Runtime {
     live: usize;
     next_id: u64;
     plan: *plan.Plan;
+    graph: *schema.Graph;
     configured: connection.Config;
     limits: message.Limits;
     observability: *telemetry.Runtime;
@@ -67,10 +79,27 @@ pub rec Runtime {
     # that does not exist, which is how a total teardown failure stayed
     # invisible until the shutdown sequence started reporting its outcome.
     teardown_failures: u64;
-    budgets: budget.Set;
-    budget_storage: [schema.MAX_BUDGETS]budget.Budget;
+    budget_generations: [2]BudgetGeneration;
+    active_budgets: *budget.Set;
     queued: u64;
     expired: u64;
+}
+
+fun configure_budgets(target: *BudgetGeneration, graph: *schema.Graph) bool {
+    if (target == nil || graph == nil || !budget.make(?target.set,
+        ?target.storage[0], schema.MAX_BUDGETS)) { ret false; }
+    var i: usize = 0;
+    for (i < graph.budget_count) {
+        val configured: *schema.Budget = ?graph.budgets[i];
+        var timeout_ns: u64 = 0;
+        if (!timeout_nanoseconds(configured.timeout_ms, ?timeout_ns)) { ret false; }
+        if (budget.define(?target.set, schema.text(?configured.name),
+            configured.concurrency, configured.queue,
+            timeout_ns,
+            configured.memory_bytes) == budget.NO_BUDGET) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 pub fun make(
@@ -91,6 +120,7 @@ pub fun make(
     runtime.live = 0;
     runtime.next_id = 1;
     runtime.plan = active_plan;
+    runtime.graph = graph;
     runtime.configured = connection.config_from(graph);
     runtime.limits = connection.message_limits(graph, runtime.configured);
     runtime.observability = nil;
@@ -100,26 +130,19 @@ pub fun make(
     runtime.accepted = 0;
     runtime.rejected = 0;
     runtime.shutdown = lifecycle.make();
-    runtime.drain_timeout_ns = graph.timeouts.drain_ms * 1000000;
+    if (!timeout_nanoseconds(graph.timeouts.drain_ms,
+        ?runtime.drain_timeout_ns)) { ret false; }
     runtime.queued = 0;
     runtime.expired = 0;
     runtime.teardown_failures = 0;
-    if (!budget.make(?runtime.budgets, ?runtime.budget_storage[0],
-        schema.MAX_BUDGETS)) { ret false; }
-    var b: usize = 0;
-    for (b < graph.budget_count) {
-        val configured: *schema.Budget = ?graph.budgets[b];
-        budget.define(?runtime.budgets, schema.text(?configured.name),
-            configured.concurrency, configured.queue,
-            configured.timeout_ms * 1000000, configured.memory_bytes);
-        b = b + 1;
-    }
+    if (!configure_budgets(?runtime.budget_generations[0], graph)) { ret false; }
+    runtime.active_budgets = ?runtime.budget_generations[0].set;
     var i: usize = 0;
     for (i < capacity) {
         slots[i].live = false;
         slots[i].waiting = false;
+        slots[i].budgets = nil;
         slots[i].charge = budget.no_charge();
-        slots[i].owned_index = 0;
         slots[i].handle = ?connections[i];
         i = i + 1;
     }
@@ -249,7 +272,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
             policy = hedge_tls.find(schema.text(?owned.name));
         }
         if (owned == nil || !connection.make(slot.handle, runtime.next_id, runtime.generation,
-            token, source, ?runtime.owner.network, runtime.plan, ?runtime.budgets,
+            token, source, ?runtime.owner.network, runtime.plan, runtime.active_budgets,
             runtime.configured, runtime.limits, owned, policy, now)) {
             runtime.rejected = runtime.rejected + 1;
             if (!listener.close_connection(?runtime.owner, token)) {
@@ -259,17 +282,17 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
         }
         slot.live = true;
         slot.waiting = false;
+        slot.budgets = runtime.active_budgets;
         slot.token = token;
-        slot.owned_index = source.listener_index;
         runtime.next_id = runtime.next_id + 1;
         runtime.live = runtime.live + 1;
         runtime.accepted = runtime.accepted + 1;
         admitted = admitted + 1;
         # the budget is charged after the connection exists but before it is
         # driven, which is the last point at which refusing it costs nothing
-        val allowance: usize = listener_budget(runtime, owned);
-        val outcome: budget.Outcome = budget.charge(?runtime.budgets, allowance, 0,
-            now, ?slot.charge);
+        val allowance: usize = listener_budget(runtime, source.listener_index);
+        val outcome: budget.Outcome = budget.charge(slot.budgets, allowance,
+            $size_of(connection.Connection), now, ?slot.charge);
         if (outcome == budget.QUEUED) {
             slot.waiting = true;
             runtime.queued = runtime.queued + 1;
@@ -281,9 +304,13 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
     ret admitted;
 }
 
-fun listener_budget(runtime: *Runtime, owned: *listener.OwnedListener) usize {
-    if (owned == nil || owned.policy.budget.len == 0) { ret budget.NO_BUDGET; }
-    ret budget.find(?runtime.budgets, schema.text(?owned.policy.budget));
+fun listener_budget(runtime: *Runtime, index: usize) usize {
+    if (runtime.graph == nil || index >= runtime.graph.listener_count) {
+        ret budget.NO_BUDGET;
+    }
+    val configured: *schema.Listener = ?runtime.graph.listeners[index];
+    if (configured.budget.len == 0) { ret budget.NO_BUDGET; }
+    ret budget.find(runtime.active_budgets, schema.text(?configured.budget));
 }
 
 # a connection holding a place in its budget's queue tries again, and is closed
@@ -293,7 +320,7 @@ fun admit_waiting(runtime: *Runtime, now: time.Time) {
     for (i < runtime.capacity) {
         val slot: *Slot = ?runtime.slots[i];
         if (!slot.live || !slot.waiting) { i = i + 1; cnt; }
-        val outcome: budget.Outcome = budget.retry(?runtime.budgets, ?slot.charge,
+        val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge,
             now);
         if (outcome == budget.ADMITTED) { slot.waiting = false; }
         or (outcome != budget.QUEUED) {
@@ -308,7 +335,8 @@ fun retire(runtime: *Runtime, index: usize) {
     if (index >= runtime.capacity) { ret; }
     val slot: *Slot = ?runtime.slots[index];
     if (!slot.live) { ret; }
-    budget.release(?runtime.budgets, ?slot.charge);
+    budget.release(slot.budgets, ?slot.charge);
+    slot.budgets = nil;
     slot.waiting = false;
     runtime.served = runtime.served + slot.handle.requests;
     # both of these can fail, and a failed release means the listener never
@@ -377,7 +405,8 @@ fun run_signal(runtime: *Runtime) bool {
     for (i < runtime.capacity) {
         # HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
         # reading. the engine decides which; the runtime only asks.
-        if (runtime.slots[i].live) { connection.begin_graceful(runtime.slots[i].handle); }
+        if (runtime.slots[i].live
+         && !connection.begin_graceful(runtime.slots[i].handle)) { ok = false; }
         i = i + 1;
     }
     ret ok;
@@ -385,12 +414,13 @@ fun run_signal(runtime: *Runtime) bool {
 
 # step 5 cancel whatever the deadline did not let finish
 fun run_cancel(runtime: *Runtime) bool {
+    val failures: u64 = runtime.teardown_failures;
     var i: usize = 0;
     for (i < runtime.capacity) {
         if (runtime.slots[i].live) { retire(runtime, i); }
         i = i + 1;
     }
-    ret true;
+    ret runtime.teardown_failures == failures;
 }
 
 fun run_action(runtime: *Runtime, action: lifecycle.Action) {
@@ -454,55 +484,93 @@ pub fun reload(runtime: *Runtime, generation: u64, active_plan: *plan.Plan,
     graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
     if (runtime == nil || active_plan == nil || graph == nil || diagnostics == nil
      || runtime.state != READY || !plan.sealed(active_plan)
+     || active_plan.generation != generation
      || generation <= runtime.generation) { ret false; }
     # a reload during shutdown would publish listeners the sequence has already
     # decided to stop accepting on
     if (!lifecycle.serving(?runtime.shutdown)) { ret false; }
+    var drain_timeout_ns: u64 = 0;
+    if (!timeout_nanoseconds(graph.timeouts.drain_ms, ?drain_timeout_ns)) {
+        ret false;
+    }
+    var next: *BudgetGeneration = ?runtime.budget_generations[0];
+    if (runtime.active_budgets == ?runtime.budget_generations[0].set) {
+        next = ?runtime.budget_generations[1];
+    }
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (runtime.slots[i].live
+         && runtime.slots[i].budgets == ?next.set) { ret false; }
+        i = i + 1;
+    }
+    if (!configure_budgets(next, graph)) { ret false; }
     # rebinding is only attempted when the listener set actually changed. a
     # routing reload must not disturb sockets it is not altering, and
     # `listener.reload` binds the candidate set before draining the previous
     # one, so rebinding an unchanged address fails outright: the old listener
     # still holds it and SO_REUSEADDR does not permit two live listeners on one
     # address.
-    if (listeners_changed(runtime, graph)
-     && !listener.reload(?runtime.owner, generation, graph, diagnostics)) {
-        ret false;
+    if (listeners_changed(runtime, graph)) {
+        if (!listener.reload(?runtime.owner, generation, graph, diagnostics)) {
+            ret false;
+        }
     }
     runtime.plan = active_plan;
+    runtime.graph = graph;
     runtime.generation = generation;
+    runtime.active_budgets = ?next.set;
     runtime.configured = connection.config_from(graph);
     runtime.limits = connection.message_limits(graph, runtime.configured);
-    runtime.drain_timeout_ns = graph.timeouts.drain_ms * 1000000;
-    var i: usize = 0;
+    runtime.drain_timeout_ns = drain_timeout_ns;
+    var signalled: bool = true;
+    i = 0;
     for (i < runtime.capacity) {
         # every connection from an older generation finishes what it is doing
         # and then closes, independently of the ones accepted since
         if (runtime.slots[i].live
          && runtime.slots[i].handle.generation != generation) {
-            connection.begin_graceful(runtime.slots[i].handle);
+            if (!connection.begin_graceful(runtime.slots[i].handle)) {
+                signalled = false;
+            }
         }
         i = i + 1;
     }
+    # publication already happened, so a signalling failure cannot be reported
+    # as a rejected reload. enter the ordered shutdown path and surface it there.
+    if (!signalled) { begin_shutdown(runtime, time.now()); }
     ret true;
 }
 
 # whether the candidate names a different set of listeners than the active one
 fun listeners_changed(runtime: *Runtime, graph: *schema.Graph) bool {
+    if (runtime.graph == nil
+     || runtime.graph.listener_count != graph.listener_count) { ret true; }
     var i: usize = 0;
     for (i < graph.listener_count) {
         val configured: *schema.Listener = ?graph.listeners[i];
-        val owned: *listener.OwnedListener = listener.active_listener(?runtime.owner, i);
-        if (owned == nil) { ret true; }
-        if (!schema.text_equals(?owned.name, schema.text(?configured.name))
-         || !schema.text_equals(?owned.configured_address,
+        val active: *schema.Listener = ?runtime.graph.listeners[i];
+        if (!schema.text_equals(?active.name, schema.text(?configured.name))
+         || !schema.text_equals(?active.address,
             schema.text(?configured.address))
-         || owned.transport != configured.transport
-         || owned.policy.protocols != configured.protocols
-         || !schema.text_equals(?owned.policy.tls_policy,
-            schema.text(?configured.tls_policy))) { ret true; }
+         || active.transport != configured.transport
+         || active.protocols != configured.protocols
+         || !schema.text_equals(?active.tls_policy,
+            schema.text(?configured.tls_policy))
+         || active.backlog != configured.backlog
+         || active.accept_depth != configured.accept_depth
+         || active.proxy_protocol != configured.proxy_protocol
+         || active.trusted_peer_count != configured.trusted_peer_count) {
+            ret true;
+        }
+        var peer: usize = 0;
+        for (peer < active.trusted_peer_count) {
+            if (!schema.text_equals(?active.trusted_peers[peer],
+                schema.text(?configured.trusted_peers[peer]))) { ret true; }
+            peer = peer + 1;
+        }
         i = i + 1;
     }
-    ret listener.active_listener(?runtime.owner, graph.listener_count) != nil;
+    ret false;
 }
 
 # live connections still belonging to a superseded generation
@@ -586,7 +654,8 @@ pub fun stop(runtime: *Runtime) bool {
         } or { run_action(runtime, action); }
         guard = guard + 1;
     }
-    ret lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED;
+    ret lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED
+        && runtime.teardown_failures == 0;
 }
 
 pub fun bound_endpoint_text(runtime: *Runtime, index: usize, output: *u8, capacity: usize) usize {
