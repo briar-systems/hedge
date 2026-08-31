@@ -166,14 +166,18 @@ superseded generation drains independently of the one that replaced it. A second
 reload is deferred until the previous generation has drained, so only one
 superseded generation exists at a time.
 
-A reload changes routes, virtual hosts and budgets. It **refuses a candidate
-whose service set differs** — a service's kind, name, or target — and keeps the
-running configuration, naming the change. Service instances own generation-wide
-state that a superseded plan still points into, so replacing one under a request
-in flight would reuse storage that request is still using. Changing a service
-definition requires a restart. A reload that changes a listener's address,
-transport, protocols or TLS policy rebinds; one that does not leaves the sockets
-untouched.
+A reload changes routes, virtual hosts and budgets. It recompiles those routes
+against the existing service instances without calling their factories again.
+It refuses a candidate that changes startup-owned state. That includes service
+identity or construction fields, feature selection, TLS policy, secrets,
+telemetry, cache, ACME, administration, the server name, and process-wide
+connection limits. Cache-wrapped services currently require restart even when
+unchanged because their wrapper binds the descriptor owned by the active plan.
+Service instances own state that a superseded plan still points into, so
+replacing or reconstructing one under a request in flight would reuse storage
+that request is still using. A reload may change plaintext listener policy and
+may rebind a secure listener without changing its name, TLS policy, or protocol
+set. An unchanged listener set leaves the sockets untouched.
 
 A host names itself with either `server_name` for a single name or `names` for several; declaring both is a conflict, and declaring neither uses the host block's own key as its name. Every name a host declares is a name it answers to, and each is compiled into its own routing pattern, so a host with three names serves all three rather than only the first. A name may be an exact host, a `*.suffix` wildcard, or carry an explicit port.
 
