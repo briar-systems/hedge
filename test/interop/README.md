@@ -81,6 +81,8 @@ Composition and optional resources:
   runtime suite
 - disabling cache leaves the configured route live without allocating the cache
   arena or opening a cache file, timer, or worker
+- a service-changing reload leaves an in-flight connection on its old handler,
+  then publishes and reclaims twelve successive service generations
 
 The PROXY protocol legs also cover the positive direction: a trusted v1 header
 followed by an HTTP/1 request is served, and a trusted header followed by the
