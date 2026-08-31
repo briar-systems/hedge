@@ -58,6 +58,12 @@ Credential selection:
 - a server name with no matching identity and no default, refused with
   `unrecognized_name`
 
+Session resumption:
+
+- OpenSSL receives and resumes a TLS 1.3 session ticket
+- a second presentation of the same ticket under `single_use` falls back to a
+  full handshake
+
 Refusals, each of which must fail the way policy says rather than falling
 through to a default:
 
@@ -88,7 +94,7 @@ HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-32 legs passed, 0 failed, on linux-x86_64 against:
+35 legs passed, 0 failed, on linux-x86_64 against:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3
@@ -112,6 +118,4 @@ replacement serves.
   certificate paths are exercised only through the clients above.
 - TLS 1.2. hedge configures its listeners for TLS 1.3 only, and the matrix
   asserts that a TLS 1.2 client is refused rather than served.
-- Session resumption and client certificates. `mach-tls` supports both and
-  hedge's listener configuration does not offer them yet.
 - Concurrency beyond one client at a time. Every leg runs against an idle server.
