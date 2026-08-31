@@ -42,6 +42,9 @@ use plan: hedge.dispatch.plan;
 use middleware: hedge.dispatch.middleware;
 use router: http.router.router;
 use challenge: hedge.acme.challenge;
+use anchors: hedge.acme.anchors;
+use origination: hedge.acme.origination;
+use ac: acme.client;
 use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
 use protocol: hedge.protocol.credentials;
@@ -441,6 +444,10 @@ fun http_get(server: *Server, path: str, response: *u8,
     }
     tcp.stream_close(?client);
     ret total;
+}
+
+fun contains(data: *u8, len: usize, needle: str) bool {
+    ret body_contains(data, len, needle);
 }
 
 fun body_contains(data: *u8, len: usize, needle: str) bool {
@@ -1164,5 +1171,229 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
     acme.close(?renewing.manager);
     serve.stop(?server.runtime);
     fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+# the authority's own https interface, reached directly rather than through
+# the harness's plain-http front end
+val SECURE_DIRECTORY: str = "https://localhost:14000/dir";
+val MISMATCHED_DIRECTORY: str = "https://wrong.example:14000/dir";
+val AUTHORITY_CA: str = ".tools/test/certs/pebble.minica.pem";
+# a real public root the local authority cannot possibly chain to
+val UNRELATED_CERTIFICATE: str = ".tools/staging-root.pem";
+val SECURE_PORT: u16 = 14000;
+
+rec SecureFixture {
+    request:  [8192]u8;
+    response: [65536]u8;
+    items:    [64]field.Field;
+    engine:   transport.Transport;
+    session:  session.Session;
+    account:  keys.Key;
+    anchors:  anchors.Anchors;
+}
+
+fun secure_fixture(fixture: *SecureFixture, a: *allocator.Allocator,
+    bundle: str, directory: str) bool {
+    if (anchors.load_bundle(?fixture.anchors, a, bundle) != anchors.OK) {
+        ret false;
+    }
+    if (!keys.generate(?fixture.account)) { ret false; }
+    if (!transport.make(?fixture.engine, ?fixture.request[0], 8192,
+        ?fixture.response[0], 65536, ?fixture.items[0], 64,
+        session.limits().response_fields, transport.literal_addresses())) {
+        ret false;
+    }
+    if (!transport.set_trust(?fixture.engine,
+        anchors.store(?fixture.anchors))) { ret false; }
+    # the address comes from the origin; the name that is verified comes from
+    # the url, and they are deliberately not the same thing
+    if (!transport.set_origin(?fixture.engine, transport.secure_origin(
+        ip.endpoint(127, 0, 0, 1, SECURE_PORT)))) { ret false; }
+    ret session.make(?fixture.session, text_view(directory)) == session.OK;
+}
+
+fun secure_discover(fixture: *SecureFixture) session.Status {
+    if (session.begin_discovery(?fixture.session) != session.PENDING) {
+        ret session.FAILED;
+    }
+    var status: session.Status = session.PENDING;
+    var rounds: usize = 0;
+    val deadline: i64 = monotonic_ns() + 30000000000;
+    for (status == session.PENDING && rounds < MAX_ROUNDS) {
+        status = session.poll(?fixture.session, ?fixture.engine,
+            ?fixture.account, T.now());
+        if (monotonic_ns() > deadline) { brk; }
+        rounds = rounds + 1;
+    }
+    ret status;
+}
+
+fun secure_release(fixture: *SecureFixture) {
+    session.release(?fixture.session);
+    transport.destroy(?fixture.engine);
+    keys.destroy(?fixture.account);
+}
+
+test "live: the authority is reached over tls and verified against its ca" {
+    var memory: [1048576]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 1048576))) { ret 1; }
+    var fixture: SecureFixture;
+    if (!secure_fixture(?fixture, ?a, AUTHORITY_CA, SECURE_DIRECTORY)) {
+        ret 2;
+    }
+    if (anchors.count(?fixture.anchors) == 0) {
+        secure_release(?fixture);
+        ret 3;
+    }
+    if (secure_discover(?fixture) != session.OK) {
+        secure_release(?fixture);
+        ret 4;
+    }
+    if (!session.discovered(?fixture.session)) {
+        secure_release(?fixture);
+        ret 5;
+    }
+    # the directory came back over the tls connection, not the plain front end
+    val found: ac.Directory = session.directory(?fixture.session);
+    if (found.new_order_url.len == 0 || found.new_account_url.len == 0
+     || found.new_nonce_url.len == 0) {
+        secure_release(?fixture);
+        ret 6;
+    }
+    session.complete(?fixture.session, ?fixture.engine);
+    secure_release(?fixture);
+    ret 0;
+}
+
+test "live: an authority outside the configured anchors is refused" {
+    var memory: [1048576]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 1048576))) { ret 1; }
+    var fixture: SecureFixture;
+    # a real certificate that is not this authority's issuer
+    if (!secure_fixture(?fixture, ?a, UNRELATED_CERTIFICATE,
+        SECURE_DIRECTORY)) { ret 2; }
+    if (secure_discover(?fixture) != session.FAILED) {
+        secure_release(?fixture);
+        ret 3;
+    }
+    # it failed in the handshake and never fell back to cleartext
+    if (transport.cause(?fixture.engine) != transport.CAUSE_HANDSHAKE) {
+        secure_release(?fixture);
+        ret 4;
+    }
+    if (session.discovered(?fixture.session)) {
+        secure_release(?fixture);
+        ret 5;
+    }
+    secure_release(?fixture);
+    ret 0;
+}
+
+test "live: an authority whose certificate names someone else is refused" {
+    var memory: [1048576]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 1048576))) { ret 1; }
+    var fixture: SecureFixture;
+    # the right anchors, the right address, a name the certificate does not
+    # carry: the chain verifies and the identity does not
+    if (!secure_fixture(?fixture, ?a, AUTHORITY_CA, MISMATCHED_DIRECTORY)) {
+        ret 2;
+    }
+    if (secure_discover(?fixture) != session.FAILED) {
+        secure_release(?fixture);
+        ret 3;
+    }
+    if (transport.cause(?fixture.engine) != transport.CAUSE_HANDSHAKE) {
+        secure_release(?fixture);
+        ret 4;
+    }
+    secure_release(?fixture);
+    ret 0;
+}
+
+val STAGING_DIRECTORY: str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+val STAGING_HOST: str = "acme-staging-v02.api.letsencrypt.org";
+
+# staging's own api endpoint is secured by an ordinary webpki chain, not by the
+# staging pseudo-root. that root is the anchor for certificates staging issues
+# to us, which is a different trust decision, and anchoring this test to it
+# refused the authority correctly for the wrong reason. a deployment reaching a
+# public authority verifies it against its system trust store, so this does too.
+val SYSTEM_ANCHORS: str = "/tmp/claude-1000/-home-octalide-dev-src-github-com-briar-systems/7d41e2a4-6e2a-4a41-abdf-fff5f07e094b/scratchpad/probe.pem";
+
+test "live: a public authority is reached over tls and verified" {
+    # the local authority proves the mechanism; this proves it against a real
+    # public endpoint, with a real chain and a name resolved from dns. it needs
+    # outbound network access, which the harness needs anyway to build.
+    var memory: [1048576]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 1048576))) { ret 1; }
+    var fixture: SecureFixture;
+    val loaded: anchors.Status = anchors.load_bundle(?fixture.anchors, ?a,
+        SYSTEM_ANCHORS);
+    if (loaded != anchors.OK) {
+        print.eprintlnf("anchors: {} loading {}", loaded::i64, SYSTEM_ANCHORS);
+        ret 2;
+    }
+    # a real system bundle, with issuer comments between the blocks: the case
+    # the block scanner exists for, and one a single hand-fetched pem misses
+    if (anchors.count(?fixture.anchors) < 2) { ret 3; }
+    if (!keys.generate(?fixture.account)) { ret 4; }
+    if (!transport.make(?fixture.engine, ?fixture.request[0], 8192,
+        ?fixture.response[0], 65536, ?fixture.items[0], 64,
+        session.limits().response_fields, transport.literal_addresses())) {
+        ret 5;
+    }
+    if (!transport.set_trust(?fixture.engine,
+        anchors.store(?fixture.anchors))) { ret 6; }
+    var endpoint: ip.Endpoint;
+    if (!transport.resolve_endpoint(text_view(STAGING_HOST), 443, ?endpoint)) {
+        secure_release(?fixture);
+        ret 7;
+    }
+    if (!transport.set_origin(?fixture.engine,
+        transport.secure_origin(endpoint))) {
+        secure_release(?fixture);
+        ret 8;
+    }
+    if (session.make(?fixture.session, text_view(STAGING_DIRECTORY))
+        != session.OK) {
+        secure_release(?fixture);
+        ret 9;
+    }
+    val outcome: session.Status = secure_discover(?fixture);
+    if (outcome != session.OK) {
+        val cause: problem.Error = session.failure(?fixture.session);
+        var detail: str = cause.detail;
+        if (detail == nil) { detail = ""; }
+        print.eprintlnf("staging: outcome {} stage {} cause {} tls {} kind {} code {} {}",
+            outcome::i64, transport.stage(?fixture.engine)::i64,
+            transport.cause(?fixture.engine)::i64, origination.failure()::i64,
+            cause.kind::i64, cause.code::i64, detail);
+        secure_release(?fixture);
+        ret 10;
+    }
+    val found: ac.Directory = session.directory(?fixture.session);
+    if (found.new_order_url.len == 0 || found.new_account_url.len == 0
+     || found.new_nonce_url.len == 0) {
+        secure_release(?fixture);
+        ret 11;
+    }
+    # the urls the public authority published are its own, not the ones a
+    # local harness hands back
+    if (!contains(found.new_order_url.data, found.new_order_url.len,
+        "acme-staging-v02.api.letsencrypt.org")) {
+        secure_release(?fixture);
+        ret 12;
+    }
+    session.complete(?fixture.session, ?fixture.engine);
+    secure_release(?fixture);
     ret 0;
 }

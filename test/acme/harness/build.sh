@@ -52,4 +52,20 @@ if [ ! -f "$tools/test/config/pebble-config.json" ]; then
     chmod -R u+w "$tools/test"
 fi
 
+# a real, unrelated public root: the authority under test cannot chain to it,
+# which is what makes "refused outside the configured anchors" mean something.
+# it is not what secures staging's own api endpoint, which uses an ordinary
+# webpki chain; that test verifies against the system trust store instead.
+if [ ! -f "$tools/staging-root.pem" ]; then
+    echo "fetching the public staging root"
+    if ! curl -fsS --max-time 30 \
+        https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem \
+        -o "$tools/staging-root.pem.partial"; then
+        echo "could not fetch the staging root; the public-authority test needs network access" >&2
+        rm -f "$tools/staging-root.pem.partial"
+        exit 1
+    fi
+    mv "$tools/staging-root.pem.partial" "$tools/staging-root.pem"
+fi
+
 echo "live acme stack built in $tools"
