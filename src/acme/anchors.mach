@@ -21,10 +21,6 @@ use std.types.result.unwrap_ok;
 use std.allocator;
 use std.allocator.fixed;
 use O: std.types.option;
-use std.types.view;
-use T: std.chrono.time;
-use base64: std.encoding.base64;
-use tlsalpn: hedge.acme.tlsalpn;
 use fs: std.filesystem;
 use std.types.path.Path;
 use file: std.io.file;
@@ -86,6 +82,11 @@ fun matches(data: *u8, at: usize, length: usize, value: str) bool {
     ret true;
 }
 
+def BlockStatus: u8;
+val BLOCK_FOUND:     BlockStatus = 1;
+val BLOCK_EOF:       BlockStatus = 2;
+val BLOCK_MALFORMED: BlockStatus = 3;
+
 # finds the next certificate block, ignoring everything between blocks.
 #
 # a ca bundle is not a chain. every distribution writes the subject as a
@@ -94,24 +95,24 @@ fun matches(data: *u8, at: usize, length: usize, value: str) bool {
 # every deployment actually has. mach-tls's `chain_pem` is strict on purpose
 # and that strictness is right for a chain; the tolerance belongs here.
 fun next_block(data: *u8, length: usize, from: usize, start: *usize,
-    finish: *usize) bool {
+    finish: *usize) BlockStatus {
     val opening: str = "-----BEGIN CERTIFICATE-----";
     val closing: str = "-----END CERTIFICATE-----";
     var at: usize = from;
     for (at < length && !matches(data, at, length, opening)) { at = at + 1; }
-    if (at >= length) { ret false; }
+    if (at >= length) { ret BLOCK_EOF; }
     @start = at;
     var cursor: usize = at + 27;
     for (cursor < length && !matches(data, cursor, length, closing)) {
         cursor = cursor + 1;
     }
-    if (cursor >= length) { ret false; }
+    if (cursor >= length) { ret BLOCK_MALFORMED; }
     cursor = cursor + 25;
     # the decoder wants the trailing newline inside the block it is given
     if (cursor < length && data[cursor] == 13) { cursor = cursor + 1; }
     if (cursor < length && data[cursor] == 10) { cursor = cursor + 1; }
     @finish = cursor;
-    ret true;
+    ret BLOCK_FOUND;
 }
 
 # loads a PEM bundle into der the caller owns for the life of the store
@@ -132,7 +133,7 @@ pub fun load_bundle(anchors: *Anchors, a: *allocator.Allocator,
     fs.close(?handle);
     if (is_err[usize, io_error.Error](read)) { ret UNREADABLE; }
     val length: usize = unwrap_ok[usize, io_error.Error](read);
-    if (length == 0 || length > size) { ret UNREADABLE; }
+    if (length != size) { ret UNREADABLE; }
 
     # der is never longer than the base64 that encoded it, so the source
     # length is a sound bound for the decoded form
@@ -141,22 +142,25 @@ pub fun load_bundle(anchors: *Anchors, a: *allocator.Allocator,
         allocator.allocate[cert.Certificate](a, MAX_ANCHORS);
     if (is_err[*u8, *u8](der_memory)
      || is_err[*cert.Certificate, *u8](slot_memory)) { ret UNREADABLE; }
-    anchors.der = unwrap_ok[*u8, *u8](der_memory);
-    anchors.der_capacity = length;
-    anchors.certificates = unwrap_ok[*cert.Certificate, *u8](slot_memory);
+    val der_storage: *u8 = unwrap_ok[*u8, *u8](der_memory);
+    val certificate_storage: *cert.Certificate =
+        unwrap_ok[*cert.Certificate, *u8](slot_memory);
     var found: usize = 0;
     var written: usize = 0;
     var at: usize = 0;
     for (at < length) {
         var start: usize = 0;
         var finish: usize = 0;
-        if (!next_block(pem, length, at, ?start, ?finish)) { brk; }
+        val scanned: BlockStatus = next_block(pem, length, at, ?start,
+            ?finish);
+        if (scanned == BLOCK_EOF) { brk; }
+        if (scanned != BLOCK_FOUND) { ret UNDECODABLE; }
         at = finish;
         if (found >= MAX_ANCHORS) { ret TOO_LARGE; }
         var block: pem_codec.Block;
         val decoded: contracts.Error = pem_codec.decode(
             contracts.Bytes{data: ?pem[start], len: finish - start},
-            contracts.Buffer{data: ?anchors.der[written],
+            contracts.Buffer{data: ?der_storage[written],
                 capacity: length - written},
             ?block);
         # malformed pem is not an anchor and refuses the bundle
@@ -172,13 +176,16 @@ pub fun load_bundle(anchors: *Anchors, a: *allocator.Allocator,
         # system bundles include algorithms this verifier cannot represent.
         # only usable anchors enter the store, and at least one is required.
         if (parsed_status == contracts.OK) {
-            anchors.certificates[found].der = block.der.data;
-            anchors.certificates[found].der_len = block.der.len;
+            certificate_storage[found].der = block.der.data;
+            certificate_storage[found].der_len = block.der.len;
             written = written + block.der.len;
             found = found + 1;
         }
     }
     if (found == 0) { ret UNDECODABLE; }
+    anchors.der = der_storage;
+    anchors.der_capacity = length;
+    anchors.certificates = certificate_storage;
     anchors.store = cert.TrustStore{anchors: anchors.certificates, len: found};
     anchors.live = true;
     ret OK;
@@ -208,29 +215,6 @@ fun put(target: *u8, at: usize, value: str) usize {
     ret at + i;
 }
 
-# writes one certificate as PEM, wrapped at 64 columns with a label around it,
-# which is the shape a real bundle has
-fun put_pem(target: *u8, at: usize, der: view.View) usize {
-    var cursor: usize = put(target, at, "-----BEGIN CERTIFICATE-----\n");
-    var encoded: [4096]u8;
-    val written: usize = base64.encode(der.data, der.len, ?encoded[0], 4096);
-    var i: usize = 0;
-    for (i < written) {
-        var span: usize = written - i;
-        if (span > 64) { span = 64; }
-        var j: usize = 0;
-        for (j < span) {
-            target[cursor + j] = encoded[i + j];
-            j = j + 1;
-        }
-        cursor = cursor + span;
-        target[cursor] = 10;
-        cursor = cursor + 1;
-        i = i + span;
-    }
-    ret put(target, cursor, "-----END CERTIFICATE-----\n");
-}
-
 test "acme anchors: blocks are found through the text a bundle carries" {
     # every distribution writes the subject as a comment above each
     # certificate, so a scanner that cannot step over text cannot read the
@@ -245,17 +229,60 @@ test "acme anchors: blocks are found through the text a bundle carries" {
 
     var start: usize = 0;
     var finish: usize = 0;
-    if (!next_block(?document[0], at, 0, ?start, ?finish)) { ret 1; }
+    if (next_block(?document[0], at, 0, ?start, ?finish)
+        != BLOCK_FOUND) { ret 1; }
     if (start != 13 || finish != first_end) { ret 2; }
     if (document[start] != '-' || document[finish - 1] != 10) { ret 3; }
-    if (!next_block(?document[0], at, finish, ?start, ?finish)) { ret 4; }
+    if (next_block(?document[0], at, finish, ?start, ?finish)
+        != BLOCK_FOUND) { ret 4; }
     if (start != second_start || finish != at) { ret 5; }
     # and nothing is found past the last block
-    if (next_block(?document[0], at, finish, ?start, ?finish)) { ret 6; }
+    if (next_block(?document[0], at, finish, ?start, ?finish)
+        != BLOCK_EOF) { ret 6; }
     # a block that never ends is not a block
     val truncated: usize = put(?document[0], 0,
         "-----BEGIN CERTIFICATE-----\nAAAA\n");
-    if (next_block(?document[0], truncated, 0, ?start, ?finish)) { ret 7; }
+    if (next_block(?document[0], truncated, 0, ?start, ?finish)
+        != BLOCK_MALFORMED) { ret 7; }
+    ret 0;
+}
+
+test "acme anchors: a valid prefix cannot hide a truncated trailing block" {
+    val valid: str = "test/interop/fixtures/root.pem";
+    var document: [4096]u8;
+    var length: usize = 0;
+    if (file_size(valid, ?length) != OK || length >= 4000) { ret 1; }
+    val opened: Result[fs.File, io_error.Error] = fs.open(valid::Path);
+    if (is_err[fs.File, io_error.Error](opened)) { ret 2; }
+    var handle: fs.File = unwrap_ok[fs.File, io_error.Error](opened);
+    val read: Result[usize, io_error.Error] = file.read_at(handle,
+        ?document[0], length, 0);
+    fs.close(?handle);
+    if (is_err[usize, io_error.Error](read)
+     || unwrap_ok[usize, io_error.Error](read) != length) { ret 3; }
+    val directory: str = "out/acme-anchors-truncated";
+    val path: str = "out/acme-anchors-truncated/bundle.pem";
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (!test_allocator(?a, ?arena, ?memory[0], 262144)) { ret 4; }
+    fs.create_dir_all(?a, directory::Path, 448);
+    if (O.is_some[str](fs.write_bytes(path::Path, ?document[0], length,
+        384))) { ret 5; }
+    var anchors: Anchors;
+    if (load_bundle(?anchors, ?a, path) != OK || count(?anchors) != 1) {
+        ret 6;
+    }
+
+    length = put(?document[0], length,
+        "# malformed tail\n-----BEGIN CERTIFICATE-----\nAAAA\n");
+    if (O.is_some[str](fs.write_bytes(path::Path, ?document[0], length,
+        384))) { ret 7; }
+    if (load_bundle(?anchors, ?a, path) != UNDECODABLE) { ret 8; }
+    if (anchors.live || anchors.certificates != nil || anchors.der != nil
+     || anchors.der_capacity != 0 || count(?anchors) != 0
+     || store(?anchors) != nil) { ret 9; }
+    fs.remove_all(?a, directory::Path);
     ret 0;
 }
 
