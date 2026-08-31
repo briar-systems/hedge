@@ -32,6 +32,11 @@ served somebody else's certificate.
 enough that a shutdown with a peer still holding a request open reaches the
 deadline within the life of a test.
 
+`cache-disabled.toml` and `cache-enabled.toml` differ only in cache activation.
+The runner observes the disabled process through `/proc`: it has one thread, no
+timer descriptor, no descriptor for the configured cache root, and no cache
+arena in its virtual memory footprint.
+
 ## What the matrix covers
 
 Serving:
@@ -70,13 +75,21 @@ outcome is visible to whoever supervises hedge:
 - a stop with a peer mid-request reaches the drain deadline, cancels the
   exchange, and exits 75 naming how many were abandoned
 
+Composition and optional resources:
+
+- the production binary serves through the same composition module used by the
+  runtime suite
+- disabling cache leaves the configured route live without allocating the cache
+  arena or opening a cache file, timer, or worker
+
 The PROXY protocol legs also cover the positive direction: a trusted v1 header
 followed by an HTTP/1 request is served, and a trusted header followed by the
 HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-26 legs passed, 0 failed, on linux-x86_64 against:
+This revision contains 32 legs. On linux-x86_64, 31 passed and the existing
+six-request HTTP/2 connection-reuse leg failed identically on `origin/dev`:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3
@@ -85,9 +98,10 @@ HTTP/2 preface selects HTTP/2.
 The in-process suites cover what this harness cannot express as a client
 command: `mach test .` for the selection, prologue, credential, PROXY, TLS
 policy, session and shutdown-ordering rules, and `mach test test/runtime` for
-PROXY decoding and peer propagation over real sockets, for the drain deadline
-against a stuck handler and a slow peer, for the two-stage HTTP/2 GOAWAY, and
-for a superseded generation draining while its replacement serves.
+the shared production composition, PROXY decoding and peer propagation over
+real sockets, the drain deadline against a stuck handler and a slow peer, the
+two-stage HTTP/2 GOAWAY, and a superseded generation draining while its
+replacement serves.
 
 ## What this does not cover
 
