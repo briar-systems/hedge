@@ -235,22 +235,22 @@ public authorities issue, and is bounded at one year.
 
 `challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
 
-`http-01` is the only one a TOML deployment can select, because it is the only
-one a web server can answer by itself. It requires a route to the native
-`acme-challenge` service, and a configuration that enables `http-01` without
-one fails to load rather than discovering it at the first renewal. The route
-must be reachable on port 80 for the names being validated.
+`http-01` requires a route to the native `acme-challenge` service, and a
+configuration that enables `http-01` without one fails to load rather than
+discovering it at the first renewal. The route must be reachable on port 80 for
+the names being validated.
 
 `dns-01` needs something that can write a zone. Hedge does not carry provider
 integrations, so an embedder supplies a publisher through
 `acme.open_with_publisher` and gets everything else unchanged. A TOML-only
 deployment that selects it fails to load.
 
-`tls-alpn-01` is refused in this build. RFC 8737 needs an ALPN-specific
-credential choice and a challenge certificate with a critical
-`acmeIdentifier` extension. The current TLS credential interface selects by
-server name only and rejects that extension while loading a server chain, so
-presenting it on an ordinary live listener cannot be made safe. See issue #37.
+`tls-alpn-01` answers RFC 8737 through the named secure listener. During one
+validation Hedge presents a transient certificate only when the client offers
+`acme-tls/1` and its SNI exactly matches the authorization name. Its critical
+`acmeIdentifier` extension is accepted only by that explicit challenge path;
+ordinary TLS handshakes continue to select the listener's configured
+certificate.
 
 **Hedge cannot obtain a certificate from a public authority yet.** RFC 8555
 URLs are `https`, and nothing in this build can originate a TLS connection —

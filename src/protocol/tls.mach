@@ -47,6 +47,7 @@ pub val MAX_ANCHORS: usize = 4;
 pub val MAX_PEM_BYTES: usize = 8192;
 pub val MAX_KEY_BYTES: usize = 4096;
 pub val MAX_ALPN: usize = 3;
+pub val MAX_ALPN_BYTES: usize = 10;
 
 pub def Status: u8;
 pub val OK: Status = 1;
@@ -112,11 +113,22 @@ pub rec Policy {
     generation_live: [BANKS]bool;
     active: usize;
     bindings: hedge_credentials.Bindings;
+    challenge_der: [MAX_PEM_BYTES]u8;
+    challenge_certificate: cert.Certificate;
+    challenge_key: keys.PrivateKey;
+    challenge_name: [schema.TEXT_CAP]u8;
+    challenge_name_len: usize;
+    challenge_identity: credentials.Identity;
+    challenge_generation: credentials.Generation;
+    challenge_store: credentials.Store;
+    challenge_live: bool;
+    challenge_retiring: bool;
+    challenge_enabled: bool;
     anchor_der: [MAX_PEM_BYTES]u8;
     anchor_certificates: [MAX_ANCHORS]cert.Certificate;
     client_trust: cert.TrustStore;
     require_client_auth: bool;
-    alpn_storage: [MAX_ALPN][8]u8;
+    alpn_storage: [MAX_ALPN][MAX_ALPN_BYTES]u8;
     alpn: [MAX_ALPN]tls_config.ProtocolName;
     alpn_len: usize;
     require_alpn: bool;
@@ -154,6 +166,10 @@ pub fun reset() {
         policies[i].identity_counts[1] = 0;
         policies[i].generation_live[0] = false;
         policies[i].generation_live[1] = false;
+        policies[i].challenge_live = false;
+        policies[i].challenge_retiring = false;
+        policies[i].challenge_enabled = false;
+        policies[i].challenge_name_len = 0;
         policies[i].active = 0;
         policies[i].name_len = 0;
         i = i + 1;
@@ -307,12 +323,20 @@ fun offer_protocol(policy: *Policy, value: str) {
     if (policy.alpn_len >= MAX_ALPN) { ret; }
     val slot: usize = policy.alpn_len;
     val length: usize = str_len(value);
-    if (length == 0 || length > 8) { ret; }
+    if (length == 0 || length > MAX_ALPN_BYTES) { ret; }
     var i: usize = 0;
     for (i < length) { policy.alpn_storage[slot][i] = value[i]; i = i + 1; }
     policy.alpn[slot] = tls_config.ProtocolName{
         data: ?policy.alpn_storage[slot][0], len: length};
     policy.alpn_len = slot + 1;
+}
+
+pub rec PublishOptions {
+    tls_alpn_challenge: bool;
+}
+
+pub fun publish_options() PublishOptions {
+    ret PublishOptions{tls_alpn_challenge: false};
 }
 
 # the listener's preference order, not the client's. mach-tls walks this list in
@@ -420,7 +444,8 @@ fun destroy_bank(policy: *Policy, bank: usize) bool {
 # named by that listener. the ALPN offer is the listener's protocol set, so two
 # listeners sharing one certificate but serving different protocols must not
 # share one published generation.
-pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status {
+fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
+    options: PublishOptions) Status {
     if (configured == nil || name == nil) { ret INVALID; }
     if (policy_count >= MAX_POLICIES) { ret EXHAUSTED; }
     identity_owner = secret.system_allocator();
@@ -430,6 +455,16 @@ pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status 
     policy.identity_counts[1] = 0;
     policy.generation_live[0] = false;
     policy.generation_live[1] = false;
+    policy.challenge_live = false;
+    policy.challenge_retiring = false;
+    policy.challenge_enabled = options.tls_alpn_challenge;
+    policy.challenge_name_len = 0;
+    policy.challenge_generation = credentials.empty_generation();
+    policy.challenge_store = credentials.empty_store();
+    policy.challenge_key = keys.empty_private();
+    if (policy.challenge_enabled &&
+        credentials.initialize_vacant_store(?policy.challenge_store) !=
+            contracts.OK) { ret UNSUPPORTED; }
     policy.active = 0;
     policy.alpn_len = 0;
     policy.require_client_auth = configured.client_auth;
@@ -452,6 +487,7 @@ pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status 
         trust = ?policy.client_trust;
     }
     offer_protocols(policy, protocols);
+    if (policy.challenge_enabled) { offer_protocol(policy, "acme-tls/1"); }
     # a listener that serves nothing over TLS has nothing to negotiate, and a
     # client that offers nothing we serve is refused rather than defaulted
     policy.require_alpn = policy.alpn_len != 0;
@@ -466,6 +502,15 @@ pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status 
     policy.live = true;
     policy_count = policy_count + 1;
     ret OK;
+}
+
+pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status {
+    ret publish_inner(name, configured, protocols, publish_options());
+}
+
+pub fun publish_with_options(name: str, configured: *schema.TlsPolicy,
+    protocols: u8, options: PublishOptions) Status {
+    ret publish_inner(name, configured, protocols, options);
 }
 
 # whether a server name resolves to a credential in this policy's generation
@@ -669,11 +714,145 @@ pub fun install_acme(index: usize, manager: *acme.Manager) Status {
     ret OK;
 }
 
+fun select_tls_alpn(store: *credentials.Store, offer: tls_server.CredentialOffer,
+    output: *credentials.Lease) contracts.Error {
+    if (store == nil || !tls_server.offered_alpn_contains(offer,
+            contracts.Bytes{data: "acme-tls/1"::*u8, len: 10})) {
+        ret contracts.UNSUPPORTED;
+    }
+    ret credentials.acquire(store, offer.server_name, output);
+}
+
+pub fun tls_alpn_selector(policy: *Policy) tls_server.CredentialSelector {
+    var value: tls_server.CredentialSelector = tls_server.no_credential_selector();
+    if (policy == nil || !policy.challenge_enabled) { ret value; }
+    value.store = ?policy.challenge_store;
+    value.select = select_tls_alpn;
+    ret value;
+}
+
+pub fun tls_alpn_enabled(index: usize) bool {
+    val policy: *Policy = policy_at(index);
+    ret policy != nil && policy.challenge_enabled;
+}
+
+fun retire_tls_alpn(policy: *Policy) bool {
+    if (policy == nil || !policy.challenge_live || policy.challenge_retiring) {
+        ret true;
+    }
+    var retired: *credentials.Generation = nil;
+    if (credentials.withdraw_store(?policy.challenge_store, ?retired) !=
+            contracts.OK || retired != ?policy.challenge_generation) {
+        ret false;
+    }
+    policy.challenge_retiring = true;
+    ret true;
+}
+
+fun reap_tls_alpn(policy: *Policy) Status {
+    if (policy == nil || !policy.challenge_live) { ret OK; }
+    if (!policy.challenge_retiring) {
+        ret INVALID;
+    }
+    if (!credentials.reclaimable(?policy.challenge_generation)) {
+        ret RETIRED_IN_USE;
+    }
+    if (credentials.clear(?policy.challenge_generation) != contracts.OK ||
+        keys.destroy_private(?policy.challenge_key) != contracts.OK) {
+        ret UNSUPPORTED;
+    }
+    wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
+    policy.challenge_name_len = 0;
+    policy.challenge_live = false;
+    policy.challenge_retiring = false;
+    ret OK;
+}
+
+# copies one RFC 8737 certificate and PKCS#8 key into the listener-owned store.
+pub fun install_tls_alpn(index: usize, name: view.View, certificate: view.View,
+    private_der: contracts.SecretBytes) Status {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || !policy.challenge_enabled || name.data == nil ||
+        name.len == 0 || name.len >= schema.TEXT_CAP || certificate.data == nil ||
+        certificate.len == 0 || certificate.len > MAX_PEM_BYTES ||
+        private_der.data == nil || private_der.len == 0 ||
+        private_der.len > MAX_KEY_BYTES) { ret INVALID; }
+    if (policy.challenge_live) {
+        if (!policy.challenge_retiring) { ret INVALID; }
+        val reaped: Status = reap_tls_alpn(policy);
+        if (reaped != OK) { ret reaped; }
+    }
+    var i: usize = 0;
+    for (i < certificate.len) {
+        policy.challenge_der[i] = certificate.data[i];
+        i = i + 1;
+    }
+    if (!copy_view_name(?policy.challenge_name[0], ?policy.challenge_name_len,
+            name)) {
+        wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
+        ret INVALID;
+    }
+    policy.challenge_certificate = cert.Certificate{der: ?policy.challenge_der[0],
+        der_len: certificate.len};
+    policy.challenge_key = keys.empty_private();
+    if (load.private_der(private_der, cert.PKCS8_DER, ?identity_owner,
+            ?policy.challenge_key) != contracts.OK) {
+        wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
+        policy.challenge_name_len = 0;
+        ret UNDECODABLE;
+    }
+    policy.challenge_identity = credentials.Identity{
+        server_name: contracts.Bytes{data: ?policy.challenge_name[0],
+            len: policy.challenge_name_len},
+        chain: cert.Chain{certificates: ?policy.challenge_certificate, len: 1},
+        private_key: ?policy.challenge_key};
+    policy.challenge_generation = credentials.empty_generation();
+    if (credentials.initialize_tls_alpn_challenge(?policy.challenge_generation,
+            ?policy.challenge_identity) != contracts.OK ||
+        credentials.publish_store(?policy.challenge_store,
+            ?policy.challenge_generation) != contracts.OK) {
+        keys.destroy_private(?policy.challenge_key);
+        wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
+        policy.challenge_name_len = 0;
+        policy.challenge_generation = credentials.empty_generation();
+        ret UNSUPPORTED;
+    }
+    policy.challenge_live = true;
+    policy.challenge_retiring = false;
+    ret OK;
+}
+
+pub fun withdraw_tls_alpn(index: usize) Status {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || !policy.challenge_live) { ret INVALID; }
+    if (!retire_tls_alpn(policy)) { ret UNSUPPORTED; }
+    val reaped: Status = reap_tls_alpn(policy);
+    if (reaped != OK && reaped != RETIRED_IN_USE) { ret reaped; }
+    ret OK;
+}
+
+pub fun maintain() bool {
+    var success: bool = true;
+    var i: usize = 0;
+    for (i < policy_count) {
+        val policy: *Policy = ?policies[i];
+        if (policy.challenge_live && policy.challenge_retiring) {
+            val reaped: Status = reap_tls_alpn(policy);
+            if (reaped != OK && reaped != RETIRED_IN_USE) { success = false; }
+        }
+        i = i + 1;
+    }
+    ret success;
+}
+
 pub fun destroy() bool {
     var success: bool = true;
     var i: usize = 0;
     for (i < policy_count) {
         val policy: *Policy = ?policies[i];
+        if (!retire_tls_alpn(policy)) { success = false; }
+        val reaped: Status = reap_tls_alpn(policy);
+        if (reaped != OK) { success = false; }
         if (!destroy_bank(policy, 0)) { success = false; }
         if (!destroy_bank(policy, 1)) { success = false; }
         policy.live = false;

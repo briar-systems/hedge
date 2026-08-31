@@ -10,9 +10,8 @@
 # critical extension no ordinary client understands. presenting it outside the
 # `acme-tls/1` protocol would be refused by anything that reads it.
 #
-# the presentation slot is filled here and read by the tls listener. this build
-# has no tls termination, so nothing reads it yet; the slot is the seam, and
-# the certificate it holds is complete and verifiable today.
+# the presentation slot is copied into the listener-owned transient credential
+# store. the acme manager never lends its certificate or key storage to TLS.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -20,6 +19,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
+use std.memory;
 use R: std.types.result;
 use T: std.chrono.time;
 use std.chrono.date;
@@ -33,6 +33,7 @@ use der: crypto.encoding.der;
 use identifier: acme.identifier;
 use problem: acme.problem;
 use keys: hedge.acme.keys;
+use tls: hedge.protocol.tls;
 
 pub val ALPN_PROTOCOL: str = "acme-tls/1";
 pub val MAX_CERTIFICATE_BYTES: usize = 1024;
@@ -116,17 +117,33 @@ pub rec Alpn {
     withdrawn:  usize;
     live:       bool;
     held:       bool;
+    listener:   usize;
 }
 
-pub fun reset(state: *Alpn) bool {
+pub fun make(state: *Alpn) bool {
     if (state == nil) { ret false; }
-    if (state.held) { keys.destroy(?state.key); }
-    state.der_len = 0;
-    state.subject_len = 0;
-    state.presented = 0;
-    state.withdrawn = 0;
-    state.held = false;
+    memory.raw_zero((state)::ptr, $size_of(Alpn));
+    state.listener = tls.NO_POLICY;
     state.live = true;
+    ret true;
+}
+
+pub fun destroy(state: *Alpn) bool {
+    if (state == nil || !state.live) { ret false; }
+    var success: bool = true;
+    if (state.held && !keys.destroy(?state.key)) { success = false; }
+    memory.raw_zero((state)::ptr, $size_of(Alpn));
+    state.listener = tls.NO_POLICY;
+    ret success;
+}
+
+pub fun bind_listener(state: *Alpn, listener: usize) bool {
+    if (state == nil || !state.live || state.listener != tls.NO_POLICY ||
+        listener == tls.NO_POLICY || !tls.tls_alpn_enabled(listener) ||
+        presenting(state)) {
+        ret false;
+    }
+    state.listener = listener;
     ret true;
 }
 
@@ -183,9 +200,12 @@ pub fun build(state: *Alpn, subject_name: view.View,
         0xce, 0x3d, 0x04, 0x03, 0x02};
     at = put(?body[0], at, 768, ?algorithm[0], 12);
 
-    # an empty issuer and subject: this certificate names nobody
+    # rfc 5280 requires a nonempty issuer while the subject may be empty
+    val issuer: [23]u8 = [23]u8{0x30, 0x15, 0x31, 0x13, 0x30, 0x11, 0x06,
+        0x03, 0x55, 0x04, 0x03, 0x0c, 0x0a, 'h', 'e', 'd', 'g', 'e', '-',
+        'a', 'c', 'm', 'e'};
+    at = put(?body[0], at, 768, ?issuer[0], 23);
     val empty_name: [2]u8 = [2]u8{0x30, 0x00};
-    at = put(?body[0], at, 768, ?empty_name[0], 2);
 
     var validity: [32]u8;
     var not_before: [13]u8;
@@ -201,6 +221,7 @@ pub fun build(state: *Alpn, subject_name: view.View,
     written = emit(0x30, ?validity[0], inner, ?scratch[0], 512);
     if (written == 0) { ret false; }
     at = put(?body[0], at, 768, ?scratch[0], written);
+    at = put(?body[0], at, 768, ?empty_name[0], 2);
 
     # the ephemeral key this presentation was built around
     val spki: view.View = keys.public_der(?state.key);
@@ -333,6 +354,21 @@ fun present(context: ptr, subject_name: identifier.Identifier,
             problem.CHALLENGE,
             "the tls-alpn-01 certificate could not be built"));
     }
+    var scratch: [keys.PKCS8_BYTES]^u8;
+    val private_der: contracts.SecretBytes = keys.private_der(?state.key,
+        ?scratch[0]);
+    val installed: tls.Status = tls.install_tls_alpn(state.listener,
+        subject(state), certificate(state), private_der);
+    ct.zeroize(?scratch[0], keys.PKCS8_BYTES);
+    if (installed != tls.OK) {
+        state.der_len = 0;
+        state.subject_len = 0;
+        keys.destroy(?state.key);
+        state.held = false;
+        ret R.err[ch.Presentation, problem.Error](problem.local(
+            problem.CHALLENGE,
+            "the tls-alpn-01 certificate could not be installed"));
+    }
     state.presented = state.presented + 1;
     ret R.ok[ch.Presentation, problem.Error](ch.Presentation{ctx: (1)::ptr});
 }
@@ -343,6 +379,10 @@ fun cleanup(context: ptr,
     if (state == nil || presentation.ctx::usize != 1) {
         ret R.err[bool, problem.Error](problem.local(problem.CHALLENGE,
             "tls-alpn-01 cleanup does not name a presentation"));
+    }
+    if (tls.withdraw_tls_alpn(state.listener) != tls.OK) {
+        ret R.err[bool, problem.Error](problem.local(problem.CHALLENGE,
+            "the tls-alpn-01 certificate still has a TLS lease"));
     }
     state.der_len = 0;
     state.subject_len = 0;
@@ -405,7 +445,7 @@ fun contains(data: *u8, len: usize, needle: *u8, wanted: usize) bool {
 
 test "acme tls-alpn: the presented certificate is a valid rfc 8737 answer" {
     var state: Alpn;
-    reset(?state);
+    make(?state);
     if (!build(?state, test_view("hedge.example"),
         test_view(TEST_AUTHORIZATION), T.now())) { ret 1; }
     val encoded: view.View = certificate(?state);
@@ -417,6 +457,11 @@ test "acme tls-alpn: the presented certificate is a valid rfc 8737 answer" {
     var refused: x509.Certificate;
     if (x509.parse(contracts.Bytes{data: encoded.data, len: encoded.len},
         ?refused) == contracts.OK) { ret 3; }
+    var accepted: x509.Certificate;
+    if (x509.parse_tls_alpn_challenge(contracts.Bytes{data: encoded.data,
+            len: encoded.len}, ?accepted) != contracts.OK ||
+        !accepted.extensions.acme_identifier_present ||
+        accepted.extensions.acme_identifier.len != ch.DIGEST_BYTES) { ret 19; }
 
     # its der structure is still exactly a certificate
     var walk: der.Cursor = der.cursor(contracts.Bytes{data: encoded.data,
@@ -492,31 +537,24 @@ test "acme tls-alpn: the presented certificate is a valid rfc 8737 answer" {
             len: signature_element.content.len - 1}) != contracts.OK) {
         ret 18;
     }
-    reset(?state);
+    destroy(?state);
     ret 0;
 }
 
-test "acme tls-alpn: a presentation is retired exactly once" {
+test "acme tls-alpn: a presentation requires a bound secure listener" {
     var state: Alpn;
-    reset(?state);
+    make(?state);
     var attempt: ch.Attempt;
     if (problem.failed(ch.attempt_init(?attempt, provider(?state)))) { ret 1; }
-    if (problem.failed(ch.begin(?attempt, test_subject(), test_challenge(),
+    if (!problem.failed(ch.begin(?attempt, test_subject(), test_challenge(),
         test_view(TEST_AUTHORIZATION)))) { ret 2; }
-    if (attempt.present_calls != 1 || state.presented != 1
-     || !presenting(?state)) { ret 3; }
-    if (!view.view_eq_str(subject(?state), "hedge.example")) { ret 4; }
-    if (problem.failed(ch.finish(?attempt))) { ret 5; }
-    if (attempt.cleanup_calls != 1 || state.withdrawn != 1
-     || presenting(?state)) { ret 6; }
-    ch.finish(?attempt);
-    if (state.withdrawn != 1) { ret 7; }
+    if (state.presented != 0 || presenting(?state) || state.held) { ret 3; }
     ret 0;
 }
 
 test "acme tls-alpn: a wildcard and the wrong challenge type are declined" {
     var state: Alpn;
-    reset(?state);
+    make(?state);
     var attempt: ch.Attempt;
     ch.attempt_init(?attempt, provider(?state));
     val wildcard: identifier.Identifier = identifier.Identifier{
@@ -536,7 +574,7 @@ test "acme tls-alpn: a wildcard and the wrong challenge type are declined" {
 
 test "acme tls-alpn: two presentations produce different keys" {
     var state: Alpn;
-    reset(?state);
+    make(?state);
     if (!build(?state, test_view("hedge.example"),
         test_view(TEST_AUTHORIZATION), T.now())) { ret 1; }
     var first: [keys.POINT_BYTES]u8;
@@ -546,7 +584,8 @@ test "acme tls-alpn: two presentations produce different keys" {
         i = i + 1;
     }
     val first_len: usize = state.der_len;
-    reset(?state);
+    destroy(?state);
+    make(?state);
     if (!build(?state, test_view("hedge.example"),
         test_view(TEST_AUTHORIZATION), T.now())) { ret 2; }
     var same: bool = true;
@@ -556,6 +595,6 @@ test "acme tls-alpn: two presentations produce different keys" {
         i = i + 1;
     }
     if (same) { ret 3; }
-    reset(?state);
+    destroy(?state);
     ret 0;
 }

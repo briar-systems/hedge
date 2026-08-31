@@ -44,6 +44,7 @@ use router: http.router.router;
 use challenge: hedge.acme.challenge;
 use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
+use tlsalpn: hedge.acme.tlsalpn;
 use protocol: hedge.protocol.credentials;
 use hedge_tls: hedge.protocol.tls;
 use issue: hedge.acme.issue;
@@ -144,9 +145,8 @@ fun configure(server: *Server, address: str) {
 
 # the tests run as separate processes in parallel, so only the run that must
 # receive the authority's validation takes pebble's fixed http-01 port
-fun boot_at(server: *Server, table: *challenge.Http01, address: str,
+fun start_server(server: *Server, table: *challenge.Http01,
     expected: u16) bool {
-    configure(server, address);
     if (!handler.bind(?server.binding, table)) { ret false; }
     service.make_applications(?server.applications,
         ?server.application_slots[0], 4);
@@ -180,6 +180,12 @@ fun boot_at(server: *Server, table: *challenge.Http01, address: str,
     if (owned == nil || !owned.has_bound_endpoint) { ret false; }
     server.endpoint = owned.bound_endpoint;
     ret expected == 0 || server.endpoint.port == expected;
+}
+
+fun boot_at(server: *Server, table: *challenge.Http01, address: str,
+    expected: u16) bool {
+    configure(server, address);
+    ret start_server(server, table, expected);
 }
 
 fun boot(server: *Server, table: *challenge.Http01) bool {
@@ -531,6 +537,7 @@ fun configure_acme(deployment: *Deployment, storage_path: str, name_len: usize) 
     schema.set_text(?graph.acme.directory, DIRECTORY_URL);
     schema.set_text(?graph.acme.storage, storage_path);
     schema.set_text(?graph.acme.origin, "127.0.0.1:14001");
+    schema.set_text(?graph.acme.listener, "public");
     graph.acme.terms_agreed = true;
     graph.acme.challenge = schema.CHALLENGE_HTTP_01;
     graph.acme.name_count = 1;
@@ -545,6 +552,7 @@ fun drive_manager(server: *Server, deployment: *Deployment,
     for (rounds < MAX_ROUNDS) {
         serve.poll(?server.runtime, 1);
         acme.poll((?deployment.manager)::ptr, T.now());
+        hedge_tls.maintain();
         if (acme.state(?deployment.manager) == wanted) { ret true; }
         if (acme.failure_count(?deployment.manager) != 0) {
             val cause: problem.Error = acme.last_failure(?deployment.manager);
@@ -938,6 +946,97 @@ test "live: dns-01 issues a certificate through a publisher" {
     acme.installed(?deployment.manager, T.now());
     acme.close(?deployment.manager);
     serve.stop(?server.runtime);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+fun boot_tls_alpn(server: *Server, table: *challenge.Http01) bool {
+    configure(server, "127.0.0.1:5001");
+    server.graph.features.tls = true;
+    val listener_config: *schema.Listener = ?server.graph.listeners[0];
+    schema.set_text(?listener_config.tls_policy, "public");
+    server.graph.tls_policy_count = 1;
+    val configured: *schema.TlsPolicy = ?server.graph.tls_policies[0];
+    schema.set_text(?configured.name, "public");
+    configured.identity_count = 1;
+    schema.set_text(?configured.identities[0].server_name, "api.example.com");
+    schema.set_text(?configured.identities[0].certificate,
+        "test/interop/fixtures/api.pem");
+    schema.set_text(?configured.identities[0].key,
+        "test/interop/fixtures/api.key");
+    configured.has_default = true;
+    schema.set_text(?configured.default_name, "api.example.com");
+    hedge_tls.reset();
+    var options: hedge_tls.PublishOptions = hedge_tls.publish_options();
+    options.tls_alpn_challenge = true;
+    if (hedge_tls.publish_with_options("public", configured,
+            schema.PROTOCOL_HTTP1, options) != hedge_tls.OK) { ret false; }
+    ret start_server(server, table, 5001);
+}
+
+test "live: tls-alpn-01 issues through the listener's transient credential" {
+    var memory: [262144]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 262144))) { ret 1; }
+    val directory: str = "out/acme-tlsalpn01";
+    fs.remove_all(?a, directory::Path);
+    var client: Client;
+    val name_len: usize = unique_name(?client, "tlsalpn01");
+    var deployment: Deployment;
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    configure_acme(?deployment, directory, name_len);
+    deployment.graph.acme.challenge = schema.CHALLENGE_TLS_ALPN_01;
+    var presentation: tlsalpn.Alpn;
+    if (!tlsalpn.make(?presentation)) { ret 2; }
+    if (acme.open_with_tls_alpn(?deployment.manager, ?a, ?deployment.graph,
+            tlsalpn.provider(?presentation)) != acme.OK) {
+        tlsalpn.destroy(?presentation);
+        ret 2;
+    }
+    var server: Server;
+    if (!boot_tls_alpn(?server, acme.challenge_table(?deployment.manager))) {
+        acme.close(?deployment.manager);
+        tlsalpn.destroy(?presentation);
+        hedge_tls.destroy();
+        ret 3;
+    }
+    val policy: usize = hedge_tls.find("public");
+    if (policy == hedge_tls.NO_POLICY ||
+        !tlsalpn.bind_listener(?presentation, policy)) {
+        acme.close(?deployment.manager);
+        tlsalpn.destroy(?presentation);
+        serve.stop(?server.runtime);
+        hedge_tls.destroy();
+        ret 4;
+    }
+    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+        acme.close(?deployment.manager);
+        tlsalpn.destroy(?presentation);
+        serve.stop(?server.runtime);
+        hedge_tls.destroy();
+        ret 5;
+    }
+    val listener_policy: *hedge_tls.Policy = hedge_tls.policy_at(policy);
+    if (presentation.presented != 1 || presentation.withdrawn != 1 ||
+        tlsalpn.presenting(?presentation) || listener_policy == nil ||
+        listener_policy.challenge_live || listener_policy.challenge_retiring ||
+        acme.chain_count(?deployment.manager) < 2) {
+        acme.close(?deployment.manager);
+        tlsalpn.destroy(?presentation);
+        serve.stop(?server.runtime);
+        hedge_tls.destroy();
+        ret 6;
+    }
+    acme.installed(?deployment.manager, T.now());
+    acme.close(?deployment.manager);
+    tlsalpn.destroy(?presentation);
+    serve.stop(?server.runtime);
+    if (!hedge_tls.destroy()) { ret 7; }
     fs.remove_all(?a, directory::Path);
     ret 0;
 }
