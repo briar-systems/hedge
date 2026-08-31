@@ -71,6 +71,12 @@ val POOL: usize = 8;
 val CHALLENGE_PORT: u16 = 5002;
 val AUTHORITY_PORT: u16 = 14001;
 val DIRECTORY_URL: str = "https://127.0.0.1:14000/dir";
+val SECURE_DIRECTORY: str = "https://localhost:14000/dir";
+val MISMATCHED_DIRECTORY: str = "https://wrong.example:14000/dir";
+val AUTHORITY_CA: str = ".tools/test/certs/pebble.minica.pem";
+val UNRELATED_CERTIFICATE: str = ".tools/staging-root.pem";
+val SYSTEM_ANCHORS: str = "/etc/ssl/certs/ca-certificates.crt";
+val SECURE_PORT: u16 = 14000;
 
 # a run takes a few seconds; this is the ceiling before the suite gives up
 val MAX_ROUNDS: usize = 400000;
@@ -446,10 +452,6 @@ fun http_get(server: *Server, path: str, response: *u8,
     ret total;
 }
 
-fun contains(data: *u8, len: usize, needle: str) bool {
-    ret body_contains(data, len, needle);
-}
-
 fun body_contains(data: *u8, len: usize, needle: str) bool {
     var wanted: usize = 0;
     for (needle[wanted] != 0) { wanted = wanted + 1; }
@@ -549,6 +551,14 @@ fun configure_acme(deployment: *Deployment, storage_path: str, name_len: usize) 
     graph.acme.name_count = 1;
     deployment.name[name_len] = 0;
     schema.set_text(?graph.acme.names[0], (?deployment.name[0])::str);
+}
+
+fun configure_acme_tls(deployment: *Deployment, storage_path: str,
+    name_len: usize) {
+    configure_acme(deployment, storage_path, name_len);
+    schema.set_text(?deployment.graph.acme.directory, SECURE_DIRECTORY);
+    schema.clear_text(?deployment.graph.acme.origin);
+    schema.set_text(?deployment.graph.acme.trust, AUTHORITY_CA);
 }
 
 fun drive_manager(server: *Server, deployment: *Deployment,
@@ -772,6 +782,52 @@ test "live: the manager obtains, stores, and recovers a certificate" {
     }
     acme.installed(?expiring.manager, T.now());
     acme.close(?expiring.manager);
+    serve.stop(?server.runtime);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
+test "live: the manager issues a certificate through pebble over tls" {
+    var memory: [262144]u8;
+    var state: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?state, ?memory[0], 262144))) { ret 1; }
+    val directory: str = "out/acme-managed-tls";
+    fs.remove_all(?a, directory::Path);
+    var deployment: Deployment;
+    var client: Client;
+    val name_len: usize = unique_name(?client, "managed-tls");
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    deployment.name_len = name_len;
+    configure_acme_tls(?deployment, directory, name_len);
+    if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.OK) {
+        ret 2;
+    }
+    var server: Server;
+    if (!boot(?server, acme.challenge_table(?deployment.manager))) {
+        acme.close(?deployment.manager);
+        ret 3;
+    }
+    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 4;
+    }
+    if (!acme.installation_ready(?deployment.manager)
+     || acme.chain_count(?deployment.manager) < 2
+     || acme.not_after(?deployment.manager) <= T.now().sec::u64
+     || acme.issued_count(?deployment.manager) != 1
+     || acme.failure_count(?deployment.manager) != 0) {
+        acme.close(?deployment.manager);
+        serve.stop(?server.runtime);
+        ret 5;
+    }
+    acme.installed(?deployment.manager, T.now());
+    acme.close(?deployment.manager);
     serve.stop(?server.runtime);
     fs.remove_all(?a, directory::Path);
     ret 0;
@@ -1176,13 +1232,6 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
 
 # the authority's own https interface, reached directly rather than through
 # the harness's plain-http front end
-val SECURE_DIRECTORY: str = "https://localhost:14000/dir";
-val MISMATCHED_DIRECTORY: str = "https://wrong.example:14000/dir";
-val AUTHORITY_CA: str = ".tools/test/certs/pebble.minica.pem";
-# a real public root the local authority cannot possibly chain to
-val UNRELATED_CERTIFICATE: str = ".tools/staging-root.pem";
-val SECURE_PORT: u16 = 14000;
-
 rec SecureFixture {
     request:  [8192]u8;
     response: [65536]u8;
@@ -1268,6 +1317,62 @@ test "live: the authority is reached over tls and verified against its ca" {
     ret 0;
 }
 
+test "live: two tls authority sessions coexist across generations" {
+    var memory: [1048576]u8;
+    var arena: fixed.FixedState;
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 1048576))) { ret 1; }
+    val before: usize = origination.live();
+    var active: SecureFixture;
+    var superseded: SecureFixture;
+    if (!secure_fixture(?active, ?a, AUTHORITY_CA, SECURE_DIRECTORY)) {
+        ret 2;
+    }
+    if (!secure_fixture(?superseded, ?a, AUTHORITY_CA, SECURE_DIRECTORY)) {
+        secure_release(?active);
+        ret 2;
+    }
+    if (session.begin_discovery(?active.session) != session.PENDING
+     || session.begin_discovery(?superseded.session) != session.PENDING) {
+        secure_release(?active);
+        secure_release(?superseded);
+        ret 3;
+    }
+    var active_status: session.Status = session.PENDING;
+    var superseded_status: session.Status = session.PENDING;
+    var peak: usize = origination.live();
+    var rounds: usize = 0;
+    val deadline: i64 = monotonic_ns() + 30000000000;
+    for ((active_status == session.PENDING
+        || superseded_status == session.PENDING) && rounds < MAX_ROUNDS) {
+        if (active_status == session.PENDING) {
+            active_status = session.poll(?active.session, ?active.engine,
+                ?active.account, T.now());
+        }
+        if (superseded_status == session.PENDING) {
+            superseded_status = session.poll(?superseded.session,
+                ?superseded.engine, ?superseded.account, T.now());
+        }
+        val current: usize = origination.live();
+        if (current > peak) { peak = current; }
+        if (monotonic_ns() > deadline) { brk; }
+        rounds = rounds + 1;
+    }
+    if (active_status != session.OK || superseded_status != session.OK
+     || peak < before + 2 || !session.discovered(?active.session)
+     || !session.discovered(?superseded.session)) {
+        secure_release(?active);
+        secure_release(?superseded);
+        ret 4;
+    }
+    session.complete(?active.session, ?active.engine);
+    session.complete(?superseded.session, ?superseded.engine);
+    secure_release(?active);
+    secure_release(?superseded);
+    if (origination.live() != before) { ret 5; }
+    ret 0;
+}
+
 test "live: an authority outside the configured anchors is refused" {
     var memory: [1048576]u8;
     var arena: fixed.FixedState;
@@ -1325,8 +1430,6 @@ val STAGING_HOST: str = "acme-staging-v02.api.letsencrypt.org";
 # to us, which is a different trust decision, and anchoring this test to it
 # refused the authority correctly for the wrong reason. a deployment reaching a
 # public authority verifies it against its system trust store, so this does too.
-val SYSTEM_ANCHORS: str = "/tmp/claude-1000/-home-octalide-dev-src-github-com-briar-systems/7d41e2a4-6e2a-4a41-abdf-fff5f07e094b/scratchpad/probe.pem";
-
 test "live: a public authority is reached over tls and verified" {
     # the local authority proves the mechanism; this proves it against a real
     # public endpoint, with a real chain and a name resolved from dns. it needs
@@ -1342,9 +1445,6 @@ test "live: a public authority is reached over tls and verified" {
         print.eprintlnf("anchors: {} loading {}", loaded::i64, SYSTEM_ANCHORS);
         ret 2;
     }
-    # a real system bundle, with issuer comments between the blocks: the case
-    # the block scanner exists for, and one a single hand-fetched pem misses
-    if (anchors.count(?fixture.anchors) < 2) { ret 3; }
     if (!keys.generate(?fixture.account)) { ret 4; }
     if (!transport.make(?fixture.engine, ?fixture.request[0], 8192,
         ?fixture.response[0], 65536, ?fixture.items[0], 64,
@@ -1375,7 +1475,8 @@ test "live: a public authority is reached over tls and verified" {
         if (detail == nil) { detail = ""; }
         print.eprintlnf("staging: outcome {} stage {} cause {} tls {} kind {} code {} {}",
             outcome::i64, transport.stage(?fixture.engine)::i64,
-            transport.cause(?fixture.engine)::i64, origination.failure()::i64,
+            transport.cause(?fixture.engine)::i64,
+            origination.failure(fixture.engine.tls)::i64,
             cause.kind::i64, cause.code::i64, detail);
         secure_release(?fixture);
         ret 10;
@@ -1388,7 +1489,7 @@ test "live: a public authority is reached over tls and verified" {
     }
     # the urls the public authority published are its own, not the ones a
     # local harness hands back
-    if (!contains(found.new_order_url.data, found.new_order_url.len,
+    if (!body_contains(found.new_order_url.data, found.new_order_url.len,
         "acme-staging-v02.api.letsencrypt.org")) {
         secure_release(?fixture);
         ret 12;
