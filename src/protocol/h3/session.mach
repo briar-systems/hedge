@@ -1,4 +1,4 @@
-# one http/3 endpoint driven over a real quic driver, plus the two-endpoint fabric
+# bounded http/3 sessions over the production quic transport
 
 use adapter: hedge.protocol.h3.adapter;
 
@@ -10,78 +10,298 @@ use http.core.exchange;
 use http.core.field;
 use http.core.message;
 use http.core.method;
+use http.core.status;
 use http.core.target;
 use qt: quic.transport;
 use binding: quic.transport.binding;
 
 use std.chrono.time;
+use std.memory;
 use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
 use std.types.view;
+use router: http.router.router;
+use hedge.dispatch;
+use call: hedge.dispatch.call;
+use plan: hedge.dispatch.plan;
+use budget: hedge.budget;
+use telemetry_trace: hedge.telemetry.trace;
 
-pub val STREAM_SLOTS: usize = 10;
+pub val NO_SESSION: usize = (-1)::usize;
+pub val MAX_STREAMS: usize = 8;
+pub val STREAM_SLOTS: usize = MAX_STREAMS + 3;
 pub val EVENT_KINDS: usize = 16;
+pub val READ_BYTES: usize = 8192;
+pub val FRAME_PAYLOAD_BYTES: usize = 8192;
+pub val HEADER_BYTES: usize = 4096;
+pub val FIELD_SLOTS: usize = 40;
+pub val STRING_BYTES: usize = 4096;
+pub val REFERENCE_SLOTS: usize = 64;
+pub val SETTING_SLOTS: usize = 16;
+pub val TABLE_ENTRIES: usize = 64;
+pub val TABLE_BYTES: usize = 4096;
+pub val SECTION_SLOTS: usize = 16;
+pub val SECTION_REFERENCES: usize = 256;
+pub val QUEUE_BYTES: usize = 4096;
+pub val PENDING_RELEASES: usize = 8;
+pub val ARENA_BYTES: usize = 12288;
+pub val STAGE_BYTES: usize = 8192;
+pub val REQUEST_FIELD_SLOTS: usize = 40;
+pub val REQUEST_TRAILER_SLOTS: usize = FIELD_SLOTS;
+pub val REQUEST_STRING_BYTES: usize = 4096;
+pub val REQUEST_TRAILER_BYTES: usize = 4096;
+pub val RESPONSE_FIELD_SLOTS: usize = 32;
+pub val RESPONSE_TRAILER_SLOTS: usize = 8;
+pub val INFORMATIONAL_SLOTS: usize = 4;
+pub val CAPTURE_SLOTS: usize = 8;
+pub val HEADER_ITEM_SLOTS: usize = RESPONSE_FIELD_SLOTS + 1;
+pub val MAX_STEPS: usize = 64;
+
+pub def State: u8;
+pub val IDLE: State = 0;
+pub val ACTIVE: State = 1;
+pub val CLOSING: State = 2;
+pub val CLOSED: State = 3;
+pub val FAILED: State = 4;
+
+pub def Step: u8;
+pub val STEP_IDLE: Step = 1;
+pub val STEP_PROGRESS: Step = 2;
+pub val STEP_BLOCKED: Step = 3;
+pub val STEP_DONE: Step = 4;
+pub val STEP_ERROR: Step = 5;
 
 pub def HandlerFun: fun(ptr, h3.Event) bool;
 
+rec Body {
+    reader: body.Reader;
+    pending_token: u64;
+    next_token: u64;
+    pending_output: *u8;
+    pending_capacity: usize;
+    data: [READ_BYTES]u8;
+    length: usize;
+    offset: usize;
+    credit_pending: usize;
+    inbound_complete: bool;
+    discard: bool;
+}
+
+rec RequestSlot {
+    live: bool;
+    id: u64;
+    generation: u64;
+    scope: cancel.Scope;
+    scope_live: bool;
+    body: Body;
+    request: message.Request;
+    response: message.Response;
+    request_items: [REQUEST_FIELD_SLOTS]field.Field;
+    request_trailer_items: [REQUEST_TRAILER_SLOTS]field.Field;
+    request_strings: [REQUEST_STRING_BYTES]u8;
+    request_string_length: usize;
+    request_trailer_strings: [REQUEST_TRAILER_BYTES]u8;
+    request_trailer_string_length: usize;
+    request_fields: field.Fields;
+    request_trailers: field.Fields;
+    response_fields: [RESPONSE_FIELD_SLOTS]field.Field;
+    response_trailers: [RESPONSE_TRAILER_SLOTS]field.Field;
+    informationals: [INFORMATIONAL_SLOTS]message.Informational;
+    captures: [CAPTURE_SLOTS]router.Capture;
+    header_items: [HEADER_ITEM_SLOTS]field.Field;
+    status_text: [3]u8;
+    arena: [ARENA_BYTES]u8;
+    memory: call.Memory;
+    trace: telemetry_trace.Context;
+    exchange: exchange.Exchange;
+    active_call: call.Call;
+    stage: [STAGE_BYTES]u8;
+    stage_length: usize;
+    stage_offset: usize;
+    body_done: bool;
+    inbound_complete: bool;
+    headers_sent: bool;
+    trailers_sent: bool;
+    response_complete: bool;
+    service_pending: bool;
+    exchange_live: bool;
+    exchange_finished: bool;
+    charge: budget.Charge;
+}
+
 pub rec Session {
+    live: bool;
+    next_free: usize;
+    state: State;
     io: adapter.Adapter;
     scope: cancel.Scope;
-    streams: [10]h3.Stream;
-    memories: [10]h3.StreamMemory;
-    pending: [4]h3.StreamHandle;
-    reads: [10][192]u8;
-    settings: [10][5]frame.Setting;
-    encoded: [10][256]u8;
-    fields: [10][16]field.Field;
-    strings: [10][512]u8;
-    scratch: [10][256]u8;
-    output: [10][384]u8;
-    references: [10][16]u64;
-    inbound_entries: [8]qpack.Entry;
-    inbound_storage: [256]u8;
-    inbound_scratch: [256]u8;
-    inbound_sections: [8]qpack.Section;
-    inbound_references: [64]qpack.Reference;
-    outbound_entries: [8]qpack.Entry;
-    outbound_storage: [256]u8;
-    outbound_scratch: [256]u8;
-    outbound_sections: [8]qpack.Section;
-    outbound_references: [64]qpack.Reference;
-    control_queue: [256]u8;
-    encoder_queue: [256]u8;
-    decoder_queue: [256]u8;
+    streams: [STREAM_SLOTS]h3.Stream;
+    memories: [STREAM_SLOTS]h3.StreamMemory;
+    pending: [PENDING_RELEASES]h3.StreamHandle;
+    reads: [STREAM_SLOTS][READ_BYTES]u8;
+    settings: [STREAM_SLOTS][SETTING_SLOTS]frame.Setting;
+    encoded: [STREAM_SLOTS][HEADER_BYTES]u8;
+    fields: [STREAM_SLOTS][FIELD_SLOTS]field.Field;
+    strings: [STREAM_SLOTS][STRING_BYTES]u8;
+    scratch: [STREAM_SLOTS][HEADER_BYTES]u8;
+    output: [STREAM_SLOTS][FRAME_PAYLOAD_BYTES]u8;
+    references: [STREAM_SLOTS][REFERENCE_SLOTS]u64;
+    inbound_entries: [TABLE_ENTRIES]qpack.Entry;
+    inbound_storage: [TABLE_BYTES]u8;
+    inbound_scratch: [TABLE_BYTES]u8;
+    inbound_sections: [SECTION_SLOTS]qpack.Section;
+    inbound_references: [SECTION_REFERENCES]qpack.Reference;
+    outbound_entries: [TABLE_ENTRIES]qpack.Entry;
+    outbound_storage: [TABLE_BYTES]u8;
+    outbound_scratch: [TABLE_BYTES]u8;
+    outbound_sections: [SECTION_SLOTS]qpack.Section;
+    outbound_references: [SECTION_REFERENCES]qpack.Reference;
+    control_queue: [QUEUE_BYTES]u8;
+    encoder_queue: [QUEUE_BYTES]u8;
+    decoder_queue: [QUEUE_BYTES]u8;
     engine: h3.Engine[adapter.Adapter];
+    requests_slots: [MAX_STREAMS]RequestSlot;
+    plan: *plan.Plan;
+    budgets: *budget.Set;
+    limits: message.Limits;
+    listener_name: str;
+    peer: message.Endpoint;
+    local: message.Endpoint;
+    request_timeout_ns: u64;
+    now_ns: u64;
+    requests: u64;
+    last_event: h3.EventKind;
+    last_step: Step;
+    final_goaway_sent: bool;
     handler: HandlerFun;
     context: ptr;
     counts: [16]usize;
     rejected: usize;
 }
 
-pub fun session_config() h3.Config {
+pub rec Pool {
+    sessions: *Session;
+    capacity: usize;
+    live: usize;
+    free_head: usize;
+}
+
+fun reset_request(slot: *RequestSlot) {
+    slot.live = false;
+    slot.id = 0;
+    slot.generation = 0;
+    slot.scope_live = false;
+    slot.stage_length = 0;
+    slot.stage_offset = 0;
+    slot.body.length = 0;
+    slot.body.offset = 0;
+    slot.body.credit_pending = 0;
+    slot.body.pending_output = nil;
+    slot.body.pending_capacity = 0;
+    slot.body.inbound_complete = false;
+    slot.body.discard = false;
+    slot.request_string_length = 0;
+    slot.request_trailer_string_length = 0;
+    slot.body_done = false;
+    slot.inbound_complete = false;
+    slot.headers_sent = false;
+    slot.trailers_sent = false;
+    slot.response_complete = false;
+    slot.service_pending = false;
+    slot.exchange_live = false;
+    slot.exchange_finished = false;
+    slot.exchange.valid = false;
+    slot.active_call.bound = false;
+    slot.active_call.settled = false;
+    slot.charge = budget.no_charge();
+}
+
+pub fun make_pool(pool: *Pool, sessions: *Session, capacity: usize) bool {
+    if (pool == nil || sessions == nil || capacity == 0) { ret false; }
+    pool.sessions = sessions;
+    pool.capacity = capacity;
+    pool.live = 0;
+    pool.free_head = 0;
+    var i: usize = 0;
+    for (i < capacity) {
+        sessions[i].live = false;
+        sessions[i].next_free = i + 1;
+        if (i + 1 == capacity) { sessions[i].next_free = NO_SESSION; }
+        sessions[i].state = IDLE;
+        var j: usize = 0;
+        for (j < MAX_STREAMS) {
+            reset_request(?sessions[i].requests_slots[j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun acquire(pool: *Pool) usize {
+    if (pool == nil || pool.sessions == nil || pool.free_head == NO_SESSION) {
+        ret NO_SESSION;
+    }
+    val index: usize = pool.free_head;
+    val session: *Session = ?pool.sessions[index];
+    pool.free_head = session.next_free;
+    session.next_free = NO_SESSION;
+    session.live = true;
+    session.state = IDLE;
+    pool.live = pool.live + 1;
+    ret index;
+}
+
+pub fun session_at(pool: *Pool, index: usize) *Session {
+    if (pool == nil || index >= pool.capacity || !pool.sessions[index].live) {
+        ret nil;
+    }
+    ret ?pool.sessions[index];
+}
+
+fun return_session(pool: *Pool, index: usize) {
+    val session: *Session = ?pool.sessions[index];
+    session.live = false;
+    session.state = IDLE;
+    session.next_free = pool.free_head;
+    pool.free_head = index;
+    if (pool.live != 0) { pool.live = pool.live - 1; }
+}
+
+pub fun abandon(pool: *Pool, index: usize) bool {
+    val session: *Session = session_at(pool, index);
+    if (session == nil || session.state != IDLE) { ret false; }
+    return_session(pool, index);
+    ret true;
+}
+
+pub fun session_config(limits: message.Limits, max_requests: usize) h3.Config {
     var configured: h3.Config = h3.config_default();
-    configured.max_requests = 6;
+    if (max_requests > MAX_STREAMS) { max_requests = MAX_STREAMS; }
+    if (max_requests == 0) { max_requests = 1; }
+    configured.max_requests = max_requests;
     configured.max_peer_unidirectional = 3;
-    configured.max_pending_release = 4;
-    configured.frames.max_frame_payload = 192;
-    configured.frames.max_settings = 5;
-    configured.local.qpack_max_table_capacity = 128;
-    configured.local.max_field_section_size = 512;
-    configured.local.qpack_blocked_streams = 2;
-    configured.inbound_qpack.max_table_capacity = 128;
-    configured.inbound_qpack.max_blocked_streams = 2;
-    configured.inbound_qpack.max_field_bytes = 128;
-    configured.inbound_qpack.max_field_count = 16;
-    configured.inbound_qpack.max_field_section_bytes = 512;
-    configured.inbound_qpack.max_encoded_section_bytes = 256;
-    configured.inbound_qpack.max_instruction_bytes = 128;
-    configured.inbound_qpack.max_outstanding_sections = 8;
-    configured.inbound_qpack.max_references = 64;
+    configured.max_pending_release = PENDING_RELEASES;
+    configured.frames.max_frame_payload = FRAME_PAYLOAD_BYTES;
+    configured.frames.max_settings = SETTING_SLOTS;
+    configured.local.qpack_max_table_capacity = TABLE_BYTES;
+    configured.local.max_field_section_size = STRING_BYTES;
+    configured.local.qpack_blocked_streams = MAX_STREAMS;
+    configured.inbound_qpack.max_table_capacity = TABLE_BYTES;
+    configured.inbound_qpack.max_blocked_streams = MAX_STREAMS;
+    configured.inbound_qpack.max_field_bytes = STRING_BYTES;
+    configured.inbound_qpack.max_field_count = FIELD_SLOTS;
+    configured.inbound_qpack.max_field_section_bytes = STRING_BYTES;
+    configured.inbound_qpack.max_encoded_section_bytes = HEADER_BYTES;
+    configured.inbound_qpack.max_instruction_bytes = HEADER_BYTES;
+    configured.inbound_qpack.max_outstanding_sections = SECTION_SLOTS;
+    configured.inbound_qpack.max_references = SECTION_REFERENCES;
     configured.outbound_qpack = configured.inbound_qpack;
-    configured.messages.max_informational = 2;
+    configured.messages = limits;
     ret configured;
 }
 
@@ -101,35 +321,35 @@ pub fun start_session(session: *Session,
     var i: usize = 0;
     for (i < STREAM_SLOTS) {
         session.memories[i] = h3.StreamMemory{
-            read: ?session.reads[i][0], read_capacity: 192,
-            settings: ?session.settings[i][0], setting_capacity: 5,
-            encoded: ?session.encoded[i][0], encoded_capacity: 256,
-            fields: ?session.fields[i][0], field_capacity: 16,
-            strings: ?session.strings[i][0], string_capacity: 512,
-            scratch: ?session.scratch[i][0], scratch_capacity: 256,
-            output: ?session.output[i][0], output_capacity: 384,
-            references: ?session.references[i][0], reference_capacity: 16};
+            read: ?session.reads[i][0], read_capacity: READ_BYTES,
+            settings: ?session.settings[i][0], setting_capacity: SETTING_SLOTS,
+            encoded: ?session.encoded[i][0], encoded_capacity: HEADER_BYTES,
+            fields: ?session.fields[i][0], field_capacity: FIELD_SLOTS,
+            strings: ?session.strings[i][0], string_capacity: STRING_BYTES,
+            scratch: ?session.scratch[i][0], scratch_capacity: HEADER_BYTES,
+            output: ?session.output[i][0], output_capacity: FRAME_PAYLOAD_BYTES,
+            references: ?session.references[i][0], reference_capacity: REFERENCE_SLOTS};
         i = i + 1;
     }
     val storage: h3.Storage = h3.Storage{
         streams: ?session.streams[0], memories: ?session.memories[0],
         stream_capacity: STREAM_SLOTS,
-        pending_release: ?session.pending[0], pending_release_capacity: 4,
-        inbound_entries: ?session.inbound_entries[0], inbound_entry_capacity: 8,
-        inbound_storage: ?session.inbound_storage[0], inbound_storage_capacity: 256,
-        inbound_scratch: ?session.inbound_scratch[0], inbound_scratch_capacity: 256,
-        inbound_sections: ?session.inbound_sections[0], inbound_section_capacity: 8,
+        pending_release: ?session.pending[0], pending_release_capacity: PENDING_RELEASES,
+        inbound_entries: ?session.inbound_entries[0], inbound_entry_capacity: TABLE_ENTRIES,
+        inbound_storage: ?session.inbound_storage[0], inbound_storage_capacity: TABLE_BYTES,
+        inbound_scratch: ?session.inbound_scratch[0], inbound_scratch_capacity: TABLE_BYTES,
+        inbound_sections: ?session.inbound_sections[0], inbound_section_capacity: SECTION_SLOTS,
         inbound_references: ?session.inbound_references[0],
-        inbound_reference_capacity: 64,
-        outbound_entries: ?session.outbound_entries[0], outbound_entry_capacity: 8,
-        outbound_storage: ?session.outbound_storage[0], outbound_storage_capacity: 256,
-        outbound_scratch: ?session.outbound_scratch[0], outbound_scratch_capacity: 256,
-        outbound_sections: ?session.outbound_sections[0], outbound_section_capacity: 8,
+        inbound_reference_capacity: SECTION_REFERENCES,
+        outbound_entries: ?session.outbound_entries[0], outbound_entry_capacity: TABLE_ENTRIES,
+        outbound_storage: ?session.outbound_storage[0], outbound_storage_capacity: TABLE_BYTES,
+        outbound_scratch: ?session.outbound_scratch[0], outbound_scratch_capacity: TABLE_BYTES,
+        outbound_sections: ?session.outbound_sections[0], outbound_section_capacity: SECTION_SLOTS,
         outbound_references: ?session.outbound_references[0],
-        outbound_reference_capacity: 64,
-        control_queue: ?session.control_queue[0], control_queue_capacity: 256,
-        encoder_queue: ?session.encoder_queue[0], encoder_queue_capacity: 256,
-        decoder_queue: ?session.decoder_queue[0], decoder_queue_capacity: 256};
+        outbound_reference_capacity: SECTION_REFERENCES,
+        control_queue: ?session.control_queue[0], control_queue_capacity: QUEUE_BYTES,
+        encoder_queue: ?session.encoder_queue[0], encoder_queue_capacity: QUEUE_BYTES,
+        decoder_queue: ?session.decoder_queue[0], decoder_queue_capacity: QUEUE_BYTES};
     val transport: h3.Transport[adapter.Adapter] = adapter.bind(
         ?session.io, driver, clock);
     ret h3.init[adapter.Adapter](?session.engine, role, transport, ?session.scope, storage,
@@ -161,4 +381,930 @@ pub fun tick(session: *Session) h3.Event {
     val event: h3.Event = h3.tick[adapter.Adapter](?session.engine);
     record(session, event);
     ret event;
+}
+
+fun request_for(session: *Session, id: u64) *RequestSlot {
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        if (session.requests_slots[i].live && session.requests_slots[i].id == id) {
+            ret ?session.requests_slots[i];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun free_request(session: *Session) *RequestSlot {
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        if (!session.requests_slots[i].live) {
+            ret ?session.requests_slots[i];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun cancel_request(slot: *RequestSlot) {
+    if (slot.exchange_live) { exchange.cancel_exchange(?slot.exchange); }
+}
+
+fun finalize_request(slot: *RequestSlot) bool {
+    if (!slot.exchange_live) { ret true; }
+    val finalized: bool = call.release(?slot.active_call);
+    slot.exchange_live = false;
+    ret finalized;
+}
+
+fun release_request(session: *Session, slot: *RequestSlot) {
+    budget.release(session.budgets, ?slot.charge);
+    if (slot.scope_live) {
+        cancel.destroy(?slot.scope);
+        slot.scope_live = false;
+    }
+    reset_request(slot);
+}
+
+pub fun begin(session: *Session, driver: *qt.Driver[binding.Binding],
+    parent: *cancel.Scope, active_plan: *plan.Plan, budgets: *budget.Set,
+    limits: message.Limits, max_requests: usize, listener_name: str,
+    peer: message.Endpoint, local: message.Endpoint,
+    request_timeout_ns: u64, now_ns: u64) bool {
+    if (session == nil || !session.live || session.state != IDLE || driver == nil
+     || parent == nil || active_plan == nil || budgets == nil) {
+        ret false;
+    }
+    if (!cancel.make_child(?session.scope, parent, false,
+        time.Time{sec: 0, nsec: 0})) { ret false; }
+    session.plan = active_plan;
+    session.budgets = budgets;
+    session.limits = limits;
+    session.listener_name = listener_name;
+    session.peer = peer;
+    session.local = local;
+    session.request_timeout_ns = request_timeout_ns;
+    session.now_ns = now_ns;
+    session.requests = 0;
+    session.last_event = h3.EVENT_NONE;
+    session.last_step = STEP_IDLE;
+    session.final_goaway_sent = false;
+    session.handler = (0::usize)::HandlerFun;
+    session.context = nil;
+    session.rejected = 0;
+    var i: usize = 0;
+    for (i < EVENT_KINDS) { session.counts[i] = 0; i = i + 1; }
+    i = 0;
+    for (i < MAX_STREAMS) {
+        reset_request(?session.requests_slots[i]);
+        i = i + 1;
+    }
+    if (!start_session(session, driver, ?session.now_ns, h3.SERVER,
+        session_config(limits, max_requests))) {
+        cancel.destroy(?session.scope);
+        ret false;
+    }
+    session.state = ACTIVE;
+    ret true;
+}
+
+fun body_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    val state: *Body = context::*Body;
+    if (state == nil) {
+        ret body.failed("request body has no owner", body.REUSE_FORBIDDEN);
+    }
+    if (state.offset < state.length) {
+        var count: usize = state.length - state.offset;
+        if (count > capacity) { count = capacity; }
+        if (count == 0) { ret body.data(0); }
+        var i: usize = 0;
+        for (i < count) { output[i] = state.data[state.offset + i]; i = i + 1; }
+        state.offset = state.offset + count;
+        state.credit_pending = state.credit_pending + count;
+        ret body.data(count);
+    }
+    if (state.inbound_complete) { ret body.complete(body.REUSE_ALLOWED); }
+    state.next_token = state.next_token + 1;
+    state.pending_token = state.next_token;
+    state.pending_output = output;
+    state.pending_capacity = capacity;
+    ret body.pending(state.pending_token);
+}
+
+fun body_finish(context: ptr, mode: body.Mode,
+    trailers: *field.Fields) body.Progress {
+    val state: *Body = context::*Body;
+    if (state == nil) {
+        ret body.failed("request body has no owner", body.REUSE_FORBIDDEN);
+    }
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    state.pending_output = nil;
+    state.pending_capacity = 0;
+    if (state.offset < state.length) {
+        state.credit_pending = state.credit_pending + state.length - state.offset;
+        state.offset = state.length;
+    }
+    if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
+    state.discard = true;
+    if (state.inbound_complete) { ret body.complete(body.REUSE_ALLOWED); }
+    state.next_token = state.next_token + 1;
+    state.pending_token = state.next_token;
+    ret body.pending(state.pending_token);
+}
+
+fun body_complete(context: ptr, token: u64,
+    trailers: *field.Fields) body.Progress {
+    val state: *Body = context::*Body;
+    if (state == nil || token != state.pending_token) {
+        ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
+    }
+    val kind: body.Operation = state.reader.pending_kind;
+    val mode: body.Mode = state.reader.pending_mode;
+    state.pending_token = 0;
+    if (kind == body.OP_FINISH) {
+        state.pending_output = nil;
+        state.pending_capacity = 0;
+        if (state.offset < state.length) {
+            state.credit_pending = state.credit_pending + state.length - state.offset;
+            state.offset = state.length;
+        }
+        state.discard = true;
+        if (!state.inbound_complete) {
+            state.next_token = state.next_token + 1;
+            state.pending_token = state.next_token;
+            ret body.pending(state.pending_token);
+        }
+        if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    val output: *u8 = state.pending_output;
+    val capacity: usize = state.pending_capacity;
+    state.pending_output = nil;
+    state.pending_capacity = 0;
+    if (state.inbound_complete && state.offset == state.length) {
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    ret body_read(context, output, capacity, trailers);
+}
+
+fun body_release(context: ptr) {
+}
+
+fun token_is(name: view.View, expected: str, length: usize) bool {
+    if (name.len != length || name.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (name.data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun method_of(name: view.View) method.Method {
+    if (token_is(name, "GET", 3)) { ret method.from_kind(method.GET); }
+    if (token_is(name, "HEAD", 4)) { ret method.from_kind(method.HEAD); }
+    if (token_is(name, "POST", 4)) { ret method.from_kind(method.POST); }
+    if (token_is(name, "PUT", 3)) { ret method.from_kind(method.PUT); }
+    if (token_is(name, "DELETE", 6)) { ret method.from_kind(method.DELETE); }
+    if (token_is(name, "CONNECT", 7)) { ret method.from_kind(method.CONNECT); }
+    if (token_is(name, "OPTIONS", 7)) { ret method.from_kind(method.OPTIONS); }
+    if (token_is(name, "TRACE", 5)) { ret method.from_kind(method.TRACE); }
+    if (token_is(name, "PATCH", 5)) { ret method.from_kind(method.PATCH); }
+    ret method.extension(name);
+}
+
+fun target_of(raw: view.View) target.Target {
+    if (raw.len == 1 && raw.data != nil && raw.data[0] == '*'::u8) {
+        ret target.asterisk();
+    }
+    var cut: usize = raw.len;
+    var i: usize = 0;
+    for (i < raw.len) {
+        if (raw.data[i] == '?'::u8) { cut = i; brk; }
+        i = i + 1;
+    }
+    val path: view.View = view.view(raw.data, cut);
+    var query: view.View = view.view(nil, 0);
+    if (cut < raw.len) {
+        query = view.view(?raw.data[cut + 1], raw.len - cut - 1);
+    }
+    ret target.origin(raw, path, query);
+}
+
+fun stored(storage: *u8, capacity: usize, length: *usize,
+    source: view.View, output: *view.View) bool {
+    if (storage == nil || length == nil || output == nil
+     || @length > capacity || source.len > capacity - @length
+     || (source.len != 0 && source.data == nil)) { ret false; }
+    if (source.len == 0) {
+        @output = view.view(nil, 0);
+        ret true;
+    }
+    val start: usize = @length;
+    memory.raw_copy(?storage[start], source.data, source.len);
+    @length = start + source.len;
+    @output = view.view(?storage[start], source.len);
+    ret true;
+}
+
+fun copy_request_fields(slot: *RequestSlot, block: h3.HeaderBlock,
+    limits: field.Limits, method_name: *view.View,
+    raw_target: *view.View) bool {
+    slot.request_string_length = 0;
+    slot.request_fields = field.init(?slot.request_items[0], REQUEST_FIELD_SLOTS,
+        limits);
+    if (!slot.request_fields.valid
+     || !stored(?slot.request_strings[0], REQUEST_STRING_BYTES,
+        ?slot.request_string_length, block.method, method_name)
+     || !stored(?slot.request_strings[0], REQUEST_STRING_BYTES,
+        ?slot.request_string_length, block.path, raw_target)) { ret false; }
+    var has_host: bool = false;
+    var i: usize = block.regular_offset;
+    for (i < block.count) {
+        var name: view.View;
+        var value: view.View;
+        if (!stored(?slot.request_strings[0], REQUEST_STRING_BYTES,
+            ?slot.request_string_length, block.fields[i].name, ?name)
+         || !stored(?slot.request_strings[0], REQUEST_STRING_BYTES,
+            ?slot.request_string_length, block.fields[i].value, ?value)) {
+            ret false;
+        }
+        if (field.name_equal(name, view.view("host", 4))) {
+            has_host = true;
+        }
+        if (field.append(?slot.request_fields, field.Field{name: name,
+            value: value, sensitive: block.fields[i].sensitive}) != field.ADD_OK) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    if (has_host || block.authority.len == 0) { ret true; }
+    var authority: view.View;
+    if (!stored(?slot.request_strings[0], REQUEST_STRING_BYTES,
+        ?slot.request_string_length, block.authority, ?authority)) { ret false; }
+    ret field.append(?slot.request_fields, field.Field{
+        name: view.view("host", 4), value: authority,
+        sensitive: false}) == field.ADD_OK;
+}
+
+fun copy_request_trailers(session: *Session, slot: *RequestSlot,
+    block: h3.HeaderBlock) bool {
+    slot.request_trailer_string_length = 0;
+    if (!slot.request.trailers.valid || slot.request.trailers.len != 0) {
+        ret false;
+    }
+    var i: usize = block.regular_offset;
+    for (i < block.count) {
+        var name: view.View;
+        var value: view.View;
+        if (!stored(?slot.request_trailer_strings[0], REQUEST_TRAILER_BYTES,
+            ?slot.request_trailer_string_length, block.fields[i].name, ?name)
+         || !stored(?slot.request_trailer_strings[0], REQUEST_TRAILER_BYTES,
+            ?slot.request_trailer_string_length, block.fields[i].value, ?value)
+         || field.append_trailer(?slot.request.trailers, field.Field{name: name,
+            value: value, sensitive: block.fields[i].sensitive}) != field.ADD_OK) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun write_status(slot: *RequestSlot, code: status.Status) view.View {
+    val value: usize = code::usize;
+    slot.status_text[0] = '0'::u8 + (value / 100)::u8;
+    slot.status_text[1] = '0'::u8 + ((value / 10) % 10)::u8;
+    slot.status_text[2] = '0'::u8 + (value % 10)::u8;
+    ret view.view(?slot.status_text[0], 3);
+}
+
+fun deadline_from(now: time.Time, timeout_ns: u64) time.Time {
+    var deadline: time.Time = now;
+    deadline.sec = now.sec + (timeout_ns / 1000000000)::i64;
+    deadline.nsec = now.nsec + (timeout_ns % 1000000000)::i64;
+    if (deadline.nsec >= 1000000000) {
+        deadline.nsec = deadline.nsec - 1000000000;
+        deadline.sec = deadline.sec + 1;
+    }
+    ret deadline;
+}
+
+fun make_exchange(session: *Session, slot: *RequestSlot, event: h3.Event,
+    now: time.Time) bool {
+    session.requests = session.requests + 1;
+    val has_deadline: bool = session.request_timeout_ns != 0;
+    var deadline: time.Time = now;
+    if (has_deadline) { deadline = deadline_from(now, session.request_timeout_ns); }
+    if (slot.scope_live) { cancel.destroy(?slot.scope); }
+    slot.scope_live = false;
+    if (!cancel.make_child(?slot.scope, ?session.scope, has_deadline, deadline)) {
+        ret false;
+    }
+    slot.scope_live = true;
+    slot.body.pending_token = 0;
+    slot.body.next_token = 0;
+    slot.body.pending_output = nil;
+    slot.body.pending_capacity = 0;
+    slot.body.length = 0;
+    slot.body.offset = 0;
+    slot.body.credit_pending = 0;
+    slot.body.inbound_complete = event.end_stream;
+    slot.body.discard = false;
+    var declared: u64 = 0;
+    var length_known: bool = event.headers.has_content_length;
+    if (length_known) { declared = event.headers.content_length; }
+    if (event.end_stream) {
+        length_known = true;
+        if (!event.headers.has_content_length) { declared = 0; }
+    }
+    slot.body.reader = body.init_reader((?slot.body)::ptr,
+        body_read, body_finish, body_complete, body_release,
+        body.OWNER_APPLICATION, event.generation, length_known, declared,
+        session.limits.request_body, nil, ?slot.scope);
+    var method_name: view.View;
+    var raw_target: view.View;
+    if (!slot.body.reader.valid
+     || !copy_request_fields(slot, event.headers, session.limits.request_fields,
+        ?method_name, ?raw_target)) {
+        ret false;
+    }
+    slot.request_trailer_string_length = 0;
+    slot.request_trailers = field.init(?slot.request_trailer_items[0],
+        REQUEST_TRAILER_SLOTS, session.limits.request_trailers);
+    val metadata: message.Metadata = message.Metadata{
+        version: message.version_h3(), secure: true, early_data: false,
+        peer: session.peer, local: session.local, received_at: now,
+        has_deadline: has_deadline, deadline: deadline,
+        request_index: event.stream_id};
+    if (!message.init_request(?slot.request, method_of(method_name),
+        target_of(raw_target), metadata, slot.request_fields,
+        slot.request_trailers, ?slot.body.reader, event.generation,
+        session.limits)
+     || !message.init_response(?slot.response, ?slot.response_fields[0],
+        RESPONSE_FIELD_SLOTS, ?slot.response_trailers[0],
+        RESPONSE_TRAILER_SLOTS, event.generation, session.limits)) { ret false; }
+    slot.exchange.valid = false;
+    if (!exchange.init(?slot.exchange, ?slot.request, ?slot.response,
+        ?slot.informationals[0], INFORMATIONAL_SLOTS, ?slot.scope,
+        event.generation, session.limits)
+     || !h3.bind_exchange[adapter.Adapter](?session.engine, event.stream_id,
+        ?slot.exchange)
+     || !exchange.begin(?slot.exchange)
+     || !call.make_memory(?slot.memory, ?slot.arena[0], ARENA_BYTES)
+     || !telemetry_trace.make_root(?slot.trace, false)
+     || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory, ?slot.trace,
+        session.plan.generation, session.listener_name)) { ret false; }
+    slot.exchange_live = true;
+    ret true;
+}
+
+fun response_headers(slot: *RequestSlot) usize {
+    slot.header_items[0] = field.Field{name: view.view(":status", 7),
+        value: write_status(slot, slot.response.status), sensitive: false};
+    var count: usize = 1;
+    var i: usize = 0;
+    for (i < slot.response.fields.len && count < HEADER_ITEM_SLOTS) {
+        val item: *field.Field = ?slot.response.fields.items[i];
+        if (!field.name_equal(item.name, view.view("connection", 10))
+         && !field.name_equal(item.name, view.view("transfer-encoding", 17))
+         && !field.name_equal(item.name, view.view("keep-alive", 10))
+         && !field.name_equal(item.name, view.view("upgrade", 7))
+         && !field.name_equal(item.name, view.view("proxy-connection", 16))) {
+            slot.header_items[count] = @item;
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+fun has_body(slot: *RequestSlot) bool {
+    ret slot.response.body_kind == message.BODY_READER;
+}
+
+fun begin_response(session: *Session, slot: *RequestSlot) Step {
+    if (slot.headers_sent || !slot.response.committed) { ret STEP_IDLE; }
+    val count: usize = response_headers(slot);
+    val final: bool = !has_body(slot) && slot.response.trailers.len == 0;
+    val offered: h3.Offer = h3.send_headers[adapter.Adapter](?session.engine,
+        slot.id, ?slot.header_items[0], count, final, true);
+    if (offered.status == h3.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    if (offered.status == h3.OFFER_ERROR) { ret STEP_ERROR; }
+    slot.headers_sent = true;
+    if (final) { slot.response_complete = true; }
+    ret STEP_PROGRESS;
+}
+
+fun send_trailers(session: *Session, slot: *RequestSlot) Step {
+    if (slot.trailers_sent || slot.response.trailers.len == 0) { ret STEP_IDLE; }
+    val offered: h3.Offer = h3.send_headers[adapter.Adapter](?session.engine,
+        slot.id, slot.response.trailers.items, slot.response.trailers.len,
+        true, true);
+    if (offered.status == h3.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    if (offered.status == h3.OFFER_ERROR) { ret STEP_ERROR; }
+    slot.trailers_sent = true;
+    slot.response_complete = true;
+    ret STEP_PROGRESS;
+}
+
+fun advance_response(session: *Session, slot: *RequestSlot) Step {
+    if (!slot.headers_sent || slot.response_complete) { ret STEP_IDLE; }
+    if (slot.stage_offset >= slot.stage_length) {
+        slot.stage_offset = 0;
+        slot.stage_length = 0;
+        if (!slot.body_done) {
+            if (has_body(slot)) {
+                val progress: body.Progress = body.read(slot.response.body_reader,
+                    ?slot.stage[0], STAGE_BYTES);
+                if (progress.status == body.DATA) { slot.stage_length = progress.count; }
+                or (progress.status == body.PENDING) { ret STEP_BLOCKED; }
+                or (progress.status == body.COMPLETE) { slot.body_done = true; }
+                or { ret STEP_ERROR; }
+            } or { slot.body_done = true; }
+        }
+    }
+    var payload: *u8 = nil;
+    var length: usize = 0;
+    if (slot.stage_offset < slot.stage_length) {
+        payload = ?slot.stage[slot.stage_offset];
+        length = slot.stage_length - slot.stage_offset;
+    }
+    val final: bool = slot.body_done && length == 0
+        && slot.response.trailers.len == 0;
+    if (length == 0 && !final) {
+        if (slot.body_done) { ret send_trailers(session, slot); }
+        ret STEP_BLOCKED;
+    }
+    val offered: h3.Offer = h3.offer_data[adapter.Adapter](?session.engine,
+        slot.id, payload, length, final);
+    if (offered.status == h3.OFFER_ERROR) { ret STEP_ERROR; }
+    if (offered.status == h3.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    slot.stage_offset = slot.stage_offset + offered.consumed;
+    if (final && offered.status == h3.OFFER_DONE) {
+        slot.response_complete = true;
+    }
+    if (offered.consumed == 0 && offered.produced == 0 && !final) {
+        ret STEP_BLOCKED;
+    }
+    ret STEP_PROGRESS;
+}
+
+fun fail_exchange(session: *Session, slot: *RequestSlot,
+    code: status.Status) Step {
+    if (slot.response.committed
+     || message.set_status(?slot.response, code) != message.RESPONSE_OK) {
+        ret STEP_ERROR;
+    }
+    if (call.disposition(?slot.active_call) == call.BODY_UNRESOLVED
+     && !call.resolve_body(?slot.active_call, call.BODY_CLOSE)) { ret STEP_ERROR; }
+    if (exchange.commit(?slot.exchange, session.limits) != message.RESPONSE_OK) {
+        ret STEP_ERROR;
+    }
+    ret begin_response(session, slot);
+}
+
+fun start_exchange(session: *Session, slot: *RequestSlot,
+    now: time.Time) Step {
+    val served: dispatch.Result = dispatch.serve(session.plan, ?slot.active_call,
+        ?slot.captures[0], CAPTURE_SLOTS, session.budgets, ?slot.charge, now);
+    if (served.outcome == dispatch.FAILED) {
+        ret fail_exchange(session, slot, status.INTERNAL_SERVER_ERROR);
+    }
+    if (served.outcome == dispatch.PENDING) {
+        slot.service_pending = true;
+        ret STEP_PROGRESS;
+    }
+    ret begin_response(session, slot);
+}
+
+fun resume_exchange(session: *Session, slot: *RequestSlot,
+    now: time.Time) Step {
+    val served: dispatch.Result = dispatch.resume(session.plan, ?slot.active_call,
+        session.budgets, ?slot.charge, now);
+    if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
+    slot.service_pending = false;
+    if (served.outcome == dispatch.FAILED) {
+        ret fail_exchange(session, slot, status.BAD_GATEWAY);
+    }
+    ret begin_response(session, slot);
+}
+
+fun terminal_exchange(slot: *RequestSlot) bool {
+    val state: exchange.State = slot.exchange.state;
+    ret state == exchange.COMPLETE_STATE
+        || state == exchange.CANCELLED_STATE
+        || state == exchange.TIMED_OUT_STATE
+        || state == exchange.FAILED_STATE;
+}
+
+fun complete_pending_body(slot: *RequestSlot) bool {
+    if (slot.body.pending_token == 0) { ret true; }
+    val completed: body.Progress = body.complete_reader(?slot.body.reader,
+        slot.body.pending_token);
+    ret completed.status != body.ERROR && completed.status != body.LIMIT_REACHED
+        && completed.status != body.INVALID;
+}
+
+fun flush_body_credit(session: *Session, slot: *RequestSlot) Step {
+    if (slot.body.credit_pending == 0) { ret STEP_IDLE; }
+    val count: usize = slot.body.credit_pending;
+    if (!h3.consume_data[adapter.Adapter](?session.engine, slot.id, count)) {
+        ret STEP_ERROR;
+    }
+    slot.body.credit_pending = 0;
+    if (slot.body.offset == slot.body.length) {
+        slot.body.offset = 0;
+        slot.body.length = 0;
+    }
+    ret STEP_PROGRESS;
+}
+
+fun settle_request(session: *Session, slot: *RequestSlot) Step {
+    if (!slot.exchange_live) {
+        if (!h3.release_stream[adapter.Adapter](?session.engine, slot.id,
+            slot.generation)) { ret STEP_BLOCKED; }
+        release_request(session, slot);
+        ret STEP_PROGRESS;
+    }
+    if (!slot.exchange_finished) {
+        if (!terminal_exchange(slot)
+         && exchange.finish(?slot.exchange) != exchange.FINISH_OK) {
+            ret STEP_ERROR;
+        }
+        slot.exchange_finished = true;
+    }
+    if (!h3.release_stream[adapter.Adapter](?session.engine, slot.id,
+        slot.generation)) { ret STEP_BLOCKED; }
+    val finalized: bool = finalize_request(slot);
+    release_request(session, slot);
+    if (!finalized) { ret STEP_ERROR; }
+    ret STEP_PROGRESS;
+}
+
+fun pump_request(session: *Session, slot: *RequestSlot,
+    now: time.Time) Step {
+    if (!slot.live) { ret STEP_IDLE; }
+    val credited: Step = flush_body_credit(session, slot);
+    if (credited == STEP_ERROR) { ret STEP_ERROR; }
+    val stream: *h3.Stream = h3.stream_for[adapter.Adapter](?session.engine,
+        slot.id);
+    if (stream == nil || stream.generation != slot.generation) {
+        ret STEP_ERROR;
+    }
+    if (!slot.exchange_live) {
+        if (stream.state != h3.STREAM_CLOSED) { ret credited; }
+        ret settle_request(session, slot);
+    }
+    if (terminal_exchange(slot)) {
+        if (stream.state != h3.STREAM_CLOSED) { ret credited; }
+        ret settle_request(session, slot);
+    }
+    if (slot.service_pending) {
+        val resumed: Step = resume_exchange(session, slot, now);
+        if (resumed != STEP_BLOCKED) { ret resumed; }
+        ret credited;
+    }
+    if (!slot.headers_sent) {
+        val started: Step = begin_response(session, slot);
+        if (started != STEP_IDLE) { ret started; }
+        ret credited;
+    }
+    if (!slot.response_complete) {
+        val response: Step = advance_response(session, slot);
+        if (response != STEP_BLOCKED) { ret response; }
+        ret credited;
+    }
+    if (!body.reader_terminal_state(slot.request.body)) {
+        if (slot.request.body.pending_kind != body.OP_NONE) { ret credited; }
+        val drained: body.Progress = body.drain(slot.request.body);
+        if (drained.status == body.ERROR || drained.status == body.LIMIT_REACHED
+         || drained.status == body.INVALID) { ret STEP_ERROR; }
+        if (!body.reader_terminal_state(slot.request.body)) { ret credited; }
+    }
+    if (stream.state != h3.STREAM_CLOSED) { ret credited; }
+    ret settle_request(session, slot);
+}
+
+fun pump_requests(session: *Session, now: time.Time) Step {
+    var progressed: bool = false;
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        val stepped: Step = pump_request(session, ?session.requests_slots[i], now);
+        if (stepped == STEP_ERROR) { ret STEP_ERROR; }
+        if (stepped == STEP_PROGRESS) { progressed = true; }
+        i = i + 1;
+    }
+    if (progressed) { ret STEP_PROGRESS; }
+    ret STEP_BLOCKED;
+}
+
+fun open_request(session: *Session, event: h3.Event,
+    now: time.Time) Step {
+    val slot: *RequestSlot = free_request(session);
+    if (slot == nil) {
+        h3.cancel_connection[adapter.Adapter](?session.engine);
+        ret STEP_ERROR;
+    }
+    reset_request(slot);
+    slot.live = true;
+    slot.id = event.stream_id;
+    slot.generation = event.generation;
+    slot.inbound_complete = event.end_stream;
+    if (!make_exchange(session, slot, event, now)
+     || !h3.release_event[adapter.Adapter](?session.engine, event.stream_id,
+        event.generation)) {
+        cancel_request(slot);
+        h3.cancel_connection[adapter.Adapter](?session.engine);
+        ret STEP_ERROR;
+    }
+    ret start_exchange(session, slot, now);
+}
+
+fun apply_data(session: *Session, event: h3.Event) Step {
+    val slot: *RequestSlot = request_for(session, event.stream_id);
+    if (slot == nil || !slot.exchange_live || slot.body.discard
+     || body.reader_terminal_state(slot.request.body)) {
+        if (!h3.consume_data[adapter.Adapter](?session.engine,
+            event.stream_id, event.data_length)) { ret STEP_ERROR; }
+        ret STEP_PROGRESS;
+    }
+    if (slot.generation != event.generation || event.data == nil
+     || event.data_length == 0 || event.data_length > READ_BYTES) {
+        ret STEP_ERROR;
+    }
+    if (slot.body.offset < slot.body.length) {
+        if (slot.body.length - slot.body.offset != event.data_length
+         || !memory.raw_equal(?slot.body.data[slot.body.offset], event.data,
+            event.data_length)) { ret STEP_ERROR; }
+        ret STEP_BLOCKED;
+    }
+    memory.raw_copy(?slot.body.data[0], event.data, event.data_length);
+    slot.body.offset = 0;
+    slot.body.length = event.data_length;
+    if (!complete_pending_body(slot)) { ret STEP_ERROR; }
+    ret STEP_PROGRESS;
+}
+
+fun finish_inbound(slot: *RequestSlot) bool {
+    slot.inbound_complete = true;
+    slot.body.inbound_complete = true;
+    ret complete_pending_body(slot);
+}
+
+fun apply_event(session: *Session, event: h3.Event,
+    now: time.Time) Step {
+    session.last_event = event.kind;
+    if (event.kind == h3.EVENT_NONE || event.kind == h3.EVENT_BLOCKED) {
+        ret STEP_BLOCKED;
+    }
+    if (event.kind == h3.EVENT_SETTINGS) { ret STEP_PROGRESS; }
+    if (event.kind == h3.EVENT_REQUEST_HEADERS) {
+        ret open_request(session, event, now);
+    }
+    if (event.kind == h3.EVENT_DATA) { ret apply_data(session, event); }
+    if (event.kind == h3.EVENT_TRAILERS) {
+        val slot: *RequestSlot = request_for(session, event.stream_id);
+        if (slot == nil) {
+            if (!h3.release_event[adapter.Adapter](?session.engine,
+                event.stream_id, event.generation)) { ret STEP_ERROR; }
+            ret STEP_PROGRESS;
+        }
+        if (slot.generation != event.generation
+         || !copy_request_trailers(session, slot, event.headers)
+         || !h3.release_event[adapter.Adapter](?session.engine,
+            event.stream_id, event.generation)) { ret STEP_ERROR; }
+        ret STEP_PROGRESS;
+    }
+    if (event.kind == h3.EVENT_STREAM_END) {
+        val slot: *RequestSlot = request_for(session, event.stream_id);
+        if (slot != nil && !finish_inbound(slot)) { ret STEP_ERROR; }
+        ret STEP_PROGRESS;
+    }
+    if (event.kind == h3.EVENT_STREAM_RESET
+     || event.kind == h3.EVENT_STREAM_RETRY
+     || event.kind == h3.EVENT_STREAM_ERROR) {
+        val slot: *RequestSlot = request_for(session, event.stream_id);
+        if (slot != nil) {
+            cancel_request(slot);
+            slot.service_pending = false;
+            slot.body.inbound_complete = true;
+            slot.inbound_complete = true;
+        }
+        ret STEP_PROGRESS;
+    }
+    if (event.kind == h3.EVENT_GOAWAY) { ret STEP_PROGRESS; }
+    if (event.kind == h3.EVENT_CLOSED) {
+        session.state = CLOSED;
+        ret STEP_DONE;
+    }
+    if (event.kind == h3.EVENT_CANCELLED || event.kind == h3.EVENT_ERROR) {
+        session.state = FAILED;
+        var i: usize = 0;
+        for (i < MAX_STREAMS) {
+            if (session.requests_slots[i].live) {
+                cancel_request(?session.requests_slots[i]);
+            }
+            i = i + 1;
+        }
+        ret STEP_PROGRESS;
+    }
+    h3.cancel_connection[adapter.Adapter](?session.engine);
+    session.state = FAILED;
+    ret STEP_ERROR;
+}
+
+pub fun step(session: *Session, now: time.Time,
+    monotonic_ns: u64) Step {
+    if (session == nil || !session.live
+     || (session.state != ACTIVE && session.state != CLOSING
+        && session.state != FAILED)) { ret STEP_DONE; }
+    session.now_ns = monotonic_ns;
+    val timed: h3.Event = tick(session);
+    if (timed.kind != h3.EVENT_NONE) {
+        val applied: Step = apply_event(session, timed, now);
+        if (applied != STEP_BLOCKED) {
+            session.last_step = applied;
+            ret applied;
+        }
+    }
+    val pumped: Step = pump_requests(session, now);
+    if (pumped == STEP_ERROR) {
+        h3.cancel_connection[adapter.Adapter](?session.engine);
+        session.state = FAILED;
+        session.last_step = STEP_ERROR;
+        ret STEP_ERROR;
+    }
+    if (pumped == STEP_PROGRESS) {
+        session.last_step = STEP_PROGRESS;
+        ret STEP_PROGRESS;
+    }
+    if (session.state == FAILED) {
+        session.last_step = STEP_DONE;
+        ret STEP_DONE;
+    }
+    if (session.state == CLOSING) {
+        if (!session.final_goaway_sent && session.engine.active_requests == 0
+         && h3.finish_graceful[adapter.Adapter](?session.engine)) {
+            session.final_goaway_sent = true;
+            session.last_step = STEP_PROGRESS;
+            ret STEP_PROGRESS;
+        }
+        if (h3.progress_close[adapter.Adapter](?session.engine)) {
+            session.last_step = STEP_PROGRESS;
+            ret STEP_PROGRESS;
+        }
+    }
+    val applied: Step = apply_event(session, poll(session), now);
+    session.last_step = applied;
+    ret applied;
+}
+
+pub fun advance(session: *Session, now: time.Time,
+    monotonic_ns: u64) Step {
+    if (session == nil || !session.live) { ret STEP_ERROR; }
+    var count: usize = 0;
+    for (count < MAX_STEPS) {
+        val progress: Step = step(session, now, monotonic_ns);
+        if (progress != STEP_PROGRESS) { ret progress; }
+        count = count + 1;
+    }
+    ret STEP_BLOCKED;
+}
+
+pub fun begin_graceful(session: *Session) bool {
+    if (session == nil || !session.live) { ret false; }
+    if (session.state == CLOSING) { ret true; }
+    if (session.state != ACTIVE
+     || !h3.begin_graceful[adapter.Adapter](?session.engine)) { ret false; }
+    session.state = CLOSING;
+    session.final_goaway_sent = false;
+    ret true;
+}
+
+pub fun cancel_session(session: *Session) bool {
+    if (session == nil || !session.live || session.state == CLOSED) { ret false; }
+    val cancelled: bool = h3.cancel_connection[adapter.Adapter](?session.engine);
+    session.state = FAILED;
+    ret cancelled;
+}
+
+fun active_requests(session: *Session) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        if (session.requests_slots[i].live) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+pub fun release(pool: *Pool, index: usize) bool {
+    val session: *Session = session_at(pool, index);
+    if (session == nil || active_requests(session) != 0
+     || !h3.destroy[adapter.Adapter](?session.engine)
+     || !cancel.destroy(?session.scope)) { ret false; }
+    return_session(pool, index);
+    ret true;
+}
+
+pub rec Snapshot {
+    state: State;
+    engine_state: h3.State;
+    last_event: h3.EventKind;
+    last_step: Step;
+    requests: u64;
+    active_requests: usize;
+}
+
+pub fun snapshot(session: *Session) Snapshot {
+    var value: Snapshot;
+    if (session == nil || !session.live) {
+        value.state = CLOSED;
+        value.engine_state = 0;
+        value.last_event = h3.EVENT_NONE;
+        value.last_step = STEP_IDLE;
+        value.requests = 0;
+        value.active_requests = 0;
+        ret value;
+    }
+    value.state = session.state;
+    value.engine_state = session.engine.state;
+    value.last_event = session.last_event;
+    value.last_step = session.last_step;
+    value.requests = session.requests;
+    value.active_requests = active_requests(session);
+    ret value;
+}
+
+test "hedge.protocol.h3.session: pool ownership is bounded and reusable" {
+    var storage: [1]Session;
+    var pool: Pool;
+    if (!make_pool(?pool, ?storage[0], 1) || pool.live != 0
+     || pool.free_head != 0) { ret 1; }
+    val first: usize = acquire(?pool);
+    if (first != 0 || pool.live != 1 || acquire(?pool) != NO_SESSION
+     || session_at(?pool, first) == nil) { ret 2; }
+    if (!abandon(?pool, first) || pool.live != 0
+     || session_at(?pool, first) != nil) { ret 3; }
+    val second: usize = acquire(?pool);
+    if (second != first || !abandon(?pool, second)) { ret 4; }
+    ret 0;
+}
+
+test "hedge.protocol.h3.session: released header events leave owned views" {
+    var method_bytes: [3]u8 = [3]u8{'G', 'E', 'T'};
+    var path_bytes: [4]u8 = [4]u8{'/', 'o', 'n', 'e'};
+    var authority_bytes: [11]u8 = [11]u8{'e', 'x', 'a', 'm', 'p', 'l', 'e',
+        '.', 'c', 'o', 'm'};
+    var name_bytes: [6]u8 = [6]u8{'x', '-', 't', 'e', 's', 't'};
+    var value_bytes: [3]u8 = [3]u8{'o', 'n', 'e'};
+    var items: [1]field.Field;
+    items[0] = field.Field{name: view.view(?name_bytes[0], 6),
+        value: view.view(?value_bytes[0], 3), sensitive: false};
+    val block: h3.HeaderBlock = h3.HeaderBlock{fields: ?items[0], count: 1,
+        regular_offset: 0, method: view.view(?method_bytes[0], 3),
+        scheme: view.view("https", 5), path: view.view(?path_bytes[0], 4),
+        authority: view.view(?authority_bytes[0], 11),
+        protocol: view.view(nil, 0), status: 0,
+        has_content_length: false, content_length: 0};
+    var slot: RequestSlot;
+    var copied_method: view.View;
+    var copied_target: view.View;
+    if (!copy_request_fields(?slot, block, field.limits(40, 4096, 256, 4096),
+        ?copied_method, ?copied_target)
+     || slot.request_fields.len != 2) { ret 1; }
+    method_bytes[0] = 'X'; path_bytes[1] = 'x';
+    authority_bytes[0] = 'x'; value_bytes[0] = 'x';
+    if (!token_is(copied_method, "GET", 3)
+     || copied_target.data[1] != 'o'
+     || slot.request_fields.items[0].value.data[0] != 'o'
+     || slot.request_fields.items[1].value.data[0] != 'e') { ret 2; }
+    ret 0;
+}
+
+test "hedge.protocol.h3.session: pending body completion fills the retained buffer" {
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) {
+        ret 1;
+    }
+    var state: Body;
+    state.reader = body.init_reader((?state)::ptr, body_read, body_finish,
+        body_complete, body_release, body.OWNER_APPLICATION, 1, false, 0,
+        body.limits(32, 8, 8), nil, ?scope);
+    var output: [4]u8;
+    val pending: body.Progress = body.read(?state.reader, ?output[0], 4);
+    if (pending.status != body.PENDING || state.pending_output != ?output[0]
+     || state.pending_capacity != 4) { ret 2; }
+    state.data[0] = 'o'; state.data[1] = 'k';
+    state.length = 2;
+    val completed: body.Progress = body.complete_reader(?state.reader,
+        pending.token);
+    if (completed.status != body.DATA || completed.count != 2
+     || output[0] != 'o' || output[1] != 'k' || state.credit_pending != 2
+     || state.pending_output != nil || state.pending_capacity != 0) { ret 3; }
+    state.inbound_complete = true;
+    if (body.read(?state.reader, ?output[0], 4).status != body.COMPLETE
+     || !cancel.destroy(?scope)) { ret 4; }
+    ret 0;
 }
