@@ -104,10 +104,12 @@ tickets_per_connection = 2
 ```
 
 All three durations are positive seconds bounded at seven days, and one
-connection may receive between one and four tickets. A sealing key rotates
-before the first handshake after its lifetime and remains usable only for the
-configured retirement overlap. A ticket is usable for the shorter of its own
-lifetime and the opening life of the key that sealed it.
+connection may receive between one and four tickets. The retirement overlap may
+span at most three key lifetimes, because the bounded four-key ring owns one
+current key and at most three retired keys. A sealing key rotates before the
+first handshake after its lifetime and remains usable only for the configured
+retirement overlap. A ticket is usable for the shorter of its own lifetime and
+the opening life of the key that sealed it.
 
 `replay` is `permissive` or `single_use`. The default inside an enabled table is
 `permissive`: Hedge implements no early data, so presenting a ticket cannot
