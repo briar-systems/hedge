@@ -1,0 +1,242 @@
+# production ownership for telemetry storage, sinks, credentials, and shutdown
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.allocator;
+use std.allocator.fixed;
+use std.log.record;
+use std.log.sink;
+use hedge.config.schema;
+use hedge.secret;
+use hedge.service;
+use telemetry: hedge.telemetry;
+use telemetry_metrics: hedge.telemetry.metrics;
+use telemetry_health: hedge.telemetry.health;
+use telemetry_admin: hedge.telemetry.admin;
+
+pub rec Production {
+    heap: *allocator.Allocator;
+    runtime: telemetry.Runtime;
+    direct: sink.Direct;
+    direct_output: sink.Sink;
+    queue: sink.Queued;
+    queue_storage: *sink.QueuedRecord;
+    queue_capacity: usize;
+    queued_output: sink.Sink;
+    metric_storage: *telemetry_metrics.Series;
+    metric_capacity: usize;
+    checks: [1]telemetry_health.Check;
+    secret_value: [secret.MAX_VALUE_BYTES + 1]u8;
+    credential: telemetry_admin.Credential;
+    listener_services: [1]service.ListenerService;
+    listener_service_count: usize;
+    queue_live: bool;
+    live: bool;
+}
+
+fun finish_queue(context: ptr) bool {
+    val production: *Production = context::*Production;
+    if (production == nil || !production.queue_live) { ret false; }
+    val closed: bool = sink.queued_close_drain(?production.queue);
+    val joined: bool = sink.queued_join(?production.queue);
+    val stats: sink.QueueStats = sink.queued_stats(?production.queue);
+    val destroyed: bool = joined && sink.queued_destroy(?production.queue);
+    if (destroyed) { production.queue_live = false; }
+    ret closed && joined && destroyed && stats.partial == 0 && stats.failed == 0;
+}
+
+fun cleanup(production: *Production) bool {
+    var ok: bool = true;
+    if (production.live) {
+        ok = telemetry.shutdown(?production.runtime);
+        production.live = false;
+    }
+    if (production.queue_live && !finish_queue(production::ptr)) { ok = false; }
+    if (production.metric_storage != nil) {
+        if (is_err[bool, *u8](allocator.deallocate[telemetry_metrics.Series](
+                production.heap, production.metric_storage,
+                production.metric_capacity))) { ok = false; }
+        or { production.metric_storage = nil; production.metric_capacity = 0; }
+    }
+    if (!production.queue_live && production.queue_storage != nil) {
+        if (is_err[bool, *u8](allocator.deallocate[sink.QueuedRecord](
+                production.heap, production.queue_storage,
+                production.queue_capacity))) { ok = false; }
+        or { production.queue_storage = nil; production.queue_capacity = 0; }
+    }
+    secret.clear(?production.secret_value[0], secret.MAX_VALUE_BYTES + 1);
+    production.credential.data = nil;
+    production.credential.len = 0;
+    production.listener_service_count = 0;
+    ret ok;
+}
+
+pub fun make(production: *Production, heap: *allocator.Allocator,
+    graph: *schema.Graph, secrets: secret.Resolver) bool {
+    if (production == nil || heap == nil || graph == nil) { ret false; }
+    production.heap = heap;
+    production.queue_storage = nil;
+    production.queue_capacity = 0;
+    production.metric_storage = nil;
+    production.metric_capacity = 0;
+    production.queue_live = false;
+    production.live = false;
+    production.listener_service_count = 0;
+    secret.clear(?production.secret_value[0], secret.MAX_VALUE_BYTES + 1);
+
+    var output: *sink.Sink = nil;
+    var flush_context: ptr = nil;
+    var flush: telemetry.FlushFun = (0::usize)::telemetry.FlushFun;
+    if (graph.telemetry.logs) {
+        val direct: Result[sink.Sink, str] = sink.console(?production.direct,
+            true, graph.telemetry.log_record_bytes, record.OVERSIZE_REJECT);
+        if (is_err[sink.Sink, str](direct)) { ret false; }
+        production.direct_output = unwrap_ok[sink.Sink, str](direct);
+        val memory: Result[*sink.QueuedRecord, *u8] =
+            allocator.allocate[sink.QueuedRecord](heap,
+                graph.telemetry.log_queue_depth);
+        if (is_err[*sink.QueuedRecord, *u8](memory)) { ret false; }
+        production.queue_storage = unwrap_ok[*sink.QueuedRecord, *u8](memory);
+        production.queue_capacity = graph.telemetry.log_queue_depth;
+        val queued: Result[sink.Sink, str] = sink.queued(?production.queue,
+            production.queue_storage, graph.telemetry.log_queue_depth,
+            ?production.direct_output, graph.telemetry.log_record_bytes,
+            record.OVERSIZE_REJECT, sink.OVERLOAD_REJECT_NEW);
+        if (is_err[sink.Sink, str](queued)) { cleanup(production); ret false; }
+        production.queued_output = unwrap_ok[sink.Sink, str](queued);
+        production.queue_live = true;
+        output = ?production.queued_output;
+        flush_context = production::ptr;
+        flush = finish_queue;
+    }
+
+    var metric_capacity: usize = 0;
+    if (graph.telemetry.metrics) {
+        metric_capacity = graph.telemetry.metric_series;
+        val metrics: Result[*telemetry_metrics.Series, *u8] =
+            allocator.allocate[telemetry_metrics.Series](heap, metric_capacity);
+        if (is_err[*telemetry_metrics.Series, *u8](metrics)) {
+            cleanup(production);
+            ret false;
+        }
+        production.metric_storage =
+            unwrap_ok[*telemetry_metrics.Series, *u8](metrics);
+        production.metric_capacity = metric_capacity;
+    }
+
+    var authenticate: telemetry_admin.AuthenticateFun =
+        (0::usize)::telemetry_admin.AuthenticateFun;
+    var auth_context: ptr = nil;
+    if (graph.admin.enabled) {
+        val length: usize = secret.resolve(graph,
+            schema.text(?graph.admin.auth_secret), secrets,
+            ?production.secret_value[0], secret.MAX_VALUE_BYTES + 1);
+        if (length == 0) { cleanup(production); ret false; }
+        production.credential.data = ?production.secret_value[0];
+        production.credential.len = length;
+        authenticate = telemetry_admin.authenticate_bearer;
+        auth_context = (?production.credential)::ptr;
+    }
+
+    if (!telemetry.make(?production.runtime, graph, output,
+            production.metric_storage, metric_capacity,
+            ?production.checks[0], 1, auth_context, authenticate,
+            nil, (0::usize)::telemetry_admin.RenderFun,
+            (0::usize)::telemetry_admin.RenderFun,
+            flush_context, flush)) {
+        cleanup(production);
+        ret false;
+    }
+    production.live = true;
+    if (graph.admin.enabled) {
+        val handler: service.Handler = telemetry_admin.bound_service(
+            ?production.runtime.admin);
+        if (!service.has_handler(handler)) { cleanup(production); ret false; }
+        production.listener_services[0] = service.ListenerService{
+            listener: schema.text(?graph.admin.listener),
+            name: "administration", handler: handler};
+        production.listener_service_count = 1;
+    }
+    ret true;
+}
+
+pub fun close(production: *Production) bool {
+    if (production == nil || (!production.live && !production.queue_live
+     && production.queue_storage == nil && production.metric_storage == nil)) {
+        ret false;
+    }
+    ret cleanup(production);
+}
+
+fun test_secret(context: ptr, provider: str, key: str, output: *u8,
+    capacity: usize) i64 {
+    if (capacity < 7) { ret -1; }
+    output[0] = 's'; output[1] = 'e'; output[2] = 'c'; output[3] = 'r';
+    output[4] = 'e'; output[5] = 't'; output[6] = 0;
+    ret 6;
+}
+
+test "telemetry production: admin credentials and listener service share one owner" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs = false;
+    graph.admin.enabled = true;
+    schema.set_text(?graph.admin.listener, "admin");
+    schema.set_text(?graph.admin.auth_secret, "admin-token");
+    graph.secret_count = 1;
+    schema.set_text(?graph.secrets[0].name, "admin-token");
+    schema.set_text(?graph.secrets[0].provider, "application");
+    schema.set_text(?graph.secrets[0].key, "token");
+    var memory: [1024]u8;
+    var state: fixed.FixedState;
+    var heap: allocator.Allocator;
+    fixed.make(?heap, ?state, ?memory[0], 1024);
+    var production: Production;
+    if (!make(?production, ?heap, ?graph,
+            secret.Resolver{context: nil, resolve: test_secret})) { ret 1; }
+    if (production.listener_service_count != 1
+     || !service.has_handler(production.listener_services[0].handler)
+     || telemetry.observer(?production.runtime).begin::usize == 0
+     || !telemetry_admin.authenticate_bearer((?production.credential)::ptr,
+        "Bearer secret")
+     || telemetry_admin.authenticate_bearer((?production.credential)::ptr,
+        "Bearer wrong")) { close(?production); ret 2; }
+    if (!close(?production)) { ret 3; }
+    var i: usize = 0;
+    for (i < secret.MAX_VALUE_BYTES + 1) {
+        if (production.secret_value[i] != 0) { ret 4; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "telemetry production: bounded sink and metric storage close together" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs = true;
+    graph.telemetry.log_record_bytes = 256;
+    graph.telemetry.log_queue_depth = 1;
+    graph.telemetry.metrics = true;
+    graph.telemetry.metric_series = schema.MIN_METRIC_SERIES;
+    var memory: [65536]u8;
+    var state: fixed.FixedState;
+    var heap: allocator.Allocator;
+    fixed.make(?heap, ?state, ?memory[0], 65536);
+    var production: Production;
+    if (!make(?production, ?heap, ?graph, secret.no_resolver())) { ret 1; }
+    if (!production.live || !production.queue_live
+     || production.queue_storage == nil || production.metric_storage == nil) {
+        close(?production);
+        ret 2;
+    }
+    if (!close(?production) || production.live || production.queue_live
+     || production.queue_storage != nil || production.metric_storage != nil
+     || production.runtime.initialized) { ret 3; }
+    ret 0;
+}
