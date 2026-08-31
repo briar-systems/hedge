@@ -188,6 +188,31 @@ check "GnuTLS completes a TLS 1.3 handshake with ALPN" 0 \
         --sni-hostname api.example.com --verify-hostname api.example.com \
         </dev/null >/dev/null 2>&1; echo $?)"
 
+request=$'GET /hello HTTP/1.1\r\nHost: api.example.com\r\nConnection: close\r\n\r\n'
+first_session="$(printf '%s' "$request" | timeout 15 openssl s_client \
+    -connect 127.0.0.1:9443 -servername api.example.com \
+    -CAfile "$fixtures/root.pem" -alpn http/1.1 -tls1_3 -ign_eof \
+    -sess_out "$work/session.pem" 2>&1)"
+first_kind="$(printf '%s' "$first_session" | sed -n 's/^\(New\|Reused\), TLSv1.3.*/\1/p' | tail -1)"
+if [ -s "$work/session.pem" ]; then saved=yes; else saved=no; fi
+check "OpenSSL receives a TLS 1.3 session ticket" "New/yes" \
+    "$first_kind/$saved"
+
+second_session="$(printf '%s' "$request" | timeout 15 openssl s_client \
+    -connect 127.0.0.1:9443 -servername api.example.com \
+    -CAfile "$fixtures/root.pem" -alpn http/1.1 -tls1_3 -ign_eof \
+    -sess_in "$work/session.pem" 2>&1)"
+second_kind="$(printf '%s' "$second_session" | sed -n 's/^\(New\|Reused\), TLSv1.3.*/\1/p' | tail -1)"
+check "OpenSSL resumes the saved TLS 1.3 session" Reused "$second_kind"
+
+third_session="$(printf '%s' "$request" | timeout 15 openssl s_client \
+    -connect 127.0.0.1:9443 -servername api.example.com \
+    -CAfile "$fixtures/root.pem" -alpn http/1.1 -tls1_3 -ign_eof \
+    -sess_in "$work/session.pem" 2>&1)"
+third_kind="$(printf '%s' "$third_session" | sed -n 's/^\(New\|Reused\), TLSv1.3.*/\1/p' | tail -1)"
+check "single-use replay falls back to a full TLS 1.3 handshake" New \
+    "$third_kind"
+
 # --- protocol-correct refusals ----------------------------------------------
 
 check "a TLS 1.2 client is refused with protocol_version" 70 \
@@ -227,6 +252,41 @@ check "an unmatched server name is refused with unrecognized_name" 112 \
     "$(alert_of -connect 127.0.0.1:9444 -servername nowhere.invalid \
         -CAfile $fixtures/root.pem -alpn http/1.1 -tls1_3)"
 
+stop_server
+
+# --- disabled cache resources ------------------------------------------------
+
+fd_target_count() {
+    local pattern="$1"
+    local count=0
+    local link
+    for link in /proc/"$server_pid"/fd/*; do
+        if readlink "$link" 2>/dev/null | grep -q "$pattern"; then
+            count=$((count + 1))
+        fi
+    done
+    echo "$count"
+}
+
+start_server test/interop/cache-disabled.toml || exit 1
+disabled_vmsize="$(awk '/^VmSize:/ { print $2 }' /proc/"$server_pid"/status)"
+check "disabled cache still serves the configured route" 200 \
+    "$(curl_code --http1.1 -H 'Host: localhost' http://127.0.0.1:9086/)"
+check "disabled cache starts no worker" 1 \
+    "$(awk '/^Threads:/ { print $2 }' /proc/"$server_pid"/status)"
+check "disabled cache opens no timer" 0 "$(fd_target_count 'anon_inode:\[timerfd\]')"
+check "disabled cache opens no cache root" 0 \
+    "$(fd_target_count 'hedge-disabled-cache-must-not-open')"
+stop_server
+
+start_server test/interop/cache-enabled.toml || exit 1
+enabled_vmsize="$(awk '/^VmSize:/ { print $2 }' /proc/"$server_pid"/status)"
+if [ $((enabled_vmsize - disabled_vmsize)) -ge 200000 ]; then
+    check "disabled cache allocates no cache arena" ok ok
+else
+    check "disabled cache allocates no cache arena" ">=200000 KiB delta" \
+        "$((enabled_vmsize - disabled_vmsize)) KiB delta"
+fi
 stop_server
 
 # --- shutdown ------------------------------------------------------------------

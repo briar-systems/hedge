@@ -32,6 +32,11 @@ served somebody else's certificate.
 enough that a shutdown with a peer still holding a request open reaches the
 deadline within the life of a test.
 
+`cache-disabled.toml` and `cache-enabled.toml` differ only in cache activation.
+The runner observes the disabled process through `/proc`: it has one thread, no
+timer descriptor, no descriptor for the configured cache root, and no cache
+arena in its virtual memory footprint.
+
 ## What the matrix covers
 
 Serving:
@@ -53,6 +58,12 @@ Credential selection:
 - a server name with no matching identity and no default, refused with
   `unrecognized_name`
 
+Session resumption:
+
+- OpenSSL receives and resumes a TLS 1.3 session ticket
+- a second presentation of the same ticket under `single_use` falls back to a
+  full handshake
+
 Refusals, each of which must fail the way policy says rather than falling
 through to a default:
 
@@ -70,13 +81,20 @@ outcome is visible to whoever supervises hedge:
 - a stop with a peer mid-request reaches the drain deadline, cancels the
   exchange, and exits 75 naming how many were abandoned
 
+Composition and optional resources:
+
+- the production binary serves through the same composition module used by the
+  runtime suite
+- disabling cache leaves the configured route live without allocating the cache
+  arena or opening a cache file, timer, or worker
+
 The PROXY protocol legs also cover the positive direction: a trusted v1 header
 followed by an HTTP/1 request is served, and a trusted header followed by the
 HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-27 legs passed, 0 failed, on linux-x86_64 against:
+35 legs passed, 0 failed, on linux-x86_64 against:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3
@@ -85,9 +103,10 @@ HTTP/2 preface selects HTTP/2.
 The in-process suites cover what this harness cannot express as a client
 command: `mach test .` for the selection, prologue, credential, PROXY, TLS
 policy, session and shutdown-ordering rules, and `mach test test/runtime` for
-PROXY decoding and peer propagation over real sockets, for the drain deadline
-against a stuck handler and a slow peer, for the two-stage HTTP/2 GOAWAY, and
-for a superseded generation draining while its replacement serves.
+the shared production composition, PROXY decoding and peer propagation over
+real sockets, the drain deadline against a stuck handler and a slow peer, the
+two-stage HTTP/2 GOAWAY, and a superseded generation draining while its
+replacement serves.
 
 ## What this does not cover
 
@@ -99,6 +118,4 @@ for a superseded generation draining while its replacement serves.
   certificate paths are exercised only through the clients above.
 - TLS 1.2. hedge configures its listeners for TLS 1.3 only, and the matrix
   asserts that a TLS 1.2 client is refused rather than served.
-- Session resumption and client certificates. `mach-tls` supports both and
-  hedge's listener configuration does not offer them yet.
 - Concurrency beyond one client at a time. Every leg runs against an idle server.

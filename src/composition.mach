@@ -1,0 +1,464 @@
+# production object wiring and lifetime ownership
+
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.allocator;
+use std.chrono.time;
+use hedge.config.schema;
+use hedge.generation;
+use hedge.service;
+use static_files: hedge.service.static;
+use proxy: hedge.service.proxy;
+use http_cache: hedge.cache;
+use cache_store: hedge.cache.store;
+use upstream: hedge.proxy.upstream;
+use engine_h1: http.h1.connection;
+use acme: hedge.acme.manager;
+use handler: hedge.acme.handler;
+use tlsalpn: hedge.acme.tlsalpn;
+use hedge_tls: hedge.protocol.tls;
+use lifecycle: hedge.lifecycle;
+use hedge.serve;
+use hedge.connection;
+use plan: hedge.dispatch.plan;
+use middleware: hedge.dispatch.middleware;
+use router: http.router.router;
+
+pub val MAX_ROUTES: usize = 64;
+pub val MAX_SEGMENTS: usize = 512;
+pub val MAX_SERVICES: usize = 32;
+pub val MAX_MIDDLEWARE: usize = 16;
+pub val MAX_STATIC_ROOTS: usize = 16;
+pub val CACHE_ENTRIES: usize = 128;
+pub val PLAN_TEXT_BYTES: usize = 16384;
+pub val DEFAULT_CONNECTIONS: usize = 64;
+
+pub rec PlanStorage {
+    routes: [MAX_ROUTES]router.CompiledRoute;
+    segments: [MAX_SEGMENTS]router.Segment;
+    specs: [MAX_ROUTES]router.Route;
+    entries: [MAX_ROUTES]plan.Entry;
+    services: [MAX_SERVICES]service.Descriptor;
+    middleware: [MAX_MIDDLEWARE]middleware.Middleware;
+    text: [PLAN_TEXT_BYTES]u8;
+}
+
+pub def StartStatus: u8;
+pub val START_OK: StartStatus = 1;
+pub val START_CONFIG: StartStatus = 2;
+pub val START_RUNTIME: StartStatus = 3;
+
+pub rec StartReport {
+    status: StartStatus;
+    detail: str;
+}
+
+pub def Event: u8;
+pub val CACHE_BINDINGS_READY: Event = 1;
+pub val CACHE_WRAPPER_READY: Event = 2;
+pub val PLAN_READY: Event = 3;
+pub val SERVE_STOPPED: Event = 4;
+pub val ACME_CLOSED: Event = 5;
+pub val TLS_DESTROYED: Event = 6;
+pub val PROXY_CLOSED: Event = 7;
+pub val CACHE_CLOSED: Event = 8;
+pub val STATIC_CLOSED: Event = 9;
+
+rec Planes {
+    proxying: *proxy.Runtime;
+    certificates: *acme.Manager;
+}
+
+pub rec Options {
+    native: service.Factory;
+    pseudonym: str;
+}
+
+pub fun default_options() Options {
+    ret Options{native: service.no_factory(), pseudonym: "hedge"};
+}
+
+pub rec Runtime {
+    heap: *allocator.Allocator;
+    graph: *schema.Graph;
+    applications: service.Applications;
+    application_slots: [service.MAX_APPLICATIONS]service.Application;
+    static_registry: static_files.Registry;
+    static_sites: [MAX_STATIC_ROOTS]static_files.Site;
+    proxying: proxy.Runtime;
+    proxy_bindings: proxy.Bindings;
+    proxy_binding_storage: [MAX_SERVICES]proxy.Binding;
+    caching: *http_cache.Layer;
+    cache_bindings: http_cache.Bindings;
+    cache_binding_storage: [MAX_SERVICES]http_cache.Binding;
+    certificates: *acme.Manager;
+    challenge_binding: handler.Binding;
+    alpn_challenge: tlsalpn.Alpn;
+    certificate_policy: usize;
+    services: service.Resolver;
+    plans: [2]plan.Plan;
+    serving: serve.Runtime;
+    slots: *serve.Slot;
+    connections: *connection.Connection;
+    planes: Planes;
+    static_live: bool;
+    proxy_live: bool;
+    cache_live: bool;
+    acme_live: bool;
+    alpn_challenge_live: bool;
+    tls_live: bool;
+    serve_live: bool;
+    events: [16]Event;
+    event_count: usize;
+}
+
+pub rec StopReport {
+    stopped: bool;
+    reason: lifecycle.Reason;
+    abandoned: usize;
+    serve_failures: u64;
+    cleanup_failures: u64;
+}
+
+fun event(runtime: *Runtime, value: Event) {
+    if (runtime.event_count < 16) {
+        runtime.events[runtime.event_count] = value;
+        runtime.event_count = runtime.event_count + 1;
+    }
+}
+
+pub fun event_at(runtime: *Runtime, index: usize) Event {
+    if (runtime == nil || index >= runtime.event_count) { ret 0; }
+    ret runtime.events[index];
+}
+
+pub fun make_storage(storage: *plan.Storage, backing: *PlanStorage) bool {
+    if (storage == nil || backing == nil) { ret false; }
+    ret plan.make_storage(storage,
+        ?backing.routes[0], MAX_ROUTES,
+        ?backing.segments[0], MAX_SEGMENTS,
+        ?backing.specs[0], MAX_ROUTES,
+        ?backing.entries[0], MAX_ROUTES,
+        ?backing.services[0], MAX_SERVICES,
+        ?backing.middleware[0], MAX_MIDDLEWARE,
+        ?backing.text[0], PLAN_TEXT_BYTES);
+}
+
+fun drive_planes(context: ptr, now: time.Time) bool {
+    val planes: *Planes = context::*Planes;
+    if (planes == nil) { ret false; }
+    var advanced: bool = true;
+    if (planes.proxying != nil) {
+        advanced = proxy.poll((planes.proxying)::ptr, now) && advanced;
+    }
+    if (planes.certificates != nil) {
+        advanced = acme.poll((planes.certificates)::ptr, now) && advanced;
+    }
+    advanced = hedge_tls.maintain() && advanced;
+    ret advanced;
+}
+
+fun clean(runtime: *Runtime) StopReport {
+    var stopped: bool = true;
+    var reason: lifecycle.Reason = lifecycle.IMMEDIATE;
+    var abandoned: usize = 0;
+    var serve_failures: u64 = 0;
+    var cleanup_failures: u64 = 0;
+    if (runtime.serve_live) {
+        stopped = serve.stop(?runtime.serving);
+        reason = serve.shutdown_reason(?runtime.serving);
+        abandoned = serve.shutdown_cancelled(?runtime.serving);
+        serve_failures = serve.teardown_failures(?runtime.serving);
+        runtime.serve_live = false;
+        event(runtime, SERVE_STOPPED);
+    }
+    if (runtime.acme_live) {
+        if (!acme.close(runtime.certificates)) { cleanup_failures = cleanup_failures + 1; }
+        runtime.acme_live = false;
+        event(runtime, ACME_CLOSED);
+    }
+    if (runtime.alpn_challenge_live) {
+        if (!tlsalpn.destroy(?runtime.alpn_challenge)) {
+            cleanup_failures = cleanup_failures + 1;
+        }
+        runtime.alpn_challenge_live = false;
+    }
+    if (runtime.tls_live) {
+        if (!hedge_tls.destroy()) { cleanup_failures = cleanup_failures + 1; }
+        runtime.tls_live = false;
+        event(runtime, TLS_DESTROYED);
+    }
+    if (runtime.proxy_live) {
+        if (!proxy.close_runtime(?runtime.proxying)) { cleanup_failures = cleanup_failures + 1; }
+        runtime.proxy_live = false;
+        event(runtime, PROXY_CLOSED);
+    }
+    if (runtime.cache_live) {
+        if (!http_cache.close(runtime.caching)) { cleanup_failures = cleanup_failures + 1; }
+        runtime.cache_live = false;
+        event(runtime, CACHE_CLOSED);
+    }
+    if (runtime.static_live) {
+        if (!static_files.close_registry(?runtime.static_registry)) {
+            cleanup_failures = cleanup_failures + 1;
+        }
+        runtime.static_live = false;
+        event(runtime, STATIC_CLOSED);
+    }
+    ret StopReport{
+        stopped: stopped,
+        reason: reason,
+        abandoned: abandoned,
+        serve_failures: serve_failures,
+        cleanup_failures: cleanup_failures,
+    };
+}
+
+fun fail(runtime: *Runtime, status: StartStatus, detail: str) StartReport {
+    clean(runtime);
+    ret StartReport{status: status, detail: detail};
+}
+
+pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema.Graph,
+    generation_id: u64, storage: *PlanStorage, diagnostics: *schema.Diagnostics,
+    options: Options) StartReport {
+    if (runtime == nil || heap == nil || configured == nil || storage == nil
+     || diagnostics == nil) {
+        ret StartReport{status: START_RUNTIME, detail: "composition input is invalid"};
+    }
+    runtime.heap = heap;
+    runtime.graph = configured;
+    runtime.caching = nil;
+    runtime.certificates = nil;
+    runtime.slots = nil;
+    runtime.connections = nil;
+    runtime.static_live = false;
+    runtime.proxy_live = false;
+    runtime.cache_live = false;
+    runtime.acme_live = false;
+    runtime.alpn_challenge_live = false;
+    runtime.tls_live = false;
+    runtime.serve_live = false;
+    runtime.event_count = 0;
+    runtime.certificate_policy = hedge_tls.NO_POLICY;
+
+    if (!service.make_applications(?runtime.applications,
+        ?runtime.application_slots[0], service.MAX_APPLICATIONS)) {
+        ret fail(runtime, START_RUNTIME, "application registry could not be constructed");
+    }
+    if (!static_files.make_registry(?runtime.static_registry, ?runtime.static_sites[0],
+        MAX_STATIC_ROOTS, static_files.default_options())) {
+        ret fail(runtime, START_RUNTIME, "static registry could not be constructed");
+    }
+    runtime.static_live = true;
+    if (!proxy.make_runtime(?runtime.proxying, nil, options.pseudonym,
+        engine_h1.config_default(), upstream.default_limits())) {
+        ret fail(runtime, START_RUNTIME, "proxy runtime could not be constructed");
+    }
+    runtime.proxy_live = true;
+    if (!proxy.make_bindings(?runtime.proxy_bindings, ?runtime.proxy_binding_storage[0],
+        MAX_SERVICES, ?runtime.proxying)) {
+        ret fail(runtime, START_RUNTIME, "proxy bindings could not be constructed");
+    }
+
+    if (configured.cache.enabled) {
+        val layer_memory: Result[*http_cache.Layer, *u8] =
+            allocator.allocate[http_cache.Layer](heap, 1);
+        val entry_memory: Result[*cache_store.Entry, *u8] =
+            allocator.allocate[cache_store.Entry](heap, CACHE_ENTRIES);
+        val body_memory: Result[*u8, *u8] =
+            allocator.allocate[u8](heap, configured.cache.memory_bytes);
+        if (is_err[*http_cache.Layer, *u8](layer_memory)
+         || is_err[*cache_store.Entry, *u8](entry_memory)
+         || is_err[*u8, *u8](body_memory)) {
+            ret fail(runtime, START_RUNTIME, "cache allocation failed");
+        }
+        runtime.caching = unwrap_ok[*http_cache.Layer, *u8](layer_memory);
+        if (!http_cache.from_config(runtime.caching, ?configured.cache,
+            unwrap_ok[*cache_store.Entry, *u8](entry_memory), CACHE_ENTRIES,
+            unwrap_ok[*u8, *u8](body_memory), configured.cache.memory_bytes, heap)) {
+            ret fail(runtime, START_CONFIG, "cache could not be constructed");
+        }
+        runtime.cache_live = true;
+        if (!http_cache.make_bindings(?runtime.cache_bindings,
+            ?runtime.cache_binding_storage[0], MAX_SERVICES, runtime.caching)) {
+            ret fail(runtime, START_RUNTIME, "cache bindings could not be constructed");
+        }
+        event(runtime, CACHE_BINDINGS_READY);
+    }
+
+    if (configured.acme.enabled) {
+        val manager_memory: Result[*acme.Manager, *u8] =
+            allocator.allocate[acme.Manager](heap, 1);
+        if (is_err[*acme.Manager, *u8](manager_memory)) {
+            ret fail(runtime, START_RUNTIME, "certificate manager allocation failed");
+        }
+        runtime.certificates = unwrap_ok[*acme.Manager, *u8](manager_memory);
+        var opened: acme.Status = acme.INVALID;
+        if (configured.acme.challenge == schema.CHALLENGE_TLS_ALPN_01) {
+            if (!tlsalpn.make(?runtime.alpn_challenge)) {
+                ret fail(runtime, START_RUNTIME,
+                    "TLS-ALPN challenge state could not be constructed");
+            }
+            runtime.alpn_challenge_live = true;
+            opened = acme.open_with_tls_alpn(runtime.certificates, heap,
+                configured, tlsalpn.provider(?runtime.alpn_challenge));
+        } or {
+            opened = acme.open(runtime.certificates, heap, configured);
+        }
+        if (opened != acme.OK) {
+            ret fail(runtime, START_CONFIG, "certificate manager could not open its state");
+        }
+        runtime.acme_live = true;
+        if (configured.acme.challenge == schema.CHALLENGE_HTTP_01 &&
+            !handler.bind(?runtime.challenge_binding,
+                acme.challenge_table(runtime.certificates))) {
+            ret fail(runtime, START_RUNTIME,
+                "challenge route could not be bound");
+        }
+    }
+
+    runtime.services = service.no_resolver();
+    runtime.services.applications = ?runtime.applications;
+    runtime.services.static_files = service.Factory{
+        ctx: (?runtime.static_registry)::ptr,
+        build: static_files.factory,
+    };
+    runtime.services.proxy = service.Factory{
+        ctx: (?runtime.proxy_bindings)::ptr,
+        build: proxy.factory,
+    };
+    runtime.services.native = options.native;
+    if (runtime.cache_live) {
+        runtime.services.caching = service.Wrapper{
+            ctx: (?runtime.cache_bindings)::ptr,
+            wrap: http_cache.wrapper,
+        };
+        event(runtime, CACHE_WRAPPER_READY);
+    }
+    if (runtime.acme_live &&
+        configured.acme.challenge == schema.CHALLENGE_HTTP_01) {
+        runtime.services.native = handler.factory(?runtime.challenge_binding);
+    }
+
+    var layout: plan.Storage;
+    if (!make_storage(?layout, storage)) {
+        ret fail(runtime, START_RUNTIME, "plan storage layout is invalid");
+    }
+    val built: plan.Report = plan.compile(?runtime.plans[0], generation_id,
+        configured, layout, ?runtime.services, nil);
+    if (built.status != plan.PLAN_OK) {
+        ret fail(runtime, START_CONFIG, built.detail);
+    }
+    event(runtime, PLAN_READY);
+
+    hedge_tls.reset();
+    runtime.tls_live = true;
+    var listener_index: usize = 0;
+    for (listener_index < configured.listener_count) {
+        val selected: *schema.Listener = ?configured.listeners[listener_index];
+        listener_index = listener_index + 1;
+        if (selected.tls_policy.len == 0) { cnt; }
+        val policy: *schema.TlsPolicy = schema.find_tls_policy(configured,
+            schema.text(?selected.tls_policy));
+        if (policy == nil) {
+            ret fail(runtime, START_CONFIG, "listener references an unknown TLS policy");
+        }
+        var tls_options: hedge_tls.PublishOptions = hedge_tls.publish_options();
+        tls_options.tls_alpn_challenge = configured.acme.enabled &&
+            configured.acme.challenge == schema.CHALLENGE_TLS_ALPN_01 &&
+            schema.text_equals(?selected.name,
+                schema.text(?configured.acme.listener));
+        if (hedge_tls.publish_with_options(schema.text(?selected.name), policy,
+            selected.protocols, tls_options) != hedge_tls.OK) {
+            ret fail(runtime, START_CONFIG, "TLS policy could not be published");
+        }
+    }
+    if (runtime.acme_live) {
+        runtime.certificate_policy = hedge_tls.find(
+            schema.text(?configured.acme.listener));
+        if (runtime.certificate_policy == hedge_tls.NO_POLICY) {
+            ret fail(runtime, START_CONFIG,
+                "ACME listener has no published TLS policy");
+        }
+        if (runtime.alpn_challenge_live &&
+            !tlsalpn.bind_listener(?runtime.alpn_challenge,
+                runtime.certificate_policy)) {
+            ret fail(runtime, START_CONFIG,
+                "TLS-ALPN challenge could not bind its listener");
+        }
+        if (acme.certificate_ready(runtime.certificates) &&
+            hedge_tls.install_acme(runtime.certificate_policy,
+                runtime.certificates) != hedge_tls.OK) {
+            ret fail(runtime, START_CONFIG,
+                "stored ACME certificate could not be installed");
+        }
+    }
+
+    var pool_size: usize = configured.limits.max_connections;
+    if (pool_size > DEFAULT_CONNECTIONS) { pool_size = DEFAULT_CONNECTIONS; }
+    if (pool_size == 0) { pool_size = 1; }
+    val slots_memory: Result[*serve.Slot, *u8] = allocator.allocate[serve.Slot](heap, pool_size);
+    val connection_memory: Result[*connection.Connection, *u8] =
+        allocator.allocate[connection.Connection](heap, pool_size);
+    if (is_err[*serve.Slot, *u8](slots_memory)
+     || is_err[*connection.Connection, *u8](connection_memory)) {
+        ret fail(runtime, START_RUNTIME, "connection pool allocation failed");
+    }
+    runtime.slots = unwrap_ok[*serve.Slot, *u8](slots_memory);
+    runtime.connections = unwrap_ok[*connection.Connection, *u8](connection_memory);
+    if (!serve.make(?runtime.serving, runtime.slots, runtime.connections, pool_size,
+        ?runtime.plans[0], configured)) {
+        ret fail(runtime, START_RUNTIME, "serving runtime initialization failed");
+    }
+    schema.reset_diagnostics(diagnostics);
+    if (!serve.start(?runtime.serving, generation_id, configured, diagnostics)) {
+        ret fail(runtime, START_RUNTIME, "listeners did not become ready");
+    }
+    runtime.serve_live = true;
+    if (!proxy.attach_driver(?runtime.proxying, ?runtime.serving.owner.network)) {
+        ret fail(runtime, START_RUNTIME, "proxy driver could not be attached");
+    }
+    runtime.planes.proxying = ?runtime.proxying;
+    runtime.planes.certificates = runtime.certificates;
+    if (!serve.attach_plane(?runtime.serving, (?runtime.planes)::ptr, drive_planes)) {
+        ret fail(runtime, START_RUNTIME, "service planes could not be attached");
+    }
+    if (runtime.acme_live) {
+        acme.attach_telemetry(runtime.certificates, runtime.serving.observability);
+    }
+    ret StartReport{status: START_OK, detail: nil};
+}
+
+pub fun stop(runtime: *Runtime) StopReport {
+    if (runtime == nil) {
+        ret StopReport{stopped: false, reason: lifecycle.FAILED, abandoned: 0,
+            serve_failures: 0, cleanup_failures: 0};
+    }
+    ret clean(runtime);
+}
+
+pub fun install_certificate(runtime: *Runtime, now: time.Time)
+    hedge_tls.Status {
+    if (runtime == nil || !runtime.acme_live || !runtime.tls_live ||
+        runtime.certificate_policy == hedge_tls.NO_POLICY ||
+        !acme.installation_ready(runtime.certificates)) { ret hedge_tls.INVALID; }
+    val installed: hedge_tls.Status = hedge_tls.install_acme(
+        runtime.certificate_policy, runtime.certificates);
+    if (installed == hedge_tls.OK) {
+        acme.installed(runtime.certificates, now);
+    }
+    ret installed;
+}
+
+pub fun cache(runtime: *Runtime) *http_cache.Layer {
+    if (runtime == nil || !runtime.cache_live) { ret nil; }
+    ret runtime.caching;
+}

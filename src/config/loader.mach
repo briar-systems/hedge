@@ -16,6 +16,7 @@ use std.allocator.fixed;
 use std.data.toml;
 use hedge.config.schema;
 use trust: hedge.protocol.trust;
+use session: tls.session;
 pub val MAX_INCLUDE_DEPTH: usize = 16;
 pub val MAX_SOURCE_BYTES: usize = 65536;
 
@@ -367,6 +368,71 @@ fun parse_tls_identity(policy: *schema.TlsPolicy, table: *toml.Table, resolver: 
     resolve_text(?identity.key, required_string(table, "key", diagnostics, source), resolver, diagnostics, source, "tls.identity.key");
 }
 
+fun tls_resumption_seconds(table: *toml.Table, key: str, fallback: usize,
+    diagnostics: *schema.Diagnostics, source: str) u32 {
+    val parsed: usize = optional_usize(table, key, fallback, false,
+        diagnostics, source);
+    if (parsed > schema.TLS_MAX_TICKET_LIFETIME_SECONDS) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, key,
+            "TLS resumption duration exceeds seven days");
+        ret fallback::u32;
+    }
+    ret parsed::u32;
+}
+
+fun parse_tls_resumption(policy: *schema.TlsPolicy, table: *toml.Table,
+    diagnostics: *schema.Diagnostics, source: str) {
+    policy.resumption.enabled = false;
+    policy.resumption.key_lifetime_seconds = 3600;
+    policy.resumption.retirement_overlap_seconds = 1800;
+    policy.resumption.ticket_lifetime_seconds = 7200;
+    policy.resumption.replay_policy = schema.TLS_REPLAY_PERMISSIVE;
+    policy.resumption.tickets_per_connection = 2;
+    val raw: *toml.Value = value(table, "resumption");
+    if (raw == nil) { ret; }
+    if (raw.tag != toml.TYPE_TABLE) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "tls.resumption",
+            "TLS resumption must be a table");
+        ret;
+    }
+    policy.resumption.enabled = true;
+    val configured: *toml.Table = ?raw.data.table;
+    var allowed: [5]str = [5]str{"key_lifetime_seconds",
+        "retirement_overlap_seconds", "ticket_lifetime_seconds", "replay",
+        "tickets_per_connection"};
+    validate_fields(configured, diagnostics, source, ?allowed[0], 5);
+    policy.resumption.key_lifetime_seconds = tls_resumption_seconds(configured,
+        "key_lifetime_seconds", 3600, diagnostics, source);
+    policy.resumption.retirement_overlap_seconds = tls_resumption_seconds(
+        configured, "retirement_overlap_seconds", 1800, diagnostics, source);
+    policy.resumption.ticket_lifetime_seconds = tls_resumption_seconds(configured,
+        "ticket_lifetime_seconds", 7200, diagnostics, source);
+    val retained_seconds: usize =
+        policy.resumption.key_lifetime_seconds::usize *
+        (session.MAX_TICKET_KEYS - 1);
+    if (policy.resumption.retirement_overlap_seconds::usize > retained_seconds) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source,
+            "tls.resumption.retirement_overlap_seconds",
+            "retirement overlap exceeds the bounded ticket key ring");
+    }
+    val replay: str = optional_string(configured, "replay", diagnostics, source);
+    if (replay != nil && str_equals(replay, "single_use")) {
+        policy.resumption.replay_policy = schema.TLS_REPLAY_SINGLE_USE;
+    } or (replay != nil && !str_equals(replay, "permissive")) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source,
+            "tls.resumption.replay", "replay must be permissive or single_use");
+    }
+    val tickets: usize = optional_usize(configured, "tickets_per_connection", 2,
+        false, diagnostics, source);
+    if (tickets > schema.TLS_MAX_TICKETS_PER_CONNECTION) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source,
+            "tls.resumption.tickets_per_connection",
+            "tickets per connection exceeds the supported bound");
+    } or {
+        policy.resumption.tickets_per_connection = tickets::u8;
+    }
+}
+
 # a policy names its identities either as one certificate and key pair or as a
 # table array. the single-pair form is the same thing with one entry, so both
 # reach the credential generation through one shape.
@@ -424,13 +490,14 @@ fun parse_tls(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, d
         } or (graph.tls_policy_count >= schema.MAX_TLS_POLICIES) {
             diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "TLS policy count exceeds the configured bound");
         } or {
-            var allowed: [7]str = [7]str{"certificate", "key", "identity", "default", "client_auth", "client_trust", "server_name"};
-            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 7);
+            var allowed: [8]str = [8]str{"certificate", "key", "identity", "default", "client_auth", "client_trust", "server_name", "resumption"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 8);
             val policy: *schema.TlsPolicy = ?graph.tls_policies[graph.tls_policy_count];
             graph.tls_policy_count = graph.tls_policy_count + 1;
             resolve_text(?policy.name, name, resolver, diagnostics, source, "tls.name");
             policy.client_auth = optional_bool(?item.data.table, "client_auth", false, diagnostics, source);
             resolve_text(?policy.client_trust, optional_string(?item.data.table, "client_trust", diagnostics, source), resolver, diagnostics, source, "tls.client_trust");
+            parse_tls_resumption(policy, ?item.data.table, diagnostics, source);
             parse_tls_identities(policy, ?item.data.table, resolver, diagnostics, source);
         }
         i = i + 1;
@@ -1463,6 +1530,32 @@ test "config loader: pipeline depth cannot exceed fixed connection storage" {
         i = i + 1;
     }
     ret 2;
+}
+
+test "config loader: TLS resumption policy is explicit and bounded" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true,
+        local_transport: true, environment_secrets: true,
+        file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"resumption\"\n\n[[listener]]\nname = \"secure\"\naddress = \"127.0.0.1:443\"\nprotocols = [\"http/1.1\"]\ntls = \"public\"\n\n[tls.public]\ncertificate = \"server.pem\"\nkey = \"server.key\"\n\n[tls.public.resumption]\nkey_lifetime_seconds = 60\nretirement_overlap_seconds = 30\nticket_lifetime_seconds = 120\nreplay = \"single_use\"\ntickets_per_connection = 3\n\n[host.site]\nlistener = \"secure\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (!build(?graph, ?diagnostics, ?a, "resumption.toml", source, nil,
+        capabilities)) { ret 1; }
+    val configured: *schema.TlsResumption =
+        ?graph.tls_policies[0].resumption;
+    if (!configured.enabled || configured.key_lifetime_seconds != 60
+     || configured.retirement_overlap_seconds != 30
+     || configured.ticket_lifetime_seconds != 120
+     || configured.replay_policy != schema.TLS_REPLAY_SINGLE_USE
+     || configured.tickets_per_connection != 3) { ret 2; }
+    val invalid: str = "[server]\nname = \"resumption\"\n\n[[listener]]\nname = \"secure\"\naddress = \"127.0.0.1:443\"\nprotocols = [\"http/1.1\"]\ntls = \"public\"\n\n[tls.public]\ncertificate = \"server.pem\"\nkey = \"server.key\"\n\n[tls.public.resumption]\nkey_lifetime_seconds = 0\nretirement_overlap_seconds = 604800\nticket_lifetime_seconds = 0\nreplay = \"sometimes\"\ntickets_per_connection = 5\n\n[host.site]\nlistener = \"secure\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (build(?graph, ?diagnostics, ?a, "resumption-invalid.toml", invalid,
+        nil, capabilities) || diagnostics.error_count != 5) { ret 3; }
+    ret 0;
 }
 
 test "config loader: administration requires an isolated authenticated listener" {

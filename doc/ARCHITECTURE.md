@@ -36,6 +36,14 @@ telemetry plane
 
 The control plane publishes immutable runtime generations. A listener and every connection retain the generation under which they were created. Reload activates a new generation atomically. Old generations remain alive until their connections drain.
 
+The executable and runtime tests enter those planes through one production
+composition module. Its runtime record owns every binding array and compiled
+plan for the process lifetime. Startup constructs cache bindings before the
+resolver and compiles only after both are stable. Teardown stops serving first,
+closes certificate management, destroys TLS credentials, closes proxy state,
+then closes cache and static storage. Partial startup follows the same ordering
+for every resource it acquired.
+
 ## Runtime generation
 
 A generation owns:
@@ -175,6 +183,10 @@ Retries are allowed only when request replay safety is known. Body buffering is 
 
 Caching is an optional service layer with independent memory and disk stores. It implements HTTP cache semantics rather than path-based object reuse. Cache keys include the selected representation dimensions. Revalidation, stale policies, range handling, and authorization behavior are explicit.
 
+When caching is disabled, composition does not allocate a layer, entry table, or
+body arena and does not install a wrapper. It opens no cache root and starts no
+worker or timer.
+
 ## Web applications
 
 Laurel applications receive only the common HTTP service exchange and framework services declared during composition. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities through typed providers.
@@ -221,6 +233,12 @@ presentation put there. DNS-01 is answered by a publisher the deployment
 supplies. TLS-ALPN-01 presents an RFC 8737 certificate on a TLS listener.
 Cleanup is owed exactly when presentation succeeded and runs exactly once
 across success, failure, timeout, and cancellation.
+
+Each TLS-ALPN-enabled listener owns one stable credential store. A presentation
+publishes its one-shot generation into that vacant store. Cleanup withdraws it
+immediately, so no later handshake can acquire it. If a validation connection
+still holds the generation, the serving loop defers key destruction until that
+exact lease is released, then reuses the same store for the next presentation.
 
 ## Graceful shutdown
 
