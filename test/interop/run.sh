@@ -30,7 +30,12 @@ stop_server() {
 
 start_server() {
     stop_server
-    "$binary" "$1" > "$work/server.log" 2>&1 &
+    local admin_token="${2-}"
+    if [ -n "$admin_token" ]; then
+        HEDGE_ADMIN_TOKEN="$admin_token" "$binary" "$1" > "$work/server.log" 2>&1 &
+    else
+        "$binary" "$1" > "$work/server.log" 2>&1 &
+    fi
     server_pid=$!
     for _ in $(seq 50); do
         if grep -q 'hedge: ready' "$work/server.log" 2>/dev/null; then return 0; fi
@@ -253,6 +258,36 @@ check "an unmatched server name is refused with unrecognized_name" 112 \
         -CAfile $fixtures/root.pem -alpn http/1.1 -tls1_3)"
 
 stop_server
+
+start_server test/interop/telemetry.toml interop-secret || exit 1
+check "the public listener does not expose administration routes" public \
+    "$(timeout 30 curl -sS -H 'Host: localhost' http://127.0.0.1:9087/ready 2>/dev/null)"
+check "the administration listener rejects a wrong bearer token" 401 \
+    "$(curl_code -H 'Authorization: Bearer wrong' http://127.0.0.1:9088/ready)"
+challenge="$(timeout 30 curl -sS -D - -o /dev/null \
+    -H 'Authorization: Bearer wrong' http://127.0.0.1:9088/ready 2>/dev/null \
+    | tr -d '\r' | awk 'tolower($1) == "www-authenticate:" { print $2 }')"
+check "an authentication failure returns a bearer challenge" Bearer "$challenge"
+ready="$(timeout 30 curl -sS -H 'Authorization: Bearer interop-secret' \
+    http://127.0.0.1:9088/ready 2>/dev/null)"
+check "the authenticated administration listener reports readiness" \
+    '{"ready":true}' "$ready"
+metrics="$(timeout 30 curl -sS -H 'Authorization: Bearer interop-secret' \
+    http://127.0.0.1:9088/metrics 2>/dev/null)"
+case "$metrics" in
+    *hedge_requests_total*) check "the administration listener renders live metrics" ok ok ;;
+    *) check "the administration listener renders live metrics" present missing ;;
+esac
+timeout 30 curl -sS -o /dev/null -H 'Host: localhost' \
+    -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+    http://127.0.0.1:9087/trace 2>/dev/null
+stop_server
+if grep -q 'kind="access".*trace_id="4bf92f3577b34da6a3ce929d0e0e4736"' \
+    "$work/server.log"; then
+    check "an incoming W3C trace reaches the flushed access log" ok ok
+else
+    check "an incoming W3C trace reaches the flushed access log" present missing
+fi
 
 # --- disabled cache resources ------------------------------------------------
 
