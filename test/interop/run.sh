@@ -254,6 +254,41 @@ check "an unmatched server name is refused with unrecognized_name" 112 \
 
 stop_server
 
+# --- disabled cache resources ------------------------------------------------
+
+fd_target_count() {
+    local pattern="$1"
+    local count=0
+    local link
+    for link in /proc/"$server_pid"/fd/*; do
+        if readlink "$link" 2>/dev/null | grep -q "$pattern"; then
+            count=$((count + 1))
+        fi
+    done
+    echo "$count"
+}
+
+start_server test/interop/cache-disabled.toml || exit 1
+disabled_vmsize="$(awk '/^VmSize:/ { print $2 }' /proc/"$server_pid"/status)"
+check "disabled cache still serves the configured route" 200 \
+    "$(curl_code --http1.1 -H 'Host: localhost' http://127.0.0.1:9086/)"
+check "disabled cache starts no worker" 1 \
+    "$(awk '/^Threads:/ { print $2 }' /proc/"$server_pid"/status)"
+check "disabled cache opens no timer" 0 "$(fd_target_count 'anon_inode:\[timerfd\]')"
+check "disabled cache opens no cache root" 0 \
+    "$(fd_target_count 'hedge-disabled-cache-must-not-open')"
+stop_server
+
+start_server test/interop/cache-enabled.toml || exit 1
+enabled_vmsize="$(awk '/^VmSize:/ { print $2 }' /proc/"$server_pid"/status)"
+if [ $((enabled_vmsize - disabled_vmsize)) -ge 200000 ]; then
+    check "disabled cache allocates no cache arena" ok ok
+else
+    check "disabled cache allocates no cache arena" ">=200000 KiB delta" \
+        "$((enabled_vmsize - disabled_vmsize)) KiB delta"
+fi
+stop_server
+
 # --- shutdown ------------------------------------------------------------------
 #
 # these legs assert the exit status, because that is the only place the outcome
