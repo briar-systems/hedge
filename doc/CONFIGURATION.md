@@ -186,11 +186,10 @@ from the in-memory store. A missing, empty, truncated, undecodable, or wholly
 unsupported bundle fails manager construction rather than opening an
 unverified connection.
 
-The current Let's Encrypt endpoint chain uses ECDSA-SHA384 signatures through
-P-384 issuers. The pinned mach-tls release cannot verify that chain yet, so the
-public endpoint is refused with an unsupported-algorithm error. Local Pebble
-issuance over authenticated TLS proves the complete transport and issuance
-path without weakening certificate verification.
+The authority client accepts ECDSA-SHA384 signatures from P-384 issuers. P-384
+is a chain-verification algorithm here, not a key-exchange group or a local
+client identity. The public staging check covers that WebPKI path, while local
+Pebble issuance covers the complete authenticated transport and issuance path.
 
 `origin` is how a local authority is reached: a `host:port` spoken to in
 cleartext, for an authority whose URLs still say `https` because the protocol
