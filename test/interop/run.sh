@@ -188,6 +188,31 @@ check "GnuTLS completes a TLS 1.3 handshake with ALPN" 0 \
         --sni-hostname api.example.com --verify-hostname api.example.com \
         </dev/null >/dev/null 2>&1; echo $?)"
 
+request=$'GET /hello HTTP/1.1\r\nHost: api.example.com\r\nConnection: close\r\n\r\n'
+first_session="$(printf '%s' "$request" | timeout 15 openssl s_client \
+    -connect 127.0.0.1:9443 -servername api.example.com \
+    -CAfile "$fixtures/root.pem" -alpn http/1.1 -tls1_3 -ign_eof \
+    -sess_out "$work/session.pem" 2>&1)"
+first_kind="$(printf '%s' "$first_session" | sed -n 's/^\(New\|Reused\), TLSv1.3.*/\1/p' | tail -1)"
+if [ -s "$work/session.pem" ]; then saved=yes; else saved=no; fi
+check "OpenSSL receives a TLS 1.3 session ticket" "New/yes" \
+    "$first_kind/$saved"
+
+second_session="$(printf '%s' "$request" | timeout 15 openssl s_client \
+    -connect 127.0.0.1:9443 -servername api.example.com \
+    -CAfile "$fixtures/root.pem" -alpn http/1.1 -tls1_3 -ign_eof \
+    -sess_in "$work/session.pem" 2>&1)"
+second_kind="$(printf '%s' "$second_session" | sed -n 's/^\(New\|Reused\), TLSv1.3.*/\1/p' | tail -1)"
+check "OpenSSL resumes the saved TLS 1.3 session" Reused "$second_kind"
+
+third_session="$(printf '%s' "$request" | timeout 15 openssl s_client \
+    -connect 127.0.0.1:9443 -servername api.example.com \
+    -CAfile "$fixtures/root.pem" -alpn http/1.1 -tls1_3 -ign_eof \
+    -sess_in "$work/session.pem" 2>&1)"
+third_kind="$(printf '%s' "$third_session" | sed -n 's/^\(New\|Reused\), TLSv1.3.*/\1/p' | tail -1)"
+check "single-use replay falls back to a full TLS 1.3 handshake" New \
+    "$third_kind"
+
 # --- protocol-correct refusals ----------------------------------------------
 
 check "a TLS 1.2 client is refused with protocol_version" 70 \
