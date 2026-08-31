@@ -122,6 +122,13 @@ A request exchange owns:
 
 The request allocator is reset only after request-body disposition and response completion are resolved. A handler that leaves a body unread must explicitly drain it, reject it, or make the connection non-reusable.
 
+A service may attach one request finalizer to the common call. The protocol owner
+runs it exactly once after the exchange reaches its terminal state and before the
+request allocator is reset. This is where an application framework receives the
+authoritative response status, transfer counters, and cancellation reason. A
+finalizer failure does not prevent memory or transport cleanup, but it fails the
+owning connection or stream so the lifecycle error remains observable.
+
 HTTP/1.1 processes ordered exchanges while respecting pipeline bounds. HTTP/2 and HTTP/3 process independent streams subject to connection and stream flow control. The service API does not expose those differences as mutable connection operations.
 
 ## Service dispatch
