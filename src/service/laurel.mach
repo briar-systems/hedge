@@ -36,6 +36,33 @@ pub rec Adapter {
     bound: bool;
 }
 
+rec RequestState {
+    application: *app.App;
+    context: context.Context;
+    recorder: observability.Recorder;
+    outcome: middleware.Outcome;
+    identifier: [32]char;
+    bound: bool;
+}
+
+fun monotonic_ns() i64 {
+    ret time.time_unix_nsec(time.monotonic());
+}
+
+fun finalize_request(owner: ptr, active: *call.Call) bool {
+    if (owner == nil || active == nil || active.exchange == nil) { ret false; }
+    val state: *RequestState = owner::*RequestState;
+    if (!state.bound) { ret true; }
+    val active_scope: *cancel.Scope = call.scope(active);
+    if (state.application == nil || active_scope == nil) { ret false; }
+    val released: bool = app.release_context(state.application, ?state.context,
+        app.Termination{outcome: state.outcome, reason: cancel.reason(active_scope),
+            status: active.exchange.completion.status,
+            transfer: active.exchange.completion, now_ns: monotonic_ns()});
+    state.bound = false;
+    ret released;
+}
+
 fun hex_digit(value: u8) char {
     if (value < 10) { ret ('0'::u8 + value)::char; }
     ret ('a'::u8 + value - 10)::char;
@@ -78,36 +105,47 @@ pub fun serve(owner: ptr, active: *call.Call) exchange.ServiceStatus {
         ret exchange.SERVICE_FAILED;
     }
 
-    # the request context and its identifier live in the request arena, which is
-    # reset only once disposition and the exchange have both settled, so two
-    # concurrent calls never share them
-    val allocated: Result[*context.Context, *u8] =
-        A.zallocate[context.Context](arena, 1);
-    if (is_err[*context.Context, *u8](allocated)) {
+    # laurel's context, recorder, outcome, and identifier live until the owning
+    # exchange settles, so no concurrent calls share request state
+    val allocated: Result[*RequestState, *u8] =
+        A.zallocate[RequestState](arena, 1);
+    if (is_err[*RequestState, *u8](allocated)) {
         ret exchange.SERVICE_FAILED;
     }
-    val identifier: Result[*char, *u8] = A.allocate[char](arena, REQUEST_ID_BYTES);
-    if (is_err[*char, *u8](identifier)) { ret exchange.SERVICE_FAILED; }
-    val request_context: *context.Context =
-        unwrap_ok[*context.Context, *u8](allocated);
-    val identifier_bytes: *char = unwrap_ok[*char, *u8](identifier);
-    if (!render_request_id(active.telemetry, identifier_bytes)) {
+    val state: *RequestState = unwrap_ok[*RequestState, *u8](allocated);
+    state.application = adapter.application;
+    if (!render_request_id(active.telemetry, ?state.identifier[0])) {
         ret exchange.SERVICE_FAILED;
     }
-
-    if (!app.bind_context(adapter.application, request_context, bound,
-            context.Params{items: nil, len: 0, generation: bound.generation},
-            arena, view.View{data: identifier_bytes, len: REQUEST_ID_BYTES})) {
+    if (!call.attach_finalizer(active, call.Finalizer{
+            ctx: state::ptr, finish: finalize_request})) {
         ret exchange.SERVICE_FAILED;
     }
+    if (!app.bind_context(adapter.application, ?state.context, ?state.recorder,
+        app.Admission{exchange: bound,
+            params: context.Params{items: nil, len: 0,
+                generation: bound.generation}, allocator: arena,
+            request_id: view.View{data: ?state.identifier[0],
+                len: REQUEST_ID_BYTES},
+            route_name: service.text_view(active.route.name),
+            started_ns: monotonic_ns()})) {
+        ret exchange.SERVICE_FAILED;
+    }
+    state.bound = true;
 
-    val outcome: middleware.Outcome = app.execute(adapter.application,
-        adapter.terminal, request_context);
-    val served: exchange.ServiceStatus = status_for(outcome);
-
-    # release is unconditional: success, handler error, and cancellation each
-    # return the reservation exactly once
-    if (!app.release_context(adapter.application, request_context)) {
+    state.outcome = app.execute(adapter.application, adapter.terminal,
+        ?state.context);
+    val served: exchange.ServiceStatus = status_for(state.outcome);
+    if (served != exchange.SERVICE_COMPLETE) { ret served; }
+    if (bound.response.committed) {
+        if (!call.resolve_body(active, call.BODY_DRAIN)) {
+            ret exchange.SERVICE_FAILED;
+        }
+    } or (bound.response.body_kind == message.BODY_NONE) {
+        if (service.commit_bodyless(active, call.BODY_DRAIN)
+            != exchange.SERVICE_COMPLETE) { ret exchange.SERVICE_FAILED; }
+    } or (!call.resolve_body(active, call.BODY_DRAIN)
+        || service.commit(active) != message.RESPONSE_OK) {
         ret exchange.SERVICE_FAILED;
     }
     ret served;
@@ -144,7 +182,16 @@ use laurel.provider;
 use laurel.router;
 use laurel.security;
 
-rec Probe { calls: usize; events: usize; }
+rec Probe {
+    calls: usize;
+    starts: usize;
+    finishes: usize;
+    errors: usize;
+    route_len: usize;
+    status: u16;
+    bytes_in: u64;
+    bytes_out: u64;
+}
 
 fun probe_start(owner: ptr) R.Result[lifecycle.CallbackStatus, view.View] {
     ret R.ok[lifecycle.CallbackStatus, view.View](lifecycle.CALLBACK_DONE);
@@ -166,15 +213,23 @@ fun probe_stop(owner: ptr) R.Result[lifecycle.CallbackStatus, view.View] {
 # laurel's own request events, so the framework's observability runs alongside
 # hedge's rather than either replacing the other
 fun probe_event_start(owner: ptr, event: *observability.RequestEvent) {
+    val state: *Probe = owner::*Probe;
+    state.starts = state.starts + 1;
+    state.route_len = observability.event_route_name(event).len;
 }
 
 fun probe_event_finish(owner: ptr, event: *observability.RequestEvent) {
     val state: *Probe = owner::*Probe;
-    state.events = state.events + 1;
+    state.finishes = state.finishes + 1;
+    state.status = event.status;
+    state.bytes_in = event.bytes_in;
+    state.bytes_out = event.bytes_out;
 }
 
 fun probe_event_error(owner: ptr, event: *observability.RequestEvent,
     failure: error.AppError) {
+    val state: *Probe = owner::*Probe;
+    state.errors = state.errors + 1;
 }
 
 # the laurel terminal handler: sets a status through laurel's own context so the
@@ -188,7 +243,7 @@ fun probe_handler(owner: ptr, request_context: *context.Context)
         ret R.err[u8, error.AppError](error.make(error.INTERNAL, 500,
             "internal server error", "probe could not set a status", false));
     }
-    ret R.ok[u8, error.AppError](0);
+    ret R.ok[u8, error.AppError](handler.RESPOND);
 }
 
 fun probe_error(owner: ptr, failure: error.AppError,
@@ -282,10 +337,13 @@ test "laurel: a real application serves a request through the hedge boundary" {
     var middlewares: middleware.Stack = middleware.Stack{items: nil, len: 0};
     var headers: security.HeadersPolicy;
     if (!security.secure_headers(?headers)) { ret 4; }
-    var probe: Probe = Probe{calls: 0, events: 0};
+    var probe: Probe = Probe{calls: 0, starts: 0, finishes: 0, errors: 0,
+        route_len: 0, status: 0, bytes_in: 0, bytes_out: 0};
     var observer: observability.Observer = observability.Observer{ctx: ?probe,
         start: probe_event_start, finish: probe_event_finish,
         error: probe_event_error};
+    var vocabulary: observability.Vocabulary;
+    if (!observability.init_vocabulary(?vocabulary, nil, 0)) { ret 5; }
     var application: app.App;
     val assembly: app.Assembly = app.Assembly{
         config: app.Config{limits: app.Limits{max_body_bytes: 1024,
@@ -300,51 +358,69 @@ test "laurel: a real application serves a request through the hedge boundary" {
         errors: error.Mapper{ctx: nil, render: probe_error},
         providers: ?providers, lifecycle: ?controller, sessions: nil,
         security: ?headers, csrf: nil, origins: nil, authenticator: nil,
-        renderer: nil, observer: ?observer, app_state: nil};
-    if (!app.assemble(?application, assembly)) { ret 5; }
-    if (app.start(?application).status != lifecycle.TRANSITION_OK) { ret 6; }
+        renderer: nil, observer: ?observer, vocabulary: ?vocabulary,
+        event_policy: observability.policy_default(), app_state: nil};
+    if (!app.assemble(?application, assembly)) { ret 6; }
+    if (app.start(?application).status != lifecycle.TRANSITION_OK) { ret 7; }
     if (app.poll_ready(?application).status != lifecycle.TRANSITION_OK) {
-        ret 7;
+        ret 8;
     }
 
     var adapter: Adapter;
     if (!make(?adapter, ?application,
-            handler.Handler{ctx: ?probe, call: probe_handler})) { ret 8; }
+            handler.Handler{ctx: ?probe, call: probe_handler})) { ret 9; }
     val bound: service.Handler = bound_handler(?adapter);
-    if (!service.has_handler(bound)) { ret 9; }
+    if (!service.has_handler(bound)) { ret 10; }
 
     # registered exactly like any other service kind, through the public table
     var slots: [1]service.Application;
     var registry: service.Applications;
-    if (!service.make_applications(?registry, ?slots[0], 1)) { ret 10; }
-    if (!service.register_application(?registry, "site", bound)) { ret 11; }
+    if (!service.make_applications(?registry, ?slots[0], 1)) { ret 11; }
+    if (!service.register_application(?registry, "site", bound)) { ret 12; }
     val found: *service.Application = service.find_application(?registry, "site");
-    if (found == nil) { ret 12; }
+    if (found == nil) { ret 13; }
 
     var harness: Harness;
-    if (!make_harness(?harness, 21)) { ret 13; }
+    if (!make_harness(?harness, 21)) { ret 14; }
     val served: exchange.ServiceStatus = found.handler.serve(
         found.handler.ctx, ?harness.call);
-    if (served != exchange.SERVICE_COMPLETE) { ret 14; }
-    if (probe.calls != 1) { ret 15; }
-    if (harness.response.status != status.ACCEPTED) { ret 16; }
-    # the reservation was returned, so a second request can still be admitted
-    if (app.active_request_count(?application) != 0) { ret 17; }
-    # laurel's own request events do not fire here: it stores an application's
-    # observer and never drives its recorder outside its in-process harness.
-    # tracked as briar-systems/laurel#30. hedge's telemetry is unaffected, and
-    # this adapter needs no change when that lands.
-    if (probe.events != 0) { ret 18; }
+    if (served != exchange.SERVICE_COMPLETE || !harness.response.committed
+        || call.disposition(?harness.call) != call.BODY_DRAIN) { ret 15; }
+    if (probe.calls != 1 || probe.starts != 1 || probe.finishes != 0
+        || probe.errors != 0 || probe.route_len != 4) { ret 16; }
+    if (harness.response.status != status.ACCEPTED
+        || app.active_request_count(?application) != 1) { ret 17; }
+    if (exchange.finish(?harness.exchange) != exchange.FINISH_OK
+        || !call.release(?harness.call)) { ret 18; }
+    if (app.active_request_count(?application) != 0) { ret 19; }
+    if (probe.finishes != 1 || probe.errors != 0) { ret 20; }
+    if (probe.status != status.ACCEPTED) { ret 21; }
+    if (probe.bytes_in != harness.exchange.completion.bytes_in) { ret 22; }
+    if (probe.bytes_out != harness.exchange.completion.bytes_out) { ret 23; }
+    if (call.release(?harness.call) || probe.finishes != 1) { ret 24; }
 
     # a cancelled call is refused before the application is entered, and leaks
     # no reservation
     var cancelled_harness: Harness;
-    if (!make_harness(?cancelled_harness, 22)) { ret 19; }
-    if (!cancel.cancel(?cancelled_harness.scope)) { ret 20; }
+    if (!make_harness(?cancelled_harness, 22)) { ret 25; }
+    if (!cancel.cancel(?cancelled_harness.scope)) { ret 26; }
     if (found.handler.serve(found.handler.ctx, ?cancelled_harness.call) !=
-        exchange.SERVICE_FAILED) { ret 21; }
+        exchange.SERVICE_FAILED) { ret 27; }
     if (probe.calls != 1 || app.active_request_count(?application) != 0) {
-        ret 22;
+        ret 28;
+    }
+
+    # cancellation after application execution still runs the deferred release
+    var interrupted: Harness;
+    if (!make_harness(?interrupted, 23)
+        || found.handler.serve(found.handler.ctx, ?interrupted.call)
+            != exchange.SERVICE_COMPLETE
+        || !cancel.cancel(?interrupted.scope)
+        || exchange.cancel_exchange(?interrupted.exchange) != exchange.FINISH_OK
+        || !call.release(?interrupted.call)) { ret 29; }
+    if (probe.calls != 2 || probe.starts != 2 || probe.finishes != 2
+        || probe.errors != 0 || app.active_request_count(?application) != 0) {
+        ret 30;
     }
     ret 0;
 }
