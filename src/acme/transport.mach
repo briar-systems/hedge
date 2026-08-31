@@ -202,6 +202,7 @@ pub rec Transport {
     addresses: Addresses;
     origin:    Origin;
     trust:     *cert.TrustStore;
+    tls:       origination.Handle;
     secure:    bool;
 
     request:          *u8;
@@ -271,6 +272,7 @@ pub fun make(transport: *Transport, request: *u8, request_capacity: usize,
     transport.addresses = addresses;
     transport.origin = no_origin();
     transport.trust = nil;
+    transport.tls = origination.no_handle();
     transport.secure = false;
     transport.request = request;
     transport.request_capacity = request_capacity;
@@ -389,8 +391,9 @@ fun submit_read(transport: *Transport) bool {
     val room: usize = transport.max_body - transport.response_len;
     if (room == 0) { ret false; }
     if (transport.secure) {
-        if (origination.start_read(?transport.response[transport.response_len],
-            room) != origination.PENDING) { ret false; }
+        if (origination.start_read(transport.tls,
+            ?transport.response[transport.response_len], room)
+            != origination.PENDING) { ret false; }
         transport.pending = true;
         ret true;
     }
@@ -405,8 +408,9 @@ fun submit_read(transport: *Transport) bool {
 fun submit_write(transport: *Transport) bool {
     val remaining: usize = transport.request_len - transport.request_sent;
     if (transport.secure) {
-        if (origination.start_write(?transport.request[transport.request_sent],
-            remaining) != origination.PENDING) { ret false; }
+        if (origination.start_write(transport.tls,
+            ?transport.request[transport.request_sent], remaining)
+            != origination.PENDING) { ret false; }
         transport.pending = true;
         ret true;
     }
@@ -450,7 +454,8 @@ fun handle_connect(transport: *Transport, completion: io_runtime.Completion) {
     if (transport.secure) {
         # the certificate is verified for the name the url gives, whatever
         # address the origin sent us to
-        if (origination.begin(?transport.driver, ?transport.stream,
+        if (origination.begin(?transport.tls, ?transport.driver,
+            ?transport.stream,
             transport.target.host, transport.trust,
             transport.verification_time) != origination.PENDING) {
             fail(transport, CAUSE_HANDSHAKE);
@@ -466,8 +471,9 @@ fun handle_connect(transport: *Transport, completion: io_runtime.Completion) {
 
 # advances a secured exchange whenever its outstanding tls operation settles
 fun settle_secure(transport: *Transport, now: time.Time) Status {
-    val progress: origination.Status = origination.poll();
+    val progress: origination.Status = origination.poll(transport.tls);
     if (progress == origination.PENDING) { ret PENDING; }
+    transport.pending = false;
     if (progress != origination.OK) {
         if (transport.stage == HANDSHAKING) {
             ret fail(transport, CAUSE_HANDSHAKE);
@@ -475,14 +481,13 @@ fun settle_secure(transport: *Transport, now: time.Time) Status {
         if (transport.stage == WRITING) { ret fail(transport, CAUSE_WRITE); }
         ret fail(transport, CAUSE_READ);
     }
-    transport.pending = false;
     if (transport.stage == HANDSHAKING) {
         if (!submit_write(transport)) { ret fail(transport, CAUSE_WRITE); }
         transport.stage = WRITING;
         ret PENDING;
     }
     if (transport.stage == WRITING) {
-        val written: usize = origination.transferred();
+        val written: usize = origination.transferred(transport.tls);
         if (written == 0) { ret fail(transport, CAUSE_WRITE); }
         transport.request_sent = transport.request_sent + written;
         if (transport.request_sent < transport.request_len) {
@@ -494,9 +499,11 @@ fun settle_secure(transport: *Transport, now: time.Time) Status {
         ret PENDING;
     }
     if (transport.stage != READING) { ret PENDING; }
-    val received: usize = origination.transferred();
+    val received: usize = origination.transferred(transport.tls);
     transport.response_len = transport.response_len + received;
-    if (received == 0 || origination.peer_closed()) { transport.eof = true; }
+    if (received == 0 || origination.peer_closed(transport.tls)) {
+        transport.eof = true;
+    }
     val parsed: Status = parse_available(transport);
     if (parsed == OK) {
         transport.stage = COMPLETE;
@@ -551,7 +558,7 @@ fun dispatch(transport: *Transport, completion: io_runtime.Completion) {
     # operation, and the engine decides when one has settled, so a completion
     # it owns never resolves the transport's own pending state
     if (completion.context == origination.COMPLETION_CONTEXT) {
-        origination.accept(?completion);
+        origination.accept(transport.tls, ?completion);
         ret;
     }
     transport.pending = false;
@@ -622,7 +629,7 @@ pub fun poll(transport: *Transport, now: time.Time) Status {
     }
     drain(transport, 0);
     if (transport.secure && transport.stage != COMPLETE
-     && transport.stage != BROKEN && origination.operating()) {
+     && transport.stage != BROKEN && origination.operating(transport.tls)) {
         val advanced: Status = settle_secure(transport, now);
         if (advanced == OK || advanced == FAILED) { ret advanced; }
     }
@@ -631,7 +638,9 @@ pub fun poll(transport: *Transport, now: time.Time) Status {
     # an expired exchange is cancelled, and its outstanding completion is
     # reaped before anything it owns is released
     if (expired(transport, now)) {
-        cancel.cancel(?transport.scope);
+        if (transport.secure && origination.operating(transport.tls)) {
+            origination.cancel_operation(transport.tls);
+        } or { cancel.cancel(?transport.scope); }
         ret fail(transport, CAUSE_TIMEOUT);
     }
     ret PENDING;
@@ -658,7 +667,21 @@ pub fun response(transport: *Transport) ac.Response {
 pub fun finish(transport: *Transport) bool {
     if (transport == nil || !transport.live) { ret false; }
     if (transport.stage == IDLE) { ret true; }
-    if (origination.active()) { origination.release(); }
+    if (origination.active(transport.tls)) {
+        if (origination.operating(transport.tls)) {
+            origination.cancel_operation(transport.tls);
+        }
+        var tls_guard: usize = 0;
+        for (origination.operating(transport.tls) && tls_guard < 64) {
+            if (!drain(transport, 50)) { brk; }
+            origination.poll(transport.tls);
+            tls_guard = tls_guard + 1;
+        }
+        if (origination.operating(transport.tls)
+         || !origination.release(transport.tls)) { ret false; }
+        transport.tls = origination.no_handle();
+        transport.pending = false;
+    }
     if (transport.pending) { cancel.cancel(?transport.scope); }
     var guard: usize = 0;
     for (transport.pending && guard < 64) {
@@ -681,7 +704,7 @@ pub fun finish(transport: *Transport) bool {
 
 pub fun destroy(transport: *Transport) bool {
     if (transport == nil || !transport.live) { ret false; }
-    finish(transport);
+    if (!finish(transport)) { ret false; }
     if (transport.scope_live) {
         cancel.destroy(?transport.scope);
         transport.scope_live = false;

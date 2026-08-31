@@ -1,15 +1,16 @@
-# originating one TLS connection to an ACME authority
+# originating TLS connections to ACME authorities
 #
 # hedge terminates TLS for the connections it serves. this is the other
 # direction, and the only place hedge is a TLS client: reaching the authority
-# that issues its certificates. one connection at a time, because ACME is one
-# exchange at a time.
+# that issues its certificates. each certificate manager still performs one
+# exchange at a time, while an active and a superseded configuration generation
+# may each own a manager during reload.
 #
-# the engine lives in module state rather than in the transport that drives it,
-# and that is forced rather than chosen. a mach-tls client holds secret-welded
-# storage, so a record containing one cannot be erased to the untyped `ptr`
-# that the serving plane hands every subsystem. the transport keeps no engine
-# and reaches this module by call; the welded state never crosses a `ptr`.
+# a mach-tls client holds secret-welded storage, so a record containing one
+# cannot be erased to the untyped `ptr` that the serving plane hands every
+# subsystem. sessions therefore live in a bounded typed table and are addressed
+# by an unwelded handle. callback contexts point only to the public channel next
+# to each session, so secret taint never crosses a `ptr`.
 #
 # the lower half is the same shape hedge's listener side uses: mach-tls submits
 # reads, writes and closes through a transport descriptor, and the completions
@@ -52,6 +53,9 @@ pub val PEER_PARAMETER_BYTES: usize = 2048;
 pub val PEER_CERTIFICATES: usize = 8;
 pub val MAX_CHAIN_BYTES: usize = 32768;
 pub val MAX_SERVER_NAME: usize = 253;
+# two overlapping generations can each originate for every tls identity slot
+pub val MAX_SESSIONS: usize = 16;
+pub val NO_SESSION: usize = MAX_SESSIONS;
 
 # the completion tag the lower half submits under. the transport that owns the
 # driver routes anything carrying it back here.
@@ -75,8 +79,19 @@ pub val SHUTDOWN:  Kind = 4;
 rec Channel {
     driver:     *net_async.Driver;
     socket:     *tcp.Stream;
+    index:      usize;
     generation: u32;
+    token_generation: u32;
+    current:    Kind;
+    settled_bytes: usize;
+    failure_value: tls_error.Error;
+    established: bool;
     live:       bool;
+}
+
+pub rec Handle {
+    index:      usize;
+    generation: u32;
 }
 
 # the half that is never erased
@@ -109,13 +124,75 @@ rec Session {
     stream_started:    bool;
 }
 
-var channel: Channel;
-var session: Session;
-var current: Kind;
-var settled_bytes: usize;
-var failure_value: tls_error.Error;
-var established_flag: bool;
-var live_flag: bool;
+var channels: [MAX_SESSIONS]Channel;
+var sessions: [MAX_SESSIONS]Session;
+var prepared: bool;
+var live_count: usize;
+
+pub fun no_handle() Handle {
+    ret Handle{index: NO_SESSION, generation: 0};
+}
+
+fun reset_channel(value: *Channel, index: usize) {
+    value.driver = nil;
+    value.socket = nil;
+    value.index = index;
+    value.token_generation = 0;
+    value.current = NONE;
+    value.settled_bytes = 0;
+    value.failure_value = tls_error.OK;
+    value.established = false;
+    value.live = false;
+}
+
+fun prepare() {
+    if (prepared) { ret; }
+    var i: usize = 0;
+    for (i < MAX_SESSIONS) {
+        channels[i].generation = 0;
+        reset_channel(?channels[i], i);
+        sessions[i].root_live = false;
+        sessions[i].operation_live = false;
+        sessions[i].engine_started = false;
+        sessions[i].stream_started = false;
+        i = i + 1;
+    }
+    live_count = 0;
+    prepared = true;
+}
+
+fun entry(handle: Handle) *Channel {
+    prepare();
+    if (handle.index >= MAX_SESSIONS || handle.generation == 0) { ret nil; }
+    val value: *Channel = ?channels[handle.index];
+    if (!value.live || value.generation != handle.generation) { ret nil; }
+    ret value;
+}
+
+fun acquire() Handle {
+    prepare();
+    var i: usize = 0;
+    for (i < MAX_SESSIONS) {
+        if (!channels[i].live) {
+            var generation: u32 = channels[i].generation + 1;
+            if (generation == 0) { generation = 1; }
+            reset_channel(?channels[i], i);
+            channels[i].generation = generation;
+            channels[i].live = true;
+            live_count = live_count + 1;
+            ret Handle{index: i, generation: generation};
+        }
+        i = i + 1;
+    }
+    ret no_handle();
+}
+
+pub fun capacity() usize { ret MAX_SESSIONS; }
+
+pub fun live() usize {
+    prepare();
+    ret live_count;
+}
 
 fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) Result[io_runtime.Token, io_error.Error] {
@@ -185,10 +262,10 @@ fun lower_aliases(context: ptr, data: *u8, len: usize) bool {
         && io_runtime.aliases(value.driver.runtime, data, len);
 }
 
-fun descriptor() tls_transport.Transport {
+fun descriptor(index: usize) tls_transport.Transport {
     var value: tls_transport.Transport;
-    value.runtime = channel.driver.runtime;
-    value.context = (?channel)::ptr;
+    value.runtime = channels[index].driver.runtime;
+    value.context = (?channels[index])::ptr;
     value.context_size = $size_of(Channel);
     value.aliases_state = lower_aliases;
     value.submit_read = lower_read;
@@ -199,26 +276,26 @@ fun descriptor() tls_transport.Transport {
     ret value;
 }
 
-fun storage() tls_client.Storage {
+fun storage(index: usize) tls_client.Storage {
     var value: tls_client.Storage;
-    value.input = ?session.handshake_input[0];
+    value.input = ?sessions[index].handshake_input[0];
     value.input_capacity = HANDSHAKE_INPUT_BYTES;
-    value.output = ?session.handshake_output[0];
+    value.output = ?sessions[index].handshake_output[0];
     value.output_capacity = HANDSHAKE_OUTPUT_BYTES;
-    value.hello = ?session.hello[0];
+    value.hello = ?sessions[index].hello[0];
     value.hello_capacity = HELLO_BYTES;
-    value.certificates = ?session.peer_certificates[0];
+    value.certificates = ?sessions[index].peer_certificates[0];
     value.certificate_capacity = PEER_CERTIFICATES;
-    value.peer_parameters = ?session.peer_parameters[0];
+    value.peer_parameters = ?sessions[index].peer_parameters[0];
     value.peer_parameters_capacity = PEER_PARAMETER_BYTES;
     ret value;
 }
 
-fun stream_storage() tls_stream.Storage {
+fun stream_storage(index: usize) tls_stream.Storage {
     var value: tls_stream.Storage;
-    value.wire_input = ?session.wire_input[0];
+    value.wire_input = ?sessions[index].wire_input[0];
     value.wire_input_capacity = WIRE_BYTES;
-    value.wire_output = ?session.wire_output[0];
+    value.wire_output = ?sessions[index].wire_output[0];
     value.wire_output_capacity = WIRE_BYTES;
     ret value;
 }
@@ -234,234 +311,321 @@ fun limits() tls_config.Limits {
     ret value;
 }
 
-fun offer_http11() {
+fun offer_http11(index: usize) {
     val name: str = "http/1.1";
     var i: usize = 0;
     for (i < 8) {
-        session.alpn_storage[i] = name[i];
+        sessions[index].alpn_storage[i] = name[i];
         i = i + 1;
     }
-    session.alpn[0] = tls_config.ProtocolName{
-        data: ?session.alpn_storage[0], len: 8};
+    sessions[index].alpn[0] = tls_config.ProtocolName{
+        data: ?sessions[index].alpn_storage[0], len: 8};
 }
 
-fun configure(trust: *cert.TrustStore) {
-    session.versions[0] = tls13.VERSION;
-    session.suites[0] = tls13.AES_128_GCM_SHA256;
-    session.suites[1] = tls13.AES_256_GCM_SHA384;
-    session.suites[2] = tls13.CHACHA20_POLY1305_SHA256;
-    session.groups[0] = tls13.X25519;
-    session.groups[1] = tls13.SECP256R1;
-    session.signatures[0] = tls13.ED25519;
-    session.signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
-    session.signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
-    session.signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
-    session.entropy = secret.system_entropy();
-    offer_http11();
+fun configure(index: usize, trust: *cert.TrustStore) {
+    sessions[index].versions[0] = tls13.VERSION;
+    sessions[index].suites[0] = tls13.AES_128_GCM_SHA256;
+    sessions[index].suites[1] = tls13.AES_256_GCM_SHA384;
+    sessions[index].suites[2] = tls13.CHACHA20_POLY1305_SHA256;
+    sessions[index].groups[0] = tls13.X25519;
+    sessions[index].groups[1] = tls13.SECP256R1;
+    sessions[index].signatures[0] = tls13.ED25519;
+    sessions[index].signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
+    sessions[index].signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
+    sessions[index].signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
+    sessions[index].entropy = secret.system_entropy();
+    offer_http11(index);
     var value: tls_config.ClientConfig;
-    value.server_name = contracts.Bytes{data: ?session.server_name[0],
-        len: session.server_name_len};
-    value.alpn = ?session.alpn[0];
+    value.server_name = contracts.Bytes{data: ?sessions[index].server_name[0],
+        len: sessions[index].server_name_len};
+    value.alpn = ?sessions[index].alpn[0];
     value.alpn_len = 1;
     value.trust = trust;
-    value.versions = ?session.versions[0];
+    value.versions = ?sessions[index].versions[0];
     value.version_len = 1;
-    value.suites = ?session.suites[0];
+    value.suites = ?sessions[index].suites[0];
     value.suite_len = 3;
-    value.groups = ?session.groups[0];
+    value.groups = ?sessions[index].groups[0];
     value.group_len = 2;
-    value.signatures = ?session.signatures[0];
+    value.signatures = ?sessions[index].signatures[0];
     value.signature_len = 4;
     value.client_identity = nil;
-    value.entropy = ?session.entropy;
+    value.entropy = ?sessions[index].entropy;
     value.entropy_context_size = 0;
     value.sessions = nil;
     value.limits = limits();
-    session.configuration = value;
+    sessions[index].configuration = value;
 }
 
-fun next_token() tls_transport.Token {
-    var generation: u32 = channel.generation + 1;
+fun next_token(value: *Channel) tls_transport.Token {
+    var generation: u32 = value.token_generation + 1;
     if (generation == 0) { generation = 1; }
-    channel.generation = generation;
+    value.token_generation = generation;
     ret tls_transport.Token{index: 1, generation: generation};
 }
 
-fun renew_operation_scope() bool {
-    if (session.operation_live) {
-        cancel.destroy(?session.operation_scope);
-        session.operation_live = false;
+fun renew_operation_scope(index: usize) bool {
+    if (sessions[index].operation_live) {
+        cancel.destroy(?sessions[index].operation_scope);
+        sessions[index].operation_live = false;
     }
-    if (!cancel.make_child(?session.operation_scope, ?session.root, false,
+    if (!cancel.make_child(?sessions[index].operation_scope,
+        ?sessions[index].root, false,
         time.Time{sec: 0, nsec: 0})) { ret false; }
-    session.operation_live = true;
+    sessions[index].operation_live = true;
     ret true;
 }
 
-pub fun active() bool {
-    ret live_flag;
+pub fun active(handle: Handle) bool {
+    ret entry(handle) != nil;
 }
 
-pub fun established() bool {
-    ret live_flag && established_flag;
+pub fun established(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    ret value != nil && value.established;
 }
 
-pub fun failure() tls_error.Error {
-    ret failure_value;
+pub fun failure(handle: Handle) tls_error.Error {
+    val value: *Channel = entry(handle);
+    if (value == nil) { ret tls_error.INTERNAL_ERROR; }
+    ret value.failure_value;
 }
 
-pub fun transferred() usize {
-    ret settled_bytes;
+pub fun transferred(handle: Handle) usize {
+    val value: *Channel = entry(handle);
+    if (value == nil) { ret 0; }
+    ret value.settled_bytes;
 }
 
-pub fun negotiated() tls_engine.Snapshot {
-    ret tls_stream.negotiated(?session.stream);
+pub fun negotiated(handle: Handle) tls_engine.Snapshot {
+    val value: *Channel = entry(handle);
+    if (value == nil || !sessions[handle.index].stream_started) {
+        ret tls_engine.empty_snapshot();
+    }
+    ret tls_stream.negotiated(?sessions[handle.index].stream);
+}
+
+pub fun cancel_operation(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    if (value == nil || value.current == NONE
+     || !sessions[handle.index].operation_live) { ret false; }
+    ret cancel.cancel(?sessions[handle.index].operation_scope);
+}
+
+# releases the engine and every scope it borrowed. the socket belongs to the
+# caller and is closed by whoever opened it.
+pub fun release(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    if (value == nil) { ret false; }
+    val index: usize = handle.index;
+    if (value.current != NONE) {
+        val settled: Status = poll(handle);
+        if (settled == PENDING || settled == INVALID) { ret false; }
+    }
+    if (sessions[index].stream_started) {
+        if (!tls_stream.destroy(?sessions[index].stream)) { ret false; }
+        sessions[index].stream_started = false;
+    }
+    if (sessions[index].engine_started) {
+        if (!tls_client.destroy(?sessions[index].engine)) { ret false; }
+        sessions[index].engine_started = false;
+    }
+    if (sessions[index].operation_live) {
+        if (!cancel.destroy(?sessions[index].operation_scope)) { ret false; }
+        sessions[index].operation_live = false;
+    }
+    if (sessions[index].root_live) {
+        if (!cancel.destroy(?sessions[index].root)) { ret false; }
+        sessions[index].root_live = false;
+    }
+    reset_channel(value, index);
+    if (live_count > 0) { live_count = live_count - 1; }
+    ret true;
 }
 
 # begins one TLS connection over a socket the caller has already connected.
 # `trust` is the anchor set the authority is verified against; without one
 # there is nothing to verify against and the connection is refused.
-pub fun begin(driver: *net_async.Driver, socket: *tcp.Stream,
+pub fun begin(output: *Handle, driver: *net_async.Driver, socket: *tcp.Stream,
     server_name: view.View, trust: *cert.TrustStore,
     verification_time: i64) Status {
-    if (live_flag) { ret INVALID; }
-    if (driver == nil || socket == nil || trust == nil || trust.len == 0
-     || server_name.data == nil || server_name.len == 0
+    if (output == nil || driver == nil || socket == nil || trust == nil
+     || trust.len == 0 || server_name.data == nil || server_name.len == 0
      || server_name.len > MAX_SERVER_NAME) { ret INVALID; }
-    channel.driver = driver;
-    channel.socket = socket;
-    channel.generation = 0;
-    channel.live = true;
-    session.root_live = false;
-    session.operation_live = false;
-    session.engine_started = false;
-    session.stream_started = false;
-    current = NONE;
-    settled_bytes = 0;
-    established_flag = false;
-    failure_value = tls_error.OK;
+    @output = no_handle();
+    val handle: Handle = acquire();
+    if (handle.index == NO_SESSION) { ret FAILED; }
+    val index: usize = handle.index;
+    val value: *Channel = ?channels[index];
+    value.driver = driver;
+    value.socket = socket;
+    sessions[index].root_live = false;
+    sessions[index].operation_live = false;
+    sessions[index].engine_started = false;
+    sessions[index].stream_started = false;
     var i: usize = 0;
     for (i < server_name.len) {
-        session.server_name[i] = server_name.data[i];
+        sessions[index].server_name[i] = server_name.data[i];
         i = i + 1;
     }
-    session.server_name_len = server_name.len;
-    configure(trust);
+    sessions[index].server_name_len = server_name.len;
+    configure(index, trust);
     var extra: tls_client.ExtraExtension;
     extra.kind = 0;
     extra.data = contracts.Bytes{data: nil, len: 0};
-    if (!tls_client.init(?session.engine, ?session.configuration, storage(),
-        extra, 0)) { ret FAILED; }
-    session.engine_started = true;
-    if (!cancel.make_root(?session.root, false, time.Time{sec: 0, nsec: 0})) {
+    if (!tls_client.init(?sessions[index].engine,
+        ?sessions[index].configuration, storage(index), extra, 0)) {
+        release(handle);
         ret FAILED;
     }
-    session.root_live = true;
-    if (!renew_operation_scope()) { ret FAILED; }
-    session.lower = descriptor();
-    live_flag = true;
-    if (!tls_stream.connect(?session.stream, ?session.engine, stream_storage(),
-        ?session.lower, ?session.operation_scope, next_token(),
-        verification_time, 0)) {
-        failure_value = tls_error.INTERNAL_ERROR;
+    sessions[index].engine_started = true;
+    if (!cancel.make_root(?sessions[index].root, false,
+        time.Time{sec: 0, nsec: 0})) {
+        release(handle);
         ret FAILED;
     }
-    session.stream_started = true;
-    current = HANDSHAKE;
+    sessions[index].root_live = true;
+    if (!renew_operation_scope(index)) {
+        release(handle);
+        ret FAILED;
+    }
+    sessions[index].lower = descriptor(index);
+    if (!tls_stream.connect(?sessions[index].stream,
+        ?sessions[index].engine, stream_storage(index),
+        ?sessions[index].lower, ?sessions[index].operation_scope,
+        next_token(value), verification_time, 0)) {
+        value.failure_value = tls_error.INTERNAL_ERROR;
+        release(handle);
+        ret FAILED;
+    }
+    sessions[index].stream_started = true;
+    value.current = HANDSHAKE;
+    @output = handle;
     ret PENDING;
 }
 
 # routes one socket completion into the engine
-pub fun accept(completion: *io_runtime.Completion) bool {
-    if (!live_flag || !session.stream_started) { ret false; }
-    ret tls_stream.accept(?session.stream, completion);
+pub fun accept(handle: Handle, completion: *io_runtime.Completion) bool {
+    if (entry(handle) == nil || !sessions[handle.index].stream_started) {
+        ret false;
+    }
+    ret tls_stream.accept(?sessions[handle.index].stream, completion);
 }
 
 # resolves the operation in flight, if it has finished
-pub fun poll() Status {
-    if (!live_flag) { ret INVALID; }
-    if (current == NONE) { ret OK; }
+pub fun poll(handle: Handle) Status {
+    val value: *Channel = entry(handle);
+    if (value == nil) { ret INVALID; }
+    if (value.current == NONE) { ret OK; }
+    val index: usize = handle.index;
     val snapshot: tls_transport.Snapshot = tls_transport.snapshot(
-        ?session.stream.operation);
+        ?sessions[index].stream.operation);
     if (snapshot.state != tls_transport.OPERATION_TERMINAL) { ret PENDING; }
-    val kind: Kind = current;
-    current = NONE;
-    settled_bytes = snapshot.application_bytes;
-    failure_value = snapshot.terminal_error;
-    tls_stream.destroy_operation(?session.stream);
+    val kind: Kind = value.current;
+    value.current = NONE;
+    value.settled_bytes = snapshot.application_bytes;
+    value.failure_value = snapshot.terminal_error;
+    tls_stream.destroy_operation(?sessions[index].stream);
     if (snapshot.terminal_error != tls_error.OK) { ret FAILED; }
-    if (kind == HANDSHAKE) { established_flag = true; }
+    if (kind == HANDSHAKE) { value.established = true; }
     ret OK;
 }
 
-fun start(kind: Kind, buffer: *u8, length: usize) Status {
-    if (!live_flag || current != NONE) { ret INVALID; }
-    if (kind != SHUTDOWN && !established_flag) { ret INVALID; }
-    if (!renew_operation_scope()) { ret FAILED; }
-    val token: tls_transport.Token = next_token();
+fun start(handle: Handle, kind: Kind, buffer: *u8, length: usize) Status {
+    val value: *Channel = entry(handle);
+    if (value == nil || value.current != NONE) { ret INVALID; }
+    if (kind != SHUTDOWN && !value.established) { ret INVALID; }
+    val index: usize = handle.index;
+    if (!renew_operation_scope(index)) { ret FAILED; }
+    val token: tls_transport.Token = next_token(value);
     var started: bool = false;
     if (kind == READ) {
-        started = tls_stream.read(?session.stream, ?session.operation_scope,
-            token, buffer, length, 0);
+        started = tls_stream.read(?sessions[index].stream,
+            ?sessions[index].operation_scope, token, buffer, length, 0);
     } or (kind == WRITE) {
-        started = tls_stream.write(?session.stream, ?session.operation_scope,
-            token, buffer, length, 0);
+        started = tls_stream.write(?sessions[index].stream,
+            ?sessions[index].operation_scope, token, buffer, length, 0);
     } or {
-        started = tls_stream.half_close(?session.stream,
-            ?session.operation_scope, token, 0);
+        started = tls_stream.half_close(?sessions[index].stream,
+            ?sessions[index].operation_scope, token, 0);
     }
     if (!started) {
-        failure_value = tls_error.INTERNAL_ERROR;
+        value.failure_value = tls_error.INTERNAL_ERROR;
         ret FAILED;
     }
-    current = kind;
-    settled_bytes = 0;
+    value.current = kind;
+    value.settled_bytes = 0;
     ret PENDING;
 }
 
-pub fun start_read(buffer: *u8, length: usize) Status {
-    ret start(READ, buffer, length);
+pub fun start_read(handle: Handle, buffer: *u8, length: usize) Status {
+    ret start(handle, READ, buffer, length);
 }
 
-pub fun start_write(buffer: *u8, length: usize) Status {
-    ret start(WRITE, buffer, length);
+pub fun start_write(handle: Handle, buffer: *u8, length: usize) Status {
+    ret start(handle, WRITE, buffer, length);
 }
 
-pub fun peer_closed() bool {
-    if (!live_flag || !session.stream_started) { ret false; }
-    val view: tls_stream.Snapshot = tls_stream.snapshot(?session.stream);
-    ret view.peer_closed || view.state == tls_stream.CLOSED;
+pub fun peer_closed(handle: Handle) bool {
+    if (entry(handle) == nil || !sessions[handle.index].stream_started) {
+        ret false;
+    }
+    val value: tls_stream.Snapshot = tls_stream.snapshot(
+        ?sessions[handle.index].stream);
+    ret value.peer_closed || value.state == tls_stream.CLOSED;
 }
 
-pub fun operating() bool {
-    ret live_flag && current != NONE;
+pub fun operating(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    ret value != nil && value.current != NONE;
 }
 
-# releases the engine and every scope it borrowed. the socket belongs to the
-# caller and is closed by whoever opened it.
-pub fun release() bool {
-    if (!live_flag) { ret false; }
-    if (session.stream_started) {
-        tls_stream.destroy(?session.stream);
-        session.stream_started = false;
+test "acme origination: session handles are bounded, reusable, and stale-safe" {
+    val before: usize = live();
+    var handles: [MAX_SESSIONS]Handle;
+    var i: usize = 0;
+    for (i < MAX_SESSIONS) {
+        handles[i] = acquire();
+        if (handles[i].index == NO_SESSION || !active(handles[i])) { ret 1; }
+        i = i + 1;
     }
-    if (session.engine_started) {
-        tls_client.destroy(?session.engine);
-        session.engine_started = false;
+    if (live() != before + MAX_SESSIONS) { ret 2; }
+    val exhausted: Handle = acquire();
+    if (exhausted.index != NO_SESSION || active(exhausted)) { ret 3; }
+    val stale: Handle = handles[0];
+    if (!release(stale) || active(stale)) { ret 4; }
+    val reused: Handle = acquire();
+    if (reused.index != stale.index || reused.generation == stale.generation
+     || !active(reused)) { ret 5; }
+    if (release(stale)) { ret 6; }
+    handles[0] = reused;
+    i = 0;
+    for (i < MAX_SESSIONS) {
+        if (!release(handles[i])) { ret 7; }
+        i = i + 1;
     }
-    if (session.operation_live) {
-        cancel.destroy(?session.operation_scope);
-        session.operation_live = false;
-    }
-    if (session.root_live) {
-        cancel.destroy(?session.root);
-        session.root_live = false;
-    }
-    channel.live = false;
-    channel.driver = nil;
-    channel.socket = nil;
-    current = NONE;
-    established_flag = false;
-    live_flag = false;
-    ret true;
+    if (live() != before) { ret 8; }
+    ret 0;
+}
+
+test "acme origination: concurrent slots keep operation state separate" {
+    val first: Handle = acquire();
+    val second: Handle = acquire();
+    if (first.index == NO_SESSION || second.index == NO_SESSION
+     || first.index == second.index) { ret 1; }
+    channels[first.index].established = true;
+    channels[first.index].current = READ;
+    channels[first.index].settled_bytes = 17;
+    channels[second.index].current = WRITE;
+    channels[second.index].settled_bytes = 29;
+    channels[second.index].failure_value = tls_error.BAD_CERTIFICATE;
+    if (!established(first) || established(second)) { ret 2; }
+    if (!operating(first) || !operating(second)) { ret 3; }
+    if (transferred(first) != 17 || transferred(second) != 29) { ret 4; }
+    if (failure(first) != tls_error.OK
+     || failure(second) != tls_error.BAD_CERTIFICATE) { ret 5; }
+    channels[first.index].current = NONE;
+    channels[second.index].current = NONE;
+    if (!release(first) || !release(second)) { ret 6; }
+    ret 0;
 }
