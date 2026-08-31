@@ -91,9 +91,10 @@ for a superseded generation draining while its replacement serves.
 
 ## What this does not cover
 
-- HTTP/3. hedge has no QUIC listener: `mach-quic` ships no binding from its
-  connection core to its own driver contract, and hedge's listener plane has no
+- HTTP/3. hedge has no QUIC listener, because its listener plane has no
   datagram receive path. A QUIC listener is rejected at configuration time.
+  `mach-quic` now ships the production binding from its connection core to its
+  driver contract, so that half of the blocker is gone. See issue #32.
 - Browser interoperability. This machine has no browser harness, so the ALPN and
   certificate paths are exercised only through the clients above.
 - TLS 1.2. hedge configures its listeners for TLS 1.3 only, and the matrix
