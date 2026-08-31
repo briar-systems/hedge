@@ -28,6 +28,10 @@ material only.
 identity and no default, so an unmatched server name is refused rather than
 served somebody else's certificate.
 
+`shutdown.toml` binds one cleartext listener with a 300ms drain deadline, short
+enough that a shutdown with a peer still holding a request open reaches the
+deadline within the life of a test.
+
 ## What the matrix covers
 
 Serving:
@@ -59,13 +63,20 @@ through to a default:
 - a malformed PROXY header: closed with no response, and the address it asserted
   is never used
 
+Shutdown, asserted through the process exit status, which is the only place the
+outcome is visible to whoever supervises hedge:
+
+- a stop with nothing in flight drains and exits 0
+- a stop with a peer mid-request reaches the drain deadline, cancels the
+  exchange, and exits 75 naming how many were abandoned
+
 The PROXY protocol legs also cover the positive direction: a trusted v1 header
 followed by an HTTP/1 request is served, and a trusted header followed by the
 HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-24 legs passed, 0 failed, on linux-x86_64 against:
+26 legs passed, 0 failed, on linux-x86_64 against:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3
@@ -73,9 +84,10 @@ HTTP/2 preface selects HTTP/2.
 
 The in-process suites cover what this harness cannot express as a client
 command: `mach test .` for the selection, prologue, credential, PROXY, TLS
-policy and session rules, and `mach test test/runtime` for PROXY decoding and
-peer propagation over real sockets, where the decoded peer is asserted from the
-response body a service produced.
+policy, session and shutdown-ordering rules, and `mach test test/runtime` for
+PROXY decoding and peer propagation over real sockets, for the drain deadline
+against a stuck handler and a slow peer, for the two-stage HTTP/2 GOAWAY, and
+for a superseded generation draining while its replacement serves.
 
 ## What this does not cover
 

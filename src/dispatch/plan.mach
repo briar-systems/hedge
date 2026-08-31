@@ -11,6 +11,7 @@ use std.types.view;
 use std.types.result.Result;
 use std.types.result.err;
 use http.core.field;
+use http.core.exchange;
 use http.core.message;
 use http.core.method;
 use http.core.status;
@@ -253,6 +254,28 @@ fun host_name_count(graph: *schema.Graph, route: *schema.Route) usize {
 # block confers no precedence: every name of a host produces an equally ranked
 # pattern for the same route, and which one answers a request is decided by the
 # router's specificity rule, not by which was written first.
+# which budget one route is charged against
+#
+# the most specific name wins: a route's own budget, else the budget of the
+# service it dispatches to, else the budget of the virtual host it belongs to.
+# an unnamed budget at every level is unbudgeted work, which is admitted without
+# accounting rather than refused.
+fun route_budget(graph: *schema.Graph, route: *schema.Route) usize {
+    if (route.budget.len != 0) {
+        ret schema.budget_index(graph, schema.text(?route.budget));
+    }
+    val configured: *schema.Service = schema.find_service(graph,
+        schema.text(?route.service));
+    if (configured != nil && configured.budget.len != 0) {
+        ret schema.budget_index(graph, schema.text(?configured.budget));
+    }
+    val host: *schema.Host = schema.find_host(graph, schema.text(?route.host));
+    if (host != nil && host.budget.len != 0) {
+        ret schema.budget_index(graph, schema.text(?host.budget));
+    }
+    ret schema.NO_BUDGET_INDEX;
+}
+
 fun host_pattern(plan: *Plan, graph: *schema.Graph, route: *schema.Route,
     index: usize) str {
     val host: *schema.Host = schema.find_host(graph, schema.text(?route.host));
@@ -290,16 +313,188 @@ fun route_failure(status: router.CompileStatus) str {
     ret "route pattern did not compile";
 }
 
-# compile a configuration graph into an immutable route graph and service set
-pub fun compile(
-    plan: *Plan,
-    generation: u64,
-    graph: *schema.Graph,
-    storage: Storage,
-    resolver: *service.Resolver,
-    plans: *middleware.Chains,
-) Report {
-    if (plan == nil || graph == nil || resolver == nil || generation == 0) {
+fun service_reusable(active: *schema.Service, candidate: *schema.Service) bool {
+    # budget selection belongs to the route plan and may change on reload. every
+    # field below shapes the service instance itself and therefore may not.
+    if (active == nil || candidate == nil || active.kind != candidate.kind
+     || active.status != candidate.status
+     || active.precompressed != candidate.precompressed
+     || active.cache != candidate.cache
+     || !schema.text_equals(?active.name, schema.text(?candidate.name))
+     || !schema.text_equals(?active.target, schema.text(?candidate.target))
+     || !schema.text_equals(?active.secret, schema.text(?candidate.secret))
+     || !schema.text_equals(?active.content_type,
+        schema.text(?candidate.content_type))
+     || !schema.text_equals(?active.index, schema.text(?candidate.index))) {
+        ret false;
+    }
+    # a cache wrapper owns a binding to its original inner descriptor, so it
+    # cannot survive that descriptor's storage being reused on a later reload
+    ret !active.cache;
+}
+
+pub fun services_reusable(active: *schema.Graph, candidate: *schema.Graph) bool {
+    if (active == nil || candidate == nil
+     || active.service_count != candidate.service_count) { ret false; }
+    var i: usize = 0;
+    for (i < active.service_count) {
+        if (!service_reusable(?active.services[i], ?candidate.services[i])) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun features_reusable(active: *schema.Features,
+    candidate: *schema.Features) bool {
+    ret active.http1 == candidate.http1
+        && active.http2 == candidate.http2
+        && active.http3 == candidate.http3
+        && active.tls == candidate.tls
+        && active.acme == candidate.acme
+        && active.proxy == candidate.proxy
+        && active.cache == candidate.cache;
+}
+
+fun telemetry_reusable(active: *schema.Telemetry,
+    candidate: *schema.Telemetry) bool {
+    ret active.logs == candidate.logs
+        && active.metrics == candidate.metrics
+        && active.traces == candidate.traces
+        && schema.text_equals(?active.endpoint,
+            schema.text(?candidate.endpoint))
+        && active.log_record_bytes == candidate.log_record_bytes
+        && active.log_queue_depth == candidate.log_queue_depth
+        && active.metric_series == candidate.metric_series
+        && active.trace_state_bytes == candidate.trace_state_bytes;
+}
+
+fun cache_reusable(active: *schema.Cache, candidate: *schema.Cache) bool {
+    ret active.enabled == candidate.enabled
+        && active.memory_bytes == candidate.memory_bytes
+        && active.disk_bytes == candidate.disk_bytes
+        && schema.text_equals(?active.disk_root,
+            schema.text(?candidate.disk_root))
+        && active.max_entry_bytes == candidate.max_entry_bytes
+        && active.entries == candidate.entries
+        && active.heuristic_percent == candidate.heuristic_percent;
+}
+
+fun acme_reusable(active: *schema.Acme, candidate: *schema.Acme) bool {
+    if (active.enabled != candidate.enabled
+     || !schema.text_equals(?active.directory,
+        schema.text(?candidate.directory))
+     || !schema.text_equals(?active.contact, schema.text(?candidate.contact))
+     || !schema.text_equals(?active.storage, schema.text(?candidate.storage))
+     || !schema.text_equals(?active.origin, schema.text(?candidate.origin))
+     || active.terms_agreed != candidate.terms_agreed
+     || active.challenge != candidate.challenge
+     || active.renew_before_seconds != candidate.renew_before_seconds
+     || active.name_count != candidate.name_count) { ret false; }
+    var i: usize = 0;
+    for (i < active.name_count) {
+        if (!schema.text_equals(?active.names[i],
+            schema.text(?candidate.names[i]))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun admin_reusable(active: *schema.Admin, candidate: *schema.Admin) bool {
+    ret active.enabled == candidate.enabled
+        && schema.text_equals(?active.listener,
+            schema.text(?candidate.listener))
+        && schema.text_equals(?active.auth_secret,
+            schema.text(?candidate.auth_secret))
+        && active.max_response_bytes == candidate.max_response_bytes;
+}
+
+fun secrets_reusable(active: *schema.Graph, candidate: *schema.Graph) bool {
+    if (active.secret_count != candidate.secret_count) { ret false; }
+    var i: usize = 0;
+    for (i < active.secret_count) {
+        val a: *schema.Secret = ?active.secrets[i];
+        val b: *schema.Secret = ?candidate.secrets[i];
+        if (!schema.text_equals(?a.name, schema.text(?b.name))
+         || !schema.text_equals(?a.provider, schema.text(?b.provider))
+         || !schema.text_equals(?a.key, schema.text(?b.key))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun tls_identity_reusable(active: *schema.TlsIdentity,
+    candidate: *schema.TlsIdentity) bool {
+    ret schema.text_equals(?active.server_name,
+            schema.text(?candidate.server_name))
+        && schema.text_equals(?active.certificate,
+            schema.text(?candidate.certificate))
+        && schema.text_equals(?active.key, schema.text(?candidate.key));
+}
+
+fun tls_reusable(active: *schema.Graph, candidate: *schema.Graph) bool {
+    if (active.tls_policy_count != candidate.tls_policy_count) { ret false; }
+    var i: usize = 0;
+    for (i < active.tls_policy_count) {
+        val a: *schema.TlsPolicy = ?active.tls_policies[i];
+        val b: *schema.TlsPolicy = ?candidate.tls_policies[i];
+        if (!schema.text_equals(?a.name, schema.text(?b.name))
+         || a.identity_count != b.identity_count
+         || !schema.text_equals(?a.default_name,
+            schema.text(?b.default_name))
+         || a.has_default != b.has_default
+         || a.client_auth != b.client_auth
+         || !schema.text_equals(?a.client_trust,
+            schema.text(?b.client_trust))) { ret false; }
+        var identity: usize = 0;
+        for (identity < a.identity_count) {
+            if (!tls_identity_reusable(?a.identities[identity],
+                ?b.identities[identity])) { ret false; }
+            identity = identity + 1;
+        }
+        i = i + 1;
+    }
+    # a secure listener is published into the TLS runtime by name at startup
+    i = 0;
+    for (i < candidate.listener_count) {
+        val next: *schema.Listener = ?candidate.listeners[i];
+        if (next.tls_policy.len != 0) {
+            val prior: *schema.Listener = schema.find_listener(active,
+                schema.text(?next.name));
+            if (prior == nil || prior.tls_policy.len == 0
+             || prior.protocols != next.protocols
+             || !schema.text_equals(?prior.tls_policy,
+                schema.text(?next.tls_policy))) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# only state rebuilt or republished by the reload path may change
+pub fun reload_compatible(active: *schema.Graph,
+    candidate: *schema.Graph) bool {
+    if (active == nil || candidate == nil
+     || !schema.text_equals(?active.server_name,
+        schema.text(?candidate.server_name))
+     || active.limits.max_connections != candidate.limits.max_connections
+     || active.limits.max_connections_per_peer
+        != candidate.limits.max_connections_per_peer
+     || !features_reusable(?active.features, ?candidate.features)
+     || !services_reusable(active, candidate)
+     || !secrets_reusable(active, candidate)
+     || !tls_reusable(active, candidate)
+     || !telemetry_reusable(?active.telemetry, ?candidate.telemetry)
+     || !cache_reusable(?active.cache, ?candidate.cache)
+     || !acme_reusable(?active.acme, ?candidate.acme)
+     || !admin_reusable(?active.admin, ?candidate.admin)) { ret false; }
+    ret true;
+}
+
+fun prepare(plan: *Plan, generation: u64, graph: *schema.Graph,
+    storage: Storage) Report {
+    if (plan == nil || graph == nil || generation == 0) {
         ret report(PLAN_INVALID, NO_INDEX, NO_INDEX, "invalid plan inputs");
     }
     plan.generation = generation;
@@ -313,33 +508,69 @@ pub fun compile(
     plan.graph.initialized = false;
     val expanded: usize = expanded_route_count(graph);
     if (expanded > storage.spec_capacity || expanded > storage.entry_capacity) {
-        ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX, "route storage is exhausted");
+        ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX,
+            "route storage is exhausted");
+    }
+    ret report(PLAN_OK, NO_INDEX, NO_INDEX, nil);
+}
+
+fun reuse_service(plan: *Plan, configured: *schema.Service,
+    active: *Plan, index: usize) Report {
+    if (active == nil || !active.sealed || index >= active.service_count
+     || index >= plan.storage.service_capacity) {
+        ret report(PLAN_INVALID, NO_INDEX, index,
+            "active service cannot be reused");
+    }
+    val source: *service.Descriptor = ?active.storage.services[index];
+    val descriptor: *service.Descriptor = ?plan.storage.services[index];
+    descriptor.kind = configured.kind;
+    descriptor.name = intern(plan, schema.text(?configured.name));
+    descriptor.target = intern(plan, schema.text(?configured.target));
+    descriptor.content_type = intern(plan, schema.text(?configured.content_type));
+    descriptor.status = configured.status::status.Status;
+    if (descriptor.name == nil || descriptor.target == nil) {
+        ret report(PLAN_CAPACITY, NO_INDEX, index,
+            "service text storage is exhausted");
+    }
+    descriptor.handler = source.handler;
+    if (configured.kind == schema.SERVICE_FIXED) {
+        descriptor.handler = service.Handler{ctx: (descriptor)::ptr,
+            serve: service.serve_fixed};
+    }
+    or (configured.kind == schema.SERVICE_REDIRECT) {
+        descriptor.handler = service.Handler{ctx: (descriptor)::ptr,
+            serve: service.serve_redirect};
+    }
+    if (!service.has_handler(descriptor.handler)) {
+        ret report(PLAN_UNSUPPORTED, NO_INDEX, index,
+            "active service has no handler");
+    }
+    plan.service_count = index + 1;
+    ret report(PLAN_OK, NO_INDEX, index, nil);
+}
+
+fun compile_routes(plan: *Plan, graph: *schema.Graph,
+    plans: *middleware.Chains) Report {
+    if (plans != nil && !middleware.install(plans, plan.storage.middleware,
+        plan.storage.middleware_capacity, ?plan.middleware_count)) {
+        ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX,
+            "middleware storage is exhausted");
     }
     var i: usize = 0;
-    for (i < graph.service_count) {
-        val built: Report = compile_service(plan, ?graph.services[i], resolver);
-        if (built.status != PLAN_OK) { ret built; }
-        i = i + 1;
-    }
-    if (plans != nil && !middleware.install(plans, plan.storage.middleware, plan.storage.middleware_capacity, ?plan.middleware_count)) {
-        ret report(PLAN_CAPACITY, NO_INDEX, NO_INDEX, "middleware storage is exhausted");
-    }
-    # one entry per emitted pattern, because the router reports a match by the
-    # index of the spec it compiled and dispatch reads the entry at that index
     var emitted: usize = 0;
-    i = 0;
     for (i < graph.route_count) {
         val configured: *schema.Route = ?graph.routes[i];
         val service_name: str = schema.text(?configured.service);
         val resolved: usize = find_service(plan, service_name);
         if (resolved == NO_INDEX) {
-            ret report(PLAN_UNRESOLVED, i, NO_INDEX, "route references an unknown service");
+            ret report(PLAN_UNRESOLVED, i, NO_INDEX,
+                "route references an unknown service");
         }
-        # the route's own text is interned once and shared by its patterns
         val route_name: str = intern(plan, schema.text(?configured.name));
         val pattern: str = translate_pattern(plan, schema.text(?configured.path));
         if (route_name == nil || pattern == nil) {
-            ret report(PLAN_CAPACITY, i, NO_INDEX, "route text storage is exhausted");
+            ret report(PLAN_CAPACITY, i, NO_INDEX,
+                "route text storage is exhausted");
         }
         var start: usize = 0;
         var count: usize = 0;
@@ -356,11 +587,12 @@ pub fun compile(
             entry.host = host_pattern(plan, graph, configured, n);
             entry.service = plan.storage.services[resolved].name;
             entry.service_index = resolved;
-            entry.budget_index = NO_INDEX;
+            entry.budget_index = route_budget(graph, configured);
             entry.middleware_start = start;
             entry.middleware_count = count;
             if (entry.host == nil) {
-                ret report(PLAN_CAPACITY, i, NO_INDEX, "route text storage is exhausted");
+                ret report(PLAN_CAPACITY, i, NO_INDEX,
+                    "route text storage is exhausted");
             }
             spec.method = view.view(nil, 0);
             spec.host = service.text_view(entry.host);
@@ -374,8 +606,8 @@ pub fun compile(
     }
     plan.entry_count = emitted;
     var configured_limits: router.Limits = router.limits_default();
-    configured_limits.max_routes = storage.route_capacity;
-    configured_limits.max_segments = storage.segment_capacity;
+    configured_limits.max_routes = plan.storage.route_capacity;
+    configured_limits.max_segments = plan.storage.segment_capacity;
     val compiled: router.Compile = router.compile(
         ?plan.graph,
         plan.storage.specs,
@@ -387,10 +619,60 @@ pub fun compile(
         configured_limits,
     );
     if (compiled.status != router.COMPILE_OK) {
-        ret report(PLAN_ROUTE, compiled.route, NO_INDEX, route_failure(compiled.status));
+        ret report(PLAN_ROUTE, compiled.route, NO_INDEX,
+            route_failure(compiled.status));
     }
     plan.sealed = true;
     ret report(PLAN_OK, NO_INDEX, NO_INDEX, nil);
+}
+
+# compile a configuration graph into an immutable route graph and service set
+pub fun compile(
+    plan: *Plan,
+    generation: u64,
+    graph: *schema.Graph,
+    storage: Storage,
+    resolver: *service.Resolver,
+    plans: *middleware.Chains,
+) Report {
+    if (resolver == nil) {
+        ret report(PLAN_INVALID, NO_INDEX, NO_INDEX, "invalid plan inputs");
+    }
+    val ready: Report = prepare(plan, generation, graph, storage);
+    if (ready.status != PLAN_OK) { ret ready; }
+    var i: usize = 0;
+    for (i < graph.service_count) {
+        val built: Report = compile_service(plan, ?graph.services[i], resolver);
+        if (built.status != PLAN_OK) { ret built; }
+        i = i + 1;
+    }
+    ret compile_routes(plan, graph, plans);
+}
+
+pub fun recompile(
+    plan: *Plan,
+    generation: u64,
+    graph: *schema.Graph,
+    storage: Storage,
+    active_plan: *Plan,
+    active_graph: *schema.Graph,
+    plans: *middleware.Chains,
+) Report {
+    if (active_plan == nil || !active_plan.sealed
+     || !services_reusable(active_graph, graph)) {
+        ret report(PLAN_INVALID, NO_INDEX, NO_INDEX,
+            "service definitions require restart");
+    }
+    val ready: Report = prepare(plan, generation, graph, storage);
+    if (ready.status != PLAN_OK) { ret ready; }
+    var i: usize = 0;
+    for (i < graph.service_count) {
+        val reused: Report = reuse_service(plan, ?graph.services[i],
+            active_plan, i);
+        if (reused.status != PLAN_OK) { ret reused; }
+        i = i + 1;
+    }
+    ret compile_routes(plan, graph, plans);
 }
 
 # route compilation requires a handler, but hedge matches and serves in separate
@@ -483,6 +765,37 @@ fun build(fixture: *Fixture, generation: u64, graph: *schema.Graph,
     ret compile(?fixture.plan, generation, graph, fixture.storage, resolver, chains);
 }
 
+fun rebuild(fixture: *Fixture, generation: u64, graph: *schema.Graph,
+    active: *Fixture, active_graph: *schema.Graph) Report {
+    make_storage(?fixture.storage,
+        ?fixture.routes[0], 4,
+        ?fixture.segments[0], 32,
+        ?fixture.specs[0], 4,
+        ?fixture.entries[0], 4,
+        ?fixture.services[0], 4,
+        ?fixture.middlewares[0], 4,
+        ?fixture.text[0], 1024);
+    ret recompile(?fixture.plan, generation, graph, fixture.storage,
+        ?active.plan, active_graph, nil);
+}
+
+rec FactoryProbe {
+    builds: usize;
+}
+
+fun serve_probe(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    ret exchange.SERVICE_PENDING;
+}
+
+fun build_probe(context: ptr, configured: *schema.Service,
+    handler: *service.Handler) bool {
+    val probe: *FactoryProbe = context::*FactoryProbe;
+    if (probe == nil || configured == nil || handler == nil) { ret false; }
+    probe.builds = probe.builds + 1;
+    @handler = service.Handler{ctx: context, serve: serve_probe};
+    ret true;
+}
+
 test "plan: a sealed graph owns its text and outlives the configuration it came from" {
     var graph: schema.Graph;
     test_graph(?graph, schema.SERVICE_FIXED, "body");
@@ -542,6 +855,108 @@ test "plan: a route naming an absent service fails before the plan seals" {
     var resolver: service.Resolver = service.no_resolver();
     if (build(?fixture, 2, ?graph, ?resolver, nil).status != PLAN_UNRESOLVED) { ret 1; }
     if (sealed(?fixture.plan)) { ret 2; }
+    ret 0;
+}
+
+test "plan: route-only recompilation reuses a service without calling its factory" {
+    var active_graph: schema.Graph;
+    test_graph(?active_graph, schema.SERVICE_NATIVE, "probe");
+    var probe: FactoryProbe;
+    probe.builds = 0;
+    var resolver: service.Resolver = service.no_resolver();
+    resolver.native = service.Factory{ctx: (?probe)::ptr, build: build_probe};
+    var active: Fixture;
+    if (build(?active, 1, ?active_graph, ?resolver, nil).status != PLAN_OK
+     || probe.builds != 1) { ret 1; }
+
+    var candidate: schema.Graph;
+    test_graph(?candidate, schema.SERVICE_NATIVE, "probe");
+    schema.set_text(?candidate.routes[0].path, "/changed/**");
+    var replacement: Fixture;
+    if (rebuild(?replacement, 2, ?candidate, ?active,
+        ?active_graph).status != PLAN_OK) { ret 2; }
+    if (probe.builds != 1 || replacement.plan.generation != 2) { ret 3; }
+    val handler: service.Handler = replacement.services[0].handler;
+    if (handler.ctx != (?probe)::ptr || handler.serve::usize != serve_probe::usize) {
+        ret 4;
+    }
+    if (routed(?replacement, "/changed/x", "example.test") == nil
+     || routed(?replacement, "/a/x", "example.test") != nil) { ret 5; }
+    ret 0;
+}
+
+test "plan: route-only recompilation refuses service state it cannot reuse" {
+    var active_graph: schema.Graph;
+    test_graph(?active_graph, schema.SERVICE_FIXED, "body");
+    var resolver: service.Resolver = service.no_resolver();
+    var active: Fixture;
+    if (build(?active, 1, ?active_graph, ?resolver, nil).status != PLAN_OK) {
+        ret 1;
+    }
+
+    var changed: schema.Graph;
+    test_graph(?changed, schema.SERVICE_FIXED, "body");
+    changed.services[0].status = 201;
+    var replacement: Fixture;
+    if (rebuild(?replacement, 2, ?changed, ?active,
+        ?active_graph).status != PLAN_INVALID) { ret 2; }
+
+    changed.services[0].status = 200;
+    changed.services[0].cache = true;
+    if (rebuild(?replacement, 2, ?changed, ?active,
+        ?active_graph).status != PLAN_INVALID) { ret 3; }
+    ret 0;
+}
+
+test "plan: request admission selects the most specific configured budget" {
+    var graph: schema.Graph;
+    test_graph(?graph, schema.SERVICE_FIXED, "body");
+    graph.budget_count = 3;
+    schema.set_text(?graph.budgets[0].name, "host");
+    schema.set_text(?graph.budgets[1].name, "service");
+    schema.set_text(?graph.budgets[2].name, "route");
+    schema.set_text(?graph.hosts[0].budget, "host");
+    schema.set_text(?graph.services[0].budget, "service");
+    schema.set_text(?graph.routes[0].budget, "route");
+    var resolver: service.Resolver = service.no_resolver();
+
+    var route_fixture: Fixture;
+    if (build(?route_fixture, 1, ?graph, ?resolver, nil).status != PLAN_OK
+     || route_fixture.entries[0].budget_index != 2) { ret 1; }
+    schema.clear_text(?graph.routes[0].budget);
+    var service_fixture: Fixture;
+    if (build(?service_fixture, 2, ?graph, ?resolver, nil).status != PLAN_OK
+     || service_fixture.entries[0].budget_index != 1) { ret 2; }
+    schema.clear_text(?graph.services[0].budget);
+    var host_fixture: Fixture;
+    if (build(?host_fixture, 3, ?graph, ?resolver, nil).status != PLAN_OK
+     || host_fixture.entries[0].budget_index != 0) { ret 3; }
+    schema.clear_text(?graph.hosts[0].budget);
+    var unbounded_fixture: Fixture;
+    if (build(?unbounded_fixture, 4, ?graph, ?resolver, nil).status != PLAN_OK
+     || unbounded_fixture.entries[0].budget_index != schema.NO_BUDGET_INDEX) {
+        ret 4;
+    }
+    ret 0;
+}
+
+test "plan: reload compatibility rejects state the reload path cannot rebuild" {
+    var active: schema.Graph;
+    test_graph(?active, schema.SERVICE_FIXED, "body");
+    var candidate: schema.Graph = active;
+    schema.set_text(?candidate.routes[0].path, "/changed/**");
+    candidate.timeouts.request_ms = candidate.timeouts.request_ms + 1;
+    candidate.limits.max_header_bytes = candidate.limits.max_header_bytes + 1;
+    if (!reload_compatible(?active, ?candidate)) { ret 1; }
+
+    candidate.telemetry.logs = !candidate.telemetry.logs;
+    if (reload_compatible(?active, ?candidate)) { ret 2; }
+    candidate.telemetry.logs = active.telemetry.logs;
+    candidate.cache.entries = candidate.cache.entries + 1;
+    if (reload_compatible(?active, ?candidate)) { ret 3; }
+    candidate.cache.entries = active.cache.entries;
+    candidate.services[0].status = candidate.services[0].status + 1;
+    if (reload_compatible(?active, ?candidate)) { ret 4; }
     ret 0;
 }
 

@@ -43,6 +43,7 @@ use hedge.dispatch;
 use hedge.service;
 use call: hedge.dispatch.call;
 use plan: hedge.dispatch.plan;
+use budget: hedge.budget;
 use hedge.listener;
 use trust: hedge.protocol.trust;
 use selection: hedge.protocol.selection;
@@ -132,6 +133,7 @@ pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Comp
 
 pub rec Config {
     engine: connection.Config;
+    max_streams: usize;
     request_timeout_ns: u64;
     # bounds the prologue and, on a TLS listener, the handshake behind it
     prologue_timeout_ns: u64;
@@ -139,7 +141,12 @@ pub rec Config {
 
 pub fun config_from(graph: *schema.Graph) Config {
     var engine: connection.Config = connection.config_default();
-    engine.max_pipeline = PIPELINE_DEPTH;
+    engine.max_pipeline = graph.limits.max_pipeline_depth;
+    if (engine.max_pipeline > PIPELINE_DEPTH) {
+        engine.max_pipeline = PIPELINE_DEPTH;
+    }
+    var max_streams: usize = graph.limits.max_pipeline_depth;
+    if (max_streams > h2.MAX_STREAMS) { max_streams = h2.MAX_STREAMS; }
     engine.parser.max_header_bytes = graph.limits.max_header_bytes;
     engine.parser.max_headers = graph.limits.max_header_count;
     engine.parser.max_body_bytes = graph.limits.max_body_bytes::u64;
@@ -154,7 +161,8 @@ pub fun config_from(graph: *schema.Graph) Config {
     if (engine.parser.max_trailer_bytes > STORAGE_BYTES) { engine.parser.max_trailer_bytes = STORAGE_BYTES; }
     if (engine.parser.max_trailers > TRAILER_SLOTS) { engine.parser.max_trailers = TRAILER_SLOTS; }
     if (engine.parser.max_chunk_line > LINE_BYTES) { engine.parser.max_chunk_line = LINE_BYTES; }
-    ret Config{engine: engine, request_timeout_ns: graph.timeouts.request_ms * 1000000,
+    ret Config{engine: engine, max_streams: max_streams,
+        request_timeout_ns: graph.timeouts.request_ms * 1000000,
         prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000};
 }
 
@@ -250,6 +258,8 @@ pub rec Connection {
     configured: Config;
     limits: message.Limits;
     plan: *plan.Plan;
+    budgets: *budget.Set;
+    charge: budget.Charge;
     requests: u64;
     last_event: connection.EventKind;
     last_step: Step;
@@ -565,6 +575,7 @@ pub fun make(
     source: *listener.Connection,
     net_driver: *net_async.Driver,
     active_plan: *plan.Plan,
+    budgets: *budget.Set,
     configured: Config,
     limits: message.Limits,
     owned: *listener.OwnedListener,
@@ -597,6 +608,8 @@ pub fun make(
     bind_policy(owner, owned, source);
     record_observed(owner, source);
     owner.plan = active_plan;
+    owner.budgets = budgets;
+    owner.charge = budget.no_charge();
     owner.configured = configured;
     owner.limits = limits;
     owner.active_slot = no_slot();
@@ -713,7 +726,9 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
             ret refuse(owner, prologue.REFUSED_EXHAUSTED);
         }
         if (!h2.begin(owner.h2_session, ?owner.channel, ?owner.engine_scope,
-            owner.plan, owner.limits, owner.listener_name, owner.secure,
+            owner.plan, owner.budgets, owner.limits, owner.configured.max_streams,
+            owner.listener_name,
+            owner.secure,
             endpoint_metadata(owner.peer_kind, ?owner.peer_text[0], owner.peer_len,
                 owner.peer_port),
             endpoint_metadata(owner.local_kind, ?owner.local_text[0],
@@ -1161,6 +1176,7 @@ fun settle_exchange(owner: *Connection, now: time.Time) bool {
     call.record_end(?owner.active_call,
         owner.exchange.state == exchange.COMPLETE_STATE);
     call.release(?owner.active_call);
+    budget.release(owner.budgets, ?owner.charge);
     connection.release(?owner.engine, owner.active_slot, now);
     owner.exchange_live = false;
     owner.active_slot = no_slot();
@@ -1217,7 +1233,8 @@ fun runnable(owner: *Connection) bool {
 # a service that is waiting on something of its own gets another turn without the
 # boundary being crossed again
 fun resume_service(owner: *Connection, now: time.Time) Step {
-    val served: dispatch.Result = dispatch.resume(owner.plan, ?owner.active_call);
+    val served: dispatch.Result = dispatch.resume(owner.plan, ?owner.active_call,
+        owner.budgets, ?owner.charge, now);
     if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
     owner.service_pending = false;
     if (served.outcome == dispatch.FAILED) {
@@ -1234,7 +1251,7 @@ fun start_exchange(owner: *Connection, slot: usize, now: time.Time) Step {
     owner.setup_failure = make_exchange(owner, slot, now);
     if (owner.setup_failure != SETUP_OK) { owner.state = FAILED; ret STEP_ERROR; }
     val served: dispatch.Result = dispatch.serve(owner.plan, ?owner.active_call,
-        ?owner.captures[0], CAPTURE_SLOTS);
+        ?owner.captures[0], CAPTURE_SLOTS, owner.budgets, ?owner.charge, now);
     if (served.outcome == dispatch.FAILED) {
         if (!fail_exchange(owner, status.INTERNAL_SERVER_ERROR, now)) {
             owner.state = FAILED;
@@ -1408,6 +1425,7 @@ pub fun begin_graceful(owner: *Connection) bool {
         ret true;
     }
     if (owner.h2_session != h2.NO_SESSION) { ret h2.begin_graceful(owner.h2_session); }
+    if (owner.engine.state == connection.DRAINING) { ret true; }
     ret connection.begin_graceful(?owner.engine);
 }
 
@@ -1419,6 +1437,7 @@ pub fun close(owner: *Connection) bool {
         exchange.cancel_exchange(?owner.exchange);
         call.record_end(?owner.active_call, false);
         call.release(?owner.active_call);
+        budget.release(owner.budgets, ?owner.charge);
         owner.exchange_live = false;
     }
     if (owner.h2_session != h2.NO_SESSION) {
@@ -1497,6 +1516,21 @@ pub fun snapshot(owner: *Connection) Snapshot {
         service_pending: owner.service_pending,
         response_status: owner.response.status,
     };
+}
+
+test "connection: the configured pipeline bound reaches both protocol engines" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.limits.max_pipeline_depth = 1;
+    var configured: Config = config_from(?graph);
+    if (configured.engine.max_pipeline != 1 || configured.max_streams != 1) {
+        ret 1;
+    }
+    graph.limits.max_pipeline_depth = 100;
+    configured = config_from(?graph);
+    if (configured.engine.max_pipeline != PIPELINE_DEPTH
+     || configured.max_streams != h2.MAX_STREAMS) { ret 2; }
+    ret 0;
 }
 
 pub fun finished(owner: *Connection) bool {

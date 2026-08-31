@@ -175,9 +175,15 @@ pub rec Snapshot {
     pending_accepts: usize;
     reload_requested: bool;
     stop_requested: bool;
+    # sockets this owner accepted and then could not close. a discarded close
+    # failure is a descriptor leak nobody can see, so it is counted.
+    leaked_descriptors: u64;
 }
 
 pub rec Owner {
+    # sockets this owner accepted and then could not close. a discarded close
+    # failure is a descriptor leak nobody can see, so it is counted.
+    leaked_descriptors: u64;
     state: u8;
     generation: u64;
     runtime_initialized: bool;
@@ -441,9 +447,12 @@ fun replenish(owner: *Owner) {
     }
 }
 
-fun close_unowned_tcp(resource: usize) {
+# a socket accepted into a full pool, or one whose owner could not be queued.
+# closing it can fail, and a discarded failure here is a leaked descriptor for
+# the life of the process, so the caller is told.
+fun close_unowned_tcp(resource: usize) bool {
     var stream: tcp.Stream = tcp.Stream{handle: io_handle.SocketHandle{value: resource}};
-    tcp.stream_close(?stream);
+    ret !is_err[bool, io_error.Error](tcp.stream_close(?stream));
 }
 
 fun dispatch_accept(owner: *Owner, context: *CompletionContext, completion: io_runtime.Completion) {
@@ -487,7 +496,9 @@ fun dispatch_accept(owner: *Owner, context: *CompletionContext, completion: io_r
             }
         }
     } or (!completion.has_error && context.kind == CONTEXT_ACCEPT_TCP) {
-        close_unowned_tcp(completion.resource);
+        if (!close_unowned_tcp(completion.resource)) {
+            owner.leaked_descriptors = owner.leaked_descriptors + 1;
+        }
     } or (!completion.has_error && context.kind == CONTEXT_ACCEPT_LOCAL) {
         val accepted: Result[local_async.Stream, io_error.Error] = local_async.accepted(?owner.local, completion);
         if (!is_err[local_async.Stream, io_error.Error](accepted)) {
@@ -527,11 +538,15 @@ fun dispatch_completion(owner: *Owner, completion: io_runtime.Completion) {
     }
 }
 
-pub fun handle_process_event(owner: *Owner, event: process_events.Event) bool {
-    if (owner == nil || owner.state == OWNER_NEW || owner.state == OWNER_STOPPED) { ret false; }
-    if (event.kind == process_events.RELOAD) {
-        owner.reload_requested = true;
-        ret true;
+# stop accepting without closing anything
+#
+# this is step two of the shutdown sequence, and it is deliberately separate
+# from `stop`: the listeners must refuse new connections while the ones already
+# accepted are still being served, and closing the sockets here would take the
+# established connections with them.
+pub fun begin_drain(owner: *Owner) bool {
+    if (owner == nil || owner.state == OWNER_NEW || owner.state == OWNER_STOPPED) {
+        ret false;
     }
     owner.stop_requested = true;
     owner.state = OWNER_DRAINING;
@@ -543,6 +558,15 @@ pub fun handle_process_event(owner: *Owner, event: process_events.Event) bool {
         }
     }
     ret true;
+}
+
+pub fun handle_process_event(owner: *Owner, event: process_events.Event) bool {
+    if (owner == nil || owner.state == OWNER_NEW || owner.state == OWNER_STOPPED) { ret false; }
+    if (event.kind == process_events.RELOAD) {
+        owner.reload_requested = true;
+        ret true;
+    }
+    ret begin_drain(owner);
 }
 
 fun drain_process_events(owner: *Owner) {
@@ -578,13 +602,6 @@ fun wait_listener_setup(owner: *Owner, listener: *OwnedListener) bool {
     ret !listener.setup_completion.has_error;
 }
 
-fun listener_limit(graph: *schema.Graph, configured: *schema.Listener) usize {
-    if (configured.budget.len == 0) { ret graph.limits.max_connections; }
-    val budget: *schema.Budget = schema.find_budget(graph, schema.text(?configured.budget));
-    if (budget == nil) { ret 0; }
-    ret budget.concurrency;
-}
-
 fun initialize_policy(policy: *Policy, configured: *schema.Listener) {
     policy.protocols = configured.protocols;
     policy.transport = configured.transport;
@@ -615,7 +632,9 @@ fun initialize_owned_listener(listener: *OwnedListener, set_index: usize, listen
     listener.backlog = configured.backlog;
     listener.accept_depth = configured.accept_depth;
     listener.accept_pending = 0;
-    listener.connection_limit = listener_limit(graph, configured);
+    # the listener plane enforces the process bound. generation-owned named
+    # budgets are enforced after accept by the serving runtime.
+    listener.connection_limit = graph.limits.max_connections;
     listener.active_connections = 0;
     listener.has_tcp_listener = false;
     listener.has_udp_socket = false;
@@ -917,6 +936,7 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
     owner.sigpipe_configured = false;
     owner.reload_requested = false;
     owner.stop_requested = false;
+    owner.leaked_descriptors = 0;
     owner.active_set = NO_INDEX;
     owner.connections = nil;
     owner.connection_ctx = nil;
@@ -1100,6 +1120,7 @@ pub fun snapshot(owner: *Owner) Snapshot {
     result.queued_connections = owner.queued_connection_count;
     result.reload_requested = owner.reload_requested;
     result.stop_requested = owner.stop_requested;
+    result.leaked_descriptors = owner.leaked_descriptors;
     result.listeners = 0;
     result.pending_accepts = 0;
     if (owner.active_set != NO_INDEX) {
@@ -1133,6 +1154,20 @@ pub fun stop(owner: *Owner) bool {
         if (process_events.close(?owner.process) < 0) { success = false; }
         owner.process_initialized = false;
     }
+    # the completions have to be dequeued before the drivers are destroyed, not
+    # after. a driver slot is released when its completion is taken off the
+    # runtime, and both `net_async.destroy` and `local_async.destroy` refuse
+    # while any slot is still occupied. destroying them first therefore fails
+    # for every connection this owner ever served, which is what made a
+    # teardown after real traffic report failure.
+    if (owner.runtime_initialized) {
+        if (is_err[bool, io_error.Error](io_runtime.close(?owner.runtime))) { success = false; }
+        var completions: [64]io_runtime.Completion;
+        for (io_runtime.pending(?owner.runtime) > 0) {
+            val waited: Result[usize, io_error.Error] = io_runtime.wait(?owner.runtime, ?completions[0], 64, -1);
+            if (is_err[usize, io_error.Error](waited)) { success = false; brk; }
+        }
+    }
     if (owner.local_initialized) {
         if (is_err[bool, io_error.Error](local_async.destroy(?owner.local))) { success = false; }
         owner.local_initialized = false;
@@ -1142,12 +1177,6 @@ pub fun stop(owner: *Owner) bool {
         owner.network_initialized = false;
     }
     if (owner.runtime_initialized) {
-        if (is_err[bool, io_error.Error](io_runtime.close(?owner.runtime))) { success = false; }
-        var completions: [64]io_runtime.Completion;
-        for (io_runtime.pending(?owner.runtime) > 0) {
-            val waited: Result[usize, io_error.Error] = io_runtime.wait(?owner.runtime, ?completions[0], 64, -1);
-            if (is_err[usize, io_error.Error](waited)) { success = false; brk; }
-        }
         if (is_err[bool, io_error.Error](io_runtime.destroy(?owner.runtime))) { success = false; }
         owner.runtime_initialized = false;
     }
