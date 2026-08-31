@@ -20,6 +20,7 @@ use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.filesystem;
+use std.types.option;
 use std.crypto.ct;
 use file: std.io.file;
 use io_error: std.io.error;
@@ -54,6 +55,9 @@ pub val UNDECODABLE: Status = 4;
 # the policy is well formed and mach-tls refuses the listener configuration
 pub val UNSUPPORTED: Status = 5;
 pub val EXHAUSTED: Status = 6;
+# a replacement arrived while the previously retired generation still has a live
+# lease, so there is no bank free to build the new one in
+pub val RETIRED_IN_USE: Status = 7;
 
 # the exact storage one server handshake needs, checked against mach-tls at load
 # time so an unusable listener fails before it becomes ready
@@ -82,13 +86,28 @@ rec Identity {
     live: bool;
 }
 
+# two banks, so a replacement is built while the current one is still leased
+#
+# a retired generation stays readable until its last connection closes, which
+# means its certificates and keys must stay where they are. One bank cannot hold
+# both, so the policy holds two and alternates. Two is enough for the real
+# workload — a renewal every sixty days against connections that live for
+# seconds — and a replacement that arrives while the previous retired generation
+# is still leased is refused rather than allowed to overwrite it.
+pub val BANKS: usize = 2;
+
 pub rec Policy {
     name: [schema.TEXT_CAP]u8;
     name_len: usize;
-    identity_count: usize;
-    identities: [MAX_IDENTITIES]Identity;
-    published: [MAX_IDENTITIES]credentials.Identity;
-    generation: credentials.Generation;
+    identity_counts: [BANKS]usize;
+    identities: [BANKS][MAX_IDENTITIES]Identity;
+    published: [BANKS][MAX_IDENTITIES]credentials.Identity;
+    generations: [BANKS]credentials.Generation;
+    # whether that bank's generation was ever published, which `reclaimable`
+    # cannot tell us: it reports false for a generation that was never published
+    # and for one still leased alike
+    generation_live: [BANKS]bool;
+    active: usize;
     bindings: hedge_credentials.Bindings;
     anchor_der: [MAX_PEM_BYTES]u8;
     anchor_certificates: [MAX_ANCHORS]cert.Certificate;
@@ -115,6 +134,12 @@ pub val NO_POLICY: usize = MAX_POLICIES;
 
 var policies: [MAX_POLICIES]Policy;
 var policy_count: usize;
+# a parsed private key stores a *pointer* to the allocator that owns its secret
+# memory and calls back through it when destroyed, so the allocator must outlive
+# every key. A stack local in the function that loads them does not: it leaves
+# each key holding a dangling pointer, and destroying one then calls a function
+# pointer read from a dead frame. This lives beside the table the keys do.
+var identity_owner: secret.Allocator;
 var scratch: [MAX_PEM_BYTES]u8;
 var key_scratch: [MAX_KEY_BYTES]^u8;
 
@@ -122,11 +147,16 @@ pub fun reset() {
     var i: usize = 0;
     for (i < MAX_POLICIES) {
         policies[i].live = false;
-        policies[i].identity_count = 0;
+        policies[i].identity_counts[0] = 0;
+        policies[i].identity_counts[1] = 0;
+        policies[i].generation_live[0] = false;
+        policies[i].generation_live[1] = false;
+        policies[i].active = 0;
         policies[i].name_len = 0;
         i = i + 1;
     }
     policy_count = 0;
+    identity_owner = secret.system_allocator();
 }
 
 pub fun count() usize { ret policy_count; }
@@ -196,11 +226,11 @@ fun wipe(buffer: *u8, length: usize) {
     }
 }
 
-fun load_identity(policy: *Policy, configured: *schema.TlsIdentity,
+fun load_identity(policy: *Policy, bank: usize, configured: *schema.TlsIdentity,
     owner: *secret.Allocator) Status {
-    if (policy.identity_count >= MAX_IDENTITIES) { ret EXHAUSTED; }
-    val slot: usize = policy.identity_count;
-    val identity: *Identity = ?policy.identities[slot];
+    if (policy.identity_counts[bank] >= MAX_IDENTITIES) { ret EXHAUSTED; }
+    val slot: usize = policy.identity_counts[bank];
+    val identity: *Identity = ?policy.identities[bank][slot];
     identity.live = false;
     if (!copy_name(?identity.name[0], ?identity.name_len,
         schema.text(?configured.server_name))) { ret INVALID; }
@@ -239,9 +269,9 @@ fun load_identity(policy: *Policy, configured: *schema.TlsIdentity,
     published.server_name = name;
     published.chain = chain;
     published.private_key = ?identity.private_key;
-    policy.published[slot] = published;
+    policy.published[bank][slot] = published;
     identity.live = true;
-    policy.identity_count = slot + 1;
+    policy.identity_counts[bank] = slot + 1;
     ret OK;
 }
 
@@ -284,12 +314,13 @@ fun offer_protocols(policy: *Policy, protocols: u8) {
     }
 }
 
-fun default_index(policy: *Policy, configured: *schema.TlsPolicy) usize {
+fun default_index(policy: *Policy, bank: usize,
+    configured: *schema.TlsPolicy) usize {
     if (!configured.has_default) { ret credentials.NO_DEFAULT; }
     val wanted: str = schema.text(?configured.default_name);
     var i: usize = 0;
-    for (i < policy.identity_count) {
-        val identity: *Identity = ?policy.identities[i];
+    for (i < policy.identity_counts[bank]) {
+        val identity: *Identity = ?policy.identities[bank][i];
         if (identity.name_len == str_len(wanted)) {
             var j: usize = 0;
             for (j < identity.name_len && identity.name[j] == wanted[j]) {
@@ -351,6 +382,28 @@ fun build_configuration(policy: *Policy) Status {
     ret OK;
 }
 
+# release one bank's private keys and forget what it held
+#
+# the caller must have established that this bank's generation is reclaimable.
+# Destroying a key an established connection is still handshaking against would
+# be exactly the failure lease pinning exists to prevent.
+fun destroy_bank(policy: *Policy, bank: usize) bool {
+    var success: bool = true;
+    var i: usize = 0;
+    for (i < policy.identity_counts[bank]) {
+        val identity: *Identity = ?policy.identities[bank][i];
+        if (identity.live
+         && keys.destroy_private(?identity.private_key) != contracts.OK) {
+            success = false;
+        }
+        identity.live = false;
+        i = i + 1;
+    }
+    policy.identity_counts[bank] = 0;
+    policy.generation_live[bank] = false;
+    ret success;
+}
+
 # published once per secure listener rather than once per configured policy, and
 # named by that listener. the ALPN offer is the listener's protocol set, so two
 # listeners sharing one certificate but serving different protocols must not
@@ -358,10 +411,14 @@ fun build_configuration(policy: *Policy) Status {
 pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status {
     if (configured == nil || name == nil) { ret INVALID; }
     if (policy_count >= MAX_POLICIES) { ret EXHAUSTED; }
-    var owner: secret.Allocator = secret.system_allocator();
+    identity_owner = secret.system_allocator();
     val policy: *Policy = ?policies[policy_count];
     policy.live = false;
-    policy.identity_count = 0;
+    policy.identity_counts[0] = 0;
+    policy.identity_counts[1] = 0;
+    policy.generation_live[0] = false;
+    policy.generation_live[1] = false;
+    policy.active = 0;
     policy.alpn_len = 0;
     policy.require_client_auth = configured.client_auth;
     policy.client_trust.anchors = nil;
@@ -370,8 +427,8 @@ pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status 
     if (configured.identity_count == 0) { ret INVALID; }
     var i: usize = 0;
     for (i < configured.identity_count) {
-        val loaded: Status = load_identity(policy, ?configured.identities[i],
-            ?owner);
+        val loaded: Status = load_identity(policy, 0, ?configured.identities[i],
+            ?identity_owner);
         if (loaded != OK) { ret loaded; }
         i = i + 1;
     }
@@ -386,11 +443,12 @@ pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status 
     # a listener that serves nothing over TLS has nothing to negotiate, and a
     # client that offers nothing we serve is refused rather than defaulted
     policy.require_alpn = policy.alpn_len != 0;
-    policy.generation = credentials.empty_generation();
-    if (hedge_credentials.publish(?policy.bindings, ?policy.generation,
-        ?policy.published[0], policy.identity_count,
-        default_index(policy, configured), trust,
+    policy.generations[0] = credentials.empty_generation();
+    if (hedge_credentials.publish(?policy.bindings, ?policy.generations[0],
+        ?policy.published[0][0], policy.identity_counts[0],
+        default_index(policy, 0, configured), trust,
         configured.client_auth) != hedge_credentials.OK) { ret UNSUPPORTED; }
+    policy.generation_live[0] = true;
     val built: Status = build_configuration(policy);
     if (built != OK) { ret built; }
     policy.live = true;
@@ -416,20 +474,101 @@ pub fun servable(index: usize, name: str) bool {
     ret true;
 }
 
+# is the generation this policy retired at its last replacement finished with
+#
+# false both for a policy that has never replaced anything and for one whose
+# retired generation still has a connection on it. Callers wanting the second
+# meaning should ask `replaceable`, which distinguishes them.
+pub fun retired_reclaimable(index: usize) bool {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil) { ret false; }
+    val idle: usize = 1 - policy.active;
+    if (!policy.generation_live[idle]) { ret false; }
+    ret hedge_credentials.reclaimable(?policy.generations[idle]);
+}
+
+# can this policy take a replacement right now
+pub fun replaceable(index: usize) bool {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil) { ret false; }
+    val idle: usize = 1 - policy.active;
+    # a bank that has never been published is free; one that has is free only
+    # once the generation it holds has no connections left on it
+    if (!policy.generation_live[idle]) { ret true; }
+    ret hedge_credentials.reclaimable(?policy.generations[idle]);
+}
+
+# the identities a live listener serves, replaced without restarting it
+#
+# the new generation answers new handshakes; every established connection keeps
+# the one its lease pins, chain and key both, until it closes. The listener
+# configuration is untouched because it names the credential store rather than a
+# generation, so the swap reaches every connection that arrives after it without
+# anything else being republished.
+#
+# Client trust is not replaceable here. A generation's trust store is borrowed by
+# reference, so rewriting it would change what the retired generation presents to
+# connections still using it. Changing who a listener trusts is a configuration
+# reload, not a credential rotation, and a policy asking for a different setting
+# is refused rather than half applied.
+pub fun replace(index: usize, configured: *schema.TlsPolicy) Status {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || configured == nil) { ret INVALID; }
+    if (configured.identity_count == 0) { ret INVALID; }
+    if (configured.client_auth != policy.require_client_auth) { ret INVALID; }
+    val target: usize = 1 - policy.active;
+    if (policy.generation_live[target]) {
+        # the previous replacement's retired generation still has a lease on it,
+        # and it owns the only other bank. refusing is what keeps this safe
+        # rather than usually safe.
+        if (!hedge_credentials.reclaimable(?policy.generations[target])) {
+            ret RETIRED_IN_USE;
+        }
+        if (!destroy_bank(policy, target)) { ret INVALID; }
+    }
+    policy.identity_counts[target] = 0;
+    identity_owner = secret.system_allocator();
+    var i: usize = 0;
+    for (i < configured.identity_count) {
+        val loaded: Status = load_identity(policy, target,
+            ?configured.identities[i], ?identity_owner);
+        if (loaded != OK) {
+            # nothing was published, so the listener is still serving the active
+            # bank; the half-built one is torn down rather than left to be
+            # mistaken for a generation
+            destroy_bank(policy, target);
+            ret loaded;
+        }
+        i = i + 1;
+    }
+    var trust: *cert.TrustStore = nil;
+    if (policy.require_client_auth) { trust = ?policy.client_trust; }
+    policy.generations[target] = credentials.empty_generation();
+    if (credentials.initialize(?policy.generations[target],
+        ?policy.published[target][0], policy.identity_counts[target],
+        default_index(policy, target, configured), trust,
+        policy.require_client_auth) != contracts.OK) {
+        destroy_bank(policy, target);
+        ret UNSUPPORTED;
+    }
+    var retired: *credentials.Generation = nil;
+    if (hedge_credentials.rotate(?policy.bindings, ?policy.generations[target],
+        ?retired) != hedge_credentials.OK || retired == nil) {
+        destroy_bank(policy, target);
+        ret UNSUPPORTED;
+    }
+    policy.generation_live[target] = true;
+    policy.active = target;
+    ret OK;
+}
+
 pub fun destroy() bool {
     var success: bool = true;
     var i: usize = 0;
     for (i < policy_count) {
         val policy: *Policy = ?policies[i];
-        var j: usize = 0;
-        for (j < policy.identity_count) {
-            if (policy.identities[j].live
-             && keys.destroy_private(?policy.identities[j].private_key) != contracts.OK) {
-                success = false;
-            }
-            policy.identities[j].live = false;
-            j = j + 1;
-        }
+        if (!destroy_bank(policy, 0)) { success = false; }
+        if (!destroy_bank(policy, 1)) { success = false; }
         policy.live = false;
         i = i + 1;
     }
@@ -505,5 +644,257 @@ test "tls: a policy naming a certificate that cannot be read is refused" {
     configured.identity_count = 0;
     if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != INVALID) { ret 4; }
     if (count() != 0) { ret 5; }
+    ret 0;
+}
+
+
+# --- replacement tests ---
+#
+# two self-signed Ed25519 identities under different names, so which generation a
+# lease is pinned to is decidable by looking at the certificate it hands back.
+
+val api_cert_pem: str = "-----BEGIN CERTIFICATE-----\nMIIBhjCCATigAwIBAgIUb1yMHSXgfQwYEQyY37QwWtTUVfMwBQYDK2VwMBkxFzAV\nBgNVBAMMDmFwaS5oZWRnZS50ZXN0MB4XDTI2MDgyOTAzNDQ1MVoXDTM2MDgyNjAz\nNDQ1MVowGTEXMBUGA1UEAwwOYXBpLmhlZGdlLnRlc3QwKjAFBgMrZXADIQC6GbDj\nK+V+WR5whTjn+IHlf+2kR5/3HNyHoPA271PhLKOBkTCBjjAdBgNVHQ4EFgQU2Ucc\nT9sn30693AkomFKf64g+djowHwYDVR0jBBgwFoAU2UccT9sn30693AkomFKf64g+\ndjowGQYDVR0RBBIwEIIOYXBpLmhlZGdlLnRlc3QwDgYDVR0PAQH/BAQDAgeAMBMG\nA1UdJQQMMAoGCCsGAQUFBwMBMAwGA1UdEwEB/wQCMAAwBQYDK2VwA0EA8KdvXtof\nftWx7/8unun/tMfnuk6UJPliBSRaKZOKwAMgv+h2yVgkTlrqBbfSajC2jbKLICdK\ncJHdzizPtTmRBg==\n-----END CERTIFICATE-----\n";
+val api_key_pem: str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIBRn6QSXLVl2hvtWrT5gXwgtwIJ3Uh0xz+u7ILSYzppC\n-----END PRIVATE KEY-----\n";
+val alt_cert_pem: str = "-----BEGIN CERTIFICATE-----\nMIIBhjCCATigAwIBAgIULpeD/Z6xJFleF615bsyI5sfkSb8wBQYDK2VwMBkxFzAV\nBgNVBAMMDmFsdC5oZWRnZS50ZXN0MB4XDTI2MDgyOTAzNDQ1MVoXDTM2MDgyNjAz\nNDQ1MVowGTEXMBUGA1UEAwwOYWx0LmhlZGdlLnRlc3QwKjAFBgMrZXADIQCptZaN\njojjbakhNU+QrolGuk4fHY9FSeDu8kZhG1dvZqOBkTCBjjAdBgNVHQ4EFgQU8ahq\npbXhN63cmoxygs2boRFx8gkwHwYDVR0jBBgwFoAU8ahqpbXhN63cmoxygs2boRFx\n8gkwGQYDVR0RBBIwEIIOYWx0LmhlZGdlLnRlc3QwDgYDVR0PAQH/BAQDAgeAMBMG\nA1UdJQQMMAoGCCsGAQUFBwMBMAwGA1UdEwEB/wQCMAAwBQYDK2VwA0EAbt5MDK9w\nwcy5lOp7RrHPo+vmnT93g+DGbc5H25V1r2GUdZVT2Ka244ST/+5R1i63N5rAcjeo\nr1Cu4LdqaBGZDw==\n-----END CERTIFICATE-----\n";
+val alt_key_pem: str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIIfXVNkxUdAtSzSVA3Xa5kn+qynPTJrWpHN1QvINItju\n-----END PRIVATE KEY-----\n";
+
+fun write_pem(path: str, contents: str) bool {
+    var length: usize = 0;
+    for (contents[length] != 0) { length = length + 1; }
+    ret !option.is_some[str](filesystem.write_bytes(path, contents::*u8, length, 420));
+}
+
+fun ensure_dir(path: str) bool {
+    if (filesystem.is_dir(path)) { ret true; }
+    ret !option.is_some[str](filesystem.create_dir(path, 493));
+}
+
+# every test runs as its own process and they run at once, so each writes its
+# material into its own directory. Sharing one would have them truncating and
+# rewriting the same files while another was reading them, which shows up as a
+# publish that fails perhaps one run in three.
+var path_storage: [2][64]u8;
+
+fun joined(dir: str, leaf: str, slot: usize) str {
+    var at: usize = 0;
+    for (dir[at] != 0 && at < 48) { path_storage[slot][at] = dir[at]; at = at + 1; }
+    path_storage[slot][at] = '/';
+    at = at + 1;
+    var i: usize = 0;
+    for (leaf[i] != 0 && at + i < 62) {
+        path_storage[slot][at + i] = leaf[i];
+        i = i + 1;
+    }
+    path_storage[slot][at + i] = 0;
+    ret (?path_storage[slot][0])::str;
+}
+
+fun material_written(dir: str) bool {
+    if (!ensure_dir("out") || !ensure_dir(dir)) { ret false; }
+    ret write_pem(joined(dir, "api.pem", 0), api_cert_pem)
+     && write_pem(joined(dir, "api.key", 0), api_key_pem)
+     && write_pem(joined(dir, "alt.pem", 0), alt_cert_pem)
+     && write_pem(joined(dir, "alt.key", 0), alt_key_pem);
+}
+
+fun configure(configured: *schema.TlsPolicy, name: str, cert_path: str,
+    key_path: str) {
+    schema.set_text(?configured.name, "public");
+    configured.identity_count = 1;
+    schema.set_text(?configured.identities[0].server_name, name);
+    schema.set_text(?configured.identities[0].certificate, cert_path);
+    schema.set_text(?configured.identities[0].key, key_path);
+    configured.has_default = false;
+    schema.clear_text(?configured.default_name);
+    configured.client_auth = false;
+    schema.clear_text(?configured.client_trust);
+}
+
+fun api_policy(configured: *schema.TlsPolicy, dir: str) {
+    configure(configured, "api.hedge.test", joined(dir, "api.pem", 0),
+        joined(dir, "api.key", 1));
+}
+
+fun alt_policy(configured: *schema.TlsPolicy, dir: str) {
+    configure(configured, "alt.hedge.test", joined(dir, "alt.pem", 0),
+        joined(dir, "alt.key", 1));
+}
+
+# the certificate bytes a held lease resolves to, which names its generation
+fun leased_der(held: *hedge_credentials.Held) *u8 {
+    ret held.lease.identity.chain.certificates.der;
+}
+
+test "tls: a replacement serves new connections and leaves established ones alone" {
+    reset();
+    if (!material_written("out/tls-serve")) { destroy(); ret 1; }
+    var configured: schema.TlsPolicy;
+    api_policy(?configured, "out/tls-serve");
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != OK) { destroy(); ret 2; }
+    val index: usize = find("secure");
+    if (index == NO_POLICY) { destroy(); ret 3; }
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || policy.active != 0) { destroy(); ret 4; }
+
+    # a connection established before the replacement
+    var established: hedge_credentials.Held;
+    established.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "api.hedge.test",
+        ?established) != hedge_credentials.OK) { destroy(); ret 5; }
+    val original: *u8 = leased_der(?established);
+    if (original == nil) { destroy(); ret 6; }
+
+    if (!replaceable(index)) { destroy(); ret 7; }
+    var replacement: schema.TlsPolicy;
+    alt_policy(?replacement, "out/tls-serve");
+    if (replace(index, ?replacement) != OK) { destroy(); ret 8; }
+    # the replacement went into the other bank, and that bank is now serving
+    if (policy.active != 1) { destroy(); ret 9; }
+
+    # the established connection still reads the certificate it handshook against
+    if (leased_der(?established) != original) { destroy(); ret 10; }
+    # and the name it was issued for no longer resolves for a new connection,
+    # which is what proves the store is answering from the replacement
+    var stale: hedge_credentials.Held;
+    stale.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "api.hedge.test", ?stale)
+        == hedge_credentials.OK) { destroy(); ret 11; }
+
+    # a connection established after it gets the new certificate
+    var fresh: hedge_credentials.Held;
+    fresh.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "alt.hedge.test", ?fresh)
+        != hedge_credentials.OK) { destroy(); ret 12; }
+    if (leased_der(?fresh) == original || leased_der(?fresh) == nil) { destroy(); ret 13; }
+
+    hedge_credentials.release(?established);
+    hedge_credentials.release(?fresh);
+    destroy();
+    ret 0;
+}
+
+test "tls: a retired generation is reclaimable only once its last lease is released" {
+    reset();
+    if (!material_written("out/tls-reclaim")) { destroy(); ret 1; }
+    var configured: schema.TlsPolicy;
+    api_policy(?configured, "out/tls-reclaim");
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != OK) { destroy(); ret 2; }
+    val index: usize = find("secure");
+    val policy: *Policy = policy_at(index);
+    if (policy == nil) { destroy(); ret 3; }
+    # nothing has been retired yet, so there is nothing to reclaim
+    if (retired_reclaimable(index)) { destroy(); ret 4; }
+
+    var established: hedge_credentials.Held;
+    established.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "api.hedge.test",
+        ?established) != hedge_credentials.OK) { destroy(); ret 5; }
+
+    var replacement: schema.TlsPolicy;
+    alt_policy(?replacement, "out/tls-reclaim");
+    if (replace(index, ?replacement) != OK) { destroy(); ret 6; }
+    # the lease pins the retired generation, so its storage cannot be reused
+    if (retired_reclaimable(index)) { destroy(); ret 7; }
+    if (replaceable(index)) { destroy(); ret 8; }
+
+    if (hedge_credentials.release(?established) != hedge_credentials.OK) {
+        destroy(); ret 9;
+    }
+    # and only now does the bank it occupies come free
+    if (!retired_reclaimable(index)) { destroy(); ret 10; }
+    if (!replaceable(index)) { destroy(); ret 11; }
+    destroy();
+    ret 0;
+}
+
+# the property that makes two banks sufficient rather than merely usually
+# sufficient: a third generation has nowhere to go while the first is still read
+test "tls: a replacement is refused while the retired generation is still leased" {
+    reset();
+    if (!material_written("out/tls-refuse")) { destroy(); ret 1; }
+    var configured: schema.TlsPolicy;
+    api_policy(?configured, "out/tls-refuse");
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != OK) { destroy(); ret 2; }
+    val index: usize = find("secure");
+    val policy: *Policy = policy_at(index);
+    if (policy == nil) { destroy(); ret 3; }
+
+    var established: hedge_credentials.Held;
+    established.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "api.hedge.test",
+        ?established) != hedge_credentials.OK) { destroy(); ret 4; }
+    val original: *u8 = leased_der(?established);
+
+    var replacement: schema.TlsPolicy;
+    alt_policy(?replacement, "out/tls-refuse");
+    if (replace(index, ?replacement) != OK) { destroy(); ret 5; }
+
+    # the second replacement has no bank to build in, because the first retired
+    # generation is still being read by the established connection
+    var again: schema.TlsPolicy;
+    api_policy(?again, "out/tls-refuse");
+    if (replace(index, ?again) != RETIRED_IN_USE) { destroy(); ret 6; }
+    # and the refusal changed nothing: the same generation is still serving and
+    # the established lease still reads its own certificate
+    if (policy.active != 1) { destroy(); ret 7; }
+    if (leased_der(?established) != original) { destroy(); ret 8; }
+    var current: hedge_credentials.Held;
+    current.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "alt.hedge.test", ?current)
+        != hedge_credentials.OK) { destroy(); ret 9; }
+    hedge_credentials.release(?current);
+
+    # once the lease goes, the same replacement is accepted
+    hedge_credentials.release(?established);
+    if (replace(index, ?again) != OK) { destroy(); ret 10; }
+    if (policy.active != 0) { destroy(); ret 11; }
+    var restored: hedge_credentials.Held;
+    restored.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "api.hedge.test", ?restored)
+        != hedge_credentials.OK) { destroy(); ret 12; }
+    hedge_credentials.release(?restored);
+    destroy();
+    ret 0;
+}
+
+test "tls: a replacement that cannot be loaded leaves the listener serving" {
+    reset();
+    if (!material_written("out/tls-partial")) { destroy(); ret 1; }
+    var configured: schema.TlsPolicy;
+    api_policy(?configured, "out/tls-partial");
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != OK) { destroy(); ret 2; }
+    val index: usize = find("secure");
+    val policy: *Policy = policy_at(index);
+    if (policy == nil) { destroy(); ret 3; }
+
+    # the first identity loads and the second does not, so the failure happens
+    # with a half-filled bank holding a live key rather than an empty one
+    var broken: schema.TlsPolicy;
+    configure(?broken, "alt.hedge.test", joined("out/tls-partial", "alt.pem", 0),
+        joined("out/tls-partial", "alt.key", 1));
+    broken.identity_count = 2;
+    schema.set_text(?broken.identities[1].server_name, "missing.hedge.test");
+    schema.set_text(?broken.identities[1].certificate, "no/such/file.pem");
+    schema.set_text(?broken.identities[1].key, "no/such/file.key");
+    if (replace(index, ?broken) != UNREADABLE) { destroy(); ret 4; }
+    # nothing was published, so the original generation is still the live one
+    if (policy.active != 0) { destroy(); ret 5; }
+    if (policy.identity_counts[1] != 0 || policy.generation_live[1]) { destroy(); ret 6; }
+    var held: hedge_credentials.Held;
+    held.held = false;
+    if (hedge_credentials.acquire(?policy.bindings, "api.hedge.test", ?held)
+        != hedge_credentials.OK) { destroy(); ret 7; }
+    hedge_credentials.release(?held);
+    # and the failure did not consume the free bank
+    if (!replaceable(index)) { destroy(); ret 8; }
+
+    # client trust is fixed for the life of a policy, so a replacement that asks
+    # for a different setting is refused rather than half applied
+    var trusted: schema.TlsPolicy;
+    alt_policy(?trusted, "out/tls-partial");
+    trusted.client_auth = true;
+    if (replace(index, ?trusted) != INVALID) { destroy(); ret 9; }
+    if (policy.active != 0) { destroy(); ret 10; }
+    destroy();
     ret 0;
 }
