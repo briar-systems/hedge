@@ -199,18 +199,18 @@ superseded generation drains independently of the one that replaced it. A second
 reload is deferred until the previous generation has drained, so only one
 superseded generation exists at a time.
 
-A reload changes routes, virtual hosts and budgets. It recompiles those routes
-against the existing service instances without calling their factories again.
-It refuses a candidate that changes startup-owned state. That includes service
-identity or construction fields, feature selection, TLS policy, secrets,
-telemetry, cache, ACME, administration, the server name, and process-wide
-connection limits. Cache-wrapped services currently require restart even when
-unchanged because their wrapper binds the descriptor owned by the active plan.
-Service instances own state that a superseded plan still points into, so
-replacing or reconstructing one under a request in flight would reuse storage
-that request is still using. A reload may change plaintext listener policy and
-may rebind a secure listener without changing its name, TLS policy, or protocol
-set. An unchanged listener set leaves the sockets untouched.
+A reload changes routes, virtual hosts, budgets and service definitions. Each
+plan bank owns its static roots, proxy routes and cache bindings. Connections
+accepted before publication retain that complete service generation while they
+drain. Only after its final connection closes are its roots, idle upstream
+connections and binding slots released for reuse. Repeated reloads therefore
+alternate between two bounded banks rather than appending service state.
+
+Process-owned state still requires a restart. That includes feature selection,
+TLS policy, secrets, telemetry, cache storage, ACME, administration, the server
+name and process-wide connection limits. A reload may change plaintext listener
+policy and may rebind a secure listener without changing its name, TLS policy or
+protocol set. An unchanged listener set leaves the sockets untouched.
 
 A host names itself with either `server_name` for a single name or `names` for several; declaring both is a conflict, and declaring neither uses the host block's own key as its name. Every name a host declares is a name it answers to, and each is compiled into its own routing pattern, so a host with three names serves all three rather than only the first. A name may be an exact host, a `*.suffix` wildcard, or carry an explicit port.
 
@@ -315,7 +315,6 @@ key = "HEDGE_ADMIN_TOKEN"
 logs = true
 metrics = true
 traces = true
-endpoint = "https://collector.example/v1/traces"
 log_record_bytes = 2048
 log_queue_depth = 256
 metric_series = 1024
@@ -332,9 +331,11 @@ Log records use bounded structured fields and an atomic sink contract. Queued si
 
 Metric storage is caller-owned and fixed at `metric_series`. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
-Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512.
+Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
-The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. It exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
+The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. The `env` and `file` secret providers resolve in the binary. Embedded deployments may supply `os` and `application` providers through the typed resolver contract. Resolved administration credentials are limited to 512 bytes, reject line breaks, remain in one production owner, and are cleared at shutdown.
+
+The administration service exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
 
 ## Caching
 
