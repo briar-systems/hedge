@@ -81,6 +81,7 @@ pub rec Attempt {
     complete: bool;
     body: ResponseBody;
     owner: *Runtime;
+    registry: *Registry;
     owner_call: *call.Call;
     owner_generation: u64;
 }
@@ -102,12 +103,18 @@ pub rec Route {
     live: bool;
 }
 
+# route state owned by one service generation
+pub rec Registry {
+    routes: [MAX_ROUTES]Route;
+    len: usize;
+    generation: u64;
+}
+
 pub rec Runtime {
     driver: *net_async.Driver;
     pseudonym: str;
-    routes: [MAX_ROUTES]Route;
-    route_count: usize;
     links: [MAX_LINKS]link.Link;
+    link_registries: [MAX_LINKS]*Registry;
     attempts: [MAX_LINKS]Attempt;
     engine: engine_h1.Config;
     limits: upstream.Limits;
@@ -123,7 +130,6 @@ pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: st
     if (runtime == nil || pseudonym == nil) { ret false; }
     runtime.driver = driver;
     runtime.pseudonym = pseudonym;
-    runtime.route_count = 0;
     runtime.engine = engine;
     runtime.limits = limits;
     runtime.total_attempts = 0;
@@ -135,7 +141,9 @@ pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: st
         runtime.links[i].state = link.FREE;
         runtime.links[i].leased = false;
         runtime.links[i].generation = 0;
+        runtime.link_registries[i] = nil;
         runtime.attempts[i].live = false;
+        runtime.attempts[i].registry = nil;
         i = i + 1;
     }
     runtime.live = true;
@@ -155,12 +163,50 @@ pub fun close_runtime(runtime: *Runtime) bool {
     var i: usize = 0;
     for (i < MAX_LINKS) {
         if (runtime.links[i].state != link.FREE) { link.close(?runtime.links[i]); }
+        runtime.link_registries[i] = nil;
         runtime.attempts[i].live = false;
+        runtime.attempts[i].registry = nil;
         i = i + 1;
     }
-    runtime.route_count = 0;
     runtime.live = false;
     ret true;
+}
+
+pub fun make_registry(registry: *Registry, generation: u64) bool {
+    if (registry == nil || generation == 0) { ret false; }
+    registry.len = 0;
+    registry.generation = generation;
+    ret true;
+}
+
+pub fun close_registry(runtime: *Runtime, registry: *Registry) bool {
+    if (runtime == nil || registry == nil || registry.generation == 0) { ret false; }
+    var i: usize = 0;
+    for (i < MAX_LINKS) {
+        if (runtime.attempts[i].live && runtime.attempts[i].registry == registry) {
+            ret false;
+        }
+        if (runtime.link_registries[i] == registry
+         && runtime.links[i].state != link.FREE
+         && runtime.links[i].state != link.IDLE) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < MAX_LINKS) {
+        if (runtime.link_registries[i] == registry) {
+            if (runtime.links[i].state != link.FREE) { link.close(?runtime.links[i]); }
+            runtime.link_registries[i] = nil;
+        }
+        i = i + 1;
+    }
+    registry.len = 0;
+    registry.generation = 0;
+    ret true;
+}
+
+pub fun route_count(registry: *Registry) usize {
+    if (registry == nil || registry.generation == 0) { ret 0; }
+    ret registry.len;
 }
 
 # the proxy owns its links, so they are driven every round rather than only while
@@ -209,10 +255,11 @@ fun free_attempt(runtime: *Runtime) *Attempt {
 }
 
 # prefer an idle connection to the chosen upstream before opening a new one
-fun acquire_link(runtime: *Runtime, upstream_index: usize) *link.Link {
+fun acquire_link(runtime: *Runtime, registry: *Registry, upstream_index: usize) *link.Link {
     var i: usize = 0;
     for (i < MAX_LINKS) {
-        if (link.idle_for(?runtime.links[i], upstream_index)
+        if (runtime.link_registries[i] == registry
+         && link.idle_for(?runtime.links[i], upstream_index)
          && link.lease(?runtime.links[i])) {
             runtime.total_reused = runtime.total_reused + 1;
             ret ?runtime.links[i];
@@ -221,7 +268,10 @@ fun acquire_link(runtime: *Runtime, upstream_index: usize) *link.Link {
     }
     i = 0;
     for (i < MAX_LINKS) {
-        if (link.free(?runtime.links[i])) { ret ?runtime.links[i]; }
+        if (link.free(?runtime.links[i])) {
+            runtime.link_registries[i] = registry;
+            ret ?runtime.links[i];
+        }
         i = i + 1;
     }
     # every slot is busy or held idle for another upstream; retire one idle slot
@@ -229,6 +279,7 @@ fun acquire_link(runtime: *Runtime, upstream_index: usize) *link.Link {
     for (i < MAX_LINKS) {
         if (runtime.links[i].state == link.IDLE && !runtime.links[i].leased) {
             link.close(?runtime.links[i]);
+            runtime.link_registries[i] = registry;
             ret ?runtime.links[i];
         }
         i = i + 1;
@@ -405,7 +456,7 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
     attempt.attempts = attempt.attempts + 1;
     runtime.total_attempts = runtime.total_attempts + 1;
     val chosen: *upstream.Upstream = ?attempt.route.pool.items[selection.index];
-    attempt.link = acquire_link(runtime, selection.index);
+    attempt.link = acquire_link(runtime, attempt.registry, selection.index);
     if (attempt.link == nil) {
         upstream.release(?attempt.route.pool, selection.index, upstream.FAILURE, now);
         ret bad_gateway(active, status.SERVICE_UNAVAILABLE);
@@ -520,6 +571,7 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
         if (attempt == nil) { ret bad_gateway(active, status.SERVICE_UNAVAILABLE); }
         attempt.live = true;
         attempt.owner = runtime;
+        attempt.registry = binding.registry;
         attempt.route = binding.route;
         attempt.phase = PHASE_SELECT;
         attempt.attempts = 0;
@@ -644,7 +696,7 @@ pub rec Snapshot {
     idle_links: usize;
 }
 
-pub fun snapshot(runtime: *Runtime) Snapshot {
+pub fun snapshot(runtime: *Runtime, registry: *Registry) Snapshot {
     var view: Snapshot = Snapshot{
         live_attempts: 0, live_links: 0, phase: PHASE_SETTLED, link_state: link.FREE,
         attempts: 0, route_inflight: 0, route_refusals: 0, unhealthy_refusals: 0,
@@ -675,10 +727,10 @@ pub fun snapshot(runtime: *Runtime) Snapshot {
     view.total_failures = runtime.total_failures;
     view.total_served = runtime.total_served;
     view.total_reused = runtime.total_reused;
-    if (runtime.route_count != 0) {
-        view.route_inflight = runtime.routes[0].pool.inflight;
-        view.route_refusals = runtime.routes[0].pool.route_refusals;
-        view.unhealthy_refusals = runtime.routes[0].pool.unhealthy_refusals;
+    if (registry != nil && registry.len != 0) {
+        view.route_inflight = registry.routes[0].pool.inflight;
+        view.route_refusals = registry.routes[0].pool.route_refusals;
+        view.unhealthy_refusals = registry.routes[0].pool.unhealthy_refusals;
     }
     ret view;
 }
@@ -686,6 +738,7 @@ pub fun snapshot(runtime: *Runtime) Snapshot {
 # one configured proxy service: a route's upstream pool bound to the runtime
 pub rec Binding {
     runtime: *Runtime;
+    registry: *Registry;
     route: *Route;
 }
 
@@ -694,15 +747,18 @@ pub rec Bindings {
     capacity: usize;
     len: usize;
     runtime: *Runtime;
+    registry: *Registry;
 }
 
 pub fun make_bindings(bindings: *Bindings, items: *Binding, capacity: usize,
-    runtime: *Runtime) bool {
-    if (bindings == nil || (capacity != 0 && items == nil) || runtime == nil) { ret false; }
+    runtime: *Runtime, registry: *Registry) bool {
+    if (bindings == nil || (capacity != 0 && items == nil) || runtime == nil
+     || registry == nil || registry.generation == 0) { ret false; }
     bindings.items = items;
     bindings.capacity = capacity;
     bindings.len = 0;
     bindings.runtime = runtime;
+    bindings.registry = registry;
     ret true;
 }
 
@@ -749,8 +805,10 @@ pub fun factory(context: ptr, configured: *schema.Service, handler: *service.Han
     if (bindings == nil || configured == nil || handler == nil
      || bindings.len >= bindings.capacity) { ret false; }
     val runtime: *Runtime = bindings.runtime;
-    if (runtime == nil || runtime.route_count >= MAX_ROUTES) { ret false; }
-    val route: *Route = ?runtime.routes[runtime.route_count];
+    val registry: *Registry = bindings.registry;
+    if (runtime == nil || registry == nil || registry.generation == 0
+     || registry.len >= MAX_ROUTES) { ret false; }
+    val route: *Route = ?registry.routes[registry.len];
     route.name = schema.text(?configured.name);
     route.max_attempts = 2;
     route.live = true;
@@ -758,11 +816,88 @@ pub fun factory(context: ptr, configured: *schema.Service, handler: *service.Han
         upstream.ROUND_ROBIN, runtime.limits)) { ret false; }
     if (!add_configured_upstreams(route, schema.text(?configured.target))) { ret false; }
     if (route.pool.len == 0) { ret false; }
-    runtime.route_count = runtime.route_count + 1;
+    registry.len = registry.len + 1;
     val binding: *Binding = ?bindings.items[bindings.len];
     bindings.len = bindings.len + 1;
     binding.runtime = runtime;
+    binding.registry = registry;
     binding.route = route;
     @handler = service.Handler{ctx: (binding)::ptr, serve: serve};
     ret true;
+}
+
+fun configured_proxy(graph: *schema.Graph, target: str) *schema.Service {
+    schema.reset_graph(graph);
+    graph.service_count = 1;
+    val configured: *schema.Service = ?graph.services[0];
+    schema.set_text(?configured.name, "backend");
+    schema.set_text(?configured.target, target);
+    configured.kind = schema.SERVICE_PROXY;
+    configured.cache = false;
+    ret configured;
+}
+
+test "proxy: route registries are reclaimed only after their generation drains" {
+    var runtime: Runtime;
+    if (!make_runtime(?runtime, nil, "hedge-test", engine_h1.config_default(),
+        upstream.default_limits())) { ret 1; }
+    var first: Registry;
+    var second: Registry;
+    if (!make_registry(?first, 1) || !make_registry(?second, 2)) { ret 2; }
+    var first_bindings: Bindings;
+    var second_bindings: Bindings;
+    var first_storage: [2]Binding;
+    var second_storage: [2]Binding;
+    if (!make_bindings(?first_bindings, ?first_storage[0], 2, ?runtime, ?first)
+     || !make_bindings(?second_bindings, ?second_storage[0], 2, ?runtime, ?second)) {
+        ret 3;
+    }
+    var graph: schema.Graph;
+    var first_handler: service.Handler;
+    if (!factory((?first_bindings)::ptr,
+        configured_proxy(?graph, "127.0.0.1:8001"), ?first_handler)) { ret 4; }
+    var second_handler: service.Handler;
+    if (!factory((?second_bindings)::ptr,
+        configured_proxy(?graph, "127.0.0.1:8002"), ?second_handler)) { ret 5; }
+    if (route_count(?first) != 1 || route_count(?second) != 1
+     || first_handler.ctx == second_handler.ctx) { ret 6; }
+
+    runtime.attempts[0].live = true;
+    runtime.attempts[0].registry = ?first;
+    if (close_registry(?runtime, ?first) || route_count(?first) != 1) { ret 7; }
+    runtime.attempts[0].live = false;
+    runtime.attempts[0].registry = nil;
+    if (!close_registry(?runtime, ?first) || route_count(?first) != 0) { ret 8; }
+
+    var generation: u64 = 3;
+    for (generation < 35) {
+        if (!make_registry(?first, generation)
+         || !make_bindings(?first_bindings, ?first_storage[0], 2, ?runtime, ?first)
+         || !factory((?first_bindings)::ptr,
+            configured_proxy(?graph, "127.0.0.1:8001"), ?first_handler)
+         || route_count(?first) != 1
+         || !close_registry(?runtime, ?first)) { ret 9; }
+        generation = generation + 1;
+    }
+    if (route_count(?second) != 1) { ret 10; }
+    ret 0;
+}
+
+test "proxy: idle upstream links are scoped to their service registry" {
+    var runtime: Runtime;
+    if (!make_runtime(?runtime, nil, "hedge-test", engine_h1.config_default(),
+        upstream.default_limits())) { ret 1; }
+    var first: Registry;
+    var second: Registry;
+    if (!make_registry(?first, 1) || !make_registry(?second, 2)) { ret 2; }
+    runtime.links[0].state = link.IDLE;
+    runtime.links[0].leased = false;
+    runtime.links[0].initialized = true;
+    runtime.links[0].upstream = 0;
+    runtime.links[0].engine.state = engine_h1.OPEN;
+    runtime.link_registries[0] = ?first;
+    val selected: *link.Link = acquire_link(?runtime, ?second, 0);
+    if (selected != ?runtime.links[1] || runtime.link_registries[0] != ?first
+     || runtime.link_registries[1] != ?second) { ret 3; }
+    ret 0;
 }

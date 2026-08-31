@@ -342,9 +342,11 @@ time.sleep(30)
 
 # --- reload -------------------------------------------------------------------
 
-reload_widens_route() {
+reload_rebuilds_services() {
     local config="$work/reload.toml"
-    sed 's|^path = "/hello"|path = "/**"|' test/interop/reload.toml > "$work/wide.toml"
+    sed -e 's|^path = "/hello"|path = "/**"|' \
+        -e 's|reload-v1|reload-v2|' \
+        test/interop/reload.toml > "$work/wide.toml"
     cp test/interop/reload.toml "$config"
     "$binary" "$config" > "$work/reload.log" 2>&1 &
     local pid=$!
@@ -355,22 +357,84 @@ reload_widens_route() {
     done
     local before
     before="$(curl_code -H 'Host: localhost' http://127.0.0.1:9086/other)"
-    # widen the route and ask the running process to take it
+    python3 - "$work/held.ready" "$work/held.go" "$work/held.response" <<'PY' &
+import pathlib, socket, sys, time
+ready, go, response = map(pathlib.Path, sys.argv[1:])
+s = socket.create_connection(('127.0.0.1', 9086), timeout=10)
+s.sendall(b'GET /hello HTTP/1.1\r\nHost: localhost\r\n')
+ready.touch()
+for _ in range(200):
+    if go.exists(): break
+    time.sleep(0.01)
+s.sendall(b'\r\n')
+s.settimeout(10)
+data = b''
+try:
+    while True:
+        part = s.recv(65536)
+        if not part: break
+        data += part
+except TimeoutError:
+    pass
+s.close()
+response.write_bytes(data)
+PY
+    local holder=$!
+    for _ in $(seq 100); do
+        [ -f "$work/held.ready" ] && break
+        sleep 0.01
+    done
     cp "$work/wide.toml" "$config"
     kill -HUP "$pid" 2>/dev/null
-    local after="000"
-    for _ in $(seq 40); do
-        after="$(curl_code -H 'Host: localhost' http://127.0.0.1:9086/other)"
-        [ "$after" = "200" ] && break
+    local after=""
+    for _ in $(seq 80); do
+        after="$(curl -sS -H 'Host: localhost' http://127.0.0.1:9086/other 2>/dev/null)"
+        [ "$after" = "reloaded" ] && break
         sleep 0.1
+    done
+    local held_roots=0
+    for link in /proc/"$pid"/fd/*; do
+        readlink "$link" 2>/dev/null | grep -q '/test/interop/reload-v' \
+            && held_roots=$((held_roots + 1))
+    done
+    touch "$work/held.go"
+    wait "$holder" 2>/dev/null
+    local old="wrong"
+    grep -q 'served' "$work/held.response" && old="served"
+    local retired_roots=0
+    for _ in $(seq 80); do
+        retired_roots=0
+        for link in /proc/"$pid"/fd/*; do
+            readlink "$link" 2>/dev/null | grep -q '/test/interop/reload-v' \
+                && retired_roots=$((retired_roots + 1))
+        done
+        [ "$retired_roots" = 1 ] && break
+        sleep 0.05
+    done
+    local repeated=0
+    for i in $(seq 1 12); do
+        local root="reload-v2"
+        local expected="reloaded"
+        if [ $((i % 2)) = 1 ]; then root="reload-v1"; expected="served"; fi
+        sed "s|reload-v2|$root|" "$work/wide.toml" > "$work/next.toml"
+        cp "$work/next.toml" "$config"
+        kill -HUP "$pid" 2>/dev/null
+        local current=""
+        for _ in $(seq 80); do
+            current="$(curl -sS -H 'Host: localhost' http://127.0.0.1:9086/other 2>/dev/null)"
+            [ "$current" = "$expected" ] && break
+            sleep 0.05
+        done
+        [ "$current" = "$expected" ] || break
+        repeated=$i
     done
     kill -TERM "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
-    echo "$before/$after"
+    echo "$before/$old/$after/$repeated/$held_roots/$retired_roots"
 }
 
-check "a reload widens a route in the running process" "404/200" \
-    "$(reload_widens_route)"
+check "service reload pins the old generation and reclaims twelve replacements" \
+    "404/served/reloaded/12/2/1" "$(reload_rebuilds_services)"
 
 check "a stop with no work in flight drains cleanly" 0 "$(shutdown_exit idle)"
 check "a stop with a peer mid-request reports the abandoned exchange" 75 \
