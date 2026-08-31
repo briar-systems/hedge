@@ -5,9 +5,16 @@ use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.view;
+use std.chrono.time;
+use std.chrono.duration;
 use std.log.record;
 use std.log.sink;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
 use hedge.config.schema;
+use call: hedge.dispatch.call;
 use telemetry_log: hedge.telemetry.log;
 use telemetry_metrics: hedge.telemetry.metrics;
 use telemetry_health: hedge.telemetry.health;
@@ -22,6 +29,8 @@ fwd hedge.telemetry.admin;
 
 pub def FlushFun: fun(ptr) bool;
 
+pub val BUILT_IN_METRIC_SERIES: usize = schema.MIN_METRIC_SERIES;
+
 pub rec Runtime {
     logger: telemetry_log.Logger;
     log_sink: sink.Sink;
@@ -35,6 +44,11 @@ pub rec Runtime {
     traces_enabled: bool;
     admin_enabled: bool;
     trace_state_bytes: usize;
+    requests: telemetry_metrics.Token;
+    failures: telemetry_metrics.Token;
+    request_bytes: telemetry_metrics.Token;
+    response_bytes: telemetry_metrics.Token;
+    duration_us: telemetry_metrics.Token;
     initialized: bool;
 }
 
@@ -129,7 +143,27 @@ pub fun make(
         )) { ret false; }
     }
     if (runtime.metrics_enabled) {
-        if (metric_storage == nil || metric_capacity < graph.telemetry.metric_series || !telemetry_metrics.make(?runtime.metrics, metric_storage, graph.telemetry.metric_series)) { ret false; }
+        if (metric_storage == nil || metric_capacity < graph.telemetry.metric_series
+         || graph.telemetry.metric_series < BUILT_IN_METRIC_SERIES
+         || !telemetry_metrics.make(?runtime.metrics, metric_storage,
+            graph.telemetry.metric_series)) { ret false; }
+        var bounds: [9]u64 = [9]u64{100, 500, 1000, 5000, 10000,
+            50000, 100000, 500000, 1000000};
+        if (!telemetry_metrics.register(?runtime.metrics,
+                telemetry_metrics.COUNTER, "hedge_requests_total", nil, 0,
+                nil, 0, ?runtime.requests)
+         || !telemetry_metrics.register(?runtime.metrics,
+                telemetry_metrics.COUNTER, "hedge_request_failures_total", nil, 0,
+                nil, 0, ?runtime.failures)
+         || !telemetry_metrics.register(?runtime.metrics,
+                telemetry_metrics.COUNTER, "hedge_request_bytes_total", nil, 0,
+                nil, 0, ?runtime.request_bytes)
+         || !telemetry_metrics.register(?runtime.metrics,
+                telemetry_metrics.COUNTER, "hedge_response_bytes_total", nil, 0,
+                nil, 0, ?runtime.response_bytes)
+         || !telemetry_metrics.register(?runtime.metrics,
+                telemetry_metrics.HISTOGRAM, "hedge_request_duration_us", nil, 0,
+                ?bounds[0], 9, ?runtime.duration_us)) { ret false; }
     }
     if (runtime.admin_enabled) {
         var metrics_context: ptr = render_context;
@@ -181,6 +215,33 @@ pub fun access(runtime: *Runtime, event: Access) sink.WriteReport {
     ret telemetry_log.emit(?runtime.logger, record.INFO, "request completed", ?fields[0], 9);
 }
 
+fun access_request(runtime: *Runtime, request: *message.Request, listener: str,
+    protocol: str, status: u16, duration_us: u64, request_bytes: u64,
+    response_bytes: u64, trace_id: str) sink.WriteReport {
+    if (runtime == nil || !runtime.initialized || !runtime.logs_enabled) {
+        ret sink.suppressed();
+    }
+    var fields: [10]record.Field;
+    fields[0] = record.field_string("kind", "access");
+    fields[1] = record.field_string("listener", listener);
+    fields[2] = record.field_bytes("method", request.method.token.data,
+        request.method.token.len);
+    fields[3] = record.field_bytes("target", request.target.raw.data,
+        request.target.raw.len);
+    fields[4] = record.field_string("protocol", protocol);
+    fields[5] = record.field_u64("status", status::u64);
+    fields[6] = record.field_u64("duration_us", duration_us);
+    fields[7] = record.field_u64("request_bytes", request_bytes);
+    fields[8] = record.field_u64("response_bytes", response_bytes);
+    var count: usize = 9;
+    if (trace_id != nil && trace_id[0] != 0) {
+        fields[9] = record.field_string("trace_id", trace_id);
+        count = 10;
+    }
+    ret telemetry_log.emit(?runtime.logger, record.INFO, "request completed",
+        ?fields[0], count);
+}
+
 pub fun error(runtime: *Runtime, event: Failure) sink.WriteReport {
     if (runtime == nil || !runtime.initialized || !runtime.logs_enabled) { ret sink.suppressed(); }
     var fields: [5]record.Field;
@@ -190,6 +251,128 @@ pub fun error(runtime: *Runtime, event: Failure) sink.WriteReport {
     fields[3] = record.field_string("code", event.code);
     fields[4] = record.field_string("trace_id", event.trace_id);
     ret telemetry_log.emit(?runtime.logger, record.ERROR, event.message, ?fields[0], 5);
+}
+
+fun copy_header(request: *message.Request, name: str, name_length: usize,
+    output: *u8, capacity: usize, combine: bool, found: *usize) bool {
+    if (request == nil || output == nil || capacity == 0 || found == nil) {
+        ret false;
+    }
+    var length: usize = 0;
+    var i: usize = 0;
+    for (i < request.fields.len) {
+        val item: *field.Field = ?request.fields.items[i];
+        if (field.name_equal(item.name, view.view(name, name_length))) {
+            if (!combine && @found != 0) { ret false; }
+            if (@found != 0) {
+                if (length + 1 >= capacity) { ret false; }
+                output[length] = ',';
+                length = length + 1;
+            }
+            if (item.value.len > capacity - length - 1) { ret false; }
+            var j: usize = 0;
+            for (j < item.value.len) {
+                output[length + j] = item.value.data[j];
+                j = j + 1;
+            }
+            length = length + item.value.len;
+            @found = @found + 1;
+        }
+        i = i + 1;
+    }
+    output[length] = 0;
+    ret true;
+}
+
+fun observe_begin(context: ptr, active: *call.Call) bool {
+    val runtime: *Runtime = context::*Runtime;
+    if (runtime == nil || !runtime.initialized || active == nil
+     || active.telemetry == nil) { ret false; }
+    if (!runtime.traces_enabled) {
+        active.telemetry.propagate = false;
+        ret true;
+    }
+    val request: *message.Request = call.request(active);
+    var parent: [telemetry_trace.TRACEPARENT_LENGTH + 1]u8;
+    var state: [telemetry_trace.TRACESTATE_CAPACITY + 1]u8;
+    var parent_count: usize = 0;
+    var state_count: usize = 0;
+    val parent_valid: bool = copy_header(request, "traceparent", 11,
+        ?parent[0], telemetry_trace.TRACEPARENT_LENGTH + 1, false,
+        ?parent_count);
+    val state_valid: bool = copy_header(request, "tracestate", 10,
+        ?state[0], runtime.trace_state_bytes + 1, true, ?state_count);
+    if (!parent_valid || parent_count != 1) {
+        active.telemetry.propagate = true;
+        ret true;
+    }
+    var state_text: str = nil;
+    if (state_count != 0 && state_valid) { state_text = (?state[0])::str; }
+    var parsed: telemetry_trace.Context;
+    if (!telemetry_trace.parse_bounded((?parent[0])::str, state_text,
+            runtime.trace_state_bytes, ?parsed)) { ret true; }
+    if (!state_valid) {
+        parsed.tracestate[0] = 0;
+        parsed.tracestate_len = 0;
+        parsed.tracestate_valid = false;
+    }
+    @active.telemetry = parsed;
+    ret true;
+}
+
+fun protocol_name(version: message.Version) str {
+    if (version.wire == message.WIRE_H1 && version.minor == 0) { ret "HTTP/1.0"; }
+    if (version.wire == message.WIRE_H1) { ret "HTTP/1.1"; }
+    if (version.wire == message.WIRE_H2) { ret "HTTP/2"; }
+    ret "HTTP/3";
+}
+
+fun failure_code(outcome: exchange.Outcome) str {
+    if (outcome == exchange.OUTCOME_CANCELLED) { ret "cancelled"; }
+    if (outcome == exchange.OUTCOME_TIMED_OUT) { ret "timed_out"; }
+    ret "failed";
+}
+
+fun observe_end(context: ptr, active: *call.Call, complete: bool) {
+    val runtime: *Runtime = context::*Runtime;
+    if (runtime == nil || !runtime.initialized || active == nil
+     || active.exchange == nil) { ret; }
+    val request: *message.Request = call.request(active);
+    val completion: exchange.Completion = active.exchange.completion;
+    var elapsed: i64 = time.time_sub(time.now(), request.metadata.received_at);
+    if (elapsed < 0) { elapsed = 0; }
+    val elapsed_us: u64 = duration.duration_usec(elapsed)::u64;
+    var trace_id: [33]u8;
+    var trace_text: str = nil;
+    if (telemetry_trace.format_id(active.telemetry, ?trace_id[0], 33) != 0) {
+        trace_text = (?trace_id[0])::str;
+    }
+    if (runtime.metrics_enabled) {
+        telemetry_metrics.counter_add(?runtime.metrics, runtime.requests, 1);
+        telemetry_metrics.counter_add(?runtime.metrics, runtime.request_bytes,
+            completion.bytes_in);
+        telemetry_metrics.counter_add(?runtime.metrics, runtime.response_bytes,
+            completion.bytes_out);
+        telemetry_metrics.observe(?runtime.metrics, runtime.duration_us, elapsed_us);
+        if (!complete || completion.outcome != exchange.OUTCOME_OK) {
+            telemetry_metrics.counter_add(?runtime.metrics, runtime.failures, 1);
+        }
+    }
+    access_request(runtime, request, active.listener,
+        protocol_name(request.metadata.version), completion.status,
+        elapsed_us, completion.bytes_in, completion.bytes_out, trace_text);
+    if (!complete || completion.outcome != exchange.OUTCOME_OK) {
+        var message: str = completion.error;
+        if (message == nil || message[0] == 0) { message = "request did not complete"; }
+        error(runtime, Failure{component: "request", operation: "serve",
+            code: failure_code(completion.outcome), message: message,
+            trace_id: trace_text});
+    }
+}
+
+pub fun observer(runtime: *Runtime) call.Observer {
+    if (runtime == nil || !runtime.initialized) { ret call.no_observer(); }
+    ret call.Observer{ctx: runtime::ptr, begin: observe_begin, end: observe_end};
 }
 
 pub fun begin_ready(runtime: *Runtime) bool {
@@ -256,17 +439,19 @@ test "telemetry: access, readiness, and flush share one bounded runtime" {
     schema.reset_graph(?graph);
     graph.telemetry.logs = true;
     graph.telemetry.metrics = true;
-    graph.telemetry.metric_series = 2;
+    graph.telemetry.metric_series = BUILT_IN_METRIC_SERIES;
     graph.telemetry.log_record_bytes = 512;
     graph.admin.enabled = false;
     var target: TestOutput;
     target.writes = 0;
     val contract: sink.Contract = sink.Contract{delivery: sink.DELIVERY_DIRECT, max_record: 512, oversize: record.OVERSIZE_REJECT, adapter: sink.ADAPTER_CUSTOM, target_atomic_limit: 0, queue_capacity: 0, overload: sink.OVERLOAD_REJECT_NEW};
     var output: sink.Sink = sink.Sink{ctx: (?target)::ptr, f_publish: test_publish, contract: contract};
-    var series: [2]telemetry_metrics.Series;
+    var series: [BUILT_IN_METRIC_SERIES]telemetry_metrics.Series;
     var checks: [2]telemetry_health.Check;
     var runtime: Runtime;
-    if (!make(?runtime, ?graph, ?output, ?series[0], 2, ?checks[0], 2, nil, test_auth, nil, test_render, test_render, nil, (0::usize)::FlushFun)) { ret 1; }
+    if (!make(?runtime, ?graph, ?output, ?series[0], BUILT_IN_METRIC_SERIES,
+        ?checks[0], 2, nil, test_auth, nil, test_render, test_render,
+        nil, (0::usize)::FlushFun)) { ret 1; }
     if (!begin_ready(?runtime)) { ret 2; }
     val report: sink.WriteReport = access(?runtime, Access{listener: "public", method: "GET", target: "/", protocol: "HTTP/1.1", status: 200, duration_us: 10, request_bytes: 0, response_bytes: 2, trace_id: nil});
     if (report.status != sink.WRITE_PERSISTED || target.writes != 1 || !telemetry_health.snapshot(?runtime.health).ready) { ret 3; }
@@ -308,16 +493,19 @@ test "telemetry: built-in administration keeps custom renderer ownership" {
     schema.reset_graph(?graph);
     graph.telemetry.logs = false;
     graph.telemetry.metrics = true;
-    graph.telemetry.metric_series = 1;
+    graph.telemetry.metric_series = BUILT_IN_METRIC_SERIES;
     graph.admin.enabled = true;
     graph.admin.max_response_bytes = 256;
     schema.set_text(?graph.admin.listener, "admin");
-    var series: [1]telemetry_metrics.Series;
+    var series: [BUILT_IN_METRIC_SERIES]telemetry_metrics.Series;
     var checks: [1]telemetry_health.Check;
     var render_state: TestRender;
     render_state.calls = 0;
     var runtime: Runtime;
-    if (!make(?runtime, ?graph, nil, ?series[0], 1, ?checks[0], 1, nil, test_auth, (?render_state)::ptr, test_context_render, (0::usize)::telemetry_admin.RenderFun, nil, (0::usize)::FlushFun)) { ret 1; }
+    if (!make(?runtime, ?graph, nil, ?series[0], BUILT_IN_METRIC_SERIES,
+        ?checks[0], 1, nil, test_auth, (?render_state)::ptr,
+        test_context_render, (0::usize)::telemetry_admin.RenderFun,
+        nil, (0::usize)::FlushFun)) { ret 1; }
     var output: [256]u8;
     var response: telemetry_admin.Response;
     if (!telemetry_admin.handle(?runtime.admin, telemetry_admin.Request{listener: "admin", method: "GET", path: "/metrics", authorization: "Bearer test"}, ?output[0], 256, ?response)

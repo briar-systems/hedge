@@ -37,6 +37,10 @@ The runner observes the disabled process through `/proc`: it has one thread, no
 timer descriptor, no descriptor for the configured cache root, and no cache
 arena in its virtual memory footprint.
 
+`telemetry.toml` binds separate public and administration listeners. The
+administration credential comes from the environment, and logs, metrics, and
+W3C trace processing are enabled together.
+
 ## What the matrix covers
 
 Serving:
@@ -89,6 +93,10 @@ Composition and optional resources:
   arena or opening a cache file, timer, or worker
 - a service-changing reload leaves an in-flight connection on its old handler,
   then publishes and reclaims twelve successive service generations
+- the public listener cannot reach administration endpoints
+- wrong administration credentials return 401 with a bearer challenge
+- an authenticated administration client reaches readiness and live metrics
+- an incoming W3C trace ID reaches the access log before the shutdown flush
 
 The PROXY protocol legs also cover the positive direction: a trusted v1 header
 followed by an HTTP/1 request is served, and a trusted header followed by the
@@ -96,7 +104,7 @@ HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-35 legs passed, 0 failed, on linux-x86_64 against:
+41 legs passed, 0 failed, on linux-x86_64 against:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3

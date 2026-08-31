@@ -7,6 +7,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_equals;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -22,6 +23,9 @@ use hedge.listener;
 use hedge.connection;
 use hedge.serve;
 use hedge.service;
+use observability: hedge.telemetry;
+use telemetry_health: hedge.telemetry.health;
+use telemetry_admin: hedge.telemetry.admin;
 use proxy: hedge.service.proxy;
 use upstream: hedge.proxy.upstream;
 use plan: hedge.dispatch.plan;
@@ -73,6 +77,8 @@ fun listener_graph(graph: *schema.Graph, name: str, address: str) {
     configured.protocols = schema.PROTOCOL_HTTP1;
     configured.backlog = 16;
     configured.accept_depth = 2;
+    configured.proxy_protocol = schema.PROXY_OFF;
+    configured.trusted_peer_count = 0;
     graph.host_count = 1;
     schema.set_text(?graph.hosts[0].name, "site");
     schema.set_text(?graph.hosts[0].listener, "public");
@@ -89,11 +95,11 @@ fun add_service(graph: *schema.Graph, name: str, kind: u8, target: str) {
     configured.kind = kind;
     schema.set_text(?configured.target, target);
     schema.clear_text(?configured.budget);
-    schema.clear_text(?configured.secret);
     schema.clear_text(?configured.content_type);
     schema.clear_text(?configured.index);
     configured.precompressed = false;
     configured.status = 200;
+    configured.cache = false;
     graph.service_count = index + 1;
 }
 
@@ -121,9 +127,13 @@ fun compile_site(site: *Site, generation: u64, resolver: *service.Resolver) bool
         == plan.PLAN_OK;
 }
 
-fun start_site(site: *Site, generation: u64) bool {
+fun start_site(site: *Site, generation: u64,
+    telemetry: *observability.Runtime) bool {
     if (!serve.make(?site.runtime, ?site.slots[0], ?site.connections[0], POOL,
         ?site.plan, ?site.graph)) { ret false; }
+    if (telemetry != nil && !serve.attach_telemetry(?site.runtime, telemetry)) {
+        ret false;
+    }
     schema.reset_diagnostics(?site.diagnostics);
     if (!serve.start(?site.runtime, generation, ?site.graph, ?site.diagnostics)) { ret false; }
     val owned: *listener.OwnedListener = listener.active_listener(?site.runtime.owner, 0);
@@ -275,10 +285,15 @@ rec Edge {
     proxy_registry: proxy.Registry;
     bindings: proxy.Bindings;
     binding_storage: [MAX_SERVICES]proxy.Binding;
+    telemetry: observability.Runtime;
+    checks: [1]telemetry_health.Check;
 }
 
-fun start_edge(edge: *Edge, generation: u64, upstream_address: str) bool {
+fun start_edge(edge: *Edge, generation: u64, upstream_address: str,
+    traces: bool) bool {
     listener_graph(?edge.site.graph, "edge", "127.0.0.1:0");
+    edge.site.graph.telemetry.logs = false;
+    edge.site.graph.telemetry.traces = traces;
     add_service(?edge.site.graph, "backend", schema.SERVICE_PROXY, upstream_address);
     add_route(?edge.site.graph, "all", "/**", "backend");
     service.make_applications(?edge.site.applications, ?edge.site.application_slots[0], 2);
@@ -293,8 +308,19 @@ fun start_edge(edge: *Edge, generation: u64, upstream_address: str) bool {
         ctx: (?edge.bindings)::ptr,
         build: proxy.factory,
     };
+    var telemetry: *observability.Runtime = nil;
+    if (traces) {
+        if (!observability.make(?edge.telemetry, ?edge.site.graph, nil, nil, 0,
+            ?edge.checks[0], 1, nil,
+            (0::usize)::telemetry_admin.AuthenticateFun, nil,
+            (0::usize)::telemetry_admin.RenderFun,
+            (0::usize)::telemetry_admin.RenderFun, nil,
+            (0::usize)::observability.FlushFun)) { ret false; }
+        telemetry = ?edge.telemetry;
+        edge.site.resolver.observer = observability.observer(telemetry);
+    }
     if (!compile_site(?edge.site, generation, ?edge.site.resolver)) { ret false; }
-    if (!start_site(?edge.site, generation)) { ret false; }
+    if (!start_site(?edge.site, generation, telemetry)) { ret false; }
     proxy.attach_driver(?edge.proxy_runtime, ?edge.site.runtime.owner.network);
     serve.attach_plane(?edge.site.runtime, (?edge.proxy_runtime)::ptr, proxy.poll);
     ret true;
@@ -336,7 +362,7 @@ test "proxy: a request is forwarded to a real origin and its response returned" 
     var origin: Origin;
     if (!start_origin(?origin, "answer from the origin")) { ret 1; }
     var edge: Edge;
-    if (!start_edge(?edge, 1, (?origin.address[0])::str)) { shutdown_edge(?edge, ?origin); ret 2; }
+    if (!start_edge(?edge, 1, (?origin.address[0])::str, false)) { shutdown_edge(?edge, ?origin); ret 2; }
     var client: tcp.Stream;
     if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, ?origin); ret 3; }
     if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
@@ -358,7 +384,7 @@ test "proxy: a request is forwarded to a real origin and its response returned" 
 test "proxy: an unreachable upstream answers 502 without hanging" {
     var edge: Edge;
     # nothing listens on this port, so every attempt fails at connect
-    if (!start_edge(?edge, 2, "127.0.0.1:9")) { shutdown_edge(?edge, nil); ret 1; }
+    if (!start_edge(?edge, 2, "127.0.0.1:9", false)) { shutdown_edge(?edge, nil); ret 1; }
     var client: tcp.Stream;
     if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, nil); ret 2; }
     if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
@@ -380,7 +406,7 @@ test "proxy: forwarded metadata and via reach the origin" {
     var origin: Origin;
     if (!start_origin(?origin, "seen")) { ret 1; }
     var edge: Edge;
-    if (!start_edge(?edge, 3, (?origin.address[0])::str)) { shutdown_edge(?edge, ?origin); ret 2; }
+    if (!start_edge(?edge, 3, (?origin.address[0])::str, false)) { shutdown_edge(?edge, ?origin); ret 2; }
     var client: tcp.Stream;
     if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, ?origin); ret 3; }
     if (!wire.send(?client, "GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
@@ -394,11 +420,72 @@ test "proxy: forwarded metadata and via reach the origin" {
     ret 0;
 }
 
+fun occurrence_count(data: *u8, length: usize, needle: str) usize {
+    val needle_length: usize = str_len(needle);
+    if (data == nil || needle_length == 0 || needle_length > length) { ret 0; }
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i + needle_length <= length) {
+        var j: usize = 0;
+        for (j < needle_length && data[i + j] == needle[j]) { j = j + 1; }
+        if (j == needle_length) {
+            count = count + 1;
+            i = i + needle_length;
+        } or { i = i + 1; }
+    }
+    ret count;
+}
+
+test "proxy: a remote trace reaches the origin as one canonical child context" {
+    var origin: Origin;
+    if (!start_origin(?origin, "traced")) { ret 1; }
+    var edge: Edge;
+    if (!start_edge(?edge, 31, (?origin.address[0])::str, true)) {
+        shutdown_edge(?edge, ?origin);
+        ret 2;
+    }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)
+     || !wire.send(?client,
+        "GET /trace HTTP/1.1\r\nHost: localhost\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\ntracestate: vendor=value\r\nConnection: close\r\n\r\n")) {
+        tcp.stream_close(?client);
+        shutdown_edge(?edge, ?origin);
+        ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = collect_both(?edge, ?origin, ?client, ?response[0],
+        RESPONSE_BYTES, "traced");
+    tcp.stream_close(?client);
+    if (length == 0
+     || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
+        shutdown_edge(?edge, ?origin);
+        ret 4;
+    }
+    var parent: [64]u8;
+    var state: [64]u8;
+    val parent_length: usize = wire.field_value(?origin.seen[0],
+        origin.seen_length, "traceparent: ", ?parent[0], 64);
+    val state_length: usize = wire.field_value(?origin.seen[0],
+        origin.seen_length, "tracestate: ", ?state[0], 64);
+    shutdown_edge(?edge, ?origin);
+    if (occurrence_count(?origin.seen[0], origin.seen_length,
+            "traceparent: ") != 1
+     || parent_length != 55
+     || !wire.starts_with(?parent[0], parent_length,
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-")
+     || str_equals((?parent[0])::str,
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+     || parent[52] != '-' || parent[53] != '0' || parent[54] != '1') { ret 5; }
+    if (state_length != 12
+     || !str_equals((?state[0])::str, "vendor=value")) { ret 6; }
+    ret 0;
+}
+
 test "proxy: successive proxied requests reuse the client connection" {
     var origin: Origin;
     if (!start_origin(?origin, "relayed")) { ret 1; }
     var edge: Edge;
-    if (!start_edge(?edge, 4, (?origin.address[0])::str)) { shutdown_edge(?edge, ?origin); ret 2; }
+    if (!start_edge(?edge, 4, (?origin.address[0])::str, false)) { shutdown_edge(?edge, ?origin); ret 2; }
     var client: tcp.Stream;
     if (!wire.connect(edge.site.endpoint, ?client)) { shutdown_edge(?edge, ?origin); ret 3; }
     var response: [RESPONSE_BYTES]u8;
@@ -428,7 +515,7 @@ test "proxy: successive proxied requests reuse the client connection" {
 
 test "proxy: repeated upstream failure opens the breaker and refuses without dialling" {
     var edge: Edge;
-    if (!start_edge(?edge, 5, "127.0.0.1:9")) { shutdown_edge(?edge, nil); ret 1; }
+    if (!start_edge(?edge, 5, "127.0.0.1:9", false)) { shutdown_edge(?edge, nil); ret 1; }
     var response: [RESPONSE_BYTES]u8;
     var request: usize = 0;
     for (request < 3) {

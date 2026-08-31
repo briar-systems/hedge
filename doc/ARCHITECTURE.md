@@ -250,11 +250,11 @@ HTTP/2 uses GOAWAY. HTTP/3 closes request acceptance through its control and QUI
 
 ## Telemetry ownership
 
-One telemetry runtime owns the log sink contract, fixed metric registry, health checks, trace propagation bound, and administration handler for a server generation. Access and error events are encoded directly into a fixed record buffer. A direct sink completes within the call. A queued sink copies into a caller-bounded queue and reports enqueued, rejected, or dropped without waiting for space.
+One process-owned telemetry runtime owns the log sink contract, fixed metric registry, health checks, trace propagation bound, administration credential, and administration handler. It is attached before listeners become ready and remains stable across route generations. Access and error events are observed at the common dispatch boundary, so HTTP/1, HTTP/2, public routes, and listener-owned services share one completion path. Events are encoded directly into a fixed record buffer. A direct sink completes within the call. A queued sink copies into a caller-bounded queue and reports enqueued, rejected, or dropped without waiting for space.
 
 Metric series are registered against caller-owned storage. Tokens identify stable series, updates are atomic, and histogram samples commit bucket, count, and sum together. Rendering performs a sizing pass before writing so an undersized administration response cannot expose a partial metric document.
 
-The administration handler has no public route access. Its listener identity and authentication callback are required policy inputs. Metrics and state renderers retain independent contexts. Shutdown makes readiness false before listener drain and invokes the telemetry flush operation exactly once.
+The administration handler has no public route access. Its listener identity is selected before virtual-host routing, and its bearer credential is resolved into bounded process-owned storage before the route plan is sealed. Metrics and state renderers retain independent contexts. Shutdown makes readiness false before listener drain, invokes the telemetry flush operation exactly once, and clears the credential after serving stops.
 
 ## Lightweight composition
 
