@@ -76,7 +76,7 @@ HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-26 legs passed, 0 failed, on linux-x86_64 against:
+27 legs passed, 0 failed, on linux-x86_64 against:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3
