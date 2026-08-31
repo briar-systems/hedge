@@ -92,6 +92,30 @@ not an oversight: an unmatched server name is then refused with
 
 `client_auth` requires and verifies a client certificate against `client_trust`.
 
+Session resumption is disabled unless the policy contains a `resumption` table:
+
+```toml
+[tls.public.resumption]
+key_lifetime_seconds = 3600
+retirement_overlap_seconds = 1800
+ticket_lifetime_seconds = 7200
+replay = "single_use"
+tickets_per_connection = 2
+```
+
+All three durations are positive seconds bounded at seven days, and one
+connection may receive between one and four tickets. A sealing key rotates
+before the first handshake after its lifetime and remains usable only for the
+configured retirement overlap. A ticket is usable for the shorter of its own
+lifetime and the opening life of the key that sealed it.
+
+`replay` is `permissive` or `single_use`. The default inside an enabled table is
+`permissive`: Hedge implements no early data, so presenting a ticket cannot
+replay an HTTP request, and allowing reuse matches common TLS client behavior.
+`single_use` instead admits one presentation in a bounded 512-entry window. A
+second presentation falls back to a full authenticated handshake rather than
+failing the connection. The other defaults are the values in the example.
+
 Each secure listener publishes its own immutable credential generation, and its
 ALPN offer is that listener's protocol set in the listener's own order, so two
 listeners sharing one certificate but serving different protocols do not share
