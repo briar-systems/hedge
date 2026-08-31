@@ -117,6 +117,13 @@ than being read as the start of a request.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
 
+`server.limits.max_pipeline_depth` bounds HTTP/1 requests admitted into one
+connection before earlier responses release their slots. The default and fixed
+storage maximum are both 2. A value above 2 is rejected during validation rather
+than accepted and silently clamped. When both slots are occupied, the HTTP/1
+engine reports saturation and leaves later bytes in its bounded read buffer
+until a slot is released.
+
 ## Budgets
 
 A named `budget` carries four bounds, and a listener that names one is held to
