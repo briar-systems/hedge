@@ -120,6 +120,10 @@ fun serve_identity(context: ptr, active: *call.Call) exchange.ServiceStatus {
         at = write_text(output, at, IDENTITY_BYTES, "0");
     }
     at = write_text(output, at, IDENTITY_BYTES, ";");
+    at = write_text(output, at, IDENTITY_BYTES, " stream=");
+    at = write_number(output, at, IDENTITY_BYTES,
+        request.metadata.request_index::usize);
+    at = write_text(output, at, IDENTITY_BYTES, ";");
     if (at >= IDENTITY_BYTES) { ret exchange.SERVICE_FAILED; }
     ret service.respond_with_bytes(active, output, at);
 }
@@ -127,6 +131,31 @@ fun serve_identity(context: ptr, active: *call.Call) exchange.ServiceStatus {
 fun build_identity(context: ptr, configured: *schema.Service,
     handler: *service.Handler) bool {
     @handler = service.Handler{ctx: nil, serve: serve_identity};
+    ret true;
+}
+
+rec FinalizerProbe {
+    calls: usize;
+}
+
+fun refuse_finalizer(context: ptr, active: *call.Call) bool {
+    val state: *FinalizerProbe = context::*FinalizerProbe;
+    state.calls = state.calls + 1;
+    ret false;
+}
+
+fun serve_finalizing_identity(context: ptr,
+    active: *call.Call) exchange.ServiceStatus {
+    if (!call.attach_finalizer(active, call.Finalizer{
+            ctx: context, finish: refuse_finalizer})) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret serve_identity(nil, active);
+}
+
+fun build_finalizing_identity(context: ptr, configured: *schema.Service,
+    handler: *service.Handler) bool {
+    @handler = service.Handler{ctx: context, serve: serve_finalizing_identity};
     ret true;
 }
 
@@ -519,6 +548,56 @@ test "protocol: prior knowledge serves a real HTTP/2 request" {
     ret 0;
 }
 
+test "protocol: an HTTP/2 finalizer failure closes the owning session" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
+        schema.PROXY_OFF);
+    var finalizer: FinalizerProbe = FinalizerProbe{calls: 0};
+    service.make_applications(?harness.applications,
+        ?harness.application_slots[0], 4);
+    harness.resolver = service.no_resolver();
+    harness.resolver.applications = ?harness.applications;
+    harness.resolver.native = service.Factory{ctx: ?finalizer,
+        build: build_finalizing_identity};
+    if (!plan.make_storage(?harness.storage,
+        ?harness.routes[0], MAX_ROUTES,
+        ?harness.segments[0], MAX_SEGMENTS,
+        ?harness.specs[0], MAX_ROUTES,
+        ?harness.entries[0], MAX_ROUTES,
+        ?harness.services[0], MAX_SERVICES,
+        ?harness.middlewares[0], 4,
+        ?harness.text[0], PLAN_TEXT)
+        || plan.compile(?harness.plan, 52, ?harness.graph, harness.storage,
+            ?harness.resolver, nil).status != plan.PLAN_OK
+        || !boot(?harness, 52)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) {
+        serve.stop(?harness.runtime);
+        ret 2;
+    }
+    var request: [256]u8;
+    var length: usize = wire.put_connection_start(?request[0]);
+    length = wire.put_request(?request[0], length, 1);
+    if (!send_bytes(?client, ?request[0], length)) {
+        tcp.stream_close(?client);
+        serve.stop(?harness.runtime);
+        ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val received: usize = wire.collect(?harness.runtime, ?client,
+        ?response[0], RESPONSE_BYTES, ";");
+    var polls: usize = 0;
+    for (polls < 40 && !connection.finished(?harness.connections[0])) {
+        serve.poll(?harness.runtime, 2);
+        polls = polls + 1;
+    }
+    val closed: bool = connection.finished(?harness.connections[0]);
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (received == 0 || finalizer.calls != 1 || !closed) { ret 4; }
+    ret 0;
+}
+
 test "protocol: one HTTP/2 connection carries two request streams" {
     var harness: Harness;
     base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
@@ -541,13 +620,76 @@ test "protocol: one HTTP/2 connection carries two request streams" {
     # the counter is published when the connection is retired
     val streams: u64 = harness.connections[0].requests;
     if (received == 0) { ret 4; }
-    # both streams produced a body, so the slot table was reused rather than
-    # holding the first exchange open
-    val first: usize = wire.index_of(?response[0], received, "peer=");
-    if (first == received) { ret 5; }
-    val rest: usize = received - first - 1;
-    if (wire.index_of(?response[first + 1], rest, "peer=") == rest) { ret 6; }
+    # each concurrent stream receives the body built from its own request
+    if (!wire.contains(?response[0], received, "stream=1;")) { ret 5; }
+    if (!wire.contains(?response[0], received, "stream=3;")) { ret 6; }
     if (streams != 2) { ret (100 + streams)::i32; }
+    ret 0;
+}
+
+test "protocol: one HTTP/2 connection carries six sequential request streams" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
+        schema.PROXY_OFF);
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP2, schema.PROXY_OFF)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    var markers: [6]str = [6]str{"stream=1;", "stream=3;", "stream=5;",
+        "stream=7;", "stream=9;", "stream=11;"};
+    var request: [256]u8;
+    var response: [RESPONSE_BYTES]u8;
+    var i: usize = 0;
+    for (i < 6) {
+        var length: usize = 0;
+        if (i == 0) { length = wire.put_connection_start(?request[0]); }
+        length = wire.put_request(?request[0], length, (i * 2 + 1)::u32);
+        if (!send_bytes(?client, ?request[0], length)) {
+            tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+        }
+        val received: usize = wire.collect(?harness.runtime, ?client,
+            ?response[0], RESPONSE_BYTES, markers[i]);
+        if (received == 0 || !wire.contains(?response[0], received, markers[i])) {
+            tcp.stream_close(?client); serve.stop(?harness.runtime);
+            ret (10 + i)::i32;
+        }
+        i = i + 1;
+    }
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (harness.runtime.accepted != 1) { ret 20; }
+    if (harness.connections[0].requests != 6) { ret 21; }
+    ret 0;
+}
+
+test "protocol: reset HTTP/2 streams release their bounded engine slots" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
+        schema.PROXY_OFF);
+    if (!start(?harness, 1, schema.PROTOCOL_HTTP2, schema.PROXY_OFF)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    var request: [1024]u8;
+    var length: usize = wire.put_connection_start(?request[0]);
+    var stream: u32 = 1;
+    for (stream < 12) {
+        length = wire.put_open_request(?request[0], length, stream);
+        length = wire.put_reset(?request[0], length, stream, 8);
+        stream = stream + 2;
+    }
+    length = wire.put_request(?request[0], length, 13);
+    if (!send_bytes(?client, ?request[0], length)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val received: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, "stream=13;");
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (received == 0 || !wire.contains(?response[0], received, "stream=13;")) {
+        ret 4;
+    }
+    if (harness.runtime.accepted != 1) { ret 5; }
+    if (harness.connections[0].requests != 7) { ret 6; }
     ret 0;
 }
 

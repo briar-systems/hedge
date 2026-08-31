@@ -88,8 +88,7 @@ HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-This revision contains 32 legs. On linux-x86_64, 31 passed and the existing
-six-request HTTP/2 connection-reuse leg failed identically on `origin/dev`:
+32 legs passed, 0 failed, on linux-x86_64 against:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3
