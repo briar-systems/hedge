@@ -65,9 +65,10 @@ rec Harness {
     counted: allocator.Allocator;
     count: Counted;
     graph: schema.Graph;
+    replacement: schema.Graph;
     diagnostics: schema.Diagnostics;
     runtime: *composition.Runtime;
-    storage: *composition.PlanStorage;
+    storages: *composition.PlanStorage;
     endpoint: ip.Endpoint;
 }
 
@@ -127,11 +128,11 @@ fun prepare(harness: *Harness, cache_enabled: bool) bool {
     val runtime_memory: Result[*composition.Runtime, *u8] =
         allocator.allocate[composition.Runtime](?harness.heap, 1);
     val storage_memory: Result[*composition.PlanStorage, *u8] =
-        allocator.allocate[composition.PlanStorage](?harness.heap, 1);
+        allocator.allocate[composition.PlanStorage](?harness.heap, 2);
     if (is_err[*composition.Runtime, *u8](runtime_memory)
      || is_err[*composition.PlanStorage, *u8](storage_memory)) { ret false; }
     harness.runtime = unwrap_ok[*composition.Runtime, *u8](runtime_memory);
-    harness.storage = unwrap_ok[*composition.PlanStorage, *u8](storage_memory);
+    harness.storages = unwrap_ok[*composition.PlanStorage, *u8](storage_memory);
     make_counted(?harness.counted, ?harness.count, ?harness.heap);
     graph(harness, cache_enabled);
     ret true;
@@ -139,7 +140,7 @@ fun prepare(harness: *Harness, cache_enabled: bool) bool {
 
 fun boot(harness: *Harness, cache_enabled: bool) composition.StartReport {
     val started: composition.StartReport = composition.start(harness.runtime,
-        ?harness.counted, ?harness.graph, 1, harness.storage,
+        ?harness.counted, ?harness.graph, 1, ?harness.storages[0],
         ?harness.diagnostics, composition.default_options());
     if (started.status == composition.START_OK) {
         val owned: *listener.OwnedListener =
@@ -167,6 +168,55 @@ fun exchange(harness: *Harness) bool {
         && wire.contains(?response[0], length, "hello from composition\n");
 }
 
+fun exchange_request_text(harness: *Harness, request: str, expected: str) bool {
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)
+     || !wire.send(?client, request)) {
+        tcp.stream_close(?client);
+        ret false;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime.serving, ?client,
+        ?response[0], RESPONSE_BYTES, expected);
+    tcp.stream_close(?client);
+    ret length != 0 && wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")
+        && wire.contains(?response[0], length, expected);
+}
+
+fun exchange_text(harness: *Harness, expected: str) bool {
+    ret exchange_request_text(harness,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", expected);
+}
+
+fun settle_connections(harness: *Harness) bool {
+    var rounds: usize = 0;
+    for (rounds < 200 && !serve.idle(?harness.runtime.serving)) {
+        serve.poll(?harness.runtime.serving, 1);
+        rounds = rounds + 1;
+    }
+    ret serve.idle(?harness.runtime.serving);
+}
+
+fun reload_fixed(harness: *Harness, generation: u64, expected: str) bool {
+    val target: usize = 1 - composition.active_service_generation(harness.runtime);
+    var candidate: *schema.Graph = ?harness.graph;
+    if (target == 1) { candidate = ?harness.replacement; }
+    @candidate = @harness.runtime.graph;
+    schema.set_text(?candidate.services[0].target, expected);
+    schema.reset_diagnostics(?harness.diagnostics);
+    val reloaded: composition.StartReport = composition.reload(harness.runtime,
+        candidate, generation, ?harness.storages[target], ?harness.diagnostics);
+    if (reloaded.status != composition.START_OK || !exchange_text(harness, expected)
+     || serve.superseded(?harness.runtime.serving) != 0
+     || !composition.reclaim_superseded(harness.runtime)) { ret false; }
+    val active: composition.ServiceSnapshot =
+        composition.service_snapshot(harness.runtime, target);
+    val retired: composition.ServiceSnapshot =
+        composition.service_snapshot(harness.runtime, 1 - target);
+    ret active.live && active.generation == generation && !retired.live
+        && retired.generation == 0;
+}
+
 fun event_index(runtime: *composition.Runtime, target: composition.Event) usize {
     var i: usize = 0;
     for (i < runtime.event_count) {
@@ -192,10 +242,12 @@ test "composition: production wiring serves after its construction frame is gone
     val started: composition.StartReport = boot(?harness, true);
     if (started.status != composition.START_OK) { ret 2; }
     if (harness.count.calls != 5) { composition.stop(harness.runtime); ret 3; }
-    if (harness.runtime.cache_bindings.items != ?harness.runtime.cache_binding_storage[0]
-     || harness.runtime.services.caching.ctx != (?harness.runtime.cache_bindings)::ptr
+    val services: *composition.ServiceGeneration =
+        ?harness.runtime.service_generations[0];
+    if (services.cache_bindings.items != ?services.cache_binding_storage[0]
+     || services.services.caching.ctx != (?services.cache_bindings)::ptr
      || harness.runtime.plans[0].storage.services[0].handler.ctx
-        != (?harness.runtime.cache_binding_storage[0])::ptr) {
+        != (?services.cache_binding_storage[0])::ptr) {
         composition.stop(harness.runtime);
         ret 4;
     }
@@ -265,7 +317,7 @@ test "composition: startup failure unwinds every acquired resource" {
     if (started.status != composition.START_CONFIG) { ret 2; }
     if (hedge_tls.count() != 0 || harness.runtime.proxying.live
      || composition.cache(harness.runtime) != nil
-     || harness.runtime.static_registry.len != 0) { ret 3; }
+     || harness.runtime.service_generations[0].static_registry.len != 0) { ret 3; }
     val tls: usize = event_index(harness.runtime, composition.TLS_DESTROYED);
     val proxy: usize = event_index(harness.runtime, composition.PROXY_CLOSED);
     val cache_close: usize = event_index(harness.runtime, composition.CACHE_CLOSED);
@@ -273,5 +325,164 @@ test "composition: startup failure unwinds every acquired resource" {
     if (!(tls < proxy && proxy < cache_close && cache_close < static_close)) { ret 4; }
     if (event_index(harness.runtime, composition.SERVE_STOPPED)
         != harness.runtime.event_count) { ret 5; }
+    ret 0;
+}
+
+test "composition: service reload pins the old registry and reclaims repeated generations" {
+    var harness: Harness;
+    if (!prepare(?harness, true)) { ret 1; }
+    val started: composition.StartReport = boot(?harness, true);
+    if (started.status != composition.START_OK) { ret 2; }
+
+    var old: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?old)
+     || !wire.send(?old, "GET / HTTP/1.1\r\nHost: localhost\r\n")) {
+        composition.stop(harness.runtime);
+        ret 3;
+    }
+    var rounds: usize = 0;
+    for (rounds < 16) {
+        serve.poll(?harness.runtime.serving, 1);
+        rounds = rounds + 1;
+    }
+    harness.replacement = harness.graph;
+    schema.set_text(?harness.replacement.services[0].target, "generation two\n");
+    schema.reset_diagnostics(?harness.diagnostics);
+    val reloaded: composition.StartReport = composition.reload(harness.runtime,
+        ?harness.replacement, 2, ?harness.storages[1], ?harness.diagnostics);
+    if (reloaded.status != composition.START_OK
+     || serve.superseded(?harness.runtime.serving) != 1) {
+        tcp.stream_close(?old);
+        composition.stop(harness.runtime);
+        ret 4;
+    }
+    val first: composition.ServiceSnapshot = composition.service_snapshot(harness.runtime, 0);
+    val second: composition.ServiceSnapshot = composition.service_snapshot(harness.runtime, 1);
+    if (!first.live || first.generation != 1 || !second.live || second.generation != 2) {
+        tcp.stream_close(?old);
+        composition.stop(harness.runtime);
+        ret 5;
+    }
+    if (composition.reload(harness.runtime, ?harness.graph, 3, ?harness.storages[0],
+        ?harness.diagnostics).status == composition.START_OK) {
+        tcp.stream_close(?old);
+        composition.stop(harness.runtime);
+        ret 6;
+    }
+    if (!wire.send(?old, "\r\n")) {
+        tcp.stream_close(?old);
+        composition.stop(harness.runtime);
+        ret 7;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime.serving, ?old,
+        ?response[0], RESPONSE_BYTES, "hello from composition\n");
+    tcp.stream_close(?old);
+    if (length == 0 || !wire.contains(?response[0], length, "hello from composition\n")
+     || !exchange_text(?harness, "generation two\n")) {
+        composition.stop(harness.runtime);
+        ret 8;
+    }
+    rounds = 0;
+    for (rounds < 200 && serve.superseded(?harness.runtime.serving) != 0) {
+        serve.poll(?harness.runtime.serving, 1);
+        rounds = rounds + 1;
+    }
+    if (serve.superseded(?harness.runtime.serving) != 0
+     || !composition.service_snapshot(harness.runtime, 0).live
+     || !composition.reclaim_superseded(harness.runtime)
+     || composition.service_snapshot(harness.runtime, 0).live) {
+        composition.stop(harness.runtime);
+        ret 9;
+    }
+
+    var generation: u64 = 3;
+    for (generation < 19) {
+        if (!reload_fixed(?harness, generation, "reloaded generation\n")) {
+            composition.stop(harness.runtime);
+            ret 10;
+        }
+        generation = generation + 1;
+    }
+    val stopped: composition.StopReport = composition.stop(harness.runtime);
+    if (!stopped.stopped || stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
+        ret 11;
+    }
+    ret 0;
+}
+
+test "composition: repeated static reloads close every retired root" {
+    var harness: Harness;
+    if (!prepare(?harness, false)) { ret 1; }
+    harness.graph.services[0].kind = schema.SERVICE_STATIC;
+    schema.set_text(?harness.graph.services[0].target, "test/interop/public");
+    schema.set_text(?harness.graph.services[0].index, "index.html");
+    harness.graph.services[0].precompressed = false;
+    val started: composition.StartReport = boot(?harness, false);
+    if (started.status != composition.START_OK
+     || !exchange_request_text(?harness,
+        "GET /files/large.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "line 000001") || !settle_connections(?harness)) {
+        composition.stop(harness.runtime);
+        ret 2;
+    }
+    var generation: u64 = 2;
+    for (generation < 18) {
+        val target: usize = 1 - composition.active_service_generation(harness.runtime);
+        var candidate: *schema.Graph = ?harness.graph;
+        if (target == 1) { candidate = ?harness.replacement; }
+        @candidate = @harness.runtime.graph;
+        candidate.services[0].precompressed = !candidate.services[0].precompressed;
+        schema.reset_diagnostics(?harness.diagnostics);
+        val reloaded: composition.StartReport = composition.reload(harness.runtime,
+            candidate, generation, ?harness.storages[target], ?harness.diagnostics);
+        val active: composition.ServiceSnapshot =
+            composition.service_snapshot(harness.runtime, target);
+        val retired: composition.ServiceSnapshot =
+            composition.service_snapshot(harness.runtime, 1 - target);
+        if (reloaded.status != composition.START_OK || !active.live
+         || active.static_roots != 1 || !retired.live || retired.static_roots != 1
+         || !composition.reclaim_superseded(harness.runtime)
+         || composition.service_snapshot(harness.runtime, 1 - target).static_roots != 0
+         || !exchange_request_text(?harness,
+            "GET /files/large.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            "line 000001") || !settle_connections(?harness)) {
+            composition.stop(harness.runtime);
+            ret 3;
+        }
+        generation = generation + 1;
+    }
+    val stopped: composition.StopReport = composition.stop(harness.runtime);
+    if (!stopped.stopped || stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
+        ret 4;
+    }
+    ret 0;
+}
+
+test "composition: a failed service generation leaves the active plan untouched" {
+    var harness: Harness;
+    if (!prepare(?harness, false)) { ret 1; }
+    val started: composition.StartReport = boot(?harness, false);
+    if (started.status != composition.START_OK) { ret 2; }
+    harness.replacement = harness.graph;
+    harness.replacement.services[0].kind = schema.SERVICE_STATIC;
+    schema.set_text(?harness.replacement.services[0].target,
+        "out/missing-service-generation-root");
+    schema.reset_diagnostics(?harness.diagnostics);
+    val rejected: composition.StartReport = composition.reload(harness.runtime,
+        ?harness.replacement, 2, ?harness.storages[1], ?harness.diagnostics);
+    val candidate: composition.ServiceSnapshot =
+        composition.service_snapshot(harness.runtime, 1);
+    if (rejected.status != composition.START_CONFIG || candidate.live
+     || candidate.static_roots != 0
+     || composition.active_service_generation(harness.runtime) != 0
+     || !exchange_text(?harness, "hello from composition\n")) {
+        composition.stop(harness.runtime);
+        ret 3;
+    }
+    val stopped: composition.StopReport = composition.stop(harness.runtime);
+    if (!stopped.stopped || stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
+        ret 4;
+    }
     ret 0;
 }
