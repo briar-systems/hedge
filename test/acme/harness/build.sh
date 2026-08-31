@@ -52,4 +52,18 @@ if [ ! -f "$tools/test/config/pebble-config.json" ]; then
     chmod -R u+w "$tools/test"
 fi
 
+# the staging pseudo-root is deliberately unrelated to pebble's issuer. it is
+# used only to prove that an authority outside configured anchors is refused.
+if [ ! -f "$tools/staging-root.pem" ]; then
+    echo "fetching the staging pseudo-root"
+    if ! curl -fsS --max-time 30 \
+        https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem \
+        -o "$tools/staging-root.pem.partial"; then
+        echo "could not fetch the staging pseudo-root" >&2
+        rm -f "$tools/staging-root.pem.partial"
+        exit 1
+    fi
+    mv "$tools/staging-root.pem.partial" "$tools/staging-root.pem"
+fi
+
 echo "live acme stack built in $tools"

@@ -24,6 +24,7 @@ use std.types.view;
 use R: std.types.result;
 use std.chrono.time;
 use std.net.ip;
+use dns: std.net.dns;
 use std.net.tcp;
 use io_error: std.io.error;
 use io_handle: std.io.handle;
@@ -36,6 +37,8 @@ use http.core.method;
 use ac: acme.client;
 use problem: acme.problem;
 use wire: hedge.acme.wire;
+use origination: hedge.acme.origination;
+use cert: tls.cert;
 
 pub val USER_AGENT: str = "hedge-acme/0.1";
 pub val USER_AGENT_BYTES: usize = 14;
@@ -59,6 +62,7 @@ pub def Stage: u8;
 pub val IDLE:       Stage = 0;
 pub val RESOLVING:  Stage = 1;
 pub val CONNECTING: Stage = 2;
+pub val HANDSHAKING: Stage = 8;
 pub val WRITING:    Stage = 3;
 pub val READING:    Stage = 4;
 pub val CLOSING:    Stage = 5;
@@ -75,6 +79,8 @@ pub val CAUSE_PROTOCOL:   Cause = 5;
 pub val CAUSE_LIMIT:      Cause = 6;
 pub val CAUSE_TIMEOUT:    Cause = 7;
 pub val CAUSE_CANCELLED:  Cause = 8;
+pub val CAUSE_TRUST:      Cause = 9;
+pub val CAUSE_HANDSHAKE:  Cause = 10;
 
 # resolution is a step, not a call, so an asynchronous resolver reports PENDING
 # until its own completion arrives without changing anything above it
@@ -116,6 +122,18 @@ pub fun cleartext_origin(endpoint: ip.Endpoint) Origin {
     ret value;
 }
 
+# reaches the authority over TLS at `endpoint`. the certificate is verified
+# against the configured anchors for the name in the url, not for the endpoint,
+# so an origin can point at one address of a name without weakening what is
+# checked.
+pub fun secure_origin(endpoint: ip.Endpoint) Origin {
+    var value: Origin;
+    value.endpoint = endpoint;
+    value.cleartext = false;
+    value.configured = true;
+    ret value;
+}
+
 fun resolve_literal(context: ptr, host: view.View, port: u16,
     output: *ip.Endpoint) Status {
     if (output == nil || host.len == 0 || host.len > 63) { ret INVALID; }
@@ -137,6 +155,37 @@ fun resolve_literal(context: ptr, host: view.View, port: u16,
     ret OK;
 }
 
+# resolves one name to one endpoint.
+#
+# this blocks, so it belongs to the moment an authority is configured and
+# never to a poll of the serving loop. hedge resolves its authority once, at
+# startup, and reaches it by address afterwards; a certificate manager that
+# contacts one authority every few weeks does not need a resolver in its hot
+# path, and the alternative — mach-std's asynchronous resolver — requires a
+# worker pool, which is a thread this server does not otherwise have.
+#
+# a name whose address changes is picked up at the next restart. between
+# restarts a moved authority looks like an unreachable one, which the renewal
+# schedule already handles by backing off within its lead.
+pub fun resolve_endpoint(host: view.View, port: u16,
+    output: *ip.Endpoint) bool {
+    if (output == nil || host.data == nil || host.len == 0
+     || host.len > 253) { ret false; }
+    var text: [256]u8;
+    var i: usize = 0;
+    for (i < host.len) {
+        text[i] = host.data[i];
+        i = i + 1;
+    }
+    text[host.len] = 0;
+    var address: ip.Addr;
+    if (resolve_literal(nil, host, port, output) == OK) { ret true; }
+    var v4: ip.IPv4;
+    if (!dns.resolve((?text[0])::str, ?v4)) { ret false; }
+    @output = ip.endpoint_v4(v4, port);
+    ret true;
+}
+
 # a deployment that cannot resolve names reaches only address literals. every
 # name is refused here rather than silently reaching some other authority.
 pub fun literal_addresses() Addresses {
@@ -152,6 +201,9 @@ pub rec Transport {
     scope:     cancel.Scope;
     addresses: Addresses;
     origin:    Origin;
+    trust:     *cert.TrustStore;
+    tls:       origination.Handle;
+    secure:    bool;
 
     request:          *u8;
     request_capacity: usize;
@@ -176,6 +228,7 @@ pub rec Transport {
     cause:          Cause;
     request_method: method.Kind;
     deadline:       time.Time;
+    verification_time: i64;
     max_body:       usize;
     pending:        bool;
     eof:            bool;
@@ -218,6 +271,9 @@ pub fun make(transport: *Transport, request: *u8, request_capacity: usize,
     transport.stage = IDLE;
     transport.addresses = addresses;
     transport.origin = no_origin();
+    transport.trust = nil;
+    transport.tls = origination.no_handle();
+    transport.secure = false;
     transport.request = request;
     transport.request_capacity = request_capacity;
     transport.response = response;
@@ -259,6 +315,23 @@ pub fun set_origin(transport: *Transport, origin: Origin) bool {
     ret true;
 }
 
+# the anchors an https authority is verified against. without them there is
+# nothing to verify against, so an https exchange is refused rather than
+# reached unverified.
+pub fun set_trust(transport: *Transport, trust: *cert.TrustStore) bool {
+    if (transport == nil || !transport.live || transport.stage != IDLE) {
+        ret false;
+    }
+    if (trust != nil && trust.len == 0) { ret false; }
+    transport.trust = trust;
+    ret true;
+}
+
+pub fun trusts(transport: *Transport) usize {
+    if (transport == nil || transport.trust == nil) { ret 0; }
+    ret transport.trust.len;
+}
+
 fun fail(transport: *Transport, cause: Cause) Status {
     transport.cause = cause;
     transport.stage = BROKEN;
@@ -286,14 +359,17 @@ pub fun begin(transport: *Transport, request: ac.WireRequest,
     if (!wire.split_url(request.url, ?transport.target)) {
         ret fail(transport, CAUSE_ADDRESS);
     }
-    # without a configured origin an https authority needs tls origination,
-    # which this build does not have. it is refused rather than reached in
-    # cleartext behind the caller's back.
-    if (transport.target.secure && !transport.origin.configured) {
-        ret fail(transport, CAUSE_ADDRESS);
-    }
-    if (transport.origin.configured && !transport.origin.cleartext) {
-        ret fail(transport, CAUSE_ADDRESS);
+    # an https authority is reached over tls, and only against anchors the
+    # deployment configured. an https url with no trust store and no cleartext
+    # origin is refused rather than reached unverified or in cleartext.
+    transport.secure = false;
+    if (transport.target.secure) {
+        val cleartext_configured: bool = transport.origin.configured
+            && transport.origin.cleartext;
+        if (!cleartext_configured) {
+            if (transport.trust == nil) { ret fail(transport, CAUSE_TRUST); }
+            transport.secure = true;
+        }
     }
     val written: usize = wire.encode_request(request, transport.target,
         USER_AGENT, USER_AGENT_BYTES, transport.request,
@@ -302,6 +378,7 @@ pub fun begin(transport: *Transport, request: ac.WireRequest,
     transport.request_len = written;
     transport.request_method = request.method.kind;
     transport.deadline = deadline_from(now, request.timeout_ns);
+    transport.verification_time = now.sec;
     transport.max_body = request.max_response_bytes;
     if (transport.max_body == 0 || transport.max_body > transport.response_capacity) {
         transport.max_body = transport.response_capacity;
@@ -313,6 +390,13 @@ pub fun begin(transport: *Transport, request: ac.WireRequest,
 fun submit_read(transport: *Transport) bool {
     val room: usize = transport.max_body - transport.response_len;
     if (room == 0) { ret false; }
+    if (transport.secure) {
+        if (origination.start_read(transport.tls,
+            ?transport.response[transport.response_len], room)
+            != origination.PENDING) { ret false; }
+        transport.pending = true;
+        ret true;
+    }
     val submitted: R.Result[io_runtime.Token, io_error.Error] = net_async.submit_read(
         ?transport.driver, ?transport.scope, ?transport.stream,
         ?transport.response[transport.response_len], room, CONTEXT_READ);
@@ -323,6 +407,13 @@ fun submit_read(transport: *Transport) bool {
 
 fun submit_write(transport: *Transport) bool {
     val remaining: usize = transport.request_len - transport.request_sent;
+    if (transport.secure) {
+        if (origination.start_write(transport.tls,
+            ?transport.request[transport.request_sent], remaining)
+            != origination.PENDING) { ret false; }
+        transport.pending = true;
+        ret true;
+    }
     val submitted: R.Result[io_runtime.Token, io_error.Error] = net_async.submit_write(
         ?transport.driver, ?transport.scope, ?transport.stream,
         ?transport.request[transport.request_sent], remaining, CONTEXT_WRITE);
@@ -360,8 +451,71 @@ fun handle_connect(transport: *Transport, completion: io_runtime.Completion) {
     }
     transport.stream = tcp.Stream{handle: io_handle.SocketHandle{value: completion.resource}};
     transport.stream_live = true;
+    if (transport.secure) {
+        # the certificate is verified for the name the url gives, whatever
+        # address the origin sent us to
+        if (origination.begin(?transport.tls, ?transport.driver,
+            ?transport.stream,
+            transport.target.host, transport.trust,
+            transport.verification_time) != origination.PENDING) {
+            fail(transport, CAUSE_HANDSHAKE);
+            ret;
+        }
+        transport.pending = true;
+        transport.stage = HANDSHAKING;
+        ret;
+    }
     if (!submit_write(transport)) { fail(transport, CAUSE_WRITE); ret; }
     transport.stage = WRITING;
+}
+
+# advances a secured exchange whenever its outstanding tls operation settles
+fun settle_secure(transport: *Transport, now: time.Time) Status {
+    val progress: origination.Status = origination.poll(transport.tls);
+    if (progress == origination.PENDING) { ret PENDING; }
+    transport.pending = false;
+    if (progress != origination.OK) {
+        if (transport.stage == HANDSHAKING) {
+            ret fail(transport, CAUSE_HANDSHAKE);
+        }
+        if (transport.stage == WRITING) { ret fail(transport, CAUSE_WRITE); }
+        ret fail(transport, CAUSE_READ);
+    }
+    if (transport.stage == HANDSHAKING) {
+        if (!submit_write(transport)) { ret fail(transport, CAUSE_WRITE); }
+        transport.stage = WRITING;
+        ret PENDING;
+    }
+    if (transport.stage == WRITING) {
+        val written: usize = origination.transferred(transport.tls);
+        if (written == 0) { ret fail(transport, CAUSE_WRITE); }
+        transport.request_sent = transport.request_sent + written;
+        if (transport.request_sent < transport.request_len) {
+            if (!submit_write(transport)) { ret fail(transport, CAUSE_WRITE); }
+            ret PENDING;
+        }
+        if (!submit_read(transport)) { ret fail(transport, CAUSE_READ); }
+        transport.stage = READING;
+        ret PENDING;
+    }
+    if (transport.stage != READING) { ret PENDING; }
+    val received: usize = origination.transferred(transport.tls);
+    transport.response_len = transport.response_len + received;
+    if (received == 0 || origination.peer_closed(transport.tls)) {
+        transport.eof = true;
+    }
+    val parsed: Status = parse_available(transport);
+    if (parsed == OK) {
+        transport.stage = COMPLETE;
+        ret OK;
+    }
+    if (parsed != PENDING) { ret parsed; }
+    if (transport.eof) { ret fail(transport, CAUSE_PROTOCOL); }
+    if (transport.response_len >= transport.max_body) {
+        ret fail(transport, CAUSE_LIMIT);
+    }
+    if (!submit_read(transport)) { ret fail(transport, CAUSE_READ); }
+    ret PENDING;
 }
 
 fun handle_write(transport: *Transport, completion: io_runtime.Completion) {
@@ -400,6 +554,13 @@ fun handle_read(transport: *Transport, completion: io_runtime.Completion) {
 }
 
 fun dispatch(transport: *Transport, completion: io_runtime.Completion) {
+    # a secured exchange submits many socket operations per application
+    # operation, and the engine decides when one has settled, so a completion
+    # it owns never resolves the transport's own pending state
+    if (completion.context == origination.COMPLETION_CONTEXT) {
+        origination.accept(transport.tls, ?completion);
+        ret;
+    }
     transport.pending = false;
     if (completion.context == CONTEXT_CLOSE) { ret; }
     # a completion that arrives after the exchange gave up releases its
@@ -467,12 +628,19 @@ pub fun poll(transport: *Transport, now: time.Time) Status {
         transport.stage = CONNECTING;
     }
     drain(transport, 0);
+    if (transport.secure && transport.stage != COMPLETE
+     && transport.stage != BROKEN && origination.operating(transport.tls)) {
+        val advanced: Status = settle_secure(transport, now);
+        if (advanced == OK || advanced == FAILED) { ret advanced; }
+    }
     if (transport.stage == COMPLETE) { ret OK; }
     if (transport.stage == BROKEN) { ret FAILED; }
     # an expired exchange is cancelled, and its outstanding completion is
     # reaped before anything it owns is released
     if (expired(transport, now)) {
-        cancel.cancel(?transport.scope);
+        if (transport.secure && origination.operating(transport.tls)) {
+            origination.cancel_operation(transport.tls);
+        } or { cancel.cancel(?transport.scope); }
         ret fail(transport, CAUSE_TIMEOUT);
     }
     ret PENDING;
@@ -499,6 +667,21 @@ pub fun response(transport: *Transport) ac.Response {
 pub fun finish(transport: *Transport) bool {
     if (transport == nil || !transport.live) { ret false; }
     if (transport.stage == IDLE) { ret true; }
+    if (origination.active(transport.tls)) {
+        if (origination.operating(transport.tls)) {
+            origination.cancel_operation(transport.tls);
+        }
+        var tls_guard: usize = 0;
+        for (origination.operating(transport.tls) && tls_guard < 64) {
+            if (!drain(transport, 50)) { brk; }
+            origination.poll(transport.tls);
+            tls_guard = tls_guard + 1;
+        }
+        if (origination.operating(transport.tls)
+         || !origination.release(transport.tls)) { ret false; }
+        transport.tls = origination.no_handle();
+        transport.pending = false;
+    }
     if (transport.pending) { cancel.cancel(?transport.scope); }
     var guard: usize = 0;
     for (transport.pending && guard < 64) {
@@ -521,7 +704,7 @@ pub fun finish(transport: *Transport) bool {
 
 pub fun destroy(transport: *Transport) bool {
     if (transport == nil || !transport.live) { ret false; }
-    finish(transport);
+    if (!finish(transport)) { ret false; }
     if (transport.scope_live) {
         cancel.destroy(?transport.scope);
         transport.scope_live = false;
@@ -620,7 +803,7 @@ test "acme transport: a configured cleartext origin reaches an https authority" 
     ret 0;
 }
 
-test "acme transport: an https authority is refused until tls origination exists" {
+test "acme transport: an https authority with no anchors is refused" {
     var fixture: Fixture;
     if (!fixture_make(?fixture)) { ret 1; }
     var request: ac.WireRequest;
@@ -633,10 +816,31 @@ test "acme transport: an https authority is refused until tls origination exists
     request.error = problem.none();
     request.response_fields = field.limits(32, 8192, 128, 4096);
     request.replay_safe = true;
+    # nothing to verify against, so the exchange never leaves the process
+    # rather than being reached unverified or downgraded to cleartext
     if (begin(?fixture.engine, request, time.now()) != FAILED) { ret 2; }
-    if (cause(?fixture.engine) != CAUSE_ADDRESS) { ret 3; }
+    if (cause(?fixture.engine) != CAUSE_TRUST) { ret 3; }
     if (!finish(?fixture.engine) || stage(?fixture.engine) != IDLE) { ret 4; }
-    if (!destroy(?fixture.engine)) { ret 5; }
+
+    # with anchors configured the same request is admitted and reaches the
+    # address it was given
+    var certificates: [1]cert.Certificate;
+    certificates[0] = cert.Certificate{der: ?fixture.request[0], der_len: 1};
+    var store: cert.TrustStore = cert.TrustStore{
+        anchors: ?certificates[0], len: 1};
+    if (!set_trust(?fixture.engine, ?store)) { ret 5; }
+    if (!set_origin(?fixture.engine,
+        secure_origin(ip.endpoint(127, 0, 0, 1, 1)))) { ret 6; }
+    if (begin(?fixture.engine, request, time.now()) != PENDING) { ret 7; }
+    var status: Status = PENDING;
+    var rounds: usize = 0;
+    for (status == PENDING && rounds < 4096) {
+        status = poll(?fixture.engine, time.now());
+        rounds = rounds + 1;
+    }
+    if (status != FAILED || cause(?fixture.engine) != CAUSE_CONNECT) { ret 8; }
+    finish(?fixture.engine);
+    if (!destroy(?fixture.engine)) { ret 9; }
     ret 0;
 }
 

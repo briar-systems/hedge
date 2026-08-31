@@ -211,14 +211,16 @@ certificate covering the configured names, its durable state, and the schedule
 that renews it. It performs no work when it is not configured.
 
 Every step is a step the serving loop takes: one outbound exchange at a time
-on the subsystem's own completion runtime, one protocol decision per round,
-and every wait expressed as a wake time. Nothing in the path blocks an accept
-or a request.
+per manager on the subsystem's own completion runtime, one protocol decision
+per round, and every wait expressed as a wake time. Nothing in the path blocks
+an accept or a request.
 
-That transport speaks cleartext only, because nothing in this build originates
-TLS, so an authority is reached either over plain HTTP or through a configured
-cleartext origin. A public authority requires a TLS client and is out of reach
-until one exists.
+An HTTPS authority is reached through a bounded table of mach-tls client
+sessions and verified for the URL's host against a configured anchor bundle.
+The typed table keeps secret-welded engine state out of callback contexts and
+allows active and superseded configuration generations to originate
+independently. A configured cleartext origin remains available for a local
+conformance authority and is never selected implicitly.
 
 The subsystem does not own TLS credentials. It produces a verified chain and
 its key material and reports that an installation is ready; the owner of the

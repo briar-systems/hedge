@@ -226,6 +226,7 @@ acme = true
 
 [acme]
 directory = "https://acme-v02.api.letsencrypt.org/directory"
+trust = "/etc/ssl/certs/ca-certificates.crt"
 contact = "mailto:ops@example.com"
 terms_agreed = true
 storage = "/var/lib/hedge/acme"
@@ -278,20 +279,25 @@ validation Hedge presents a transient certificate only when the client offers
 ordinary TLS handshakes continue to select the listener's configured
 certificate.
 
-**Hedge cannot obtain a certificate from a public authority yet.** RFC 8555
-URLs are `https`, and nothing in this build can originate a TLS connection —
-`mach-tls` is wired for termination, so Hedge can serve TLS but not speak it as
-a client. Certificate management therefore works end to end against a local
-authority reached in cleartext, and not against Let's Encrypt or any other
-public CA. This is a client-transport limit rather than an ACME one, and it is
-the one thing between this feature and production use.
+`trust` names a PEM anchor bundle used to authenticate every HTTPS URL the
+authority publishes. A public deployment normally points it at the operating
+system's CA bundle. Roots using algorithms outside this verifier are excluded
+from the in-memory store. A missing, empty, truncated, undecodable, or wholly
+unsupported bundle fails manager construction rather than opening an
+unverified connection.
+
+The authority client accepts ECDSA-SHA384 signatures from P-384 issuers. P-384
+is a chain-verification algorithm here, not a key-exchange group or a local
+client identity. The public staging check covers that WebPKI path, while local
+Pebble issuance covers the complete authenticated transport and issuance path.
 
 `origin` is how a local authority is reached: a `host:port` spoken to in
 cleartext, for an authority whose URLs still say `https` because the protocol
 requires it. It applies to the one configured authority and nothing else, and
-without it an `https` directory is refused rather than silently reached in
-cleartext. A conformance stack that terminates TLS in front of the authority
-and passes every ACME byte through unchanged is exactly what it is for.
+cannot be combined with `trust`. Without either setting an `https` directory is
+refused rather than silently reached in cleartext or without verification. A
+conformance stack that terminates TLS in front of the authority and passes
+every ACME byte through unchanged is exactly what `origin` is for.
 
 Renewal is driven from the serving loop. A certificate inside its renewal lead
 is renewed with jitter so a fleet does not renew in lockstep; a failure backs
