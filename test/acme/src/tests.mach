@@ -23,6 +23,7 @@ use std.allocator;
 use std.print;
 use problem: acme.problem;
 use std.allocator.fixed;
+use page: std.allocator.page;
 use fs: std.filesystem;
 use std.types.path.Path;
 use std.net.ip;
@@ -44,14 +45,10 @@ use router: http.router.router;
 use challenge: hedge.acme.challenge;
 use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
+use tlsalpn: hedge.acme.tlsalpn;
 use protocol: hedge.protocol.credentials;
-use credentials: tls.cert.credentials;
-use tls_cert: tls.cert;
-use load: tls.cert.load;
-use crypto_keys: crypto.encoding.keys;
-use secret: crypto.secret;
-use contracts: crypto.contracts;
-use ct: std.crypto.ct;
+use hedge_tls: hedge.protocol.tls;
+use composition: hedge.composition;
 use issue: hedge.acme.issue;
 use keys: hedge.acme.keys;
 use session: hedge.acme.session;
@@ -149,9 +146,8 @@ fun configure(server: *Server, address: str) {
 
 # the tests run as separate processes in parallel, so only the run that must
 # receive the authority's validation takes pebble's fixed http-01 port
-fun boot_at(server: *Server, table: *challenge.Http01, address: str,
+fun start_server(server: *Server, table: *challenge.Http01,
     expected: u16) bool {
-    configure(server, address);
     if (!handler.bind(?server.binding, table)) { ret false; }
     service.make_applications(?server.applications,
         ?server.application_slots[0], 4);
@@ -185,6 +181,12 @@ fun boot_at(server: *Server, table: *challenge.Http01, address: str,
     if (owned == nil || !owned.has_bound_endpoint) { ret false; }
     server.endpoint = owned.bound_endpoint;
     ret expected == 0 || server.endpoint.port == expected;
+}
+
+fun boot_at(server: *Server, table: *challenge.Http01, address: str,
+    expected: u16) bool {
+    configure(server, address);
+    ret start_server(server, table, expected);
 }
 
 fun boot(server: *Server, table: *challenge.Http01) bool {
@@ -536,6 +538,7 @@ fun configure_acme(deployment: *Deployment, storage_path: str, name_len: usize) 
     schema.set_text(?graph.acme.directory, DIRECTORY_URL);
     schema.set_text(?graph.acme.storage, storage_path);
     schema.set_text(?graph.acme.origin, "127.0.0.1:14001");
+    schema.set_text(?graph.acme.listener, "public");
     graph.acme.terms_agreed = true;
     graph.acme.challenge = schema.CHALLENGE_HTTP_01;
     graph.acme.name_count = 1;
@@ -550,6 +553,7 @@ fun drive_manager(server: *Server, deployment: *Deployment,
     for (rounds < MAX_ROUNDS) {
         serve.poll(?server.runtime, 1);
         acme.poll((?deployment.manager)::ptr, T.now());
+        hedge_tls.maintain();
         if (acme.state(?deployment.manager) == wanted) { ret true; }
         if (acme.failure_count(?deployment.manager) != 0) {
             val cause: problem.Error = acme.last_failure(?deployment.manager);
@@ -947,62 +951,133 @@ test "live: dns-01 issues a certificate through a publisher" {
     ret 0;
 }
 
-# one installed credential: the chain and key copied out of the manager, in
-# the shape mach-tls serves and hedge's credential generation holds
-rec Installed {
-    der:          [16384]u8;
-    certificates: [8]tls_cert.Certificate;
-    chain:        tls_cert.Chain;
-    key:          keys.Key;
-    private:      crypto_keys.PrivateKey;
-    name:         [64]u8;
-    live:         bool;
+fun configure_tls_alpn(deployment: *Deployment) {
+    val graph: *schema.Graph = ?deployment.graph;
+    graph.features.tls = true;
+    graph.limits.max_connections = POOL;
+    graph.limits.max_connections_per_peer = POOL;
+    graph.listener_count = 1;
+    val public: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?public.name, "public");
+    schema.set_text(?public.address, "127.0.0.1:5001");
+    schema.set_text(?public.tls_policy, "public");
+    schema.clear_text(?public.budget);
+    public.transport = schema.TRANSPORT_TCP;
+    public.protocols = schema.PROTOCOL_HTTP1;
+    public.backlog = 16;
+    public.accept_depth = 4;
+    graph.tls_policy_count = 1;
+    val policy: *schema.TlsPolicy = ?graph.tls_policies[0];
+    schema.set_text(?policy.name, "public");
+    policy.identity_count = 1;
+    schema.set_text(?policy.identities[0].server_name, "api.example.com");
+    schema.set_text(?policy.identities[0].certificate,
+        "test/interop/fixtures/api.pem");
+    schema.set_text(?policy.identities[0].key,
+        "test/interop/fixtures/api.key");
+    policy.has_default = true;
+    schema.set_text(?policy.default_name, "api.example.com");
+    graph.host_count = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    schema.set_text(?graph.hosts[0].listener, "public");
+    graph.hosts[0].server_name_count = 0;
+    graph.service_count = 1;
+    val fixed_service: *schema.Service = ?graph.services[0];
+    schema.set_text(?fixed_service.name, "fixed");
+    fixed_service.kind = schema.SERVICE_FIXED;
+    schema.set_text(?fixed_service.target, "ok\n");
+    schema.clear_text(?fixed_service.budget);
+    schema.set_text(?fixed_service.content_type, "text/plain");
+    fixed_service.status = 200;
+    graph.route_count = 1;
+    schema.set_text(?graph.routes[0].name, "all");
+    schema.set_text(?graph.routes[0].host, "site");
+    schema.set_text(?graph.routes[0].path, "/**");
+    schema.set_text(?graph.routes[0].service, "fixed");
+    schema.clear_text(?graph.routes[0].budget);
 }
 
-fun install(target: *Installed, manager: *acme.Manager, name: view.View,
-    owner: *secret.Allocator) bool {
-    val count: usize = acme.chain_count(manager);
-    if (count == 0 || count > 8) { ret false; }
-    var at: usize = 0;
-    var i: usize = 0;
-    for (i < count) {
-        var entry: view.View;
-        if (!acme.chain_entry(manager, i, ?entry)) { ret false; }
-        if (at + entry.len > 16384) { ret false; }
-        var j: usize = 0;
-        for (j < entry.len) {
-            target.der[at + j] = entry.data[j];
-            j = j + 1;
+fun drive_composition(runtime: *composition.Runtime, wanted: acme.State) bool {
+    var rounds: usize = 0;
+    val deadline: i64 = monotonic_ns() + 120000000000;
+    for (rounds < MAX_ROUNDS) {
+        serve.poll(?runtime.serving, 1);
+        if (acme.state(runtime.certificates) == wanted) { ret true; }
+        if (acme.failure_count(runtime.certificates) != 0) {
+            val cause: problem.Error = acme.last_failure(runtime.certificates);
+            var detail: str = cause.detail;
+            if (detail == nil) { detail = ""; }
+            print.eprintlnf("manager failed: kind {} code {} status {} {}",
+                cause.kind::i64, cause.code::i64, cause.http.status::i64,
+                detail);
+            ret false;
         }
-        target.certificates[i] = tls_cert.Certificate{der: ?target.der[at],
-            der_len: entry.len};
-        at = at + entry.len;
-        i = i + 1;
+        if (monotonic_ns() > deadline) { ret false; }
+        rounds = rounds + 1;
     }
-    target.chain = tls_cert.Chain{certificates: ?target.certificates[0],
-        len: count};
-    if (!keys.adopt(?target.key, keys.material(
-        acme.certificate_key(manager)).data)) { ret false; }
-    var scratch: [keys.PKCS8_BYTES]^u8;
-    target.private = crypto_keys.empty_private();
-    val loaded: contracts.Error = load.private_der(
-        keys.private_der(?target.key, ?scratch[0]), tls_cert.PKCS8_DER, owner,
-        ?target.private);
-    ct.zeroize(?scratch[0], keys.PKCS8_BYTES);
-    if (loaded != contracts.OK) { ret false; }
-    i = 0;
-    for (i < name.len && i < 63) {
-        target.name[i] = name.data[i];
-        i = i + 1;
-    }
-    target.name[i] = 0;
-    target.live = true;
-    ret true;
+    ret false;
 }
 
-fun installed_identity(target: *Installed) credentials.Identity {
-    ret protocol.identity((?target.name[0])::str, target.chain,
-        ?target.private);
+test "live: production composition issues through its TLS-ALPN credential" {
+    var a: allocator.Allocator;
+    if (O.is_some[*u8](page.make(?a))) { ret 1; }
+    val directory: str = "out/acme-tlsalpn01";
+    fs.remove_all(?a, directory::Path);
+    var client: Client;
+    val name_len: usize = unique_name(?client, "tlsalpn01");
+    var deployment: Deployment;
+    var i: usize = 0;
+    for (i < name_len) {
+        deployment.name[i] = client.name[i];
+        i = i + 1;
+    }
+    configure_acme(?deployment, directory, name_len);
+    deployment.graph.acme.challenge = schema.CHALLENGE_TLS_ALPN_01;
+    configure_tls_alpn(?deployment);
+    val runtime_memory: R.Result[*composition.Runtime, *u8] =
+        allocator.allocate[composition.Runtime](?a, 1);
+    val storage_memory: R.Result[*composition.PlanStorage, *u8] =
+        allocator.allocate[composition.PlanStorage](?a, 1);
+    if (R.is_err[*composition.Runtime, *u8](runtime_memory)
+     || R.is_err[*composition.PlanStorage, *u8](storage_memory)) { ret 2; }
+    val composed: *composition.Runtime =
+        R.unwrap_ok[*composition.Runtime, *u8](runtime_memory);
+    val plan_storage: *composition.PlanStorage =
+        R.unwrap_ok[*composition.PlanStorage, *u8](storage_memory);
+    var diagnostics: schema.Diagnostics;
+    val started: composition.StartReport = composition.start(composed, ?a,
+        ?deployment.graph, 1, plan_storage, ?diagnostics,
+        composition.default_options());
+    if (started.status != composition.START_OK) {
+        print.eprintln(started.detail);
+        ret 3;
+    }
+    if (!drive_composition(composed, acme.INSTALLING)) {
+        composition.stop(composed);
+        ret 4;
+    }
+    val listener_policy: *hedge_tls.Policy = hedge_tls.policy_at(
+        composed.certificate_policy);
+    if (composed.alpn_challenge.presented != 1
+     || composed.alpn_challenge.withdrawn != 1
+     || tlsalpn.presenting(?composed.alpn_challenge)
+     || listener_policy == nil || listener_policy.challenge_live
+     || listener_policy.challenge_retiring
+     || acme.chain_count(composed.certificates) < 2) {
+        composition.stop(composed);
+        ret 5;
+    }
+    if (composition.install_certificate(composed, T.now()) != hedge_tls.OK
+     || acme.issued_count(composed.certificates) != 1
+     || acme.state(composed.certificates) != acme.IDLE) {
+        composition.stop(composed);
+        ret 6;
+    }
+    val stopped: composition.StopReport = composition.stop(composed);
+    if (!stopped.stopped || stopped.serve_failures != 0
+     || stopped.cleanup_failures != 0 || hedge_tls.count() != 0) { ret 7; }
+    fs.remove_all(?a, directory::Path);
+    ret 0;
 }
 
 test "live: a renewed certificate rotates without disturbing a live connection" {
@@ -1012,8 +1087,6 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
     if (O.is_some[*u8](fixed.make(?a, ?arena, ?memory[0], 262144))) { ret 1; }
     val directory: str = "out/acme-rotation";
     fs.remove_all(?a, directory::Path);
-    var owner: secret.Allocator = secret.system_allocator();
-
     var client: Client;
     val name_len: usize = unique_name(?client, "rotate");
     var deployment: Deployment;
@@ -1036,9 +1109,22 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
         serve.stop(?server.runtime);
         ret 4;
     }
-    val served: view.View = acme.name(?deployment.manager, 0);
-    var first: Installed;
-    if (!install(?first, ?deployment.manager, served, ?owner)) {
+    var tls_graph: schema.Graph;
+    schema.reset_graph(?tls_graph);
+    tls_graph.tls_policy_count = 1;
+    val configured: *schema.TlsPolicy = ?tls_graph.tls_policies[0];
+    schema.set_text(?configured.name, "managed");
+    configured.identity_count = 1;
+    schema.set_text(?configured.identities[0].server_name, "api.example.com");
+    schema.set_text(?configured.identities[0].certificate,
+        "test/interop/fixtures/api.pem");
+    schema.set_text(?configured.identities[0].key, "test/interop/fixtures/api.key");
+    configured.has_default = true;
+    schema.set_text(?configured.default_name, "api.example.com");
+    hedge_tls.reset();
+    if (hedge_tls.publish("public", configured, schema.PROTOCOL_HTTP1)
+        != hedge_tls.OK || hedge_tls.install_acme(0, ?deployment.manager)
+        != hedge_tls.OK) {
         acme.close(?deployment.manager);
         serve.stop(?server.runtime);
         ret 5;
@@ -1047,21 +1133,13 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
 
     # a connection established on the first certificate holds its lease for
     # its whole life
-    var identities: [1]credentials.Identity;
-    identities[0] = installed_identity(?first);
-    var generation: credentials.Generation = credentials.empty_generation();
-    var bindings: protocol.Bindings;
-    if (protocol.publish(?bindings, ?generation, ?identities[0], 1,
-        protocol.NO_DEFAULT, nil, false) != protocol.OK) {
-        acme.close(?deployment.manager);
-        serve.stop(?server.runtime);
-        ret 6;
-    }
+    val listener_policy: *hedge_tls.Policy = hedge_tls.policy_at(0);
     var established: protocol.Held;
-    if (protocol.acquire(?bindings, (?first.name[0])::str, ?established)
-        != protocol.OK) {
+    if (listener_policy == nil || protocol.acquire(?listener_policy.bindings,
+        (?deployment.name[0])::str, ?established) != protocol.OK) {
         acme.close(?deployment.manager);
         serve.stop(?server.runtime);
+        hedge_tls.destroy();
         ret 7;
     }
     val original: *u8 = established.lease.identity.chain.certificates.der;
@@ -1091,24 +1169,7 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
         serve.stop(?server.runtime);
         ret 10;
     }
-    var second: Installed;
-    if (!install(?second, ?renewing.manager, served, ?owner)) {
-        acme.close(?renewing.manager);
-        serve.stop(?server.runtime);
-        ret 11;
-    }
-    var replacements: [1]credentials.Identity;
-    replacements[0] = installed_identity(?second);
-    var next: credentials.Generation = credentials.empty_generation();
-    if (credentials.initialize(?next, ?replacements[0], 1,
-        protocol.NO_DEFAULT, nil, false) != contracts.OK) {
-        acme.close(?renewing.manager);
-        serve.stop(?server.runtime);
-        ret 12;
-    }
-    var retired: *credentials.Generation = nil;
-    if (protocol.rotate(?bindings, ?next, ?retired) != protocol.OK
-     || retired != ?generation) {
+    if (hedge_tls.install_acme(0, ?renewing.manager) != hedge_tls.OK) {
         acme.close(?renewing.manager);
         serve.stop(?server.runtime);
         ret 13;
@@ -1120,26 +1181,21 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
         serve.stop(?server.runtime);
         ret 14;
     }
-    if (original != ?first.der[0]) {
-        acme.close(?renewing.manager);
-        serve.stop(?server.runtime);
-        ret 15;
-    }
     # a connection that arrives after the rotation gets the renewed one
     var arriving: protocol.Held;
-    if (protocol.acquire(?bindings, (?first.name[0])::str, ?arriving)
+    if (protocol.acquire(?listener_policy.bindings, (?renewing.name[0])::str, ?arriving)
         != protocol.OK) {
         acme.close(?renewing.manager);
         serve.stop(?server.runtime);
         ret 16;
     }
-    if (arriving.lease.identity.chain.certificates.der != ?second.der[0]) {
+    if (arriving.lease.identity.chain.certificates.der == original) {
         acme.close(?renewing.manager);
         serve.stop(?server.runtime);
         ret 17;
     }
     # and the old generation stays alive until its last lease is gone
-    if (protocol.reclaimable(?generation)) {
+    if (hedge_tls.retired_reclaimable(0)) {
         acme.close(?renewing.manager);
         serve.stop(?server.runtime);
         ret 18;
@@ -1149,19 +1205,16 @@ test "live: a renewed certificate rotates without disturbing a live connection" 
         serve.stop(?server.runtime);
         ret 19;
     }
-    if (!protocol.reclaimable(?generation)) {
+    if (!hedge_tls.retired_reclaimable(0)) {
         acme.close(?renewing.manager);
         serve.stop(?server.runtime);
         ret 20;
     }
     protocol.release(?arriving);
-    crypto_keys.destroy_private(?first.private);
-    crypto_keys.destroy_private(?second.private);
-    keys.destroy(?first.key);
-    keys.destroy(?second.key);
     acme.installed(?renewing.manager, T.now());
     acme.close(?renewing.manager);
     serve.stop(?server.runtime);
+    hedge_tls.destroy();
     fs.remove_all(?a, directory::Path);
     ret 0;
 }

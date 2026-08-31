@@ -229,6 +229,7 @@ directory = "https://acme-v02.api.letsencrypt.org/directory"
 contact = "mailto:ops@example.com"
 terms_agreed = true
 storage = "/var/lib/hedge/acme"
+listener = "public"
 names = ["example.com", "www.example.com"]
 challenge = "http-01"
 
@@ -248,30 +249,34 @@ names, which is what the durable record holds. `storage` is a directory the
 process owns: it is created with owner-only permissions and every file in it,
 including both private keys, is written owner-only and replaced atomically.
 
+`listener` names the TCP listener with the TLS policy that owns the live
+credential generation. Hedge copies a verified ACME chain and PKCS#8 key into
+that listener before it begins serving, then rotates later renewals in the
+same listener-owned two-bank store. Existing connections keep their leased
+generation while new handshakes use the replacement.
+
 `renew_before` is the lead, in seconds, before expiry at which a certificate is
 renewed. It defaults to thirty days, which suits the ninety-day certificates
 public authorities issue, and is bounded at one year.
 
 `challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
 
-`http-01` is the only one a TOML deployment can select, because it is the only
-one a web server can answer by itself. It requires a route to the native
-`acme-challenge` service, and a configuration that enables `http-01` without
-one fails to load rather than discovering it at the first renewal. The route
-must be reachable on port 80 for the names being validated.
+`http-01` requires a route to the native `acme-challenge` service, and a
+configuration that enables `http-01` without one fails to load rather than
+discovering it at the first renewal. The route must be reachable on port 80 for
+the names being validated.
 
 `dns-01` needs something that can write a zone. Hedge does not carry provider
 integrations, so an embedder supplies a publisher through
 `acme.open_with_publisher` and gets everything else unchanged. A TOML-only
 deployment that selects it fails to load.
 
-`tls-alpn-01` presentation is implemented, including the RFC 8737 certificate
-and its critical `acmeIdentifier` extension. TLS termination exists and is
-qualified against external clients, so that is not the obstacle. What is
-missing is a way to install the challenge certificate into a running listener:
-a listener publishes one immutable credential generation at startup and there
-is no supported way to replace it. Selecting `tls-alpn-01` fails to load until
-that exists. See issue #37.
+`tls-alpn-01` answers RFC 8737 through the named secure listener. During one
+validation Hedge presents a transient certificate only when the client offers
+`acme-tls/1` and its SNI exactly matches the authorization name. Its critical
+`acmeIdentifier` extension is accepted only by that explicit challenge path;
+ordinary TLS handshakes continue to select the listener's configured
+certificate.
 
 **Hedge cannot obtain a certificate from a public authority yet.** RFC 8555
 URLs are `https`, and nothing in this build can originate a TLS connection —

@@ -234,6 +234,12 @@ supplies. TLS-ALPN-01 presents an RFC 8737 certificate on a TLS listener.
 Cleanup is owed exactly when presentation succeeded and runs exactly once
 across success, failure, timeout, and cancellation.
 
+Each TLS-ALPN-enabled listener owns one stable credential store. A presentation
+publishes its one-shot generation into that vacant store. Cleanup withdraws it
+immediately, so no later handshake can acquire it. If a validation connection
+still holds the generation, the serving loop defers key destruction until that
+exact lease is released, then reuses the same store for the next presentation.
+
 ## Graceful shutdown
 
 Shutdown proceeds through explicit states:
