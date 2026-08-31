@@ -92,6 +92,32 @@ not an oversight: an unmatched server name is then refused with
 
 `client_auth` requires and verifies a client certificate against `client_trust`.
 
+Session resumption is disabled unless the policy contains a `resumption` table:
+
+```toml
+[tls.public.resumption]
+key_lifetime_seconds = 3600
+retirement_overlap_seconds = 1800
+ticket_lifetime_seconds = 7200
+replay = "single_use"
+tickets_per_connection = 2
+```
+
+All three durations are positive seconds bounded at seven days, and one
+connection may receive between one and four tickets. The retirement overlap may
+span at most three key lifetimes, because the bounded four-key ring owns one
+current key and at most three retired keys. A sealing key rotates before the
+first handshake after its lifetime and remains usable only for the configured
+retirement overlap. A ticket is usable for the shorter of its own lifetime and
+the opening life of the key that sealed it.
+
+`replay` is `permissive` or `single_use`. The default inside an enabled table is
+`permissive`: Hedge implements no early data, so presenting a ticket cannot
+replay an HTTP request, and allowing reuse matches common TLS client behavior.
+`single_use` instead admits one presentation in a bounded 512-entry window. A
+second presentation falls back to a full authenticated handshake rather than
+failing the connection. The other defaults are the values in the example.
+
 Each secure listener publishes its own immutable credential generation, and its
 ALPN offer is that listener's protocol set in the listener's own order, so two
 listeners sharing one certificate but serving different protocols do not share
@@ -115,7 +141,76 @@ routing, and forwarded headers all name the same client. Both the v1 text and v2
 binary forms are accepted, and a malformed header closes the connection rather
 than being read as the start of a request.
 
-Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. A named listener `budget` limits its accepted connections. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+
+`server.limits.max_pipeline_depth` bounds HTTP/1 requests admitted into one
+connection before earlier responses release their slots. The default and fixed
+storage maximum are both 2. A value above 2 is rejected during validation rather
+than accepted and silently clamped. When both slots are occupied, the HTTP/1
+engine reports saturation and leaves later bytes in its bounded read buffer
+until a slot is released.
+
+## Budgets
+
+A named `budget` carries four bounds, and a listener that names one is held to
+all of them:
+
+- `concurrency` is how many connections it may serve at once
+- `queue` is how many more may be accepted and made to wait for a turn
+- `timeout_ms` is how long one of those may wait before it is closed
+- `memory_bytes` is how many bytes the work may hold at once
+
+A budget is charged before the work it authorises and released exactly once when
+that work ends, so admitting something and then finding there is no room for it
+cannot happen. A connection holding a place in a queue is accepted but not
+served: that is what makes the queue a queue rather than a label. A charge larger
+than the whole budget is refused rather than queued, because no amount of other
+work finishing would make room for it.
+
+A seam with no budget configured is not a seam with a budget of zero. It is
+admitted without accounting.
+
+A route is charged against the most specific budget that names it: its own,
+otherwise the budget of the service it dispatches to, otherwise the budget of its
+virtual host. The charge is taken after the route is selected and before the
+handler runs, and a request refused for want of budget is answered
+`503 Service Unavailable` rather than dropped. A proxy service that names a
+budget also bounds the requests it may have in flight to its upstreams by that
+budget's concurrency.
+
+## Shutdown
+
+Shutdown runs one ordered sequence: readiness goes false, the listeners stop
+accepting, each protocol engine is asked to close gracefully — HTTP/2 sends
+GOAWAY, HTTP/1 marks its responses for close and stops reading — exchanges
+already in flight are given until the `drain_ms` deadline to finish, whatever
+remains is cancelled, telemetry is flushed, and the resources are released last.
+
+The exit status reports which of those happened. A clean drain exits 0. A drain
+whose deadline passed with exchanges still running exits 75 and names how many
+were abandoned, because that is not a clean shutdown even though it is a
+complete one. A step of the sequence failing exits 70 and names the step.
+
+`SIGHUP` reloads the routing graph. The configuration is re-read, validated and
+sealed into a second generation, a new plan is compiled beside the running one,
+and connections accepted after it use the new plan. Connections accepted before
+it keep the plan and generation they began under and are asked to finish, so a
+superseded generation drains independently of the one that replaced it. A second
+reload is deferred until the previous generation has drained, so only one
+superseded generation exists at a time.
+
+A reload changes routes, virtual hosts, budgets and service definitions. Each
+plan bank owns its static roots, proxy routes and cache bindings. Connections
+accepted before publication retain that complete service generation while they
+drain. Only after its final connection closes are its roots, idle upstream
+connections and binding slots released for reuse. Repeated reloads therefore
+alternate between two bounded banks rather than appending service state.
+
+Process-owned state still requires a restart. That includes feature selection,
+TLS policy, secrets, telemetry, cache storage, ACME, administration, the server
+name and process-wide connection limits. A reload may change plaintext listener
+policy and may rebind a secure listener without changing its name, TLS policy or
+protocol set. An unchanged listener set leaves the sockets untouched.
 
 A host names itself with either `server_name` for a single name or `names` for several; declaring both is a conflict, and declaring neither uses the host block's own key as its name. Every name a host declares is a name it answers to, and each is compiled into its own routing pattern, so a host with three names serves all three rather than only the first. A name may be an exact host, a `*.suffix` wildcard, or carry an explicit port.
 
@@ -135,6 +230,7 @@ trust = "/etc/ssl/certs/ca-certificates.crt"
 contact = "mailto:ops@example.com"
 terms_agreed = true
 storage = "/var/lib/hedge/acme"
+listener = "public"
 names = ["example.com", "www.example.com"]
 challenge = "http-01"
 
@@ -154,30 +250,34 @@ names, which is what the durable record holds. `storage` is a directory the
 process owns: it is created with owner-only permissions and every file in it,
 including both private keys, is written owner-only and replaced atomically.
 
+`listener` names the TCP listener with the TLS policy that owns the live
+credential generation. Hedge copies a verified ACME chain and PKCS#8 key into
+that listener before it begins serving, then rotates later renewals in the
+same listener-owned two-bank store. Existing connections keep their leased
+generation while new handshakes use the replacement.
+
 `renew_before` is the lead, in seconds, before expiry at which a certificate is
 renewed. It defaults to thirty days, which suits the ninety-day certificates
 public authorities issue, and is bounded at one year.
 
 `challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
 
-`http-01` is the only one a TOML deployment can select, because it is the only
-one a web server can answer by itself. It requires a route to the native
-`acme-challenge` service, and a configuration that enables `http-01` without
-one fails to load rather than discovering it at the first renewal. The route
-must be reachable on port 80 for the names being validated.
+`http-01` requires a route to the native `acme-challenge` service, and a
+configuration that enables `http-01` without one fails to load rather than
+discovering it at the first renewal. The route must be reachable on port 80 for
+the names being validated.
 
 `dns-01` needs something that can write a zone. Hedge does not carry provider
 integrations, so an embedder supplies a publisher through
 `acme.open_with_publisher` and gets everything else unchanged. A TOML-only
 deployment that selects it fails to load.
 
-`tls-alpn-01` presentation is implemented, including the RFC 8737 certificate
-and its critical `acmeIdentifier` extension. TLS termination exists and is
-qualified against external clients, so that is not the obstacle. What is
-missing is a way to install the challenge certificate into a running listener:
-a listener publishes one immutable credential generation at startup and there
-is no supported way to replace it. Selecting `tls-alpn-01` fails to load until
-that exists. See issue #37.
+`tls-alpn-01` answers RFC 8737 through the named secure listener. During one
+validation Hedge presents a transient certificate only when the client offers
+`acme-tls/1` and its SNI exactly matches the authorization name. Its critical
+`acmeIdentifier` extension is accepted only by that explicit challenge path;
+ordinary TLS handshakes continue to select the listener's configured
+certificate.
 
 `trust` names a PEM anchor bundle used to authenticate every HTTPS URL the
 authority publishes. A public deployment normally points it at the operating
@@ -221,7 +321,6 @@ key = "HEDGE_ADMIN_TOKEN"
 logs = true
 metrics = true
 traces = true
-endpoint = "https://collector.example/v1/traces"
 log_record_bytes = 2048
 log_queue_depth = 256
 metric_series = 1024
@@ -238,9 +337,11 @@ Log records use bounded structured fields and an atomic sink contract. Queued si
 
 Metric storage is caller-owned and fixed at `metric_series`. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
-Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512.
+Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
-The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. It exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
+The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. The `env` and `file` secret providers resolve in the binary. Embedded deployments may supply `os` and `application` providers through the typed resolver contract. Resolved administration credentials are limited to 512 bytes, reject line breaks, remain in one production owner, and are cleared at shutdown.
+
+The administration service exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
 
 ## Caching
 

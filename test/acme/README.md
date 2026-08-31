@@ -11,13 +11,15 @@ mach test test/acme --profile release --jobs 1
 test/acme/harness/start.sh.stop
 ```
 
-`--jobs 1` is required. Pebble validates HTTP-01 on one fixed port (5002), so
-only one test at a time can own the listener that answers it.
+`--jobs 1` is required. Pebble validates HTTP-01 and TLS-ALPN-01 on fixed ports
+5002 and 5001, so only one test at a time can own the listener that answers a
+challenge.
 
-The harness runs pebble's challenge test server with its own HTTP-01 responder
-disabled and with AAAA answers turned off, so the authority resolves every name
-to loopback IPv4 and the only process that can answer a validation is hedge.
-Both flags are load bearing and are commented as such in `start.sh`.
+The harness runs pebble's challenge test server with its own HTTP-01 and
+TLS-ALPN-01 responders disabled and with AAAA answers turned off, so the
+authority resolves every name to loopback IPv4 and the only process that can
+answer a validation is Hedge. These flags are load bearing and are commented
+as such in `start.sh`.
 
 Pebble picks between its `default` (90-day) and `shortlived` (6-day)
 certificate profile when an order names neither, so the issued lifetime varies

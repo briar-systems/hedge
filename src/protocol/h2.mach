@@ -35,6 +35,7 @@ use router: http.router.router;
 use hedge.dispatch;
 use call: hedge.dispatch.call;
 use plan: hedge.dispatch.plan;
+use budget: hedge.budget;
 use telemetry_trace: hedge.telemetry.trace;
 
 # this build's concurrent HTTP/2 connection bound
@@ -58,7 +59,7 @@ pub val STREAM_FIELD_SLOTS: usize = 32;
 pub val STREAM_STRING_BYTES: usize = 4096;
 pub val STREAM_PENDING_ENTRIES: usize = 32;
 
-pub val ARENA_BYTES: usize = 4096;
+pub val ARENA_BYTES: usize = 12288;
 pub val STAGE_BYTES: usize = 8192;
 pub val REQUEST_FIELD_SLOTS: usize = 40;
 pub val RESPONSE_FIELD_SLOTS: usize = 32;
@@ -127,6 +128,7 @@ rec Slot {
     service_pending: bool;
     exchange_live: bool;
     bound: bool;
+    charge: budget.Charge;
 }
 
 rec Session {
@@ -154,6 +156,7 @@ rec Session {
     held_data: *u8;
     held_length: usize;
     plan: *plan.Plan;
+    budgets: *budget.Set;
     limits: message.Limits;
     listener_name: str;
     secure: bool;
@@ -165,6 +168,7 @@ rec Session {
     last_event: engine_h2.EventKind;
     last_step: Step;
     engine_started: bool;
+    final_goaway_sent: bool;
 }
 
 var sessions: [MAX_SESSIONS]Session;
@@ -186,6 +190,7 @@ fun reset_slot(slot: *Slot) {
     slot.service_pending = false;
     slot.exchange_live = false;
     slot.bound = false;
+    slot.charge = budget.no_charge();
 }
 
 fun prepare() {
@@ -224,6 +229,7 @@ pub fun acquire() usize {
             sessions[i].requests = 0;
             sessions[i].last_event = engine_h2.EVENT_NONE;
             sessions[i].last_step = STEP_IDLE;
+            sessions[i].final_goaway_sent = false;
             var j: usize = 0;
             for (j < MAX_STREAMS) { reset_slot(?sessions[i].slots[j]); j = j + 1; }
             live_count = live_count + 1;
@@ -234,12 +240,22 @@ pub fun acquire() usize {
     ret NO_SESSION;
 }
 
-fun retire_slot(session: *Session, slot: *Slot) {
+fun cancel_slot(slot: *Slot) {
     if (slot.exchange_live) {
         exchange.cancel_exchange(?slot.exchange);
-        call.release(?slot.active_call);
-        slot.exchange_live = false;
     }
+}
+
+fun finalize_slot(slot: *Slot) bool {
+    if (!slot.exchange_live) { ret true; }
+    val finalized: bool = call.release(?slot.active_call);
+    slot.exchange_live = false;
+    ret finalized;
+}
+
+fun release_slot_resources(session: *Session, slot: *Slot) {
+    # the charge is returned whether the exchange finished or was abandoned
+    budget.release(session.budgets, ?slot.charge);
     if (slot.scope_live) {
         cancel.destroy(?slot.scope);
         slot.scope_live = false;
@@ -247,12 +263,33 @@ fun retire_slot(session: *Session, slot: *Slot) {
     reset_slot(slot);
 }
 
+fun retire_slot(session: *Session, slot: *Slot) bool {
+    cancel_slot(slot);
+    val finalized: bool = finalize_slot(slot);
+    release_slot_resources(session, slot);
+    ret finalized;
+}
+
+fun retire_closed_stream(session: *Session, slot: *Slot) bool {
+    val id: u32 = slot.id;
+    val generation: u64 = slot.generation;
+    cancel_slot(slot);
+    if (!engine_h2.release_stream(?session.engine, id, generation)) { ret false; }
+    val finalized: bool = finalize_slot(slot);
+    release_slot_resources(session, slot);
+    ret finalized;
+}
+
 pub fun release(index: usize) bool {
     prepare();
     if (index >= MAX_SESSIONS || !sessions[index].live) { ret false; }
     val session: *Session = ?sessions[index];
+    var finalized: bool = true;
     var j: usize = 0;
-    for (j < MAX_STREAMS) { retire_slot(session, ?session.slots[j]); j = j + 1; }
+    for (j < MAX_STREAMS) {
+        if (!retire_slot(session, ?session.slots[j])) { finalized = false; }
+        j = j + 1;
+    }
     # mach-http has no destroy for an HTTP/2 engine, and every one of its
     # sub-initialisers refuses to run twice. a pooled session therefore has to
     # clear those flags itself or the slot is usable exactly once.
@@ -266,15 +303,16 @@ pub fun release(index: usize) bool {
     session.state = CLOSED;
     session.live = false;
     if (live_count > 0) { live_count = live_count - 1; }
-    ret true;
+    ret finalized;
 }
 
 # --- configuration ---
 
-pub fun config_from(limits: message.Limits) engine_h2.Config {
+pub fun config_from(limits: message.Limits, max_streams: usize) engine_h2.Config {
     var configured: engine_h2.Config = engine_h2.config_default();
-    configured.max_streams = MAX_STREAMS;
-    configured.local.max_concurrent_streams = MAX_STREAMS::u32;
+    if (max_streams > MAX_STREAMS) { max_streams = MAX_STREAMS; }
+    configured.max_streams = max_streams;
+    configured.local.max_concurrent_streams = max_streams::u32;
     configured.local.enable_push = 0;
     configured.local.max_frame_size = FRAME_PAYLOAD_BYTES::u32;
     configured.max_frame_payload = FRAME_PAYLOAD_BYTES;
@@ -292,7 +330,9 @@ pub fun config_from(limits: message.Limits) engine_h2.Config {
 }
 
 pub fun begin(index: usize, channel: *transport.Transport, scope: *cancel.Scope,
-    active_plan: *plan.Plan, limits: message.Limits, listener_name: str,
+    active_plan: *plan.Plan, budgets: *budget.Set, limits: message.Limits,
+    max_streams: usize,
+    listener_name: str,
     secure: bool, peer: message.Endpoint, local: message.Endpoint,
     request_timeout_ns: u64) bool {
     prepare();
@@ -300,6 +340,7 @@ pub fun begin(index: usize, channel: *transport.Transport, scope: *cancel.Scope,
      || scope == nil || active_plan == nil) { ret false; }
     val session: *Session = ?sessions[index];
     session.plan = active_plan;
+    session.budgets = budgets;
     session.limits = limits;
     session.listener_name = listener_name;
     session.secure = secure;
@@ -321,7 +362,7 @@ pub fun begin(index: usize, channel: *transport.Transport, scope: *cancel.Scope,
         };
         i = i + 1;
     }
-    val configured: engine_h2.Config = config_from(limits);
+    val configured: engine_h2.Config = config_from(limits, max_streams);
     session.engine.initialized = false;
     if (!engine_h2.init(?session.engine, engine_h2.SERVER, channel, scope,
         ?session.streams[0], ?session.memories[0], STREAM_CAPACITY,
@@ -751,15 +792,12 @@ fun settle_exchange(index: usize, slot: *Slot) bool {
     val session: *Session = ?sessions[index];
     if (!slot.exchange_live) { ret true; }
     if (exchange.finish(?slot.exchange) != exchange.FINISH_OK) { ret false; }
-    call.release(?slot.active_call);
-    slot.exchange_live = false;
-    engine_h2.release_stream(?session.engine, slot.id, slot.generation);
-    if (slot.scope_live) {
-        cancel.destroy(?slot.scope);
-        slot.scope_live = false;
+    if (!engine_h2.release_stream(?session.engine, slot.id, slot.generation)) {
+        ret false;
     }
-    reset_slot(slot);
-    ret true;
+    val finalized: bool = finalize_slot(slot);
+    release_slot_resources(session, slot);
+    ret finalized;
 }
 
 fun fail_exchange(index: usize, slot: *Slot, code: status.Status) Step {
@@ -778,7 +816,8 @@ fun fail_exchange(index: usize, slot: *Slot, code: status.Status) Step {
 fun start_exchange(index: usize, slot: *Slot) Step {
     val session: *Session = ?sessions[index];
     val served: dispatch.Result = dispatch.serve(session.plan, ?slot.active_call,
-        ?slot.captures[0], CAPTURE_SLOTS);
+        ?slot.captures[0], CAPTURE_SLOTS, session.budgets, ?slot.charge,
+        time.now());
     if (served.outcome == dispatch.FAILED) {
         ret fail_exchange(index, slot, status.INTERNAL_SERVER_ERROR);
     }
@@ -791,7 +830,8 @@ fun start_exchange(index: usize, slot: *Slot) Step {
 
 fun resume_exchange(index: usize, slot: *Slot) Step {
     val session: *Session = ?sessions[index];
-    val served: dispatch.Result = dispatch.resume(session.plan, ?slot.active_call);
+    val served: dispatch.Result = dispatch.resume(session.plan, ?slot.active_call,
+        session.budgets, ?slot.charge, time.now());
     if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
     slot.service_pending = false;
     if (served.outcome == dispatch.FAILED) {
@@ -806,9 +846,11 @@ fun open_stream(index: usize, event: engine_h2.Event, now: time.Time) Step {
     val session: *Session = ?sessions[index];
     val slot: *Slot = free_slot(session);
     if (slot == nil) {
-        engine_h2.cancel_stream(?session.engine, event.stream_id,
-            engine_h2.H2_REFUSED_STREAM);
-        engine_h2.release_event(?session.engine, event.stream_id, event.generation);
+        if (!engine_h2.cancel_stream(?session.engine, event.stream_id,
+            engine_h2.H2_REFUSED_STREAM)
+         || !engine_h2.release_event(?session.engine, event.stream_id, event.generation)
+         || !engine_h2.release_stream(?session.engine, event.stream_id,
+            event.generation)) { ret STEP_ERROR; }
         ret STEP_PROGRESS;
     }
     reset_slot(slot);
@@ -817,10 +859,11 @@ fun open_stream(index: usize, event: engine_h2.Event, now: time.Time) Step {
     slot.generation = event.generation;
     slot.inbound_complete = event.end_stream;
     if (!make_exchange(index, slot, event, now)) {
-        engine_h2.release_event(?session.engine, event.stream_id, event.generation);
-        engine_h2.cancel_stream(?session.engine, event.stream_id,
-            engine_h2.H2_INTERNAL_ERROR);
-        retire_slot(session, slot);
+        if (!engine_h2.release_event(?session.engine, event.stream_id,
+            event.generation)
+         || !engine_h2.cancel_stream(?session.engine, event.stream_id,
+            engine_h2.H2_INTERNAL_ERROR)
+         || !retire_closed_stream(session, slot)) { ret STEP_ERROR; }
         ret STEP_PROGRESS;
     }
     engine_h2.release_event(?session.engine, event.stream_id, event.generation);
@@ -883,7 +926,10 @@ fun apply(index: usize, event: engine_h2.Event, now: time.Time) Step {
     if (event.kind == engine_h2.EVENT_STREAM_RESET
      || event.kind == engine_h2.EVENT_STREAM_ERROR) {
         val slot: *Slot = slot_for(session, event.stream_id);
-        if (slot != nil) { retire_slot(session, slot); }
+        if (slot != nil && !retire_closed_stream(session, slot)) {
+            session.state = FAILED;
+            ret STEP_ERROR;
+        }
         ret STEP_PROGRESS;
     }
     if (event.kind == engine_h2.EVENT_GOAWAY) {
@@ -920,6 +966,10 @@ fun pump_slot(index: usize, slot: *Slot, now: time.Time) Step {
         if (settled.status == body.PENDING) { ret STEP_BLOCKED; }
         if (!body.reader_terminal_state(slot.request.body)) { ret STEP_ERROR; }
     }
+    val stream: *engine_h2.Stream = engine_h2.stream_for(
+        ?sessions[index].engine, slot.id);
+    if (stream == nil || stream.generation != slot.generation) { ret STEP_ERROR; }
+    if (stream.state != engine_h2.STREAM_CLOSED) { ret STEP_BLOCKED; }
     if (!settle_exchange(index, slot)) { ret STEP_ERROR; }
     ret STEP_PROGRESS;
 }
@@ -968,10 +1018,22 @@ pub fun step(index: usize, now: time.Time) Step {
         session.last_step = STEP_PROGRESS;
         ret STEP_PROGRESS;
     }
-    if (session.state == CLOSING
-     && engine_h2.progress_close(?session.engine)) {
-        session.last_step = STEP_PROGRESS;
-        ret STEP_PROGRESS;
+    if (session.state == CLOSING) {
+        # a graceful HTTP/2 close is two GOAWAYs: the first warns and refuses
+        # nothing, the second names the last stream this connection will
+        # process. `progress_close` refuses to close until that second one has
+        # been sent, so without this a drained connection never closes at all.
+        if (!session.final_goaway_sent
+         && session.engine.active_local == 0 && session.engine.active_remote == 0
+         && engine_h2.finish_graceful(?session.engine)) {
+            session.final_goaway_sent = true;
+            session.last_step = STEP_PROGRESS;
+            ret STEP_PROGRESS;
+        }
+        if (engine_h2.progress_close(?session.engine)) {
+            session.last_step = STEP_PROGRESS;
+            ret STEP_PROGRESS;
+        }
     }
     val taken: Step = apply(index, engine_h2.process(?session.engine), now);
     session.last_step = taken;
@@ -1007,7 +1069,9 @@ pub fun begin_graceful(index: usize) bool {
     prepare();
     if (index >= MAX_SESSIONS || !sessions[index].live
      || !sessions[index].engine_started) { ret false; }
+    if (sessions[index].state == CLOSING) { ret true; }
     sessions[index].state = CLOSING;
+    sessions[index].final_goaway_sent = false;
     ret engine_h2.begin_graceful(?sessions[index].engine);
 }
 
@@ -1064,6 +1128,17 @@ test "h2: the session table is bounded and reusable" {
     if (acquire() != first) { ret 4; }
     if (!release(first) || !release(second) || live() != before) { ret 5; }
     if (release(NO_SESSION)) { ret 6; }
+    ret 0;
+}
+
+test "h2: the configured stream bound reaches local admission and settings" {
+    val configured: engine_h2.Config = config_from(message.limits_default(), 1);
+    if (configured.max_streams != 1
+     || configured.local.max_concurrent_streams != 1) { ret 1; }
+    val bounded: engine_h2.Config = config_from(message.limits_default(),
+        MAX_STREAMS + 1);
+    if (bounded.max_streams != MAX_STREAMS
+     || bounded.local.max_concurrent_streams != MAX_STREAMS::u32) { ret 2; }
     ret 0;
 }
 

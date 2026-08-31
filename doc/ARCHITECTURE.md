@@ -36,6 +36,14 @@ telemetry plane
 
 The control plane publishes immutable runtime generations. A listener and every connection retain the generation under which they were created. Reload activates a new generation atomically. Old generations remain alive until their connections drain.
 
+The executable and runtime tests enter those planes through one production
+composition module. Its runtime record owns every binding array and compiled
+plan for the process lifetime. Startup constructs cache bindings before the
+resolver and compiles only after both are stable. Teardown stops serving first,
+closes certificate management, destroys TLS credentials, closes proxy state,
+then closes cache and static storage. Partial startup follows the same ordering
+for every resource it acquired.
+
 ## Runtime generation
 
 A generation owns:
@@ -122,6 +130,13 @@ A request exchange owns:
 
 The request allocator is reset only after request-body disposition and response completion are resolved. A handler that leaves a body unread must explicitly drain it, reject it, or make the connection non-reusable.
 
+A service may attach one request finalizer to the common call. The protocol owner
+runs it exactly once after the exchange reaches its terminal state and before the
+request allocator is reset. This is where an application framework receives the
+authoritative response status, transfer counters, and cancellation reason. A
+finalizer failure does not prevent memory or transport cleanup, but it fails the
+owning connection or stream so the lifecycle error remains observable.
+
 HTTP/1.1 processes ordered exchanges while respecting pipeline bounds. HTTP/2 and HTTP/3 process independent streams subject to connection and stream flow control. The service API does not expose those differences as mutable connection operations.
 
 ## Service dispatch
@@ -167,6 +182,10 @@ Retries are allowed only when request replay safety is known. Body buffering is 
 ## Cache
 
 Caching is an optional service layer with independent memory and disk stores. It implements HTTP cache semantics rather than path-based object reuse. Cache keys include the selected representation dimensions. Revalidation, stale policies, range handling, and authorization behavior are explicit.
+
+When caching is disabled, composition does not allocate a layer, entry table, or
+body arena and does not install a wrapper. It opens no cache root and starts no
+worker or timer.
 
 ## Web applications
 
@@ -217,6 +236,12 @@ supplies. TLS-ALPN-01 presents an RFC 8737 certificate on a TLS listener.
 Cleanup is owed exactly when presentation succeeded and runs exactly once
 across success, failure, timeout, and cancellation.
 
+Each TLS-ALPN-enabled listener owns one stable credential store. A presentation
+publishes its one-shot generation into that vacant store. Cleanup withdraws it
+immediately, so no later handshake can acquire it. If a validation connection
+still holds the generation, the serving loop defers key destruction until that
+exact lease is released, then reuses the same store for the next presentation.
+
 ## Graceful shutdown
 
 Shutdown proceeds through explicit states:
@@ -233,11 +258,11 @@ HTTP/2 uses GOAWAY. HTTP/3 closes request acceptance through its control and QUI
 
 ## Telemetry ownership
 
-One telemetry runtime owns the log sink contract, fixed metric registry, health checks, trace propagation bound, and administration handler for a server generation. Access and error events are encoded directly into a fixed record buffer. A direct sink completes within the call. A queued sink copies into a caller-bounded queue and reports enqueued, rejected, or dropped without waiting for space.
+One process-owned telemetry runtime owns the log sink contract, fixed metric registry, health checks, trace propagation bound, administration credential, and administration handler. It is attached before listeners become ready and remains stable across route generations. Access and error events are observed at the common dispatch boundary, so HTTP/1, HTTP/2, public routes, and listener-owned services share one completion path. Events are encoded directly into a fixed record buffer. A direct sink completes within the call. A queued sink copies into a caller-bounded queue and reports enqueued, rejected, or dropped without waiting for space.
 
 Metric series are registered against caller-owned storage. Tokens identify stable series, updates are atomic, and histogram samples commit bucket, count, and sum together. Rendering performs a sizing pass before writing so an undersized administration response cannot expose a partial metric document.
 
-The administration handler has no public route access. Its listener identity and authentication callback are required policy inputs. Metrics and state renderers retain independent contexts. Shutdown makes readiness false before listener drain and invokes the telemetry flush operation exactly once.
+The administration handler has no public route access. Its listener identity is selected before virtual-host routing, and its bearer credential is resolved into bounded process-owned storage before the route plan is sealed. Metrics and state renderers retain independent contexts. Shutdown makes readiness false before listener drain, invokes the telemetry flush operation exactly once, and clears the credential after serving stops.
 
 ## Lightweight composition
 

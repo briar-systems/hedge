@@ -28,6 +28,19 @@ material only.
 identity and no default, so an unmatched server name is refused rather than
 served somebody else's certificate.
 
+`shutdown.toml` binds one cleartext listener with a 300ms drain deadline, short
+enough that a shutdown with a peer still holding a request open reaches the
+deadline within the life of a test.
+
+`cache-disabled.toml` and `cache-enabled.toml` differ only in cache activation.
+The runner observes the disabled process through `/proc`: it has one thread, no
+timer descriptor, no descriptor for the configured cache root, and no cache
+arena in its virtual memory footprint.
+
+`telemetry.toml` binds separate public and administration listeners. The
+administration credential comes from the environment, and logs, metrics, and
+W3C trace processing are enabled together.
+
 ## What the matrix covers
 
 Serving:
@@ -49,6 +62,12 @@ Credential selection:
 - a server name with no matching identity and no default, refused with
   `unrecognized_name`
 
+Session resumption:
+
+- OpenSSL receives and resumes a TLS 1.3 session ticket
+- a second presentation of the same ticket under `single_use` falls back to a
+  full handshake
+
 Refusals, each of which must fail the way policy says rather than falling
 through to a default:
 
@@ -59,13 +78,33 @@ through to a default:
 - a malformed PROXY header: closed with no response, and the address it asserted
   is never used
 
+Shutdown, asserted through the process exit status, which is the only place the
+outcome is visible to whoever supervises hedge:
+
+- a stop with nothing in flight drains and exits 0
+- a stop with a peer mid-request reaches the drain deadline, cancels the
+  exchange, and exits 75 naming how many were abandoned
+
+Composition and optional resources:
+
+- the production binary serves through the same composition module used by the
+  runtime suite
+- disabling cache leaves the configured route live without allocating the cache
+  arena or opening a cache file, timer, or worker
+- a service-changing reload leaves an in-flight connection on its old handler,
+  then publishes and reclaims twelve successive service generations
+- the public listener cannot reach administration endpoints
+- wrong administration credentials return 401 with a bearer challenge
+- an authenticated administration client reaches readiness and live metrics
+- an incoming W3C trace ID reaches the access log before the shutdown flush
+
 The PROXY protocol legs also cover the positive direction: a trusted v1 header
 followed by an HTTP/1 request is served, and a trusted header followed by the
 HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-24 legs passed, 0 failed, on linux-x86_64 against:
+41 legs passed, 0 failed, on linux-x86_64 against:
 
 - curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
 - OpenSSL 3.6.3
@@ -73,9 +112,11 @@ HTTP/2 preface selects HTTP/2.
 
 The in-process suites cover what this harness cannot express as a client
 command: `mach test .` for the selection, prologue, credential, PROXY, TLS
-policy and session rules, and `mach test test/runtime` for PROXY decoding and
-peer propagation over real sockets, where the decoded peer is asserted from the
-response body a service produced.
+policy, session and shutdown-ordering rules, and `mach test test/runtime` for
+the shared production composition, PROXY decoding and peer propagation over
+real sockets, the drain deadline against a stuck handler and a slow peer, the
+two-stage HTTP/2 GOAWAY, and a superseded generation draining while its
+replacement serves.
 
 ## What this does not cover
 
@@ -87,6 +128,4 @@ response body a service produced.
   certificate paths are exercised only through the clients above.
 - TLS 1.2. hedge configures its listeners for TLS 1.3 only, and the matrix
   asserts that a TLS 1.2 client is refused rather than served.
-- Session resumption and client certificates. `mach-tls` supports both and
-  hedge's listener configuration does not offer them yet.
 - Concurrency beyond one client at a time. Every leg runs against an idle server.

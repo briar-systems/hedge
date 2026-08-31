@@ -1,0 +1,849 @@
+# graceful shutdown over real sockets
+#
+# the ordering itself is proved in `hedge.lifecycle`'s own tests, where the clock
+# is an argument. what needs a socket is the part that cannot be faked: that a
+# peer holding a connection open is actually signalled, that a handler which
+# never finishes is actually cancelled when the deadline passes rather than
+# holding the process open, and that HTTP/2 sends the second GOAWAY that lets a
+# drained connection close at all.
+
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.chrono.time;
+use std.net.ip;
+use std.net.tcp;
+use io_error: std.io.error;
+use http.core.exchange;
+use http.core.message;
+use http.core.status;
+use http.router.router;
+use hedge.config.schema;
+use hedge.listener;
+use hedge.connection;
+use hedge.serve;
+use hedge.service;
+use lifecycle: hedge.lifecycle;
+use budget: hedge.budget;
+use call: hedge.dispatch.call;
+use plan: hedge.dispatch.plan;
+use middleware: hedge.dispatch.middleware;
+use wire: hedgetest.wire;
+
+val MAX_ROUTES: usize = 8;
+val MAX_SEGMENTS: usize = 64;
+val MAX_SERVICES: usize = 8;
+val PLAN_TEXT: usize = 2048;
+val POOL: usize = 2;
+val RESPONSE_BYTES: usize = 2048;
+
+# a handler that never completes, which is what a stuck application looks like
+# to the connection plane: the exchange is bound, dispatch has been entered, and
+# no response will ever be committed
+fun serve_stuck(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    ret exchange.SERVICE_PENDING;
+}
+
+fun build_stuck(context: ptr, configured: *schema.Service,
+    handler: *service.Handler) bool {
+    @handler = service.Handler{ctx: nil, serve: serve_stuck};
+    ret true;
+}
+
+rec Harness {
+    graph: schema.Graph;
+    replacement_graph: schema.Graph;
+    diagnostics: schema.Diagnostics;
+    routes: [MAX_ROUTES]router.CompiledRoute;
+    segments: [MAX_SEGMENTS]router.Segment;
+    specs: [MAX_ROUTES]router.Route;
+    entries: [MAX_ROUTES]plan.Entry;
+    services: [MAX_SERVICES]service.Descriptor;
+    middlewares: [4]middleware.Middleware;
+    text: [PLAN_TEXT]u8;
+    storage: plan.Storage;
+    plan: plan.Plan;
+    replacement_routes: [MAX_ROUTES]router.CompiledRoute;
+    replacement_segments: [MAX_SEGMENTS]router.Segment;
+    replacement_specs: [MAX_ROUTES]router.Route;
+    replacement_entries: [MAX_ROUTES]plan.Entry;
+    replacement_services: [MAX_SERVICES]service.Descriptor;
+    replacement_middlewares: [4]middleware.Middleware;
+    replacement_text: [PLAN_TEXT]u8;
+    replacement_storage: plan.Storage;
+    replacement_plan: plan.Plan;
+    slots: [POOL]serve.Slot;
+    connections: [POOL]connection.Connection;
+    runtime: serve.Runtime;
+    applications: service.Applications;
+    application_slots: [4]service.Application;
+    resolver: service.Resolver;
+    endpoint: ip.Endpoint;
+}
+
+fun compile_replacement(harness: *Harness, generation: u64) bool {
+    if (!plan.make_storage(?harness.replacement_storage,
+        ?harness.replacement_routes[0], MAX_ROUTES,
+        ?harness.replacement_segments[0], MAX_SEGMENTS,
+        ?harness.replacement_specs[0], MAX_ROUTES,
+        ?harness.replacement_entries[0], MAX_ROUTES,
+        ?harness.replacement_services[0], MAX_SERVICES,
+        ?harness.replacement_middlewares[0], 4,
+        ?harness.replacement_text[0], PLAN_TEXT)) { ret false; }
+    ret plan.recompile(?harness.replacement_plan, generation,
+        ?harness.replacement_graph, harness.replacement_storage,
+        ?harness.plan, ?harness.graph, nil).status == plan.PLAN_OK;
+}
+
+fun base_graph(graph: *schema.Graph, protocols: u8, drain_ms: u64, stuck: bool) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "lifecycle-test");
+    # the listener is given more room than the connection pool on purpose, so
+    # the pool is the bound under test. with both equal the listener stops
+    # accepting first and a test cannot say which layer refused.
+    graph.limits.max_connections = POOL + 4;
+    graph.limits.max_connections_per_peer = POOL + 4;
+    graph.timeouts.drain_ms = drain_ms;
+    graph.listener_count = 1;
+    val configured: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?configured.name, "public");
+    schema.set_text(?configured.address, "127.0.0.1:0");
+    schema.clear_text(?configured.tls_policy);
+    schema.clear_text(?configured.budget);
+    configured.transport = schema.TRANSPORT_TCP;
+    configured.protocols = protocols;
+    configured.backlog = 16;
+    configured.accept_depth = 2;
+    configured.proxy_protocol = schema.PROXY_OFF;
+    configured.trusted_peer_count = 0;
+    graph.host_count = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    schema.set_text(?graph.hosts[0].listener, "public");
+    graph.hosts[0].server_name_count = 1;
+    schema.set_text(?graph.hosts[0].server_names[0], "localhost");
+    graph.service_count = 1;
+    val entry: *schema.Service = ?graph.services[0];
+    schema.set_text(?entry.name, "handler");
+    if (stuck) { entry.kind = schema.SERVICE_NATIVE; }
+    or { entry.kind = schema.SERVICE_FIXED; }
+    schema.set_text(?entry.target, "served\n");
+    schema.clear_text(?entry.budget);
+    entry.status = 200;
+    schema.set_text(?entry.content_type, "text/plain");
+    graph.route_count = 1;
+    val route: *schema.Route = ?graph.routes[0];
+    schema.set_text(?route.name, "root");
+    schema.set_text(?route.host, "site");
+    schema.set_text(?route.path, "/**");
+    schema.set_text(?route.service, "handler");
+    schema.clear_text(?route.budget);
+}
+
+fun start(harness: *Harness, generation: u64) bool {
+    service.make_applications(?harness.applications, ?harness.application_slots[0], 4);
+    harness.resolver = service.no_resolver();
+    harness.resolver.applications = ?harness.applications;
+    harness.resolver.native = service.Factory{ctx: nil, build: build_stuck};
+    if (!plan.make_storage(?harness.storage,
+        ?harness.routes[0], MAX_ROUTES,
+        ?harness.segments[0], MAX_SEGMENTS,
+        ?harness.specs[0], MAX_ROUTES,
+        ?harness.entries[0], MAX_ROUTES,
+        ?harness.services[0], MAX_SERVICES,
+        ?harness.middlewares[0], 4,
+        ?harness.text[0], PLAN_TEXT)) { ret false; }
+    if (plan.compile(?harness.plan, generation, ?harness.graph, harness.storage,
+        ?harness.resolver, nil).status != plan.PLAN_OK) { ret false; }
+    if (!serve.make(?harness.runtime, ?harness.slots[0], ?harness.connections[0], POOL,
+        ?harness.plan, ?harness.graph)) { ret false; }
+    schema.reset_diagnostics(?harness.diagnostics);
+    if (!serve.start(?harness.runtime, generation, ?harness.graph, ?harness.diagnostics)) {
+        ret false;
+    }
+    val owned: *listener.OwnedListener = listener.active_listener(?harness.runtime.owner, 0);
+    if (owned == nil || !owned.has_bound_endpoint) { ret false; }
+    harness.endpoint = owned.bound_endpoint;
+    ret true;
+}
+
+# poll until the sequence has closed or the budget runs out
+# poll until every step but the resource close has run, then close, exactly as
+# the serving loop in `main` does
+fun pump(harness: *Harness, rounds: usize) bool {
+    var i: usize = 0;
+    for (i < rounds) {
+        serve.poll(?harness.runtime, 2);
+        if (serve.drained(?harness.runtime)) {
+            serve.stop(?harness.runtime);
+            ret serve.finished(?harness.runtime);
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+val REQUEST: str = "GET /r HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+# reload rebinds, so the port the new generation listens on has to be read again
+fun reloaded_endpoint(harness: *Harness) ip.Endpoint {
+    val owned: *listener.OwnedListener = listener.active_listener(?harness.runtime.owner, 0);
+    if (owned == nil || !owned.has_bound_endpoint) { ret harness.endpoint; }
+    ret owned.bound_endpoint;
+}
+
+test "lifecycle: an idle runtime drains cleanly and closes" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+    if (!serve.begin_shutdown(?harness.runtime, time.now())) { ret 2; }
+    if (!pump(?harness, 64)) { ret 3; }
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.DRAINED) { ret 4; }
+    if (serve.shutdown_cancelled(?harness.runtime) != 0) { ret 5; }
+    ret 0;
+}
+
+test "lifecycle: a connection that finishes is drained, not cancelled" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, "served");
+    if (length == 0) { tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4; }
+    # the peer goes away, so the drain has nothing left to wait for
+    tcp.stream_close(?client);
+    if (!serve.begin_shutdown(?harness.runtime, time.now())) { ret 5; }
+    if (!pump(?harness, 200)) { ret 6; }
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.DRAINED) {
+        # 110 + reason + 10 * failed step, so a regression names both at once
+        ret (110 + serve.shutdown_reason(?harness.runtime)::usize
+            + 10 * serve.shutdown_failed_step(?harness.runtime)::usize)::i32;
+    }
+    if (serve.shutdown_cancelled(?harness.runtime) != 0) { ret 8; }
+    ret 0;
+}
+
+test "lifecycle: a stuck handler is cancelled when the deadline passes" {
+    var harness: Harness;
+    # the handler never completes, so only the deadline can end this
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 150, true);
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    # let the request reach dispatch and stick there
+    var i: usize = 0;
+    for (i < 40) { serve.poll(?harness.runtime, 2); i = i + 1; }
+    if (harness.runtime.live == 0) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4;
+    }
+    if (!serve.begin_shutdown(?harness.runtime, time.now())) { ret 5; }
+    # the process must end on its own rather than waiting for the peer
+    if (!pump(?harness, 4000)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 6;
+    }
+    val reason: lifecycle.Reason = serve.shutdown_reason(?harness.runtime);
+    val abandoned: usize = serve.shutdown_cancelled(?harness.runtime);
+    tcp.stream_close(?client);
+    # 110 + the reason, so a regression says what happened instead of "not 2"
+    if (reason != lifecycle.DEADLINE) { ret (110 + reason::usize)::i32; }
+    # and the exit status can say how many exchanges were abandoned
+    if (abandoned != 1) { ret (100 + abandoned)::i32; }
+    ret 0;
+}
+
+test "lifecycle: a slow peer that never sends is cancelled at the deadline" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 150, false);
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    # a request that stops mid-head: the connection is live and will never
+    # complete on its own
+    if (!wire.send(?client, "GET /r HTTP/1.1\r\nHost: local")) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var i: usize = 0;
+    for (i < 40) { serve.poll(?harness.runtime, 2); i = i + 1; }
+    if (harness.runtime.live == 0) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4;
+    }
+    if (!serve.begin_shutdown(?harness.runtime, time.now())) { ret 5; }
+    if (!pump(?harness, 4000)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 6;
+    }
+    val reason: lifecycle.Reason = serve.shutdown_reason(?harness.runtime);
+    tcp.stream_close(?client);
+    if (reason != lifecycle.DEADLINE) { ret 7; }
+    ret 0;
+}
+
+test "lifecycle: a repeated stop request cannot extend the drain" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 150, true);
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var i: usize = 0;
+    for (i < 40) { serve.poll(?harness.runtime, 2); i = i + 1; }
+    val started: time.Time = time.now();
+    if (!serve.begin_shutdown(?harness.runtime, started)) { ret 4; }
+    # asking again, repeatedly, must not push the deadline out
+    var j: usize = 0;
+    for (j < 20) {
+        serve.begin_shutdown(?harness.runtime, time.now());
+        serve.poll(?harness.runtime, 2);
+        j = j + 1;
+    }
+    if (!pump(?harness, 4000)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 5;
+    }
+    tcp.stream_close(?client);
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.DEADLINE) { ret 6; }
+    ret 0;
+}
+
+test "lifecycle: stop without a deadline ends at once and says so" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 60000, true);
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var i: usize = 0;
+    for (i < 40) { serve.poll(?harness.runtime, 2); i = i + 1; }
+    if (harness.runtime.live == 0) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4;
+    }
+    # a minute of drain is configured, and `stop` must not wait for any of it
+    if (!serve.stop(?harness.runtime)) { tcp.stream_close(?client); ret 5; }
+    tcp.stream_close(?client);
+    if (!serve.finished(?harness.runtime)) { ret 6; }
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.IMMEDIATE) { ret 7; }
+    if (serve.shutdown_cancelled(?harness.runtime) != 1) { ret 8; }
+    # stopping twice is not an error and does not change the outcome
+    if (!serve.stop(?harness.runtime)) { ret 9; }
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.IMMEDIATE) { ret 10; }
+    ret 0;
+}
+
+test "lifecycle: a full connection pool refuses what it cannot hold, and recovers" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+    # each client is served and then holds its connection open on keep-alive,
+    # so the pool fills with connections that are idle rather than stuck
+    var clients: [POOL]tcp.Stream;
+    var opened: usize = 0;
+    for (opened < POOL) {
+        if (!wire.connect(harness.endpoint, ?clients[opened])) {
+            serve.stop(?harness.runtime);
+            ret 2;
+        }
+        wire.send(?clients[opened], REQUEST);
+        var served: [RESPONSE_BYTES]u8;
+        if (wire.collect(?harness.runtime, ?clients[opened], ?served[0],
+            RESPONSE_BYTES, "served") == 0) {
+            serve.stop(?harness.runtime);
+            ret 3;
+        }
+        opened = opened + 1;
+    }
+    if (harness.runtime.live != POOL) { serve.stop(?harness.runtime); ret 4; }
+
+    # one more than the pool holds. the listener has room and accepts it, so it
+    # is the connection pool that must refuse, and it must say so rather than
+    # starving the peer quietly.
+    val refused_before: u64 = harness.runtime.rejected;
+    var extra: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?extra)) { serve.stop(?harness.runtime); ret 5; }
+    wire.send(?extra, REQUEST);
+    var response: [RESPONSE_BYTES]u8;
+    val body: usize = wire.drain(?harness.runtime, ?extra, ?response[0], RESPONSE_BYTES);
+    val refused_after: u64 = harness.runtime.rejected;
+    tcp.stream_close(?extra);
+    if (body != 0) { serve.stop(?harness.runtime); ret 6; }
+    if (refused_after <= refused_before) { serve.stop(?harness.runtime); ret 7; }
+    if (harness.runtime.live != POOL) { serve.stop(?harness.runtime); ret 8; }
+
+    # the bound is a bound, not a leak: freeing a slot lets the next peer be
+    # served rather than refused for the rest of the process
+    tcp.stream_close(?clients[0]);
+    var i: usize = 0;
+    for (i < 200 && harness.runtime.live == POOL) {
+        serve.poll(?harness.runtime, 2);
+        i = i + 1;
+    }
+    var later: tcp.Stream;
+    var length: usize = 0;
+    if (wire.connect(harness.endpoint, ?later)) {
+        wire.send(?later, REQUEST);
+        var again: [RESPONSE_BYTES]u8;
+        length = wire.collect(?harness.runtime, ?later, ?again[0], RESPONSE_BYTES,
+            "served");
+        tcp.stream_close(?later);
+    }
+    i = 1;
+    for (i < POOL) { tcp.stream_close(?clients[i]); i = i + 1; }
+    serve.stop(?harness.runtime);
+    if (length == 0) { ret 9; }
+    ret 0;
+}
+
+test "lifecycle: acceptance stops the moment the sequence begins" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+    if (!serve.begin_shutdown(?harness.runtime, time.now())) { ret 2; }
+    # the sequence has begun; a client arriving now must never be served
+    var client: tcp.Stream;
+    val connected: bool = wire.connect(harness.endpoint, ?client);
+    if (connected) { wire.send(?client, REQUEST); }
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = 0;
+    if (connected) {
+        length = wire.drain(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES);
+        tcp.stream_close(?client);
+    }
+    pump(?harness, 200);
+    val accepted: u64 = harness.runtime.accepted;
+    if (length != 0) { ret 3; }
+    if (accepted != 0) { ret 4; }
+    if (!serve.finished(?harness.runtime)) { ret 5; }
+    ret 0;
+}
+
+# the frame type an HTTP/2 GOAWAY carries
+val FRAME_GOAWAY: u8 = 0x07;
+
+# scan framed HTTP/2 output for a frame of the given type
+fun has_frame(buffer: *u8, length: usize, kind: u8) bool {
+    var at: usize = 0;
+    for (at + 9 <= length) {
+        val payload: usize = (buffer[at]::usize << 16)
+            | (buffer[at + 1]::usize << 8) | buffer[at + 2]::usize;
+        if (buffer[at + 3] == kind) { ret true; }
+        if (at + 9 + payload < at + 9) { ret false; }
+        at = at + 9 + payload;
+    }
+    ret false;
+}
+
+fun count_frames(buffer: *u8, length: usize, kind: u8) usize {
+    var seen: usize = 0;
+    var at: usize = 0;
+    for (at + 9 <= length) {
+        val payload: usize = (buffer[at]::usize << 16)
+            | (buffer[at + 1]::usize << 8) | buffer[at + 2]::usize;
+        if (buffer[at + 3] == kind) { seen = seen + 1; }
+        at = at + 9 + payload;
+    }
+    ret seen;
+}
+
+test "lifecycle: draining an HTTP/2 connection sends GOAWAY and closes it" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
+        5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    var request: [256]u8;
+    var length: usize = wire.put_connection_start(?request[0]);
+    length = wire.put_request(?request[0], length, 1);
+    val written: Result[usize, io_error.Error] = tcp.stream_write(?client,
+        ?request[0], length);
+    if (is_err[usize, io_error.Error](written)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    if (wire.collect(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES,
+        "served") == 0) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4;
+    }
+
+    # the stream is finished but the connection is idle and still open, which is
+    # exactly the state a drain has to signal rather than simply drop
+    if (!serve.begin_shutdown(?harness.runtime, time.now())) { ret 5; }
+    var tail: [RESPONSE_BYTES]u8;
+    val remaining: usize = wire.drain(?harness.runtime, ?client, ?tail[0],
+        RESPONSE_BYTES);
+    val drained: bool = pump(?harness, 400);
+    tcp.stream_close(?client);
+    if (remaining == 0) { ret 6; }
+    # HTTP/2 says goodbye before it goes: the peer is told, not cut off
+    if (!has_frame(?tail[0], remaining, FRAME_GOAWAY)) { ret 7; }
+    # and a graceful close is two of them, the second naming the last stream
+    # this connection processed. without it `progress_close` never closes.
+    if (count_frames(?tail[0], remaining, FRAME_GOAWAY) != 2) {
+        ret (100 + count_frames(?tail[0], remaining, FRAME_GOAWAY))::i32;
+    }
+    if (!drained) { ret 8; }
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.DRAINED) { ret 9; }
+    ret 0;
+}
+
+test "lifecycle: a superseded generation drains while the new one serves" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+
+    # a client served under generation one, still open on keep-alive
+    var old_client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?old_client)) { serve.stop(?harness.runtime); ret 2; }
+    wire.send(?old_client, REQUEST);
+    var served: [RESPONSE_BYTES]u8;
+    if (wire.collect(?harness.runtime, ?old_client, ?served[0], RESPONSE_BYTES,
+        "served") == 0) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 3;
+    }
+    if (serve.superseded(?harness.runtime) != 0) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 4;
+    }
+
+    # publish a separately compiled generation over the same listener address
+    base_graph(?harness.replacement_graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!compile_replacement(?harness, 2)) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 5;
+    }
+    if (serve.reload(?harness.runtime, 2, ?harness.plan,
+        ?harness.replacement_graph, ?harness.diagnostics)) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 6;
+    }
+    if (!serve.reload(?harness.runtime, 2, ?harness.replacement_plan,
+        ?harness.replacement_graph,
+        ?harness.diagnostics)) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 7;
+    }
+    # the connection accepted under generation one is now superseded, and it was
+    # asked to finish rather than cut off
+    if (serve.superseded(?harness.runtime) != 1) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 8;
+    }
+
+    # the new generation serves normally while the old one drains
+    var new_client: tcp.Stream;
+    val endpoint: ip.Endpoint = reloaded_endpoint(?harness);
+    if (!wire.connect(endpoint, ?new_client)) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 9;
+    }
+    wire.send(?new_client, REQUEST);
+    var fresh: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?new_client, ?fresh[0],
+        RESPONSE_BYTES, "served");
+    if (length == 0) {
+        tcp.stream_close(?new_client); tcp.stream_close(?old_client);
+        serve.stop(?harness.runtime); ret 10;
+    }
+
+    # the superseded connection goes away on its own, independently of the one
+    # still being served
+    tcp.stream_close(?old_client);
+    var i: usize = 0;
+    for (i < 200 && serve.superseded(?harness.runtime) != 0) {
+        serve.poll(?harness.runtime, 2);
+        i = i + 1;
+    }
+    val remaining: usize = serve.superseded(?harness.runtime);
+    val live: usize = harness.runtime.live;
+    tcp.stream_close(?new_client);
+    serve.stop(?harness.runtime);
+    if (remaining != 0) { ret 11; }
+    # and the new generation's connection was untouched by any of it
+    if (live != 1) { ret (100 + live)::i32; }
+    ret 0;
+}
+
+# name the budget on the route rather than the listener, so the charge is taken
+# per request at dispatch instead of per connection at admission
+fun route_budgeted(graph: *schema.Graph, concurrency: usize, queue: usize,
+    timeout_ms: u64) {
+    graph.budget_count = 1;
+    val entry: *schema.Budget = ?graph.budgets[0];
+    schema.set_text(?entry.name, "route");
+    entry.concurrency = concurrency;
+    entry.queue = queue;
+    entry.timeout_ms = timeout_ms;
+    entry.memory_bytes = 0;
+    schema.set_text(?graph.routes[0].budget, "route");
+}
+
+fun route_budgeted_memory(graph: *schema.Graph, concurrency: usize,
+    memory_bytes: usize) {
+    route_budgeted(graph, concurrency, 0, 0);
+    graph.budgets[0].memory_bytes = memory_bytes;
+}
+
+# a listener budget that admits one connection at a time and lets one wait
+fun budgeted(graph: *schema.Graph, concurrency: usize, queue: usize,
+    timeout_ms: u64) {
+    graph.budget_count = 1;
+    val entry: *schema.Budget = ?graph.budgets[0];
+    schema.set_text(?entry.name, "public");
+    entry.concurrency = concurrency;
+    entry.queue = queue;
+    entry.timeout_ms = timeout_ms;
+    entry.memory_bytes = 0;
+    schema.set_text(?graph.listeners[0].budget, "public");
+}
+
+test "lifecycle: a listener budget queues past its concurrency and serves in turn" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    budgeted(?harness.graph, 1, 1, 5000);
+    if (!start(?harness, 1)) { ret 1; }
+
+    var first: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?first)) { serve.stop(?harness.runtime); ret 2; }
+    wire.send(?first, REQUEST);
+    var served: [RESPONSE_BYTES]u8;
+    if (wire.collect(?harness.runtime, ?first, ?served[0], RESPONSE_BYTES,
+        "served") == 0) {
+        tcp.stream_close(?first); serve.stop(?harness.runtime); ret 3;
+    }
+
+    # the budget admits one at a time, so the second is accepted and held
+    var second: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?second)) {
+        tcp.stream_close(?first); serve.stop(?harness.runtime); ret 4;
+    }
+    wire.send(?second, REQUEST);
+    var waiting: [RESPONSE_BYTES]u8;
+    val early: usize = wire.drain(?harness.runtime, ?second, ?waiting[0],
+        RESPONSE_BYTES);
+    if (early != 0) {
+        tcp.stream_close(?second); tcp.stream_close(?first);
+        serve.stop(?harness.runtime); ret 5;
+    }
+    if (harness.runtime.queued == 0) {
+        tcp.stream_close(?second); tcp.stream_close(?first);
+        serve.stop(?harness.runtime); ret 6;
+    }
+
+    # the first connection goes away, so the waiter takes its turn and is served
+    tcp.stream_close(?first);
+    var late: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?second, ?late[0],
+        RESPONSE_BYTES, "served");
+    tcp.stream_close(?second);
+    serve.stop(?harness.runtime);
+    if (length == 0) { ret 7; }
+    ret 0;
+}
+
+test "lifecycle: a connection that waits past its budget timeout is closed" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    # a short wait, and a queue one deep
+    budgeted(?harness.graph, 1, 1, 150);
+    if (!start(?harness, 1)) { ret 1; }
+
+    var holder: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?holder)) { serve.stop(?harness.runtime); ret 2; }
+    wire.send(?holder, REQUEST);
+    var served: [RESPONSE_BYTES]u8;
+    if (wire.collect(?harness.runtime, ?holder, ?served[0], RESPONSE_BYTES,
+        "served") == 0) {
+        tcp.stream_close(?holder); serve.stop(?harness.runtime); ret 3;
+    }
+
+    # this one waits, and the holder never leaves
+    var waiter: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?waiter)) {
+        tcp.stream_close(?holder); serve.stop(?harness.runtime); ret 4;
+    }
+    wire.send(?waiter, REQUEST);
+    var response: [RESPONSE_BYTES]u8;
+    val body: usize = wire.drain(?harness.runtime, ?waiter, ?response[0],
+        RESPONSE_BYTES);
+    var i: usize = 0;
+    for (i < 400 && harness.runtime.expired == 0) {
+        serve.poll(?harness.runtime, 2);
+        i = i + 1;
+    }
+    val expired: u64 = harness.runtime.expired;
+    tcp.stream_close(?waiter);
+    tcp.stream_close(?holder);
+    serve.stop(?harness.runtime);
+    if (body != 0) { ret 5; }
+    # the wait ended rather than continuing for the life of the process
+    if (expired == 0) { ret 6; }
+    ret 0;
+}
+
+test "budget: a route budget refuses a real request once it is exhausted" {
+    var harness: Harness;
+    # the handler never completes, so the first request holds the budget
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, true);
+    route_budgeted(?harness.graph, 1, 0, 0);
+    if (!start(?harness, 1)) { ret 1; }
+
+    var first: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?first)) { serve.stop(?harness.runtime); ret 2; }
+    wire.send(?first, REQUEST);
+    var i: usize = 0;
+    for (i < 60) { serve.poll(?harness.runtime, 2); i = i + 1; }
+
+    # a second request, on its own connection, finds the budget full. it must be
+    # refused with a real response rather than served or silently dropped.
+    var second: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?second)) {
+        tcp.stream_close(?first); serve.stop(?harness.runtime); ret 3;
+    }
+    wire.send(?second, REQUEST);
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?second, ?response[0],
+        RESPONSE_BYTES, "\r\n\r\n");
+    tcp.stream_close(?second);
+    tcp.stream_close(?first);
+    serve.stop(?harness.runtime);
+    if (length == 0) { ret 4; }
+    # the denial is reachable from a request path and says so on the wire
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 503 Service Unavailable")) {
+        ret 5;
+    }
+    ret 0;
+}
+
+test "budget: a request may wait for a route budget and is refused when it cannot" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, true);
+    # room for one, one may wait, and the wait is short
+    route_budgeted(?harness.graph, 1, 1, 150);
+    if (!start(?harness, 1)) { ret 1; }
+
+    var first: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?first)) { serve.stop(?harness.runtime); ret 2; }
+    wire.send(?first, REQUEST);
+    var i: usize = 0;
+    for (i < 60) { serve.poll(?harness.runtime, 2); i = i + 1; }
+
+    var second: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?second)) {
+        tcp.stream_close(?first); serve.stop(?harness.runtime); ret 3;
+    }
+    wire.send(?second, REQUEST);
+    # the holder never finishes, so the waiter runs out of time and is refused
+    # rather than waiting for the life of the process
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?second, ?response[0],
+        RESPONSE_BYTES, "\r\n\r\n");
+    tcp.stream_close(?second);
+    tcp.stream_close(?first);
+    serve.stop(?harness.runtime);
+    if (length == 0) { ret 4; }
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 503 Service Unavailable")) {
+        ret 5;
+    }
+    ret 0;
+}
+
+test "budget: a completed HTTP/1 request returns its route charge" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    route_budgeted_memory(?harness.graph, 1, connection.ARENA_BYTES);
+    if (!start(?harness, 1)) { ret 1; }
+
+    var first: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?first)) { serve.stop(?harness.runtime); ret 2; }
+    wire.send(?first, REQUEST);
+    var first_response: [RESPONSE_BYTES]u8;
+    if (wire.collect(?harness.runtime, ?first, ?first_response[0],
+        RESPONSE_BYTES, "served") == 0) {
+        tcp.stream_close(?first); serve.stop(?harness.runtime); ret 3;
+    }
+    var i: usize = 0;
+    for (i < 20) { serve.poll(?harness.runtime, 2); i = i + 1; }
+
+    var second: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?second)) {
+        tcp.stream_close(?first); serve.stop(?harness.runtime); ret 4;
+    }
+    wire.send(?second, REQUEST);
+    var second_response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?second,
+        ?second_response[0], RESPONSE_BYTES, "served");
+    tcp.stream_close(?second);
+    tcp.stream_close(?first);
+    serve.stop(?harness.runtime);
+    if (length == 0 || !wire.starts_with(?second_response[0], length,
+        "HTTP/1.1 200")) { ret 5; }
+    ret 0;
+}
+
+test "budget: request memory is charged before the handler runs" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    route_budgeted_memory(?harness.graph, 1, connection.ARENA_BYTES - 1);
+    if (!start(?harness, 1)) { ret 1; }
+
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?harness.runtime); ret 2; }
+    wire.send(?client, REQUEST);
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, "\r\n\r\n");
+    tcp.stream_close(?client);
+    serve.stop(?harness.runtime);
+    if (length == 0 || !wire.starts_with(?response[0], length,
+        "HTTP/1.1 503 Service Unavailable")) { ret 3; }
+    ret 0;
+}
+
+test "budget: a reload gives each generation an independent listener budget" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, true);
+    budgeted(?harness.graph, 1, 0, 0);
+    if (!start(?harness, 1)) { ret 1; }
+
+    var old_client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?old_client)) {
+        serve.stop(?harness.runtime); ret 2;
+    }
+    wire.send(?old_client, REQUEST);
+    var i: usize = 0;
+    for (i < 40) { serve.poll(?harness.runtime, 2); i = i + 1; }
+    if (harness.runtime.live != 1
+     || !connection.snapshot(harness.runtime.slots[0].handle).service_pending) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 3;
+    }
+    base_graph(?harness.replacement_graph, schema.PROTOCOL_HTTP1, 5000, true);
+    budgeted(?harness.replacement_graph, 1, 0, 0);
+    if (!compile_replacement(?harness, 2)
+     || !serve.reload(?harness.runtime, 2, ?harness.replacement_plan,
+        ?harness.replacement_graph, ?harness.diagnostics)) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 4;
+    }
+    var new_client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?new_client)) {
+        tcp.stream_close(?old_client); serve.stop(?harness.runtime); ret 5;
+    }
+    wire.send(?new_client, REQUEST);
+    i = 0;
+    for (i < 40) { serve.poll(?harness.runtime, 2); i = i + 1; }
+    val live: usize = harness.runtime.live;
+    val old_live: usize = serve.superseded(?harness.runtime);
+    tcp.stream_close(?new_client);
+    tcp.stream_close(?old_client);
+    serve.stop(?harness.runtime);
+    if (live != 2 || old_live != 1) { ret 6; }
+    ret 0;
+}

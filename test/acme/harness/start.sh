@@ -2,9 +2,9 @@
 # start the live acme stack: pebble, its challenge test server, and the plain
 # http front end. every process is local and bound to loopback.
 #
-# challtestsrv's own http-01 responder is disabled. answering http-01 is what
-# this suite is proving hedge does, so port 5002 belongs to hedge's listener
-# and nothing else may hold it.
+# challtestsrv's http-01 and tls-alpn-01 responders are disabled. answering
+# those challenges is what this suite is proving hedge does, so ports 5001 and
+# 5002 belong to hedge listeners and nothing else may hold them.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
@@ -17,10 +17,8 @@ mkdir -p "$run"
 
 "$0.stop" 2>/dev/null || true
 
-# -http01 "" is load bearing, not tidying: answering http-01 is the thing this
-# suite proves hedge does, so port 5002 must belong to hedge's listener and
-# nothing else may hold it. restoring this responder would make the suite pass
-# whether or not hedge served a byte.
+# -http01 "" and -tlsalpn01 "" are load bearing, not tidying: restoring either
+# responder would make its suite pass whether or not hedge served a byte.
 #
 # -defaultIPv6 "" is load bearing too: challtestsrv answers AAAA with ::1 by
 # default, and the authority follows it to a listener that is not there. the
@@ -29,7 +27,7 @@ mkdir -p "$run"
 # challtestsrv still answers dns for the names under test, and still exposes
 # its management api so a dns-01 provider can publish a record.
 "$bin/pebble-challtestsrv" \
-    -http01 "" -tlsalpn01 ":5001" -https01 "" \
+    -http01 "" -tlsalpn01 "" -https01 "" \
     -defaultIPv6 "" \
     -dnsserver ":8053" -doh "" -management ":8055" \
     >"$run/challtestsrv.log" 2>&1 &
