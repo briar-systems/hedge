@@ -203,6 +203,7 @@ directory = "https://acme-v02.api.letsencrypt.org/directory"
 contact = "mailto:ops@example.com"
 terms_agreed = true
 storage = "/var/lib/hedge/acme"
+listener = "public"
 names = ["example.com", "www.example.com"]
 challenge = "http-01"
 
@@ -222,6 +223,12 @@ names, which is what the durable record holds. `storage` is a directory the
 process owns: it is created with owner-only permissions and every file in it,
 including both private keys, is written owner-only and replaced atomically.
 
+`listener` names the TCP listener with the TLS policy that owns the live
+credential generation. Hedge copies a verified ACME chain and PKCS#8 key into
+that listener before it begins serving, then rotates later renewals in the
+same listener-owned two-bank store. Existing connections keep their leased
+generation while new handshakes use the replacement.
+
 `renew_before` is the lead, in seconds, before expiry at which a certificate is
 renewed. It defaults to thirty days, which suits the ninety-day certificates
 public authorities issue, and is bounded at one year.
@@ -239,13 +246,11 @@ integrations, so an embedder supplies a publisher through
 `acme.open_with_publisher` and gets everything else unchanged. A TOML-only
 deployment that selects it fails to load.
 
-`tls-alpn-01` presentation is implemented, including the RFC 8737 certificate
-and its critical `acmeIdentifier` extension. TLS termination exists and is
-qualified against external clients, so that is not the obstacle. What is
-missing is a way to install the challenge certificate into a running listener:
-a listener publishes one immutable credential generation at startup and there
-is no supported way to replace it. Selecting `tls-alpn-01` fails to load until
-that exists. See issue #37.
+`tls-alpn-01` is refused in this build. RFC 8737 needs an ALPN-specific
+credential choice and a challenge certificate with a critical
+`acmeIdentifier` extension. The current TLS credential interface selects by
+server name only and rejects that extension while loading a server chain, so
+presenting it on an ordinary live listener cannot be made safe. See issue #37.
 
 **Hedge cannot obtain a certificate from a public authority yet.** RFC 8555
 URLs are `https`, and nothing in this build can originate a TLS connection —

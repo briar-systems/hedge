@@ -16,6 +16,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.view;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -35,6 +36,8 @@ use tls_server: tls.server;
 use session: tls.session;
 use tls13: tls.tls13;
 use schema: hedge.config.schema;
+use acme: hedge.acme.manager;
+use acme_keys: hedge.acme.keys;
 use hedge_credentials: hedge.protocol.credentials;
 
 pub val MAX_IDENTITIES: usize = schema.MAX_TLS_IDENTITIES;
@@ -189,6 +192,15 @@ fun copy_name(output: *u8, length: *usize, value: str) bool {
     for (i < n) { output[i] = value[i]; i = i + 1; }
     output[n] = 0;
     @length = n;
+    ret true;
+}
+
+fun copy_view_name(output: *u8, length: *usize, value: view.View) bool {
+    if (value.data == nil || value.len >= schema.TEXT_CAP) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) { output[i] = value.data[i]; i = i + 1; }
+    output[value.len] = 0;
+    @length = value.len;
     ret true;
 }
 
@@ -547,6 +559,101 @@ pub fun replace(index: usize, configured: *schema.TlsPolicy) Status {
     if (credentials.initialize(?policy.generations[target],
         ?policy.published[target][0], policy.identity_counts[target],
         default_index(policy, target, configured), trust,
+        policy.require_client_auth) != contracts.OK) {
+        destroy_bank(policy, target);
+        ret UNSUPPORTED;
+    }
+    var retired: *credentials.Generation = nil;
+    if (hedge_credentials.rotate(?policy.bindings, ?policy.generations[target],
+        ?retired) != hedge_credentials.OK || retired == nil) {
+        destroy_bank(policy, target);
+        ret UNSUPPORTED;
+    }
+    policy.generation_live[target] = true;
+    policy.active = target;
+    ret OK;
+}
+
+# imports ACME source bytes into the listener-owned idle bank.
+pub fun install_acme(index: usize, manager: *acme.Manager) Status {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || !acme.certificate_ready(manager)) { ret INVALID; }
+    val names: usize = acme.name_count(manager);
+    val chain_len: usize = acme.chain_count(manager);
+    if (names == 0 || names > MAX_IDENTITIES || chain_len == 0
+     || chain_len > MAX_CHAIN) { ret INVALID; }
+    val target: usize = 1 - policy.active;
+    if (policy.generation_live[target]) {
+        if (!hedge_credentials.reclaimable(?policy.generations[target])) {
+            ret RETIRED_IN_USE;
+        }
+        if (!destroy_bank(policy, target)) { ret INVALID; }
+    }
+    policy.identity_counts[target] = 0;
+    identity_owner = secret.system_allocator();
+    var name_index: usize = 0;
+    for (name_index < names) {
+        val slot: usize = policy.identity_counts[target];
+        val identity: *Identity = ?policy.identities[target][slot];
+        identity.live = false;
+        if (!copy_view_name(?identity.name[0], ?identity.name_len,
+            acme.name(manager, name_index))) {
+            destroy_bank(policy, target);
+            ret INVALID;
+        }
+        var chain_bytes: usize = 0;
+        var certificate_index: usize = 0;
+        for (certificate_index < chain_len) {
+            var encoded: view.View;
+            if (!acme.chain_entry(manager, certificate_index, ?encoded)
+             || encoded.data == nil || encoded.len == 0) {
+                destroy_bank(policy, target);
+                ret UNDECODABLE;
+            }
+            if (encoded.len > MAX_PEM_BYTES - chain_bytes) {
+                destroy_bank(policy, target);
+                ret EXHAUSTED;
+            }
+            var byte_index: usize = 0;
+            for (byte_index < encoded.len) {
+                identity.der[chain_bytes + byte_index] = encoded.data[byte_index];
+                byte_index = byte_index + 1;
+            }
+            if (load.certificate_der(contracts.Bytes{
+                data: ?identity.der[chain_bytes], len: encoded.len},
+                ?identity.certificates[certificate_index]) != contracts.OK) {
+                destroy_bank(policy, target);
+                ret UNDECODABLE;
+            }
+            chain_bytes = chain_bytes + encoded.len;
+            certificate_index = certificate_index + 1;
+        }
+        identity.private_key = keys.empty_private();
+        val private_der: contracts.SecretBytes = acme_keys.private_der(
+            acme.certificate_key(manager), ?key_scratch[0]);
+        val parsed: contracts.Error = load.private_der(private_der,
+            cert.PKCS8_DER, ?identity_owner, ?identity.private_key);
+        ct.zeroize(?key_scratch[0], MAX_KEY_BYTES);
+        if (parsed != contracts.OK) {
+            destroy_bank(policy, target);
+            ret UNDECODABLE;
+        }
+        var served: credentials.Identity;
+        served.server_name = contracts.Bytes{data: ?identity.name[0],
+            len: identity.name_len};
+        served.chain = cert.Chain{certificates: ?identity.certificates[0],
+            len: chain_len};
+        served.private_key = ?identity.private_key;
+        policy.published[target][slot] = served;
+        identity.live = true;
+        policy.identity_counts[target] = slot + 1;
+        name_index = name_index + 1;
+    }
+    var trust: *cert.TrustStore = nil;
+    if (policy.require_client_auth) { trust = ?policy.client_trust; }
+    policy.generations[target] = credentials.empty_generation();
+    if (credentials.initialize(?policy.generations[target],
+        ?policy.published[target][0], policy.identity_counts[target], 0, trust,
         policy.require_client_auth) != contracts.OK) {
         destroy_bank(policy, target);
         ret UNSUPPORTED;
