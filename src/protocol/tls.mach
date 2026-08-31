@@ -22,6 +22,7 @@ use std.types.result.unwrap_ok;
 use std.filesystem;
 use std.types.option;
 use std.crypto.ct;
+use std.chrono.time;
 use file: std.io.file;
 use io_error: std.io.error;
 use contracts: crypto.contracts;
@@ -122,6 +123,14 @@ pub rec Policy {
     groups: [2]tls13.NamedGroup;
     signatures: [4]tls13.SignatureScheme;
     entropy: secret.Entropy;
+    ticket_ring: session.KeyRing;
+    replay_window: session.ReplayWindow;
+    ticket_key_lifetime_seconds: u32;
+    ticket_rotate_at: i64;
+    ticket_replay_policy: session.ReplayPolicy;
+    tickets_per_connection: u8;
+    tickets_live: bool;
+    replay_live: bool;
     configuration: tls_config.ServerConfig;
     live: bool;
 }
@@ -144,6 +153,7 @@ var scratch: [MAX_PEM_BYTES]u8;
 var key_scratch: [MAX_KEY_BYTES]^u8;
 
 pub fun reset() {
+    destroy();
     var i: usize = 0;
     for (i < MAX_POLICIES) {
         policies[i].live = false;
@@ -153,6 +163,9 @@ pub fun reset() {
         policies[i].generation_live[1] = false;
         policies[i].active = 0;
         policies[i].name_len = 0;
+        policies[i].tickets_live = false;
+        policies[i].replay_live = false;
+        policies[i].ticket_rotate_at = 0;
         i = i + 1;
     }
     policy_count = 0;
@@ -164,6 +177,17 @@ pub fun count() usize { ret policy_count; }
 pub fun policy_at(index: usize) *Policy {
     if (index >= policy_count || !policies[index].live) { ret nil; }
     ret ?policies[index];
+}
+
+pub fun prepare(index: usize, now: i64) bool {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil) { ret false; }
+    if (!policy.tickets_live || now <= policy.ticket_rotate_at) { ret true; }
+    if (!session.keyring_rotate(?policy.ticket_ring, ?policy.entropy, now)) {
+        ret false;
+    }
+    policy.ticket_rotate_at = now + policy.ticket_key_lifetime_seconds::i64;
+    ret true;
 }
 
 pub fun find(name: str) usize {
@@ -344,7 +368,6 @@ fun build_configuration(policy: *Policy) Status {
     policy.signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
     policy.signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
     policy.signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
-    policy.entropy = secret.system_entropy();
     var configuration: tls_config.ServerConfig;
     configuration.credentials = ?policy.bindings.store;
     configuration.alpn = ?policy.alpn[0];
@@ -360,10 +383,21 @@ fun build_configuration(policy: *Policy) Status {
     configuration.signature_len = 4;
     configuration.entropy = ?policy.entropy;
     configuration.entropy_context_size = 0;
-    configuration.tickets = nil;
-    configuration.replay = nil;
-    configuration.replay_policy = session.REPLAY_PERMISSIVE;
-    configuration.tickets_per_connection = 0;
+    if (policy.tickets_live) {
+        configuration.tickets = ?policy.ticket_ring;
+        configuration.tickets_per_connection = policy.tickets_per_connection;
+        configuration.replay_policy = policy.ticket_replay_policy;
+        if (policy.replay_live) {
+            configuration.replay = ?policy.replay_window;
+        } or {
+            configuration.replay = nil;
+        }
+    } or {
+        configuration.tickets = nil;
+        configuration.replay = nil;
+        configuration.replay_policy = session.REPLAY_PERMISSIVE;
+        configuration.tickets_per_connection = 0;
+    }
     configuration.limits = listener_limits();
     policy.configuration = configuration;
 
@@ -379,6 +413,50 @@ fun build_configuration(policy: *Policy) Status {
     # than they hold must fail here rather than at the first handshake
     if (hello_required > HANDSHAKE_OUTPUT_BYTES
      || flight_required > HANDSHAKE_OUTPUT_BYTES) { ret UNSUPPORTED; }
+    ret OK;
+}
+
+fun destroy_resumption(policy: *Policy) {
+    if (policy.replay_live) {
+        session.replay_destroy(?policy.replay_window);
+        policy.replay_live = false;
+    }
+    if (policy.tickets_live) {
+        session.keyring_destroy(?policy.ticket_ring);
+        policy.tickets_live = false;
+    }
+    policy.ticket_rotate_at = 0;
+}
+
+fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption,
+    now: i64) Status {
+    policy.tickets_live = false;
+    policy.replay_live = false;
+    policy.ticket_rotate_at = 0;
+    policy.ticket_replay_policy = session.REPLAY_PERMISSIVE;
+    policy.tickets_per_connection = 0;
+    if (configured == nil || !configured.enabled) { ret OK; }
+    if (!session.keyring_init(?policy.ticket_ring, ?policy.entropy, now,
+        configured.key_lifetime_seconds,
+        configured.retirement_overlap_seconds,
+        configured.ticket_lifetime_seconds)) { ret UNSUPPORTED; }
+    policy.tickets_live = true;
+    policy.ticket_key_lifetime_seconds = configured.key_lifetime_seconds;
+    policy.ticket_rotate_at = now + configured.key_lifetime_seconds::i64;
+    policy.tickets_per_connection = configured.tickets_per_connection;
+    if (configured.replay_policy == schema.TLS_REPLAY_SINGLE_USE) {
+        if (!session.replay_init(?policy.replay_window)) {
+            destroy_resumption(policy);
+            ret UNSUPPORTED;
+        }
+        policy.replay_live = true;
+        policy.ticket_replay_policy = session.REPLAY_SINGLE_USE;
+    } or (configured.replay_policy == schema.TLS_REPLAY_PERMISSIVE) {
+        policy.ticket_replay_policy = session.REPLAY_PERMISSIVE;
+    } or {
+        destroy_resumption(policy);
+        ret INVALID;
+    }
     ret OK;
 }
 
@@ -421,22 +499,37 @@ pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status 
     policy.active = 0;
     policy.alpn_len = 0;
     policy.require_client_auth = configured.client_auth;
+    policy.tickets_live = false;
+    policy.replay_live = false;
+    policy.ticket_rotate_at = 0;
     policy.client_trust.anchors = nil;
     policy.client_trust.len = 0;
     if (!copy_name(?policy.name[0], ?policy.name_len, name)) { ret INVALID; }
     if (configured.identity_count == 0) { ret INVALID; }
+    policy.entropy = secret.system_entropy();
+    val resumable: Status = configure_resumption(policy,
+        ?configured.resumption, time.time_unix_sec(time.now()));
+    if (resumable != OK) { ret resumable; }
     var i: usize = 0;
     for (i < configured.identity_count) {
         val loaded: Status = load_identity(policy, 0, ?configured.identities[i],
             ?identity_owner);
-        if (loaded != OK) { ret loaded; }
+        if (loaded != OK) {
+            destroy_resumption(policy);
+            destroy_bank(policy, 0);
+            ret loaded;
+        }
         i = i + 1;
     }
     var trust: *cert.TrustStore = nil;
     if (configured.client_auth) {
         val anchored: Status = load_anchor(policy,
             schema.text(?configured.client_trust));
-        if (anchored != OK) { ret anchored; }
+        if (anchored != OK) {
+            destroy_resumption(policy);
+            destroy_bank(policy, 0);
+            ret anchored;
+        }
         trust = ?policy.client_trust;
     }
     offer_protocols(policy, protocols);
@@ -447,10 +540,18 @@ pub fun publish(name: str, configured: *schema.TlsPolicy, protocols: u8) Status 
     if (hedge_credentials.publish(?policy.bindings, ?policy.generations[0],
         ?policy.published[0][0], policy.identity_counts[0],
         default_index(policy, 0, configured), trust,
-        configured.client_auth) != hedge_credentials.OK) { ret UNSUPPORTED; }
+        configured.client_auth) != hedge_credentials.OK) {
+        destroy_resumption(policy);
+        destroy_bank(policy, 0);
+        ret UNSUPPORTED;
+    }
     policy.generation_live[0] = true;
     val built: Status = build_configuration(policy);
-    if (built != OK) { ret built; }
+    if (built != OK) {
+        destroy_resumption(policy);
+        destroy_bank(policy, 0);
+        ret built;
+    }
     policy.live = true;
     policy_count = policy_count + 1;
     ret OK;
@@ -567,6 +668,7 @@ pub fun destroy() bool {
     var i: usize = 0;
     for (i < policy_count) {
         val policy: *Policy = ?policies[i];
+        destroy_resumption(policy);
         if (!destroy_bank(policy, 0)) { success = false; }
         if (!destroy_bank(policy, 1)) { success = false; }
         policy.live = false;
@@ -600,12 +702,15 @@ test "tls: a policy offers the listener's protocols in the listener's order" {
 
 test "tls: the handshake storage a listener configuration needs is bounded" {
     var policy: Policy;
+    policy.entropy = secret.system_entropy();
     policy.alpn_len = 0;
     # the widest offer this listener can make, which is what sizes the flight
     offer_protocols(?policy, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2);
     policy.require_alpn = true;
     policy.bindings.store = credentials.empty_store();
     policy.bindings.live = false;
+    policy.tickets_live = false;
+    policy.replay_live = false;
     # the same call the listener makes, so an oversized configuration is caught
     # here rather than at the first handshake
     if (build_configuration(?policy) != OK) { ret 1; }
@@ -634,6 +739,7 @@ test "tls: a policy naming a certificate that cannot be read is refused" {
     schema.clear_text(?configured.default_name);
     configured.client_auth = false;
     schema.clear_text(?configured.client_trust);
+    configured.resumption.enabled = false;
     # nothing is published, so a listener referencing this policy cannot start
     if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != UNREADABLE) {
         ret 1;
@@ -708,6 +814,7 @@ fun configure(configured: *schema.TlsPolicy, name: str, cert_path: str,
     schema.clear_text(?configured.default_name);
     configured.client_auth = false;
     schema.clear_text(?configured.client_trust);
+    configured.resumption.enabled = false;
 }
 
 fun api_policy(configured: *schema.TlsPolicy, dir: str) {
@@ -718,6 +825,45 @@ fun api_policy(configured: *schema.TlsPolicy, dir: str) {
 fun alt_policy(configured: *schema.TlsPolicy, dir: str) {
     configure(configured, "alt.hedge.test", joined(dir, "alt.pem", 0),
         joined(dir, "alt.key", 1));
+}
+
+test "tls: configured session keys rotate and retain their exact overlap" {
+    reset();
+    if (!material_written("out/tls-resumption")) { destroy(); ret 1; }
+    var configured: schema.TlsPolicy;
+    api_policy(?configured, "out/tls-resumption");
+    configured.resumption.enabled = true;
+    configured.resumption.key_lifetime_seconds = 60;
+    configured.resumption.retirement_overlap_seconds = 30;
+    configured.resumption.ticket_lifetime_seconds = 120;
+    configured.resumption.replay_policy = schema.TLS_REPLAY_SINGLE_USE;
+    configured.resumption.tickets_per_connection = 2;
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != OK) {
+        destroy(); ret 2;
+    }
+    val index: usize = find("secure");
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || !policy.tickets_live || !policy.replay_live
+     || policy.configuration.tickets != ?policy.ticket_ring
+     || policy.configuration.replay != ?policy.replay_window
+     || policy.configuration.replay_policy != session.REPLAY_SINGLE_USE
+     || policy.configuration.tickets_per_connection != 2) {
+        destroy(); ret 3;
+    }
+    val first: u64 = session.keyring_generation(?policy.ticket_ring);
+    val boundary: i64 = policy.ticket_rotate_at;
+    if (first == 0 || !prepare(index, boundary)
+     || session.keyring_generation(?policy.ticket_ring) != first) {
+        destroy(); ret 4;
+    }
+    if (!prepare(index, boundary + 1)
+     || session.keyring_generation(?policy.ticket_ring) != first + 1
+     || session.keyring_openable(?policy.ticket_ring, boundary + 1) != 2
+     || policy.ticket_rotate_at != boundary + 61) {
+        destroy(); ret 5;
+    }
+    if (!destroy()) { ret 6; }
+    ret 0;
 }
 
 # the certificate bytes a held lease resolves to, which names its generation
