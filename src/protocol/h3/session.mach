@@ -29,6 +29,7 @@ use hedge.dispatch;
 use call: hedge.dispatch.call;
 use plan: hedge.dispatch.plan;
 use budget: hedge.budget;
+use hedge.service;
 use telemetry_trace: hedge.telemetry.trace;
 
 pub val NO_SESSION: usize = (-1)::usize;
@@ -137,8 +138,6 @@ rec RequestSlot {
     service_pending: bool;
     exchange_live: bool;
     exchange_finished: bool;
-    record_head_done: bool;
-    record_end_done: bool;
     call_released: bool;
     call_release_ok: bool;
     stream_released: bool;
@@ -227,8 +226,6 @@ fun reset_request(slot: *RequestSlot) {
     slot.service_pending = false;
     slot.exchange_live = false;
     slot.exchange_finished = false;
-    slot.record_head_done = false;
-    slot.record_end_done = false;
     slot.call_released = false;
     slot.call_release_ok = true;
     slot.stream_released = false;
@@ -887,10 +884,6 @@ fun begin_response(session: *Session, slot: *RequestSlot) Step {
     if (offered.status == h3.OFFER_BLOCKED) { ret STEP_BLOCKED; }
     if (offered.status == h3.OFFER_ERROR) { ret STEP_ERROR; }
     slot.headers_sent = true;
-    if (!slot.record_head_done) {
-        call.record_head(?slot.active_call);
-        slot.record_head_done = true;
-    }
     slot.phase = REQUEST_RESPONDING;
     if (final) { slot.response_complete = true; }
     ret STEP_PROGRESS;
@@ -969,12 +962,13 @@ fun advance_response(session: *Session, slot: *RequestSlot) Step {
 fun fail_exchange(session: *Session, slot: *RequestSlot,
     code: status.Status) Step {
     if (slot.response.committed
+     || !call.reset_response_for_failure(?slot.active_call)
      || message.set_status(?slot.response, code) != message.RESPONSE_OK) {
         ret STEP_ERROR;
     }
     if (call.disposition(?slot.active_call) == call.BODY_UNRESOLVED
      && !call.resolve_body(?slot.active_call, call.BODY_CLOSE)) { ret STEP_ERROR; }
-    if (exchange.commit(?slot.exchange, session.limits) != message.RESPONSE_OK) {
+    if (service.commit(?slot.active_call) != message.RESPONSE_OK) {
         ret STEP_ERROR;
     }
     ret begin_response(session, slot);
@@ -1096,11 +1090,6 @@ fun finish_exchange(slot: *RequestSlot) Step {
 
 fun release_common_ownership(slot: *RequestSlot) bool {
     if (!slot.exchange_live) { ret true; }
-    if (!slot.record_end_done && slot.active_call.bound) {
-        call.record_end(?slot.active_call,
-            slot.exchange.state == exchange.COMPLETE_STATE);
-        slot.record_end_done = true;
-    }
     if (!slot.call_released) {
         slot.call_released = true;
         if (slot.active_call.bound) {
@@ -1732,7 +1721,7 @@ test "hedge.protocol.h3.session: response body completion remains consumer-owned
 }
 
 fun test_exchange_slot(slot: *RequestSlot, scope: *cancel.Scope,
-    response_body: *body.Reader) bool {
+    response_body: *body.Reader, commit_response: bool) bool {
     val limits: message.Limits = message.limits_default();
     slot.body.reader = body.empty_reader(1);
     slot.request_fields = field.init(nil, 0, limits.request_fields);
@@ -1758,8 +1747,11 @@ fun test_exchange_slot(slot: *RequestSlot, scope: *cancel.Scope,
         != message.RESPONSE_OK) { ret false; }
     if (!exchange.init(?slot.exchange, ?slot.request, ?slot.response,
         ?slot.informationals[0], INFORMATIONAL_SLOTS, scope, 1, limits)
-     || !exchange.begin(?slot.exchange)
-     || exchange.commit(?slot.exchange, limits) != message.RESPONSE_OK) {
+     || !exchange.begin(?slot.exchange)) {
+        ret false;
+    }
+    if (commit_response
+     && exchange.commit(?slot.exchange, limits) != message.RESPONSE_OK) {
         ret false;
     }
     slot.exchange_live = true;
@@ -1781,7 +1773,7 @@ test "hedge.protocol.h3.session: cancellation starts once and retries pending bo
         body.limits(16, 8, 8), nil, ?scope);
     var slot: RequestSlot;
     reset_request(?slot);
-    if (!test_exchange_slot(?slot, ?scope, ?reader)) { ret 2; }
+    if (!test_exchange_slot(?slot, ?scope, ?reader, true)) { ret 2; }
     slot.service_pending = true;
     if (progress_cancellation(?slot, false) != STEP_BLOCKED
      || !slot.cancellation_started || slot.service_pending
@@ -1802,7 +1794,7 @@ test "hedge.protocol.h3.session: expired deadlines settle as timeouts" {
     }
     var slot: RequestSlot;
     reset_request(?slot);
-    if (!test_exchange_slot(?slot, ?scope, nil)) { ret 2; }
+    if (!test_exchange_slot(?slot, ?scope, nil, true)) { ret 2; }
     cancel.expire(?scope, time.Time{sec: 2, nsec: 0});
     if (cancel.reason(?scope) != cancel.TIMED_OUT
      || progress_cancellation(?slot, false) != STEP_PROGRESS
@@ -1879,6 +1871,20 @@ rec TestRecorder {
     complete: bool;
 }
 
+rec TestInterceptor {
+    calls: usize;
+}
+
+fun test_replace_response(context: ptr, active: *call.Call)
+    call.Interception {
+    val interceptor: *TestInterceptor = context::*TestInterceptor;
+    interceptor.calls = interceptor.calls + 1;
+    if (!call.reset_response_for_interceptor(active)
+     || message.set_status(call.response(active), status.BAD_GATEWAY)
+        != message.RESPONSE_OK) { ret call.INTERCEPT_FAILED; }
+    ret call.INTERCEPT_REPLACED;
+}
+
 fun test_record_head(context: ptr, active: *call.Call) bool {
     val recorder: *TestRecorder = context::*TestRecorder;
     recorder.heads = recorder.heads + 1;
@@ -1897,35 +1903,43 @@ fun test_record_end(context: ptr, complete: bool) {
     recorder.complete = complete;
 }
 
-test "hedge.protocol.h3.session: common ownership records and releases exactly once" {
+test "hedge.protocol.h3.session: dispatch owns response and call finalization" {
     var scope: cancel.Scope;
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) {
         ret 1;
     }
     var slot: RequestSlot;
     reset_request(?slot);
-    if (!test_exchange_slot(?slot, ?scope, nil)
+    if (!test_exchange_slot(?slot, ?scope, nil, false)
      || !call.make_memory(?slot.memory, ?slot.arena[0], ARENA_BYTES)
      || !telemetry_trace.make_root(?slot.trace, false)
      || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory,
         ?slot.trace, 1, "test")
-     || !call.resolve_body(?slot.active_call, call.BODY_DRAIN)
-     || exchange.finish(?slot.exchange) != exchange.FINISH_OK) { ret 2; }
+     || !call.resolve_body(?slot.active_call, call.BODY_DRAIN)) { ret 2; }
     var recorder: TestRecorder;
     if (!call.attach_recorder(?slot.active_call, call.Recorder{
         ctx: (?recorder)::ptr, on_head: test_record_head,
         on_body: test_record_body, on_end: test_record_end})) { ret 3; }
-    call.record_head(?slot.active_call);
-    slot.record_head_done = true;
+    slot.active_call.entered = true;
+    var interceptor: TestInterceptor;
+    if (!call.attach_interceptor(?slot.active_call, call.Interceptor{
+        ctx: (?interceptor)::ptr, intercept: test_replace_response})
+     || message.set_status(?slot.response, status.INTERNAL_SERVER_ERROR)
+        != message.RESPONSE_OK
+     || service.commit(?slot.active_call) != message.RESPONSE_OK
+     || slot.response.status != status.BAD_GATEWAY
+     || interceptor.calls != 1
+     || recorder.heads != 1
+     || exchange.finish(?slot.exchange) != exchange.FINISH_OK) { ret 4; }
     var byte: u8 = 'x';
     call.record_body(?slot.active_call, ?byte, 1);
     slot.phase = REQUEST_SETTLING;
     release_common_ownership(?slot);
     release_common_ownership(?slot);
     if (recorder.heads != 1 || recorder.bodies != 1 || recorder.ends != 1
-     || !recorder.complete || !slot.record_end_done || !slot.call_released
+     || !recorder.complete || !slot.call_released
      || !slot.call_release_ok || !slot.active_call.settled
-     || !cancel.destroy(?scope)) { ret 4; }
+     || !cancel.destroy(?scope)) { ret 5; }
     ret 0;
 }
 
