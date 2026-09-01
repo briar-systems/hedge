@@ -286,6 +286,13 @@ pub rec Connection {
     session: usize;
     h2_session: usize;
     handshaking: bool;
+    close_started: bool;
+    close_pending: bool;
+    close_failed: bool;
+    engine_close_started: bool;
+    engine_close_owned: bool;
+    exchange_cancelling: bool;
+    exchange_call_released: bool;
     secure_operation: Operation;
     proxy_scratch: [PROXY_SCRATCH_BYTES]u8;
 }
@@ -378,7 +385,7 @@ fun submit_close(context: ptr, scope: *cancel.Scope,
         ret err[io_runtime.Token, io_error.Error](io_error.from_code(-22, io_error.OP_CLOSE));
     }
     ret net_async.submit_stream_close(owner.driver, scope, ?owner.stream,
-        io_lifecycle.EXPLICIT, (?owner.contexts[index])::usize);
+        io_lifecycle.ABORTIVE, (?owner.contexts[index])::usize);
 }
 
 pub fun logical_kind(kind: io_runtime.Kind) transport.Kind {
@@ -591,6 +598,11 @@ pub fun make(
     owner.session = secure.NO_SESSION;
     owner.h2_session = h2.NO_SESSION;
     owner.handshaking = false;
+    owner.close_started = false;
+    owner.close_pending = false;
+    owner.close_failed = false;
+    owner.engine_close_started = false;
+    owner.engine_close_owned = false;
     owner.state = NEW;
     owner.id = id;
     owner.generation = generation;
@@ -614,6 +626,8 @@ pub fun make(
     owner.limits = limits;
     owner.active_slot = no_slot();
     owner.exchange_live = false;
+    owner.exchange_cancelling = false;
+    owner.exchange_call_released = false;
     owner.response_started = false;
     owner.request_scope_live = false;
     owner.request_generation = 0;
@@ -1042,6 +1056,8 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
         owner.plan.generation, owner.listener_name)) { ret SETUP_BIND; }
     owner.active_slot = slot;
     owner.exchange_live = true;
+    owner.exchange_cancelling = false;
+    owner.exchange_call_released = false;
     owner.response_started = false;
     owner.stage_length = 0;
     owner.stage_offset = 0;
@@ -1113,7 +1129,6 @@ fun begin_response(owner: *Connection, now: time.Time) bool {
     if (!connection.prepare_response(?owner.engine, owner.active_slot, owner.response.status,
         reason_for(owner.response.status), ?owner.response.fields, trailers, now)) { ret false; }
     owner.response_started = true;
-    call.record_head(?owner.active_call);
     # a response the framing plan cannot keep alive stops this connection from
     # admitting another request, so the engine drains rather than waiting to read
     if (owner.engine_slots[owner.active_slot].close_after) {
@@ -1127,6 +1142,18 @@ fun begin_response(owner: *Connection, now: time.Time) bool {
 fun response_complete(owner: *Connection) bool {
     if (!owner.response_started || owner.active_slot >= PIPELINE_DEPTH) { ret false; }
     ret owner.engine_slots[owner.active_slot].outbound_complete;
+}
+
+fun response_body_progress(reader: *body.Reader, output: *u8,
+    capacity: usize) body.Progress {
+    if (reader.pending_kind == body.OP_NONE) {
+        ret body.read(reader, output, capacity);
+    }
+    if (reader.pending_kind == body.OP_READ) {
+        ret body.complete_reader(reader, reader.pending_token);
+    }
+    ret body.failed("response body has a conflicting pending operation",
+        body.REUSE_FORBIDDEN);
 }
 
 # pull from the response body into the staging buffer and hand it to the
@@ -1143,7 +1170,8 @@ fun advance_response(owner: *Connection, now: time.Time) Step {
         owner.stage_length = 0;
         if (!owner.body_done) {
             if (owner.response.body_kind == message.BODY_READER) {
-                val progress: body.Progress = body.read(owner.response.body_reader,
+                val reader: *body.Reader = owner.response.body_reader;
+                val progress: body.Progress = response_body_progress(reader,
                     ?owner.stage[0], READ_BYTES);
                 if (progress.status == body.DATA) {
                     owner.stage_length = progress.count;
@@ -1177,8 +1205,6 @@ fun advance_response(owner: *Connection, now: time.Time) Step {
 fun settle_exchange(owner: *Connection, now: time.Time) bool {
     if (!owner.exchange_live) { ret true; }
     if (exchange.finish(?owner.exchange) != exchange.FINISH_OK) { ret false; }
-    call.record_end(?owner.active_call,
-        owner.exchange.state == exchange.COMPLETE_STATE);
     val finalized: bool = call.release(?owner.active_call);
     budget.release(owner.budgets, ?owner.charge);
     connection.release(?owner.engine, owner.active_slot, now);
@@ -1189,10 +1215,11 @@ fun settle_exchange(owner: *Connection, now: time.Time) bool {
 
 fun fail_exchange(owner: *Connection, code: status.Status, now: time.Time) bool {
     if (owner.response.committed) { ret false; }
+    if (!call.reset_response_for_failure(?owner.active_call)) { ret false; }
     if (message.set_status(?owner.response, code) != message.RESPONSE_OK) { ret false; }
     if (call.disposition(?owner.active_call) == call.BODY_UNRESOLVED
      && !call.resolve_body(?owner.active_call, call.BODY_CLOSE)) { ret false; }
-    if (exchange.commit(?owner.exchange, owner.limits) != message.RESPONSE_OK) { ret false; }
+    if (service.commit(?owner.active_call) != message.RESPONSE_OK) { ret false; }
     ret begin_response(owner, now);
 }
 
@@ -1433,26 +1460,124 @@ pub fun begin_graceful(owner: *Connection) bool {
     ret connection.begin_graceful(?owner.engine);
 }
 
+fun exchange_terminal(active: *exchange.Exchange) bool {
+    ret active.state == exchange.COMPLETE_STATE
+        || active.state == exchange.CANCELLED_STATE
+        || active.state == exchange.TIMED_OUT_STATE
+        || active.state == exchange.FAILED_STATE;
+}
+
+fun settle_exchange_close(owner: *Connection) exchange.FinishStatus {
+    if (!owner.exchange_live) { ret exchange.FINISH_OK; }
+    var settled: exchange.FinishStatus = exchange.FINISH_OK;
+    if (!exchange_terminal(?owner.exchange)) {
+        if (owner.exchange_cancelling) {
+            settled = exchange.settle_cancellation(?owner.exchange);
+        } or {
+            owner.exchange_cancelling = true;
+            settled = exchange.cancel_exchange(?owner.exchange);
+        }
+        if (settled != exchange.FINISH_OK) { ret settled; }
+    }
+    if (!owner.exchange_call_released) {
+        if (!call.release(?owner.active_call)) { owner.close_failed = true; }
+        owner.exchange_call_released = true;
+    }
+    if (owner.charge.live && !budget.release(owner.budgets, ?owner.charge)) {
+        owner.close_failed = true;
+    }
+    owner.exchange_live = false;
+    ret exchange.FINISH_OK;
+}
+
+fun abandon_exchange_close(owner: *Connection) {
+    if (!owner.exchange_live) { ret; }
+    if (!owner.exchange_call_released) {
+        call.abandon(?owner.active_call);
+        owner.exchange_call_released = true;
+    }
+    if (owner.charge.live) { budget.release(owner.budgets, ?owner.charge); }
+    owner.exchange_live = false;
+    owner.close_failed = true;
+}
+
+fun close_h1_engine(owner: *Connection) bool {
+    if (!owner.engine_live) { ret true; }
+    if (!owner.engine_close_started) {
+        owner.engine_close_started = true;
+        owner.engine_close_owned = owner.engine_close_owned
+            || owner.engine.state == connection.CLOSED
+            || owner.engine.close_pending;
+        if (!connection.cancel_connection(?owner.engine)
+         && owner.engine.state != connection.CLOSED) {
+            owner.close_failed = true;
+        }
+        owner.engine_close_owned = owner.engine_close_owned
+            || owner.engine.state == connection.CLOSED
+            || owner.engine.close_pending;
+    }
+    var i: usize = 0;
+    for (i < PIPELINE_DEPTH) {
+        if (owner.engine_slots[i].state != connection.SLOT_FREE
+         && !owner.engine_slots[i].released) {
+            val sequence: u64 = owner.engine_slots[i].sequence;
+            if (sequence == 0
+             || !connection.abandon(?owner.engine, i, sequence)) {
+                owner.close_failed = true;
+            }
+        }
+        i = i + 1;
+    }
+    if (!connection.destroy(?owner.engine)) { ret false; }
+    owner.engine_live = false;
+    owner.active_slot = connection.NO_SLOT;
+    ret true;
+}
+
 pub fun close(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || owner.state == CLOSED) { ret false; }
-    var finalized: bool = true;
+    owner.close_pending = false;
+    if (!owner.close_started) {
+        owner.close_started = true;
+        owner.state = CLOSING;
+        # cancellation settles every transport operation through its normal
+        # completion path while this owner remains live for those completions.
+        cancel.cancel(?owner.operation_root);
+    }
     # a live exchange must settle before the connection goes away, or a service
     # holding a resource in its body reader never gets its release call
     if (owner.exchange_live) {
-        exchange.cancel_exchange(?owner.exchange);
-        call.record_end(?owner.active_call, false);
-        if (!call.release(?owner.active_call)) { finalized = false; }
-        budget.release(owner.budgets, ?owner.charge);
-        owner.exchange_live = false;
+        val settled: exchange.FinishStatus = settle_exchange_close(owner);
+        if (settled == exchange.FINISH_BODY_PENDING) {
+            owner.close_pending = true;
+            ret false;
+        }
+        if (settled != exchange.FINISH_OK) {
+            # no completion can turn a terminal contract failure into success.
+            # record it and tear down instead of parking stop in a retry loop.
+            abandon_exchange_close(owner);
+        }
     }
     if (owner.h2_session != h2.NO_SESSION) {
         owner.requests = h2.requests(owner.h2_session);
-        h2.release(owner.h2_session);
+        val released: h2.ReleaseStatus = h2.release_status(owner.h2_session);
+        if (released == h2.RELEASE_PENDING) {
+            owner.close_pending = true;
+            ret false;
+        }
+        if (released == h2.RELEASE_FAILED) { owner.close_failed = true; }
         owner.h2_session = h2.NO_SESSION;
+        owner.engine_live = false;
     } or (owner.engine_live) {
-        connection.cancel_connection(?owner.engine);
+        if (!close_h1_engine(owner)) {
+            owner.close_pending = true;
+            ret false;
+        }
     }
-    owner.engine_live = false;
+    if (owner.prologue_pending) {
+        owner.close_pending = true;
+        ret false;
+    }
     if (owner.session != secure.NO_SESSION) {
         secure.release(owner.session);
         owner.session = secure.NO_SESSION;
@@ -1463,13 +1588,21 @@ pub fun close(owner: *Connection) bool {
         cancel.destroy(?owner.request_scope);
         owner.request_scope_live = false;
     }
-    val closed: Result[bool, io_error.Error] = tcp.stream_close(?owner.stream);
-    cancel.destroy(?owner.engine_scope);
-    cancel.destroy(?owner.control_scope);
-    cancel.destroy(?owner.operation_root);
+    var stream_failed: bool = false;
+    if (!owner.engine_close_owned) {
+        val closed: Result[bool, io_error.Error] = tcp.stream_close(?owner.stream);
+        stream_failed = is_err[bool, io_error.Error](closed);
+    }
+    if (!cancel.destroy(?owner.engine_scope)
+     || !cancel.destroy(?owner.control_scope)
+     || !cancel.destroy(?owner.operation_root)) { owner.close_failed = true; }
     owner.state = CLOSED;
     owner.initialized = false;
-    ret finalized && !is_err[bool, io_error.Error](closed);
+    ret !owner.close_failed && !stream_failed;
+}
+
+pub fun close_waiting(owner: *Connection) bool {
+    ret owner != nil && owner.initialized && owner.close_pending;
 }
 
 # the operational view of one connection, for tests and telemetry alike
@@ -1521,6 +1654,215 @@ pub fun snapshot(owner: *Connection) Snapshot {
         service_pending: owner.service_pending,
         response_status: owner.response.status,
     };
+}
+
+rec PendingResponseTest {
+    output: *u8;
+    capacity: usize;
+    ready: bool;
+    reader: body.Reader;
+}
+
+fun pending_response_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    val state: *PendingResponseTest = context::*PendingResponseTest;
+    if (state.ready) { ret body.complete(body.REUSE_ALLOWED); }
+    state.output = output;
+    state.capacity = capacity;
+    ret body.pending(41);
+}
+
+fun pending_response_finish(context: ptr, mode: body.Mode,
+    trailers: *field.Fields) body.Progress {
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    if (mode == body.REJECT) { ret body.rejected(body.REUSE_FORBIDDEN); }
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+fun pending_response_complete(context: ptr, token: u64,
+    trailers: *field.Fields) body.Progress {
+    val state: *PendingResponseTest = context::*PendingResponseTest;
+    if (state == nil || token != 41 || state.output == nil || state.capacity < 4) {
+        ret body.failed("pending response completion lost its buffer",
+            body.REUSE_FORBIDDEN);
+    }
+    state.output[0] = 'l';
+    state.output[1] = 'a';
+    state.output[2] = 't';
+    state.output[3] = 'e';
+    state.ready = true;
+    ret body.data(4);
+}
+
+fun pending_response_release(context: ptr) {
+}
+
+test "connection: a pending response read completes into the retained stage" {
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    var state: PendingResponseTest;
+    state.output = nil;
+    state.capacity = 0;
+    state.ready = false;
+    state.reader = body.init_reader((?state)::ptr, pending_response_read,
+        pending_response_finish, pending_response_complete,
+        pending_response_release, body.OWNER_APPLICATION, 1, true, 4,
+        body.limits(4, 4, 2), nil, ?scope);
+    var output: [4]u8;
+    val pending: body.Progress = response_body_progress(?state.reader,
+        ?output[0], 4);
+    if (pending.status != body.PENDING
+     || state.reader.pending_kind != body.OP_READ) { cancel.destroy(?scope); ret 2; }
+    val completed: body.Progress = response_body_progress(?state.reader,
+        ?output[0], 4);
+    if (completed.status != body.DATA || completed.count != 4
+     || output[0] != 'l' || output[3] != 'e') { cancel.destroy(?scope); ret 3; }
+    if (response_body_progress(?state.reader, ?output[0], 4).status
+     != body.COMPLETE) { cancel.destroy(?scope); ret 4; }
+    cancel.destroy(?scope);
+    ret 0;
+}
+
+rec PendingCloseTest {
+    finish_calls: usize;
+    release_calls: usize;
+    reader: body.Reader;
+}
+
+fun pending_close_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    ret body.pending(51);
+}
+
+fun pending_close_finish(context: ptr, mode: body.Mode,
+    trailers: *field.Fields) body.Progress {
+    val state: *PendingCloseTest = context::*PendingCloseTest;
+    state.finish_calls = state.finish_calls + 1;
+    if (mode != body.CANCEL) {
+        ret body.failed("unexpected close finish mode", body.REUSE_FORBIDDEN);
+    }
+    if (state.finish_calls == 1) { ret body.pending(52); }
+    ret body.cancelled(body.REUSE_FORBIDDEN);
+}
+
+fun pending_close_complete(context: ptr, token: u64,
+    trailers: *field.Fields) body.Progress {
+    ret body.failed("pending close is settled by cancellation retry",
+        body.REUSE_FORBIDDEN);
+}
+
+fun pending_close_release(context: ptr) {
+    val state: *PendingCloseTest = context::*PendingCloseTest;
+    state.release_calls = state.release_calls + 1;
+}
+
+test "connection: pending H1 response cancellation retains exchange and budget" {
+    val configured: message.Limits = message.limits_default();
+    val generation: u64 = 81;
+    var owner: Connection;
+    if (!cancel.make_root(?owner.request_scope, false,
+        time.Time{sec: 0, nsec: 0})) { ret 1; }
+    var request_body: body.Reader = body.empty_reader(generation);
+    var request_fields: field.Fields = field.init(nil, 0,
+        field.limits(0, 0, 0, 0));
+    var request_trailers: field.Fields = field.init(nil, 0,
+        field.limits(0, 0, 0, 0));
+    val metadata: message.Metadata = message.Metadata{
+        version: message.version_h1(1, 1),
+        secure: false,
+        early_data: false,
+        peer: message.unspecified_endpoint(),
+        local: message.unspecified_endpoint(),
+        received_at: time.Time{sec: 0, nsec: 0},
+        has_deadline: false,
+        deadline: time.Time{sec: 0, nsec: 0},
+        request_index: generation,
+    };
+    if (!message.init_request(?owner.request, method.from_kind(method.GET),
+        target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)),
+        metadata, request_fields, request_trailers, ?request_body,
+        generation, configured)
+     || !message.init_response(?owner.response, ?owner.response_fields[0],
+        RESPONSE_FIELD_SLOTS, ?owner.response_trailers[0],
+        RESPONSE_TRAILER_SLOTS, generation, configured)) {
+        cancel.destroy(?owner.request_scope); ret 2;
+    }
+    var state: PendingCloseTest;
+    state.finish_calls = 0;
+    state.release_calls = 0;
+    state.reader = body.init_reader((?state)::ptr, pending_close_read,
+        pending_close_finish, pending_close_complete, pending_close_release,
+        body.OWNER_APPLICATION, generation, true, 0,
+        configured.response_body, ?owner.response.trailers,
+        ?owner.request_scope);
+    if (!state.reader.valid
+     || message.set_status(?owner.response, status.OK) != message.RESPONSE_OK
+     || message.set_body_reader(?owner.response, ?state.reader, configured)
+        != message.RESPONSE_OK
+     || !exchange.init(?owner.exchange, ?owner.request, ?owner.response,
+        ?owner.informationals[0], INFORMATIONAL_SLOTS, ?owner.request_scope,
+        generation, configured)
+     || !exchange.begin(?owner.exchange)
+     || exchange.commit(?owner.exchange, configured) != message.RESPONSE_OK
+     || !call.make_memory(?owner.memory, ?owner.arena[0], ARENA_BYTES)
+     || !telemetry_trace.make_root(?owner.trace, false)
+     || !call.bind(?owner.active_call, ?owner.exchange, ?owner.memory,
+        ?owner.trace, generation, "test")) {
+        cancel.destroy(?owner.request_scope); ret 3;
+    }
+    var items: [1]budget.Budget;
+    var budgets: budget.Set;
+    if (!budget.make(?budgets, ?items[0], 1)) {
+        cancel.destroy(?owner.request_scope); ret 4;
+    }
+    val index: usize = budget.define(?budgets, "requests", 1, 0, 0, 0);
+    owner.budgets = ?budgets;
+    if (index == budget.NO_BUDGET
+     || budget.charge(?budgets, index, 0, time.Time{sec: 0, nsec: 0},
+        ?owner.charge) != budget.ADMITTED) {
+        cancel.destroy(?owner.request_scope); ret 5;
+    }
+    owner.exchange_live = true;
+    owner.exchange_cancelling = false;
+    owner.exchange_call_released = false;
+    owner.close_failed = false;
+    if (settle_exchange_close(?owner) != exchange.FINISH_BODY_PENDING
+     || !owner.exchange_live || !owner.charge.live
+     || owner.active_call.settled || state.finish_calls != 1
+     || state.release_calls != 0
+     || budget.snapshot(?budgets, index).active != 1) {
+        cancel.destroy(?owner.request_scope); ret 6;
+    }
+    if (settle_exchange_close(?owner) != exchange.FINISH_OK
+     || owner.exchange_live || owner.charge.live
+     || !owner.active_call.settled || state.finish_calls != 2
+     || state.release_calls != 1
+     || budget.snapshot(?budgets, index).active != 0) {
+        cancel.destroy(?owner.request_scope); ret 7;
+    }
+    if (settle_exchange_close(?owner) != exchange.FINISH_OK
+     || state.finish_calls != 2 || state.release_calls != 1) {
+        cancel.destroy(?owner.request_scope); ret 8;
+    }
+    owner.exchange.valid = false;
+    owner.exchange.state = exchange.RESPONDING;
+    owner.exchange_live = true;
+    owner.exchange_cancelling = false;
+    owner.exchange_call_released = false;
+    owner.close_failed = false;
+    if (budget.charge(?budgets, index, 0, time.Time{sec: 0, nsec: 0},
+        ?owner.charge) != budget.ADMITTED
+     || settle_exchange_close(?owner) != exchange.FINISH_INVALID) {
+        cancel.destroy(?owner.request_scope); ret 9;
+    }
+    abandon_exchange_close(?owner);
+    if (owner.exchange_live || owner.charge.live || !owner.close_failed
+     || budget.snapshot(?budgets, index).active != 0) {
+        cancel.destroy(?owner.request_scope); ret 10;
+    }
+    if (!cancel.destroy(?owner.request_scope)) { ret 11; }
+    ret 0;
 }
 
 test "connection: the configured pipeline bound reaches both protocol engines" {

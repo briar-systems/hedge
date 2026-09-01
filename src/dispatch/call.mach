@@ -9,7 +9,9 @@ use std.allocator;
 use std.allocator.fixed;
 use std.chrono.time;
 use std.sync.cancel;
+use http.core.body;
 use http.core.exchange;
+use http.core.field;
 use http.core.message;
 use trace: hedge.telemetry.trace;
 
@@ -115,6 +117,23 @@ pub fun recording(active: *Call) bool {
     ret active != nil && active.recorder.on_head::usize != 0;
 }
 
+# a pre-commit interceptor may replace a proposed response exactly once
+pub def Interception: u8;
+pub val INTERCEPT_CONTINUE: Interception = 1;
+pub val INTERCEPT_REPLACED: Interception = 2;
+pub val INTERCEPT_FAILED: Interception = 3;
+
+pub def InterceptFun: fun(ptr, *Call) Interception;
+
+pub rec Interceptor {
+    ctx: ptr;
+    intercept: InterceptFun;
+}
+
+pub fun no_interceptor() Interceptor {
+    ret Interceptor{ctx: nil, intercept: (0::usize)::InterceptFun};
+}
+
 # a call is observed by at most one recorder, attached before the service runs
 pub fun attach_recorder(active: *Call, recorder: Recorder) bool {
     if (active == nil || !active.bound || recording(active)
@@ -163,6 +182,9 @@ pub rec Call {
     disposition: Disposition;
     recorder: Recorder;
     recorder_live: bool;
+    interceptor: Interceptor;
+    interceptor_running: bool;
+    interceptor_replaced: bool;
     finalizer: Finalizer;
     observer: Observer;
     observed: bool;
@@ -191,6 +213,9 @@ pub fun bind(
     call.disposition = BODY_UNRESOLVED;
     call.recorder = no_recorder();
     call.recorder_live = false;
+    call.interceptor = no_interceptor();
+    call.interceptor_running = false;
+    call.interceptor_replaced = false;
     call.finalizer = no_finalizer();
     call.observer = no_observer();
     call.observed = false;
@@ -230,6 +255,82 @@ pub fun attach_finalizer(call: *Call, finalizer: Finalizer) bool {
     }
     call.finalizer = finalizer;
     ret true;
+}
+
+pub fun attach_interceptor(call: *Call, interceptor: Interceptor) bool {
+    if (call == nil || !call.bound || !call.entered || call.settled
+     || call.interceptor.intercept::usize != 0 || call.interceptor_running
+     || interceptor.intercept::usize == 0) { ret false; }
+    call.interceptor = interceptor;
+    ret true;
+}
+
+fun reset_uncommitted_response(call: *Call) bool {
+    if (call == nil || !call.bound || call.settled || call.exchange == nil) {
+        ret false;
+    }
+    val response: *message.Response = call.exchange.response;
+    if (response == nil || response.committed) { ret false; }
+    if (response.body_kind == message.BODY_READER) {
+        val reader: *body.Reader = response.body_reader;
+        if (reader == nil) { ret false; }
+        if (!body.reader_terminal_state(reader)) {
+            if (reader.pending_kind != body.OP_NONE) { ret false; }
+            val cancelled: body.Progress = body.cancel_reader(reader);
+            if (cancelled.status == body.PENDING
+             || !body.reader_terminal_state(reader)) { ret false; }
+        }
+    } or (response.body_kind != message.BODY_NONE) {
+        ret false;
+    }
+    val fields: *field.Field = response.fields.items;
+    val field_capacity: usize = response.fields.capacity;
+    val trailers: *field.Field = response.trailers.items;
+    val trailer_capacity: usize = response.trailers.capacity;
+    val generation: u64 = response.generation;
+    if (!message.init_response(response, fields, field_capacity, trailers,
+        trailer_capacity, generation, call.exchange.limits)) { ret false; }
+    ret true;
+}
+
+# replacement preserves the inner service's one request-body ownership decision
+pub fun reset_response_for_interceptor(call: *Call) bool {
+    if (call == nil || !call.interceptor_running
+     || call.interceptor_replaced) { ret false; }
+    if (!reset_uncommitted_response(call)) { ret false; }
+    call.interceptor_replaced = true;
+    ret true;
+}
+
+# a generated failure never inherits fields or a body from the proposal that
+# failed. an asynchronously cancelling body keeps the exchange noncommittable.
+pub fun reset_response_for_failure(call: *Call) bool {
+    if (call == nil || call.interceptor_running) { ret false; }
+    ret reset_uncommitted_response(call);
+}
+
+# service.commit is the sole caller, immediately before exchange commitment
+pub fun intercept_response(call: *Call) Interception {
+    if (call == nil || !call.bound || call.settled || call.exchange == nil
+     || call.exchange.response == nil || call.exchange.response.committed) {
+        ret INTERCEPT_FAILED;
+    }
+    if (call.interceptor.intercept::usize == 0) { ret INTERCEPT_CONTINUE; }
+    if (!call.entered || call.interceptor_running
+     || call.disposition == BODY_UNRESOLVED) { ret INTERCEPT_FAILED; }
+    val interceptor: Interceptor = call.interceptor;
+    call.interceptor = no_interceptor();
+    call.interceptor_running = true;
+    call.interceptor_replaced = false;
+    val outcome: Interception = interceptor.intercept(interceptor.ctx, call);
+    call.interceptor_running = false;
+    if (outcome == INTERCEPT_REPLACED && call.interceptor_replaced) {
+        ret INTERCEPT_REPLACED;
+    }
+    if (outcome == INTERCEPT_CONTINUE && !call.interceptor_replaced) {
+        ret INTERCEPT_CONTINUE;
+    }
+    ret INTERCEPT_FAILED;
 }
 
 # the owning service resolves body disposition once; the connection reads it after
@@ -299,12 +400,11 @@ pub fun releasable(call: *Call) bool {
         || state == exchange.FAILED_STATE;
 }
 
-pub fun release(call: *Call) bool {
-    if (!releasable(call) || call.settled) { ret false; }
+fun finish_call(call: *Call, complete: bool) bool {
     call.settled = true;
+    record_end(call, complete);
     if (call.observed && call.observer.end::usize != 0) {
-        call.observer.end(call.observer.ctx, call,
-            call.exchange.state == exchange.COMPLETE_STATE);
+        call.observer.end(call.observer.ctx, call, complete);
     }
     var finalized: bool = true;
     if (call.finalizer.finish::usize != 0) {
@@ -314,4 +414,102 @@ pub fun release(call: *Call) bool {
     }
     val reset: bool = reset_memory(call.memory);
     ret finalized && reset;
+}
+
+pub fun release(call: *Call) bool {
+    if (!releasable(call) || call.settled) { ret false; }
+    ret finish_call(call, call.exchange.state == exchange.COMPLETE_STATE);
+}
+
+# a permanently invalid exchange still releases call-owned observers, recorders,
+# finalizers and arena exactly once before its transport owner is discarded
+pub fun abandon(call: *Call) bool {
+    if (call == nil || !call.bound || call.settled) { ret false; }
+    ret finish_call(call, false);
+}
+
+rec PendingCancelBody {
+    finish_calls: usize;
+    release_calls: usize;
+}
+
+fun pending_cancel_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+fun pending_cancel_finish(context: ptr, mode: body.Mode,
+    trailers: *field.Fields) body.Progress {
+    val state: *PendingCancelBody = context::*PendingCancelBody;
+    state.finish_calls = state.finish_calls + 1;
+    if (mode == body.CANCEL) { ret body.pending(77); }
+    ret body.failed("unexpected finish mode", body.REUSE_FORBIDDEN);
+}
+
+fun pending_cancel_complete(context: ptr, token: u64,
+    trailers: *field.Fields) body.Progress {
+    if (token != 77) {
+        ret body.failed("unexpected cancellation token", body.REUSE_FORBIDDEN);
+    }
+    ret body.cancelled(body.REUSE_FORBIDDEN);
+}
+
+fun pending_cancel_release(context: ptr) {
+    val state: *PendingCancelBody = context::*PendingCancelBody;
+    state.release_calls = state.release_calls + 1;
+}
+
+fun replace_pending_response(context: ptr, active: *Call) Interception {
+    if (reset_response_for_interceptor(active)) { ret INTERCEPT_REPLACED; }
+    ret INTERCEPT_FAILED;
+}
+
+test "call: an asynchronously cancelling intercepted body remains noncommittable" {
+    val configured: message.Limits = message.limits_default();
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var body_state: PendingCancelBody;
+    body_state.finish_calls = 0;
+    body_state.release_calls = 0;
+    var reader: body.Reader = body.init_reader((?body_state)::ptr,
+        pending_cancel_read, pending_cancel_finish, pending_cancel_complete,
+        pending_cancel_release, body.OWNER_APPLICATION, 7, true, 4,
+        configured.response_body, ?trailers, ?scope);
+    var response_fields: [4]field.Field;
+    var response_trailers: [2]field.Field;
+    var response: message.Response;
+    if (!message.init_response(?response, ?response_fields[0], 4,
+        ?response_trailers[0], 2, 7, configured)
+     || message.set_body_reader(?response, ?reader, configured)
+        != message.RESPONSE_OK) { cancel.destroy(?scope); ret 2; }
+    var active_exchange: exchange.Exchange;
+    active_exchange.response = ?response;
+    active_exchange.limits = configured;
+    var active: Call;
+    active.exchange = ?active_exchange;
+    active.bound = true;
+    active.entered = true;
+    active.settled = false;
+    active.disposition = BODY_DRAIN;
+    active.interceptor_running = false;
+    active.interceptor_replaced = false;
+    active.interceptor = Interceptor{
+        ctx: nil,
+        intercept: replace_pending_response,
+    };
+    if (intercept_response(?active) != INTERCEPT_FAILED
+     || body_state.finish_calls != 1 || body_state.release_calls != 0
+     || reader.pending_kind != body.OP_FINISH || response.committed
+     || response.body_kind != message.BODY_READER) {
+        cancel.destroy(?scope); ret 3;
+    }
+    if (reset_response_for_failure(?active)) { cancel.destroy(?scope); ret 4; }
+    if (body.complete_reader(?reader, 77).status != body.CANCELLED
+     || body_state.release_calls != 1
+     || !reset_response_for_failure(?active)
+     || response.body_kind != message.BODY_NONE
+     || response.committed) { cancel.destroy(?scope); ret 5; }
+    if (!cancel.destroy(?scope)) { ret 6; }
+    ret 0;
 }

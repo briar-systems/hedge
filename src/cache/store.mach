@@ -43,6 +43,7 @@ pub def State: u8;
 pub val EMPTY: State = 0;
 pub val WRITING: State = 1;
 pub val READY: State = 2;
+pub val RETIRED: State = 3;
 
 pub rec Limits {
     memory_bytes: usize;
@@ -81,7 +82,10 @@ pub rec Entry {
     disk_name: [64]u8;
     disk_name_length: usize;
     used_at: u64;
+    stored_at: u64;
     revalidating: bool;
+    readers: usize;
+    discard_pending: bool;
 }
 
 pub rec Store {
@@ -153,7 +157,10 @@ pub fun make(store: *Store, entries: *Entry, capacity: usize, body: *u8,
         entries[i].body_length = 0;
         entries[i].reserved = 0;
         entries[i].used_at = 0;
+        entries[i].stored_at = 0;
         entries[i].revalidating = false;
+        entries[i].readers = 0;
+        entries[i].discard_pending = false;
         i = i + 1;
     }
     store.live = true;
@@ -223,6 +230,11 @@ pub fun close(store: *Store) bool {
     if (store == nil || !store.live) { ret false; }
     var i: usize = 0;
     for (i < store.capacity) {
+        if (store.entries[i].readers != 0) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < store.capacity) {
         if (store.entries[i].state != EMPTY && store.entries[i].placement == ON_DISK) {
             remove_file(store, ?store.entries[i]);
         }
@@ -287,7 +299,7 @@ fun remove_file(store: *Store, entry: *Entry) {
 
 # reclaim exactly what was reserved for this entry, not what was written into it:
 # an abandoned partial write reserved the whole declared length
-fun discard(store: *Store, index: usize) {
+fun reclaim(store: *Store, index: usize) {
     val entry: *Entry = ?store.entries[index];
     if (entry.state == EMPTY) { ret; }
     if (entry.placement == IN_MEMORY) {
@@ -302,6 +314,28 @@ fun discard(store: *Store, index: usize) {
     entry.body_length = 0;
     entry.reserved = 0;
     entry.revalidating = false;
+    entry.readers = 0;
+    entry.discard_pending = false;
+}
+
+fun discard(store: *Store, index: usize) {
+    val entry: *Entry = ?store.entries[index];
+    if (entry.state == EMPTY) { ret; }
+    if (entry.state == READY && entry.readers != 0) {
+        entry.state = RETIRED;
+        entry.revalidating = false;
+        entry.discard_pending = true;
+        ret;
+    }
+    reclaim(store, index);
+}
+
+# discard exactly one selected representation after a matched validation makes
+# its stored metadata unusable; sibling variants remain independently valid
+pub fun discard_entry(store: *Store, index: usize) bool {
+    if (entry_at(store, index) == nil) { ret false; }
+    discard(store, index);
+    ret true;
 }
 
 # the memory arena is compacted on release, so the budget is exact rather than
@@ -386,6 +420,14 @@ pub fun touch(store: *Store, index: usize) bool {
     ret true;
 }
 
+pub fun mark_refreshed(store: *Store, index: usize) bool {
+    val entry: *Entry = entry_at(store, index);
+    if (entry == nil) { ret false; }
+    entry.used_at = tick(store);
+    entry.stored_at = entry.used_at;
+    ret true;
+}
+
 pub fun record_hit(store: *Store) {
     if (enabled(store)) { store.hits = store.hits + 1; }
 }
@@ -464,7 +506,10 @@ pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
     entry.body_length = 0;
     entry.disk_name_length = 0;
     entry.revalidating = false;
+    entry.readers = 0;
+    entry.discard_pending = false;
     entry.used_at = tick(store);
+    entry.stored_at = entry.used_at;
     entry.reserved = declared_length;
     if (chosen == IN_MEMORY) {
         entry.body_offset = store.body_used;
@@ -595,8 +640,12 @@ pub fun read_body(store: *Store, index: usize, offset: usize, output: *u8,
     capacity: usize, produced: *usize) bool {
     if (produced == nil) { ret false; }
     @produced = 0;
-    val entry: *Entry = entry_at(store, index);
-    if (entry == nil || offset > entry.body_length) { ret false; }
+    if (!enabled(store) || index >= store.capacity) { ret false; }
+    val entry: *Entry = ?store.entries[index];
+    if (entry.state != READY && !(entry.state == RETIRED && entry.readers != 0)) {
+        ret false;
+    }
+    if (offset > entry.body_length) { ret false; }
     var count: usize = entry.body_length - offset;
     if (count > capacity) { count = capacity; }
     if (count == 0) { ret true; }
@@ -618,6 +667,26 @@ pub fun read_body(store: *Store, index: usize, offset: usize, output: *u8,
     filesystem.close(?handle);
     if (is_err[usize, io_error.Error](read)) { ret false; }
     @produced = unwrap_ok[usize, io_error.Error](read);
+    ret true;
+}
+
+pub fun pin(store: *Store, index: usize) bool {
+    val entry: *Entry = entry_at(store, index);
+    if (entry == nil || entry.readers == (-1)::usize) { ret false; }
+    entry.readers = entry.readers + 1;
+    ret true;
+}
+
+pub fun unpin(store: *Store, index: usize) bool {
+    if (!enabled(store) || index >= store.capacity) { ret false; }
+    val entry: *Entry = ?store.entries[index];
+    if ((entry.state != READY && entry.state != RETIRED) || entry.readers == 0) {
+        ret false;
+    }
+    entry.readers = entry.readers - 1;
+    if (entry.readers == 0 && entry.state == RETIRED && entry.discard_pending) {
+        reclaim(store, index);
+    }
     ret true;
 }
 
@@ -715,6 +784,28 @@ test "cache store: a stored entry is found by its key and read back exactly" {
     make_key(?absent, "b");
     if (lookup(?fixture.store, ?absent) != NO_ENTRY) { ret 6; }
     if (memory_used(?fixture.store) != 5) { ret 7; }
+    ret 0;
+}
+
+test "cache store: discard defers reclamation until the last reader releases" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 16, 8)
+     || !store_entry(?fixture, "a", "hello", 5)) { ret 1; }
+    var identity: key.Key;
+    make_key(?identity, "a");
+    val index: usize = lookup(?fixture.store, ?identity);
+    if (index == NO_ENTRY || !pin(?fixture.store, index)
+     || !discard_entry(?fixture.store, index)) { ret 2; }
+    if (entry_at(?fixture.store, index) != nil
+     || live_entries(?fixture.store) != 0
+     || memory_used(?fixture.store) != 5) { ret 3; }
+    var output: [8]u8;
+    var produced: usize = 0;
+    if (!read_body(?fixture.store, index, 0, ?output[0], 8, ?produced)
+     || produced != 5 || output[0] != 'h' || output[4] != 'o') { ret 4; }
+    if (!unpin(?fixture.store, index)
+     || memory_used(?fixture.store) != 0
+     || fixture.store.entries[index].state != EMPTY) { ret 5; }
     ret 0;
 }
 

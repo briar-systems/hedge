@@ -29,6 +29,7 @@ use hedge.listener;
 use hedge.connection;
 use hedge.serve;
 use hedge.service;
+use h2: hedge.protocol.h2;
 use lifecycle: hedge.lifecycle;
 use budget: hedge.budget;
 use call: hedge.dispatch.call;
@@ -496,8 +497,148 @@ test "lifecycle: draining an HTTP/2 connection sends GOAWAY and closes it" {
     if (count_frames(?tail[0], remaining, FRAME_GOAWAY) != 2) {
         ret (100 + count_frames(?tail[0], remaining, FRAME_GOAWAY))::i32;
     }
-    if (!drained) { ret 8; }
+    if (!drained) {
+        if (harness.runtime.live != 0) {
+            if (harness.slots[0].retiring) { ret 811; }
+            val connection_view: connection.Snapshot = connection.snapshot(
+                ?harness.connections[0]);
+            val h2_view: h2.Snapshot = h2.snapshot(
+                harness.connections[0].h2_session);
+            ret (820 + connection_view.state::usize * 10
+                + h2_view.state::usize)::i32;
+        }
+        if (!serve.drained(?harness.runtime)) { ret 82; }
+        if (!serve.finished(?harness.runtime)) { ret 83; }
+        ret 84;
+    }
     if (serve.shutdown_reason(?harness.runtime) != lifecycle.DRAINED) { ret 9; }
+    ret 0;
+}
+
+test "lifecycle: a pending HTTP/2 close retains its slot token and budget" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
+        0, false);
+    budgeted(?harness.graph, 1, 0, 0);
+    if (!start(?harness, 25)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) {
+        serve.stop(?harness.runtime); ret 2;
+    }
+    var request: [256]u8;
+    var length: usize = wire.put_connection_start(?request[0]);
+    length = wire.put_request(?request[0], length, 1);
+    val written: Result[usize, io_error.Error] = tcp.stream_write(?client,
+        ?request[0], length);
+    if (is_err[usize, io_error.Error](written)) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 3;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    if (wire.collect(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES,
+        "served") == 0 || harness.runtime.live != 1) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 4;
+    }
+    val token: listener.ConnectionToken = harness.slots[0].token;
+    val budget_index: usize = budget.find(harness.runtime.active_budgets,
+        "public");
+    if (budget_index == budget.NO_BUDGET
+     || budget.snapshot(harness.runtime.active_budgets, budget_index).active != 1) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 5;
+    }
+    # cancellation first leaves both the open read and the graceful write to be
+    # completed by the listener. every owner remains live in the meantime.
+    if (!serve.begin_shutdown(?harness.runtime, time.now())) {
+        tcp.stream_close(?client); serve.stop(?harness.runtime); ret 6;
+    }
+    if (!harness.slots[0].live || !harness.slots[0].retiring
+     || !connection.close_waiting(?harness.connections[0])
+     || listener.inspect_connection(?harness.runtime.owner, token) == nil
+     || budget.snapshot(harness.runtime.active_budgets, budget_index).active != 1) {
+        tcp.stream_close(?client); ret 7;
+    }
+    # stop blocks in the ordinary poll path until both completions have been
+    # settled and only then releases the connection token and budget charge.
+    if (!serve.stop(?harness.runtime)) { tcp.stream_close(?client); ret 8; }
+    if (harness.runtime.live != 0 || harness.slots[0].live
+     || listener.inspect_connection(?harness.runtime.owner, token) != nil
+     || budget.snapshot(harness.runtime.active_budgets, budget_index).active != 0) {
+        tcp.stream_close(?client); ret 9;
+    }
+    tcp.stream_close(?client);
+    if (!serve.finished(?harness.runtime)) { ret 10; }
+    ret 0;
+}
+
+test "lifecycle: a late HTTP/1 close settles before its pool slot is reused" {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 26)) { ret 1; }
+    var holder: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?holder)) {
+        serve.stop(?harness.runtime); ret 2;
+    }
+    var rounds: usize = 0;
+    for (rounds < 32 && harness.runtime.live != 1) {
+        serve.poll(?harness.runtime, 1);
+        rounds = rounds + 1;
+    }
+    if (harness.runtime.live != 1) {
+        tcp.stream_close(?holder); serve.stop(?harness.runtime); ret 3;
+    }
+    var holder_index: usize = 0;
+    if (!harness.slots[0].live) { holder_index = 1; }
+    var first: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?first)) {
+        tcp.stream_close(?holder); serve.stop(?harness.runtime); ret 4;
+    }
+    if (!wire.send(?first, REQUEST)) {
+        tcp.stream_close(?first); tcp.stream_close(?holder);
+        serve.stop(?harness.runtime); ret 4;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    if (wire.collect(?harness.runtime, ?first, ?response[0], RESPONSE_BYTES,
+        "served") == 0) {
+        tcp.stream_close(?first); tcp.stream_close(?holder);
+        serve.stop(?harness.runtime); ret 5;
+    }
+    var closing_index: usize = 0;
+    if (holder_index == 0) { closing_index = 1; }
+    val old_token: listener.ConnectionToken = harness.slots[closing_index].token;
+    tcp.stream_close(?first);
+    rounds = 0;
+    for (rounds < wire.MAX_ROUNDS
+     && listener.inspect_connection(?harness.runtime.owner, old_token) != nil
+     && !harness.slots[closing_index].retiring) {
+        if (!serve.poll(?harness.runtime, -1)) { brk; }
+        rounds = rounds + 1;
+    }
+    val retained: bool = harness.slots[closing_index].live
+        && harness.slots[closing_index].retiring
+        && connection.close_waiting(harness.slots[closing_index].handle)
+        && listener.inspect_connection(?harness.runtime.owner, old_token) != nil;
+    val settled: bool = !harness.slots[closing_index].live
+        && listener.inspect_connection(?harness.runtime.owner, old_token) == nil;
+    if (!retained && !settled) {
+        tcp.stream_close(?holder); serve.stop(?harness.runtime); ret 6;
+    }
+    var replacement: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?replacement)) {
+        tcp.stream_close(?holder); serve.stop(?harness.runtime); ret 7;
+    }
+    if (!wire.send(?replacement, REQUEST)) {
+        tcp.stream_close(?replacement); tcp.stream_close(?holder);
+        serve.stop(?harness.runtime); ret 7;
+    }
+    val length: usize = wire.collect(?harness.runtime, ?replacement,
+        ?response[0], RESPONSE_BYTES, "served");
+    val new_token: listener.ConnectionToken = harness.slots[closing_index].token;
+    tcp.stream_close(?replacement);
+    tcp.stream_close(?holder);
+    val stopped: bool = serve.stop(?harness.runtime);
+    if (length == 0 || !stopped || new_token.generation == old_token.generation
+     || listener.inspect_connection(?harness.runtime.owner, old_token) != nil) {
+        ret 8;
+    }
     ret 0;
 }
 
