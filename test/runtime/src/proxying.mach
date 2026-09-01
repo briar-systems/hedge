@@ -153,6 +153,9 @@ rec Origin {
     endpoint: ip.Endpoint;
     address: [64]u8;
     body: str;
+    declared_length: usize;
+    sent_length: usize;
+    not_modified: bool;
     open: bool;
     served: usize;
     accepted: usize;
@@ -172,6 +175,9 @@ fun start_origin(origin: *Origin, body: str) bool {
     origin.endpoint = unwrap_ok[ip.Endpoint, io_error.Error](local);
     ip.endpoint_format(origin.endpoint, ?origin.address[0], 64);
     origin.body = body;
+    origin.declared_length = 0;
+    origin.sent_length = 0;
+    origin.not_modified = false;
     origin.open = true;
     origin.served = 0;
     origin.accepted = 0;
@@ -258,18 +264,28 @@ fun pump_origin(origin: *Origin) bool {
     for (i < total && i < 2048) { origin.seen[i] = request[i]; i = i + 1; }
     origin.seen_length = total;
     var response: [4096]u8;
+    if (origin.not_modified) {
+        val head: str = "HTTP/1.1 304 Not Modified\r\n\r\n";
+        val ok: bool = write_all(peer, head::*u8, str_len(head));
+        if (ok) { origin.served = origin.served + 1; }
+        ret ok;
+    }
     val head: str = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: ";
     var at: usize = 0;
     var h: usize = 0;
     for (head[h] != 0) { response[at] = head[h]; at = at + 1; h = h + 1; }
     val body_length: usize = str_len(origin.body);
-    at = at + decimal(body_length, ?response[at]);
+    var declared: usize = origin.declared_length;
+    if (declared == 0) { declared = body_length; }
+    var sent_length: usize = origin.sent_length;
+    if (sent_length == 0 || sent_length > body_length) { sent_length = body_length; }
+    at = at + decimal(declared, ?response[at]);
     response[at] = '\r'; response[at + 1] = '\n';
     response[at + 2] = '\r'; response[at + 3] = '\n';
     at = at + 4;
     var b: usize = 0;
-    for (b < body_length) { response[at + b] = origin.body[b]; b = b + 1; }
-    at = at + body_length;
+    for (b < sent_length) { response[at + b] = origin.body[b]; b = b + 1; }
+    at = at + sent_length;
     val ok: bool = write_all(peer, ?response[0], at);
     if (ok) { origin.served = origin.served + 1; }
     or {
@@ -287,6 +303,14 @@ rec Edge {
     binding_storage: [MAX_SERVICES]proxy.Binding;
     telemetry: observability.Runtime;
     checks: [1]telemetry_health.Check;
+}
+
+fun quiesce_proxy(context: ptr, now: time.Time) serve.PlaneQuiesceStatus {
+    val runtime: *proxy.Runtime = context::*proxy.Runtime;
+    val status: proxy.QuiesceStatus = proxy.quiesce(runtime, now);
+    if (status == proxy.QUIESCED) { ret serve.PLANE_QUIESCED; }
+    if (status == proxy.QUIESCE_PENDING) { ret serve.PLANE_PENDING; }
+    ret serve.PLANE_FAILED;
 }
 
 fun start_edge(edge: *Edge, generation: u64, upstream_address: str,
@@ -322,7 +346,8 @@ fun start_edge(edge: *Edge, generation: u64, upstream_address: str,
     if (!compile_site(?edge.site, generation, ?edge.site.resolver)) { ret false; }
     if (!start_site(?edge.site, generation, telemetry)) { ret false; }
     proxy.attach_driver(?edge.proxy_runtime, ?edge.site.runtime.owner.network);
-    serve.attach_plane(?edge.site.runtime, (?edge.proxy_runtime)::ptr, proxy.poll);
+    serve.attach_plane_lifecycle(?edge.site.runtime,
+        (?edge.proxy_runtime)::ptr, proxy.poll, quiesce_proxy);
     ret true;
 }
 
@@ -358,6 +383,16 @@ fun collect_both(edge: *Edge, origin: *Origin, client: *tcp.Stream, output: *u8,
     ret total;
 }
 
+fun drive_origin_request(edge: *Edge, origin: *Origin) bool {
+    var rounds: usize = 0;
+    for (rounds < wire.MAX_ROUNDS) {
+        serve.poll(?edge.site.runtime, 1);
+        if (pump_origin(origin)) { ret true; }
+        rounds = rounds + 1;
+    }
+    ret false;
+}
+
 test "proxy: a request is forwarded to a real origin and its response returned" {
     var origin: Origin;
     if (!start_origin(?origin, "answer from the origin")) { ret 1; }
@@ -378,6 +413,208 @@ test "proxy: a request is forwarded to a real origin and its response returned" 
     if (!wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) { ret 6; }
     if (!wire.contains(?response[0], length, "answer from the origin")) { ret 7; }
     if (view.total_attempts != 1 || view.total_served != 1) { ret 8; }
+    ret 0;
+}
+
+test "proxy: an idle upstream link quiesces before the shared driver closes" {
+    var origin: Origin;
+    if (!start_origin(?origin, "idle before stop")) { ret 1; }
+    var edge: Edge;
+    if (!start_edge(?edge, 46, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin); ret 2;
+    }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) {
+        shutdown_edge(?edge, ?origin); ret 3;
+    }
+    if (!wire.send(?client,
+        "GET /idle HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 4;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = collect_both(?edge, ?origin, ?client,
+        ?response[0], RESPONSE_BYTES, "idle before stop");
+    tcp.stream_close(?client);
+    var before: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    var rounds: usize = 0;
+    for (rounds < 64 && (before.live_attempts != 0 || before.idle_links != 1)) {
+        serve.poll(?edge.site.runtime, 1);
+        before = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+        rounds = rounds + 1;
+    }
+    val stopped: bool = serve.stop(?edge.site.runtime);
+    val after: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    val registry_closed: bool = proxy.close_registry(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    val runtime_closed: bool = proxy.close_runtime(?edge.proxy_runtime);
+    stop_origin(?origin);
+    if (length == 0 || before.idle_links != 1 || before.live_attempts != 0) {
+        ret 5;
+    }
+    if (!stopped || after.live_links != 0 || after.live_attempts != 0
+     || !registry_closed || !runtime_closed) { ret 6; }
+    ret 0;
+}
+
+test "proxy: stopping a pending upstream connect retains its completion owner" {
+    var origin: Origin;
+    if (!start_origin(?origin, "unused")) { ret 1; }
+    var edge: Edge;
+    if (!start_edge(?edge, 47, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin); ret 2;
+    }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) {
+        shutdown_edge(?edge, ?origin); ret 3;
+    }
+    if (!wire.send(?client,
+        "GET /connecting HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 4;
+    }
+    var before: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    var rounds: usize = 0;
+    for (rounds < 16 && !before.connect_pending) {
+        serve.poll(?edge.site.runtime, 1);
+        before = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+        rounds = rounds + 1;
+    }
+    if (!before.connect_pending) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 5;
+    }
+    val stopped: bool = serve.stop(?edge.site.runtime);
+    val after: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    tcp.stream_close(?client);
+    val registry_closed: bool = proxy.close_registry(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    val runtime_closed: bool = proxy.close_runtime(?edge.proxy_runtime);
+    stop_origin(?origin);
+    if (!stopped || after.live_attempts != 0 || after.live_links != 0
+     || after.connect_pending || !registry_closed || !runtime_closed) { ret 6; }
+    ret 0;
+}
+
+test "proxy: stopping a pending response releases its attempt before driver teardown" {
+    var origin: Origin;
+    if (!start_origin(?origin, "partial")) { ret 1; }
+    origin.declared_length = 64;
+    origin.sent_length = 7;
+    var edge: Edge;
+    if (!start_edge(?edge, 41, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin); ret 2;
+    }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)
+     || !wire.send(?client,
+        "GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 3;
+    }
+    if (!drive_origin_request(?edge, ?origin)) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 4;
+    }
+    var before: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    var rounds: usize = 0;
+    for (rounds < 100 && before.phase != proxy.PHASE_STREAM) {
+        serve.poll(?edge.site.runtime, 1);
+        before = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+        rounds = rounds + 1;
+    }
+    val stopped: bool = serve.stop(?edge.site.runtime);
+    val after: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    tcp.stream_close(?client);
+    val registry_closed: bool = proxy.close_registry(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    proxy.close_runtime(?edge.proxy_runtime);
+    stop_origin(?origin);
+    if (before.phase != proxy.PHASE_STREAM || before.live_attempts != 1
+     || before.live_links != 1) { ret 5; }
+    if (!stopped || after.live_attempts != 0 || after.live_links != 0
+     || after.route_inflight != 0 || !registry_closed) { ret 6; }
+    ret 0;
+}
+
+test "proxy: a delayed upstream read completes into the retained body buffer" {
+    var origin: Origin;
+    if (!start_origin(?origin, "delayed-response")) { ret 1; }
+    origin.declared_length = str_len(origin.body);
+    origin.sent_length = 4;
+    var edge: Edge;
+    if (!start_edge(?edge, 48, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin); ret 2;
+    }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) {
+        shutdown_edge(?edge, ?origin); ret 3;
+    }
+    if (!wire.send(?client,
+        "GET /delayed HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 4;
+    }
+    if (!drive_origin_request(?edge, ?origin)) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 5;
+    }
+    var pending: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    var rounds: usize = 0;
+    for (rounds < 64 && !pending.body_read_pending) {
+        serve.poll(?edge.site.runtime, 1);
+        pending = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+        rounds = rounds + 1;
+    }
+    if (!pending.body_read_pending || !pending.body_buffer_retained
+     || !write_all(?origin.peer, ?origin.body[origin.sent_length],
+        origin.declared_length - origin.sent_length)) {
+        tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 6;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length: usize = wire.collect(?edge.site.runtime, ?client,
+        ?response[0], RESPONSE_BYTES, "delayed-response");
+    tcp.stream_close(?client);
+    shutdown_edge(?edge, ?origin);
+    if (length == 0 || !wire.contains(?response[0], length,
+        "delayed-response")) { ret 7; }
+    ret 0;
+}
+
+test "proxy: repeated bodyless upstream responses release more than one attempt pool" {
+    var origin: Origin;
+    if (!start_origin(?origin, "unused")) { ret 1; }
+    origin.not_modified = true;
+    var edge: Edge;
+    if (!start_edge(?edge, 44, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin); ret 2;
+    }
+    var request: usize = 0;
+    for (request < proxy.MAX_LINKS + 2) {
+        var client: tcp.Stream;
+        if (!wire.connect(edge.site.endpoint, ?client)
+         || !wire.send(?client,
+            "GET /bodyless HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"x\"\r\nConnection: close\r\n\r\n")) {
+            tcp.stream_close(?client); shutdown_edge(?edge, ?origin); ret 3;
+        }
+        var response: [RESPONSE_BYTES]u8;
+        val length: usize = collect_both(?edge, ?origin, ?client,
+            ?response[0], RESPONSE_BYTES, "\r\n\r\n");
+        tcp.stream_close(?client);
+        if (length == 0 || !wire.starts_with(?response[0], length,
+            "HTTP/1.1 304 ")) { shutdown_edge(?edge, ?origin); ret 4; }
+        var rounds: usize = 0;
+        for (rounds < 32 && !serve.idle(?edge.site.runtime)) {
+            serve.poll(?edge.site.runtime, 1);
+            rounds = rounds + 1;
+        }
+        request = request + 1;
+    }
+    val view: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime,
+        ?edge.proxy_registry);
+    shutdown_edge(?edge, ?origin);
+    if (origin.served != proxy.MAX_LINKS + 2 || view.total_served != origin.served
+     || view.live_attempts != 0 || view.live_links != 0) { ret 5; }
     ret 0;
 }
 
