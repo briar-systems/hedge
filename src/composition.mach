@@ -20,6 +20,9 @@ use http_cache: hedge.cache;
 use cache_store: hedge.cache.store;
 use upstream: hedge.proxy.upstream;
 use engine_h1: http.h1.connection;
+use quic_admission: quic.connection.admission;
+use quic_listener: quic.connection.listener;
+use quic_token: quic.connection.token;
 use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
 use tlsalpn: hedge.acme.tlsalpn;
@@ -27,6 +30,10 @@ use hedge_tls: hedge.protocol.tls;
 use lifecycle: hedge.lifecycle;
 use hedge.serve;
 use hedge.connection;
+use h3_session: hedge.protocol.h3.session;
+use quic_runtime: hedge.protocol.quic.runtime;
+use quic_routing: hedge.protocol.quic.routing;
+use quic_timers: hedge.protocol.quic.timers;
 use plan: hedge.dispatch.plan;
 use middleware: hedge.dispatch.middleware;
 use router: http.router.router;
@@ -40,7 +47,6 @@ pub val MAX_MIDDLEWARE: usize = 16;
 pub val MAX_STATIC_ROOTS: usize = 16;
 pub val CACHE_ENTRIES: usize = 128;
 pub val PLAN_TEXT_BYTES: usize = 16384;
-pub val DEFAULT_CONNECTIONS: usize = 64;
 
 pub rec PlanStorage {
     routes: [MAX_ROUTES]router.CompiledRoute;
@@ -124,6 +130,20 @@ pub rec Runtime {
     serving: serve.Runtime;
     slots: *serve.Slot;
     connections: *connection.Connection;
+    quic: quic_runtime.Runtime;
+    quic_pumps: [quic_runtime.MAX_PUMPS]quic_runtime.PumpStorage;
+    quic_connections: *quic_runtime.Connection;
+    quic_connection_storages: *quic_runtime.ConnectionStorage;
+    quic_sessions: *h3_session.Session;
+    quic_session_storages: *h3_session.SessionStorage;
+    quic_routes: *quic_routing.Entry;
+    quic_timer_nodes: *quic_timers.Node;
+    quic_timer_positions: *quic_timers.Position;
+    quic_initials: *quic_runtime.PendingInitial;
+    quic_pending: *quic_listener.Pending;
+    quic_peers: *quic_admission.PeerSlot;
+    quic_charges: *quic_admission.ChargeSlot;
+    quic_replay: *quic_token.ReplaySlot;
     planes: Planes;
     options: Options;
     active_generation: usize;
@@ -134,6 +154,7 @@ pub rec Runtime {
     tls_live: bool;
     telemetry_live: bool;
     serve_live: bool;
+    quic_live: bool;
     events: [16]Event;
     event_count: usize;
 }
@@ -243,8 +264,22 @@ fun clean(runtime: *Runtime) StopReport {
         reason = serve.shutdown_reason(?runtime.serving);
         abandoned = serve.shutdown_cancelled(?runtime.serving);
         serve_failures = serve.teardown_failures(?runtime.serving);
+        if (!stopped) {
+            ret StopReport{stopped: false, reason: reason,
+                abandoned: abandoned, serve_failures: serve_failures,
+                cleanup_failures: cleanup_failures};
+        }
         runtime.serve_live = false;
         event(runtime, SERVE_STOPPED);
+    }
+    if (runtime.quic_live) {
+        val snapshot: quic_runtime.Snapshot = quic_runtime.snapshot(?runtime.quic);
+        if (snapshot.initialized
+         && quic_runtime.release(?runtime.quic) != quic_runtime.OK) {
+            cleanup_failures = cleanup_failures + 1;
+        } or {
+            runtime.quic_live = false;
+        }
     }
     if (runtime.telemetry_live) {
         if (!telemetry_production.close(?runtime.observability)) {
@@ -421,6 +456,18 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
     runtime.certificates = nil;
     runtime.slots = nil;
     runtime.connections = nil;
+    runtime.quic_connections = nil;
+    runtime.quic_connection_storages = nil;
+    runtime.quic_sessions = nil;
+    runtime.quic_session_storages = nil;
+    runtime.quic_routes = nil;
+    runtime.quic_timer_nodes = nil;
+    runtime.quic_timer_positions = nil;
+    runtime.quic_initials = nil;
+    runtime.quic_pending = nil;
+    runtime.quic_peers = nil;
+    runtime.quic_charges = nil;
+    runtime.quic_replay = nil;
     runtime.options = options;
     runtime.active_generation = 0;
     runtime.proxy_live = false;
@@ -430,6 +477,9 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
     runtime.tls_live = false;
     runtime.telemetry_live = false;
     runtime.serve_live = false;
+    runtime.quic_live = false;
+    runtime.quic.initialized = false;
+    runtime.quic.generation = 0;
     runtime.event_count = 0;
     runtime.certificate_policy = hedge_tls.NO_POLICY;
     var generation_slot: usize = 0;
@@ -559,9 +609,7 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
         }
     }
 
-    var pool_size: usize = configured.limits.max_connections;
-    if (pool_size > DEFAULT_CONNECTIONS) { pool_size = DEFAULT_CONNECTIONS; }
-    if (pool_size == 0) { pool_size = 1; }
+    val pool_size: usize = configured.limits.max_connections;
     val slots_memory: Result[*serve.Slot, *u8] = allocator.allocate[serve.Slot](heap, pool_size);
     val connection_memory: Result[*connection.Connection, *u8] =
         allocator.allocate[connection.Connection](heap, pool_size);
@@ -575,12 +623,133 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
         ?runtime.plans[0], configured)) {
         ret fail(runtime, START_RUNTIME, "serving runtime initialization failed");
     }
+    var quic_listeners: usize = 0;
+    listener_index = 0;
+    for (listener_index < configured.listener_count) {
+        if (configured.listeners[listener_index].transport
+            == schema.TRANSPORT_QUIC) { quic_listeners = quic_listeners + 1; }
+        listener_index = listener_index + 1;
+    }
+    if (quic_listeners != 0) {
+        val route_capacity: usize = quic_runtime.route_capacity_required(pool_size);
+        val admission_capacity: usize =
+            quic_runtime.admission_capacity_required(pool_size,
+                quic_listeners);
+        val quic_connections: Result[*quic_runtime.Connection, *u8] =
+            allocator.allocate[quic_runtime.Connection](heap, pool_size);
+        val quic_connection_storages: Result[*quic_runtime.ConnectionStorage,
+            *u8] = allocator.allocate[quic_runtime.ConnectionStorage](heap,
+                pool_size);
+        val quic_sessions: Result[*h3_session.Session, *u8] =
+            allocator.allocate[h3_session.Session](heap, pool_size);
+        val quic_session_storages: Result[*h3_session.SessionStorage, *u8] =
+            allocator.allocate[h3_session.SessionStorage](heap, pool_size);
+        val quic_routes: Result[*quic_routing.Entry, *u8] =
+            allocator.allocate[quic_routing.Entry](heap, route_capacity);
+        val quic_timer_nodes: Result[*quic_timers.Node, *u8] =
+            allocator.allocate[quic_timers.Node](heap, pool_size);
+        val quic_timer_positions: Result[*quic_timers.Position, *u8] =
+            allocator.allocate[quic_timers.Position](heap, pool_size);
+        val quic_initials: Result[*quic_runtime.PendingInitial, *u8] =
+            allocator.allocate[quic_runtime.PendingInitial](heap, pool_size);
+        val quic_pending: Result[*quic_listener.Pending, *u8] =
+            allocator.allocate[quic_listener.Pending](heap, admission_capacity);
+        val quic_peers: Result[*quic_admission.PeerSlot, *u8] =
+            allocator.allocate[quic_admission.PeerSlot](heap, admission_capacity);
+        val quic_charges: Result[*quic_admission.ChargeSlot, *u8] =
+            allocator.allocate[quic_admission.ChargeSlot](heap, admission_capacity);
+        val quic_replay: Result[*quic_token.ReplaySlot, *u8] =
+            allocator.allocate[quic_token.ReplaySlot](heap, admission_capacity);
+        if (route_capacity == 0 || admission_capacity == 0
+         || is_err[*quic_runtime.Connection, *u8](quic_connections)
+         || is_err[*quic_runtime.ConnectionStorage, *u8](
+            quic_connection_storages)
+         || is_err[*h3_session.Session, *u8](quic_sessions)
+         || is_err[*h3_session.SessionStorage, *u8](quic_session_storages)
+         || is_err[*quic_routing.Entry, *u8](quic_routes)
+         || is_err[*quic_timers.Node, *u8](quic_timer_nodes)
+         || is_err[*quic_timers.Position, *u8](quic_timer_positions)
+         || is_err[*quic_runtime.PendingInitial, *u8](quic_initials)
+         || is_err[*quic_listener.Pending, *u8](quic_pending)
+         || is_err[*quic_admission.PeerSlot, *u8](quic_peers)
+         || is_err[*quic_admission.ChargeSlot, *u8](quic_charges)
+         || is_err[*quic_token.ReplaySlot, *u8](quic_replay)) {
+            ret fail(runtime, START_RUNTIME, "QUIC runtime allocation failed");
+        }
+        runtime.quic_connections = unwrap_ok[*quic_runtime.Connection, *u8](
+            quic_connections);
+        runtime.quic_connection_storages =
+            unwrap_ok[*quic_runtime.ConnectionStorage, *u8](
+                quic_connection_storages);
+        runtime.quic_sessions = unwrap_ok[*h3_session.Session, *u8](quic_sessions);
+        runtime.quic_session_storages =
+            unwrap_ok[*h3_session.SessionStorage, *u8](quic_session_storages);
+        runtime.quic_routes = unwrap_ok[*quic_routing.Entry, *u8](quic_routes);
+        runtime.quic_timer_nodes = unwrap_ok[*quic_timers.Node, *u8](
+            quic_timer_nodes);
+        runtime.quic_timer_positions = unwrap_ok[*quic_timers.Position, *u8](
+            quic_timer_positions);
+        runtime.quic_initials = unwrap_ok[*quic_runtime.PendingInitial, *u8](
+            quic_initials);
+        runtime.quic_pending = unwrap_ok[*quic_listener.Pending, *u8](quic_pending);
+        runtime.quic_peers = unwrap_ok[*quic_admission.PeerSlot, *u8](quic_peers);
+        runtime.quic_charges = unwrap_ok[*quic_admission.ChargeSlot, *u8](
+            quic_charges);
+        runtime.quic_replay = unwrap_ok[*quic_token.ReplaySlot, *u8](quic_replay);
+        var pump: usize = 0;
+        listener_index = 0;
+        for (listener_index < configured.listener_count) {
+            if (configured.listeners[listener_index].transport
+                != schema.TRANSPORT_QUIC) {
+                listener_index = listener_index + 1;
+                cnt;
+            }
+            var bank: usize = 0;
+            for (bank < quic_runtime.ADMISSION_BANKS) {
+                val offset: usize = (pump * quic_runtime.ADMISSION_BANKS + bank)
+                    * pool_size;
+                runtime.quic_pumps[listener_index].admissions[bank] =
+                    quic_runtime.AdmissionStorage{
+                        pending: ?runtime.quic_pending[offset],
+                        pending_capacity: pool_size,
+                        peers: ?runtime.quic_peers[offset],
+                        peer_capacity: pool_size,
+                        charges: ?runtime.quic_charges[offset],
+                        charge_capacity: pool_size,
+                        replay: ?runtime.quic_replay[offset],
+                        replay_capacity: pool_size,
+                    };
+                bank = bank + 1;
+            }
+            pump = pump + 1;
+            listener_index = listener_index + 1;
+        }
+        var quic_storage: quic_runtime.Storage;
+        if (!quic_runtime.make_storage(?quic_storage,
+                runtime.quic_connections, runtime.quic_connection_storages,
+                pool_size,
+                runtime.quic_sessions, runtime.quic_session_storages, pool_size,
+                runtime.quic_routes, route_capacity,
+                runtime.quic_timer_nodes, runtime.quic_timer_positions,
+                pool_size, runtime.quic_initials, pool_size)
+         || !quic_runtime.make(?runtime.quic, quic_storage,
+                quic_runtime.RuntimeConfig{max_connections: pool_size})) {
+            ret fail(runtime, START_RUNTIME, "QUIC runtime initialization failed");
+        }
+        runtime.quic_live = true;
+        if (!serve.attach_quic(?runtime.serving, ?runtime.quic,
+            ?runtime.quic_pumps[0])) {
+            ret fail(runtime, START_RUNTIME, "QUIC runtime could not be attached");
+        }
+    }
     if (!serve.attach_telemetry(?runtime.serving,
         ?runtime.observability.runtime)) {
         ret fail(runtime, START_RUNTIME, "telemetry runtime could not be attached");
     }
     schema.reset_diagnostics(diagnostics);
     if (!serve.start(?runtime.serving, generation_id, configured, diagnostics)) {
+        runtime.serve_live = runtime.serving.state != serve.NEW
+            && runtime.serving.state != serve.STOPPED;
         ret fail(runtime, START_RUNTIME, "listeners did not become ready");
     }
     runtime.serve_live = true;
