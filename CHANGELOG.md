@@ -4,11 +4,12 @@
 
 ### Added
 
-- QUIC serving up to the handshake. A `transport = "quic"` listener binds,
-  becomes ready instead of refusing, and carries a datagram through
-  classification, address validation with Retry, admission, connection
-  assembly, routing, and packet generation. The TLS handshake inside QUIC
-  does not yet complete, so HTTP/3 requests are not served (#32).
+- HTTP/3 serving. A `transport = "quic"` listener becomes ready and serves
+  instead of refusing before readiness. ALPN inside QUIC selects `h3` per
+  listener policy, and an HTTP/3 request reaches the same dispatch
+  boundary as HTTP/1 and HTTP/2. Verified against curl 8.21.0 over
+  ngtcp2: 30 consecutive `GET` requests returned 200 over HTTP/3 against
+  one server process.
 - `composition.Controls`, a typed secret owner for every welded QUIC
   record. The pump, connection, assembly secret storage, and HTTP/3
   session control records are allocated through `mach-crypto`
@@ -42,6 +43,22 @@
 - `advance` looped on a timer that was re-armed still due, starving the
   I/O completions the connection was waiting on. One pass now services a
   connection's timer once and yields.
+- A connection was built with a fresh random connection ID while the
+  client addressed the one the server named in its Retry, so nothing the
+  client sent could be routed. The connection now adopts the accepted
+  initial destination, which is the single local routing ID the
+  production core carries.
+- Stream scratch was sized at one maximum field where the HTTP/3 engine
+  requires two, so every session failed to start and the connection was
+  closed as a protocol error.
+
+### Known limitations
+
+- A served QUIC connection is not released after its exchange.
+  `transport.finish_close` stays blocked with six streams still active on
+  the driver after the HTTP/3 engine has destroyed cleanly, so the
+  connection is only reclaimed when the drain deadline expires. Requests
+  with a body, large responses, and prompt shutdown are affected (#32).
 
 ### Removed
 
