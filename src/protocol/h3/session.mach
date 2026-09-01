@@ -75,6 +75,11 @@ pub val STEP_BLOCKED: Step = 3;
 pub val STEP_DONE: Step = 4;
 pub val STEP_ERROR: Step = 5;
 
+pub def ReleaseStatus: u8;
+pub val RELEASE_OK: ReleaseStatus = 1;
+pub val RELEASE_PENDING: ReleaseStatus = 2;
+pub val RELEASE_FAILED: ReleaseStatus = 3;
+
 def RequestPhase: u8;
 val REQUEST_FREE: RequestPhase = 0;
 val REQUEST_BINDING: RequestPhase = 1;
@@ -178,6 +183,8 @@ pub rec Session {
     encoder_queue: [QUEUE_BYTES]u8;
     decoder_queue: [QUEUE_BYTES]u8;
     engine: h3.Engine[adapter.Adapter];
+    scope_live: bool;
+    engine_started: bool;
     requests_slots: [MAX_STREAMS]RequestSlot;
     plan: *plan.Plan;
     budgets: *budget.Set;
@@ -192,6 +199,7 @@ pub rec Session {
     last_step: Step;
     final_goaway_sent: bool;
     engine_closed: bool;
+    release_failed: bool;
 }
 
 pub rec Pool {
@@ -250,6 +258,9 @@ pub fun make_pool(pool: *Pool, sessions: *Session, capacity: usize) bool {
         sessions[i].next_free = i + 1;
         if (i + 1 == capacity) { sessions[i].next_free = NO_SESSION; }
         sessions[i].state = IDLE;
+        sessions[i].release_failed = false;
+        sessions[i].scope_live = false;
+        sessions[i].engine_started = false;
         var j: usize = 0;
         for (j < MAX_STREAMS) {
             reset_request(?sessions[i].requests_slots[j]);
@@ -270,6 +281,9 @@ pub fun acquire(pool: *Pool) usize {
     session.next_free = NO_SESSION;
     session.live = true;
     session.state = IDLE;
+    session.release_failed = false;
+    session.scope_live = false;
+    session.engine_started = false;
     pool.live = pool.live + 1;
     ret index;
 }
@@ -469,6 +483,7 @@ pub fun begin(session: *Session, driver: *qt.Driver[binding.Binding],
     }
     if (!cancel.make_child(?session.scope, parent, false,
         time.Time{sec: 0, nsec: 0})) { ret false; }
+    session.scope_live = true;
     session.plan = active_plan;
     session.budgets = budgets;
     session.limits = limits;
@@ -482,6 +497,7 @@ pub fun begin(session: *Session, driver: *qt.Driver[binding.Binding],
     session.last_step = STEP_IDLE;
     session.final_goaway_sent = false;
     session.engine_closed = false;
+    session.release_failed = false;
     var i: usize = 0;
     for (i < MAX_STREAMS) {
         reset_request(?session.requests_slots[i]);
@@ -490,8 +506,10 @@ pub fun begin(session: *Session, driver: *qt.Driver[binding.Binding],
     if (!start_session(session, driver, ?session.now_ns, h3.SERVER,
         configured)) {
         cancel.destroy(?session.scope);
+        session.scope_live = false;
         ret false;
     }
+    session.engine_started = true;
     session.state = ACTIVE;
     ret true;
 }
@@ -1088,12 +1106,19 @@ fun finish_exchange(slot: *RequestSlot) Step {
     ret STEP_PROGRESS;
 }
 
-fun release_common_ownership(slot: *RequestSlot) bool {
+fun finalize_call(session: *Session, slot: *RequestSlot) bool {
     if (!slot.exchange_live) { ret true; }
     if (!slot.call_released) {
         slot.call_released = true;
         if (slot.active_call.bound) {
-            slot.call_release_ok = call.release(?slot.active_call);
+            if (terminal_exchange(slot)) {
+                slot.call_release_ok = call.release(?slot.active_call);
+            } or {
+                slot.call_release_ok = call.abandon(?slot.active_call);
+            }
+            if (!slot.call_release_ok && session != nil) {
+                session.release_failed = true;
+            }
         }
     }
     ret true;
@@ -1103,7 +1128,7 @@ fun settle_request(session: *Session, slot: *RequestSlot) Step {
     if (slot.phase != REQUEST_SETTLING && slot.phase != REQUEST_RELEASING) {
         ret STEP_ERROR;
     }
-    release_common_ownership(slot);
+    finalize_call(session, slot);
     slot.phase = REQUEST_RELEASING;
     if (!slot.stream_released) {
         if (!h3.release_stream[adapter.Adapter](?session.engine, slot.id,
@@ -1115,6 +1140,7 @@ fun settle_request(session: *Session, slot: *RequestSlot) Step {
         if (slot.charge.live
          && !budget.release(session.budgets, ?slot.charge)) {
             slot.call_release_ok = false;
+            session.release_failed = true;
         }
     }
     if (slot.scope_live) {
@@ -1506,14 +1532,28 @@ fun active_requests(session: *Session) usize {
     ret count;
 }
 
-pub fun release(pool: *Pool, index: usize) bool {
+pub fun release_status(pool: *Pool, index: usize) ReleaseStatus {
     val session: *Session = session_at(pool, index);
     if (session == nil || session.state != CLOSED
-     || active_requests(session) != 0
-     || !h3.destroy[adapter.Adapter](?session.engine)
-     || !cancel.destroy(?session.scope)) { ret false; }
+     || active_requests(session) != 0) { ret RELEASE_FAILED; }
+    if (session.engine_started) {
+        if (!h3.destroy[adapter.Adapter](?session.engine)) {
+            ret RELEASE_PENDING;
+        }
+        session.engine_started = false;
+    }
+    if (session.scope_live) {
+        if (!cancel.destroy(?session.scope)) { ret RELEASE_PENDING; }
+        session.scope_live = false;
+    }
+    val failed: bool = session.release_failed;
     return_session(pool, index);
-    ret true;
+    if (failed) { ret RELEASE_FAILED; }
+    ret RELEASE_OK;
+}
+
+pub fun release(pool: *Pool, index: usize) bool {
+    ret release_status(pool, index) == RELEASE_OK;
 }
 
 pub rec Snapshot {
@@ -1934,11 +1974,13 @@ test "hedge.protocol.h3.session: dispatch owns response and call finalization" {
     var byte: u8 = 'x';
     call.record_body(?slot.active_call, ?byte, 1);
     slot.phase = REQUEST_SETTLING;
-    release_common_ownership(?slot);
-    release_common_ownership(?slot);
+    var session: Session;
+    finalize_call(?session, ?slot);
+    finalize_call(?session, ?slot);
     if (recorder.heads != 1 || recorder.bodies != 1 || recorder.ends != 1
      || !recorder.complete || !slot.call_released
-     || !slot.call_release_ok || !slot.active_call.settled
+     || !slot.call_release_ok || session.release_failed
+     || !slot.active_call.settled
      || !cancel.destroy(?scope)) { ret 5; }
     ret 0;
 }
