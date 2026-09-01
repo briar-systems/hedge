@@ -1,0 +1,2504 @@
+# caller-owned quic and http/3 socket runtime
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.chrono.time;
+use std.sync.cancel;
+use std.net.ip;
+use std.net.udp;
+use std.memory;
+use std.crypto.ct;
+use random: std.crypto.rand;
+use std.system.os;
+use net_async: std.net.async;
+use net_types: std.net.async.types;
+use io_runtime: std.io.runtime;
+use io_error: std.io.error;
+
+use crypto.contracts;
+use crypto.encoding.keys;
+use crypto.secret;
+use tls.cert;
+use credentials: tls.cert.credentials;
+use tls_config: tls.config;
+use tls.server;
+use tls.engine;
+use tls.tls13;
+
+use admission: quic.connection.admission;
+use assembly: quic.connection.assembly;
+use quic_listener: quic.connection.listener;
+use token: quic.connection.token;
+use packet: quic.packet.packet;
+use test_credentials: quic.connection.credentials_simulated;
+use qt: quic.transport;
+use binding: quic.transport.binding;
+use transport_parameters: quic.transport_parameters;
+
+use h3: http.h3.connection;
+use http.core.message;
+
+use schema: hedge.config.schema;
+use hedge.listener;
+use hedge_connection: hedge.connection;
+use hedge.budget;
+use plan: hedge.dispatch.plan;
+use hedge_tls: hedge.protocol.tls;
+use h3_session: hedge.protocol.h3.session;
+use routing: hedge.protocol.quic.routing;
+use timers: hedge.protocol.quic.timers;
+
+pub val MAX_PUMPS: usize = schema.MAX_LISTENERS;
+pub val ADMISSION_BANKS: usize = 2;
+pub val RECEIVE_BATCH: usize = 16;
+pub val STATELESS_SENDS: usize = 4;
+pub val CONNECTION_ID_BYTES: usize = 20;
+pub val ENDPOINT_BYTES: usize = 80;
+pub val ROUTE_TABLE_LOAD: usize = 2;
+pub val NO_PUMP: usize = (-1)::usize;
+pub val NO_CONNECTION: usize = (-1)::usize;
+
+pub def Status: u8;
+pub val OK: Status = 1;
+pub val INVALID: Status = 2;
+pub val BLOCKED: Status = 3;
+pub val STALE: Status = 4;
+pub val FAILED: Status = 5;
+pub val STOPPED: Status = 6;
+
+pub def ConnectionState: u8;
+pub val CONNECTION_FREE: ConnectionState = 0;
+pub val CONNECTION_ACCEPTING: ConnectionState = 1;
+pub val CONNECTION_LIVE: ConnectionState = 2;
+pub val CONNECTION_GRACEFUL: ConnectionState = 3;
+pub val CONNECTION_CANCELLING: ConnectionState = 4;
+pub val CONNECTION_RELEASING: ConnectionState = 5;
+pub val CONNECTION_BROKEN: ConnectionState = 6;
+
+def CompletionKind: u8;
+val COMPLETION_RECEIVE: CompletionKind = 1;
+val COMPLETION_SEND: CompletionKind = 2;
+val COMPLETION_STATELESS: CompletionKind = 3;
+
+pub rec RuntimeConfig {
+    max_connections: usize;
+    external_live: *usize;
+}
+
+pub rec PumpConfig {
+    admission_generation: u64;
+    connection_limit: usize;
+    max_connections_per_peer: usize;
+    require_retry: bool;
+    retry_max_age_ns: u64;
+    address_max_age_ns: u64;
+    tls_policy: *hedge_tls.Policy;
+    plan: *plan.Plan;
+    budgets: *budget.Set;
+    limits: message.Limits;
+    max_requests: usize;
+    listener_name: str;
+    handshake_timeout_ns: u64;
+    request_timeout_ns: u64;
+    idle_timeout_ms: u64;
+    drain_timeout_ns: u64;
+}
+
+pub rec AdmissionStorage {
+    pending: *quic_listener.Pending;
+    pending_capacity: usize;
+    peers: *admission.PeerSlot;
+    peer_capacity: usize;
+    charges: *admission.ChargeSlot;
+    charge_capacity: usize;
+    replay: *token.ReplaySlot;
+    replay_capacity: usize;
+}
+
+pub rec PumpStorage {
+    admissions: [ADMISSION_BANKS]AdmissionStorage;
+}
+
+pub rec Storage {
+    connections: *Connection;
+    connection_capacity: usize;
+    sessions: *h3_session.Session;
+    session_capacity: usize;
+    routes: *routing.Entry;
+    route_capacity: usize;
+    timer_nodes: *timers.Node;
+    timer_positions: *timers.Position;
+    timer_capacity: usize;
+}
+
+pub rec PumpHandle {
+    index: usize;
+    generation: u64;
+}
+
+pub rec PumpUpdate {
+    handle: PumpHandle;
+    config: PumpConfig;
+}
+
+pub rec UpdateResult {
+    status: Status;
+    committed: bool;
+}
+
+rec CompletionContext {
+    route: listener.ConnectionContext;
+    operation_owner: hedge_connection.Operation;
+    completion: io_runtime.Completion;
+    kind: CompletionKind;
+    pump: usize;
+    pump_generation: u64;
+    connection: usize;
+    connection_generation: u64;
+    operation: usize;
+    operation_generation: u64;
+    token_source: u64;
+    token_index: u32;
+    token_generation: u64;
+    completion_pending: bool;
+}
+
+rec SendOperation {
+    buffer: [assembly.MAX_UDP_PAYLOAD]u8;
+    packet: net_types.Packet;
+    token: qt.Token;
+    context: CompletionContext;
+    generation: u64;
+    pending: bool;
+}
+
+rec StatelessSend {
+    buffer: [assembly.MAX_UDP_PAYLOAD]u8;
+    packet: net_types.Packet;
+    context: CompletionContext;
+    generation: u64;
+    pending: bool;
+}
+
+rec PublishedRoute {
+    key: routing.Key;
+    binding: routing.Binding;
+    live: bool;
+}
+
+rec AdmissionGeneration {
+    listener: quic_listener.Listener;
+    admissions: admission.Manager;
+    tokens: token.Manager;
+    storage: AdmissionStorage;
+    source: u64;
+    active_connections: usize;
+    live: bool;
+    retiring: bool;
+}
+
+pub rec Connection {
+    assembly: assembly.Connection;
+    tls: server.Server;
+    tls_input: [hedge_tls.HANDSHAKE_INPUT_BYTES]u8;
+    tls_output: [hedge_tls.HANDSHAKE_OUTPUT_BYTES]u8;
+    tls_hello: [hedge_tls.HELLO_BYTES]u8;
+    tls_certificates: [hedge_tls.PEER_CERTIFICATES]cert.Certificate;
+    tls_peer_parameters: [assembly.PARAMETER_CAPACITY]u8;
+    local_parameters: [assembly.PARAMETER_CAPACITY]u8;
+    local_cid: [CONNECTION_ID_BYTES]u8;
+    peer_text: [ENDPOINT_BYTES]u8;
+    local_text: [ENDPOINT_BYTES]u8;
+    listener_name: [schema.TEXT_CAP]u8;
+    sends: [assembly.SEND_CAPACITY]SendOperation;
+    published: [assembly.CONNECTION_ID_CAPACITY]PublishedRoute;
+    scope: cancel.Scope;
+    charge: admission.Charge;
+    policy: *hedge_tls.Policy;
+    plan: *plan.Plan;
+    budgets: *budget.Set;
+    limits: message.Limits;
+    peer: ip.Endpoint;
+    local: ip.Endpoint;
+    h3_session: usize;
+    listener_name_length: usize;
+    max_requests: usize;
+    request_timeout_ns: u64;
+    generation: u64;
+    source: u64;
+    next_free: usize;
+    pump: usize;
+    pump_generation: u64;
+    admission_bank: usize;
+    state: ConnectionState;
+    scope_live: bool;
+    charge_live: bool;
+    h3_started: bool;
+    h3_cancelled: bool;
+    close_started: bool;
+    transport_finished: bool;
+    assembly_released: bool;
+    live: bool;
+}
+
+rec Pump {
+    admissions: [ADMISSION_BANKS]AdmissionGeneration;
+    receive_buffers: [RECEIVE_BATCH][assembly.MAX_UDP_PAYLOAD]u8;
+    receive_packets: [RECEIVE_BATCH]net_types.Packet;
+    stateless: [STATELESS_SENDS]StatelessSend;
+    preflight_output: [assembly.MAX_UDP_PAYLOAD]u8;
+    token_key: [token.KEY_SIZE]^u8;
+    versions: [2]u32;
+    receive_context: CompletionContext;
+    scope: cancel.Scope;
+    driver: *net_async.Driver;
+    socket: *udp.Socket;
+    root: *cancel.Scope;
+    tls_policy: *hedge_tls.Policy;
+    plan: *plan.Plan;
+    budgets: *budget.Set;
+    limits: message.Limits;
+    local: ip.Endpoint;
+    listener_name: str;
+    handshake_timeout_ns: u64;
+    request_timeout_ns: u64;
+    idle_timeout_ms: u64;
+    drain_timeout_ns: u64;
+    connection_limit: usize;
+    max_connections_per_peer: usize;
+    max_requests: usize;
+    active_connections: usize;
+    generation: u64;
+    active_admission: usize;
+    token_generation: u64;
+    receive_pending: bool;
+    scope_live: bool;
+    started: bool;
+    draining: bool;
+    cancelling: bool;
+    live: bool;
+}
+
+pub rec Snapshot {
+    pumps: usize;
+    live: usize;
+    superseded: usize;
+    routes: usize;
+    timers: usize;
+    broken: usize;
+    stopping: bool;
+    initialized: bool;
+}
+
+pub rec Runtime {
+    pumps: [MAX_PUMPS]Pump;
+    storage: Storage;
+    routes: routing.Table;
+    timer_queue: timers.Queue;
+    sessions: h3_session.Pool;
+    free_head: usize;
+    connection_capacity: usize;
+    max_connections: usize;
+    external_live: *usize;
+    live_connections: usize;
+    pump_count: usize;
+    next_source: u64;
+    generation: u64;
+    stopping: bool;
+    initialized: bool;
+}
+
+fun next_generation(value: u64) u64 {
+    var next: u64 = value + 1;
+    if (next == 0) { next = 1; }
+    ret next;
+}
+
+fun saturated_add(left: u64, right: u64) u64 {
+    if (left > 0xffffffffffffffff - right) { ret 0xffffffffffffffff; }
+    ret left + right;
+}
+
+fun exact_h3(policy: *hedge_tls.Policy) bool {
+    ret policy != nil && policy.live && policy.configuration.require_alpn
+        && policy.configuration.alpn != nil
+        && policy.configuration.alpn_len == 1
+        && policy.configuration.alpn[0].data != nil
+        && policy.configuration.alpn[0].len == 2
+        && policy.configuration.alpn[0].data[0] == 'h'::u8
+        && policy.configuration.alpn[0].data[1] == '3'::u8;
+}
+
+fun pump_config_valid(config: *PumpConfig) bool {
+    ret config != nil && config.admission_generation != 0
+        && config.connection_limit != 0
+        && config.max_connections_per_peer != 0
+        && config.max_connections_per_peer <= config.connection_limit
+        && config.retry_max_age_ns != 0 && config.address_max_age_ns != 0
+        && exact_h3(config.tls_policy) && config.plan != nil
+        && config.plan.sealed && config.budgets != nil
+        && config.max_requests != 0
+        && config.max_requests <= h3_session.MAX_STREAMS
+        && config.listener_name != nil
+        && str_len(config.listener_name) < schema.TEXT_CAP
+        && config.handshake_timeout_ns != 0
+        && config.idle_timeout_ms != 0 && config.drain_timeout_ns != 0;
+}
+
+fun admission_storage_valid(storage: *AdmissionStorage,
+    connection_limit: usize) bool {
+    ret storage != nil && storage.pending != nil
+        && storage.pending_capacity != 0 && storage.peers != nil
+        && storage.peer_capacity != 0 && storage.charges != nil
+        && storage.charge_capacity >= connection_limit
+        && storage.replay != nil && storage.replay_capacity != 0;
+}
+
+pub fun route_capacity_required(connection_capacity: usize) usize {
+    # maximum cid ownership stays at or below half table load
+    val per_connection: usize =
+        assembly.CONNECTION_ID_CAPACITY * ROUTE_TABLE_LOAD;
+    if (connection_capacity == 0
+     || connection_capacity > (-1)::usize / per_connection) { ret 0; }
+    ret connection_capacity * per_connection;
+}
+
+pub fun make_storage(storage: *Storage, connections: *Connection,
+    connection_capacity: usize, sessions: *h3_session.Session,
+    session_capacity: usize, routes: *routing.Entry, route_capacity: usize,
+    timer_nodes: *timers.Node, timer_positions: *timers.Position,
+    timer_capacity: usize) bool {
+    val required_routes: usize = route_capacity_required(connection_capacity);
+    if (storage == nil || connections == nil || connection_capacity == 0
+     || sessions == nil || session_capacity < connection_capacity
+     || required_routes == 0 || routes == nil || route_capacity < required_routes
+     || timer_nodes == nil || timer_positions == nil
+     || timer_capacity < connection_capacity) { ret false; }
+    storage.connections = connections;
+    storage.connection_capacity = connection_capacity;
+    storage.sessions = sessions;
+    storage.session_capacity = session_capacity;
+    storage.routes = routes;
+    storage.route_capacity = route_capacity;
+    storage.timer_nodes = timer_nodes;
+    storage.timer_positions = timer_positions;
+    storage.timer_capacity = timer_capacity;
+    ret true;
+}
+
+fun reset_connection(value: *Connection, index: usize,
+    capacity: usize) {
+    value.live = false;
+    value.state = CONNECTION_FREE;
+    value.next_free = index + 1;
+    if (index + 1 == capacity) { value.next_free = NO_CONNECTION; }
+    value.h3_session = h3_session.NO_SESSION;
+    value.scope_live = false;
+    value.charge_live = false;
+    value.h3_started = false;
+    value.h3_cancelled = false;
+    value.close_started = false;
+    value.transport_finished = false;
+    value.assembly_released = false;
+    var i: usize = 0;
+    for (i < assembly.SEND_CAPACITY) {
+        value.sends[i].pending = false;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < assembly.CONNECTION_ID_CAPACITY) {
+        value.published[i].live = false;
+        i = i + 1;
+    }
+}
+
+pub fun make(runtime: *Runtime, storage: Storage,
+    config: RuntimeConfig) bool {
+    val required_routes: usize =
+        route_capacity_required(storage.connection_capacity);
+    if (runtime == nil || runtime.initialized || config.max_connections == 0
+     || config.external_live == nil
+     || storage.connections == nil || storage.connection_capacity == 0
+     || storage.connection_capacity < config.max_connections
+     || storage.sessions == nil
+     || storage.session_capacity < storage.connection_capacity
+     || required_routes == 0 || storage.routes == nil
+     || storage.route_capacity < required_routes
+     || storage.timer_nodes == nil || storage.timer_positions == nil
+     || storage.timer_capacity < storage.connection_capacity
+     || !routing.make(?runtime.routes, storage.routes, storage.route_capacity)
+     || !timers.make(?runtime.timer_queue, storage.timer_nodes,
+        storage.timer_positions, storage.timer_capacity)
+     || !h3_session.make_pool(?runtime.sessions, storage.sessions,
+        storage.session_capacity)) { ret false; }
+    runtime.storage = storage;
+    runtime.connection_capacity = storage.connection_capacity;
+    runtime.max_connections = config.max_connections;
+    runtime.external_live = config.external_live;
+    runtime.free_head = 0;
+    runtime.live_connections = 0;
+    runtime.pump_count = 0;
+    runtime.next_source = 1;
+    runtime.generation = next_generation(runtime.generation);
+    runtime.stopping = false;
+    var i: usize = 0;
+    for (i < storage.connection_capacity) {
+        reset_connection(?storage.connections[i], i,
+            storage.connection_capacity);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < MAX_PUMPS) {
+        runtime.pumps[i].live = false;
+        runtime.pumps[i].started = false;
+        runtime.pumps[i].scope_live = false;
+        i = i + 1;
+    }
+    runtime.initialized = true;
+    ret true;
+}
+
+fun pump_for(runtime: *Runtime, handle: PumpHandle) *Pump {
+    if (runtime == nil || !runtime.initialized || handle.index >= MAX_PUMPS) {
+        ret nil;
+    }
+    val pump: *Pump = ?runtime.pumps[handle.index];
+    if (!pump.live || pump.generation != handle.generation) { ret nil; }
+    ret pump;
+}
+
+fun queue_completion(owner: ptr, token_context: usize,
+    completion: io_runtime.Completion) {
+    val context: *CompletionContext = owner::*CompletionContext;
+    if (context == nil || context.completion_pending) { ret; }
+    context.completion = completion;
+    context.completion_pending = true;
+}
+
+fun make_context(context: *CompletionContext, kind: CompletionKind,
+    pump: usize, pump_generation: u64, connection: usize,
+    connection_generation: u64, operation: usize,
+    operation_generation: u64, value: qt.Token) bool {
+    if (context == nil) { ret false; }
+    context.kind = kind;
+    context.pump = pump;
+    context.pump_generation = pump_generation;
+    context.connection = connection;
+    context.connection_generation = connection_generation;
+    context.operation = operation;
+    context.operation_generation = operation_generation;
+    context.token_source = value.source;
+    context.token_index = value.index;
+    context.token_generation = value.generation;
+    context.completion_pending = false;
+    ret hedge_connection.bind_operation(?context.operation_owner,
+        ?context.route, (context)::ptr, queue_completion, 0);
+}
+
+fun no_token() qt.Token {
+    ret qt.Token{source: 0, index: 0, generation: 0};
+}
+
+fun reset_receive_packet(pump: *Pump, index: usize) {
+    val packet: *net_types.Packet = ?pump.receive_packets[index];
+    packet.buffer = ?pump.receive_buffers[index][0];
+    packet.capacity = assembly.MAX_UDP_PAYLOAD;
+    packet.length = 0;
+    packet.interface_index = 0;
+    packet.has_local_destination = false;
+    packet.truncated = false;
+    packet.zero_length = false;
+}
+
+fun abandon_admission_parts(bank: *AdmissionGeneration,
+    listener_live: bool, admissions_live: bool, tokens_live: bool) bool {
+    if (bank == nil) { ret false; }
+    var success: bool = true;
+    if (listener_live) {
+        if (!quic_listener.begin_close(?bank.listener)
+         || !quic_listener.finish_close(?bank.listener)) { success = false; }
+    }
+    if (admissions_live) {
+        if (!admission.begin_close(?bank.admissions)
+         || !admission.finish_close(?bank.admissions)) { success = false; }
+    }
+    if (tokens_live) {
+        if (!token.begin_close(?bank.tokens)
+         || !token.finish_close(?bank.tokens)) { success = false; }
+    }
+    ret success;
+}
+
+fun initialize_admission(pump: *Pump, bank_index: usize,
+    config: *PumpConfig, storage: AdmissionStorage) bool {
+    if (pump == nil || bank_index >= ADMISSION_BANKS
+     || !pump_config_valid(config)
+     || !admission_storage_valid(?storage, config.connection_limit)) {
+        ret false;
+    }
+    val bank: *AdmissionGeneration = ?pump.admissions[bank_index];
+    if (bank.live) { ret false; }
+    if (!admission.initialize(?bank.admissions, admission.Config{
+            source: config.admission_generation,
+            max_connections: config.connection_limit,
+            max_connections_per_peer: config.max_connections_per_peer},
+        admission.Storage{peers: storage.peers,
+            peer_capacity: storage.peer_capacity, charges: storage.charges,
+            charge_capacity: storage.charge_capacity})) { ret false; }
+    if (!token.initialize(?bank.tokens, token.Config{
+            source: config.admission_generation,
+            retry_max_age_ns: config.retry_max_age_ns,
+            address_max_age_ns: config.address_max_age_ns},
+        token.Storage{replay: storage.replay,
+            replay_capacity: storage.replay_capacity},
+        pump.token_generation, contracts.SecretBytes{
+            data: ?pump.token_key[0], len: token.KEY_SIZE})) {
+        abandon_admission_parts(bank, false, true, false);
+        ret false;
+    }
+    pump.versions[0] = 0x00000001;
+    pump.versions[1] = 0x6b3343cf;
+    if (!quic_listener.initialize(?bank.listener, quic_listener.Config{
+            source: config.admission_generation,
+            supported_versions: ?pump.versions[0],
+            supported_version_count: 2, minimum_initial_size: 1200,
+            require_retry: config.require_retry},
+        quic_listener.Storage{pending: storage.pending,
+            pending_capacity: storage.pending_capacity},
+        ?bank.admissions, ?bank.tokens)) {
+        abandon_admission_parts(bank, false, true, true);
+        ret false;
+    }
+    bank.storage = storage;
+    bank.source = config.admission_generation;
+    bank.active_connections = 0;
+    bank.retiring = false;
+    bank.live = true;
+    ret true;
+}
+
+fun abandon_attached_pump(pump: *Pump) bool {
+    if (pump == nil) { ret false; }
+    var success: bool = true;
+    var i: usize = 0;
+    for (i < ADMISSION_BANKS) {
+        val bank: *AdmissionGeneration = ?pump.admissions[i];
+        if (bank.live) {
+            if (!begin_retire(bank) || !reap_admission(bank)) {
+                success = false;
+            }
+        }
+        i = i + 1;
+    }
+    if (pump.scope_live) {
+        if (!cancel.destroy(?pump.scope)) {
+            success = false;
+        } or {
+            pump.scope_live = false;
+        }
+    }
+    ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+    if (!success) { ret false; }
+    pump.driver = nil;
+    pump.socket = nil;
+    pump.root = nil;
+    pump.tls_policy = nil;
+    pump.plan = nil;
+    pump.budgets = nil;
+    pump.listener_name = nil;
+    pump.started = false;
+    pump.receive_pending = false;
+    pump.draining = false;
+    pump.cancelling = false;
+    pump.live = false;
+    ret true;
+}
+
+fun free_pump(runtime: *Runtime) usize {
+    var i: usize = 0;
+    for (i < MAX_PUMPS) {
+        if (!runtime.pumps[i].live) { ret i; }
+        i = i + 1;
+    }
+    ret NO_PUMP;
+}
+
+pub fun attach(runtime: *Runtime, driver: *net_async.Driver,
+    socket: *udp.Socket, root: *cancel.Scope, local: ip.Endpoint,
+    config: PumpConfig, storage: PumpStorage,
+    output: *PumpHandle) Status {
+    if (runtime == nil || !runtime.initialized || runtime.stopping
+     || driver == nil || socket == nil || root == nil || output == nil
+     || !pump_config_valid(?config)
+     || !admission_storage_valid(?storage.admissions[0],
+        config.connection_limit)
+     || !admission_storage_valid(?storage.admissions[1],
+        config.connection_limit)) { ret INVALID; }
+    val index: usize = free_pump(runtime);
+    if (index == NO_PUMP) { ret BLOCKED; }
+    val pump: *Pump = ?runtime.pumps[index];
+    pump.generation = next_generation(pump.generation);
+    pump.token_generation = next_generation(pump.token_generation);
+    pump.live = false;
+    pump.scope_live = false;
+    pump.receive_pending = false;
+    pump.started = false;
+    pump.draining = false;
+    pump.cancelling = false;
+    var i: usize = 0;
+    for (i < ADMISSION_BANKS) {
+        pump.admissions[i].live = false;
+        pump.admissions[i].retiring = false;
+        pump.admissions[i].storage = storage.admissions[i];
+        i = i + 1;
+    }
+    if (os.secret_random_fill(?pump.token_key[0], token.KEY_SIZE) != 0) {
+        ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+        ret FAILED;
+    }
+    if (!cancel.make_child(?pump.scope, root, false,
+        time.Time{sec: 0, nsec: 0})) {
+        ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+        ret FAILED;
+    }
+    pump.scope_live = true;
+    pump.driver = driver;
+    pump.socket = socket;
+    pump.root = root;
+    pump.local = local;
+    pump.active_connections = 0;
+    pump.active_admission = 0;
+    if (!initialize_admission(pump, 0, ?config,
+        storage.admissions[0])) {
+        abandon_attached_pump(pump);
+        ret FAILED;
+    }
+    apply_pump_config(pump, ?config);
+    i = 0;
+    for (i < RECEIVE_BATCH) {
+        reset_receive_packet(pump, i);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < STATELESS_SENDS) {
+        pump.stateless[i].pending = false;
+        i = i + 1;
+    }
+    if (!make_context(?pump.receive_context, COMPLETION_RECEIVE, index,
+        pump.generation, NO_CONNECTION, 0, 0, 0, no_token())) {
+        abandon_attached_pump(pump);
+        ret FAILED;
+    }
+    pump.live = true;
+    runtime.pump_count = runtime.pump_count + 1;
+    @output = PumpHandle{index: index, generation: pump.generation};
+    ret OK;
+}
+
+fun submit_receive(pump: *Pump) Status {
+    if (pump == nil || !pump.live || !pump.started || pump.receive_pending
+     || pump.driver == nil || pump.socket == nil || !pump.scope_live
+     || cancel.reason(?pump.scope) != cancel.ACTIVE) { ret INVALID; }
+    val submitted: Result[io_runtime.Token, io_error.Error] =
+        net_async.submit_receive_batch(pump.driver, ?pump.scope, pump.socket,
+            ?pump.receive_packets[0], RECEIVE_BATCH,
+            (?pump.receive_context.route)::usize);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret FAILED; }
+    pump.receive_pending = true;
+    ret OK;
+}
+
+pub fun start(runtime: *Runtime, handle: PumpHandle) Status {
+    val pump: *Pump = pump_for(runtime, handle);
+    if (pump == nil || pump.started || pump.draining || pump.cancelling) {
+        ret INVALID;
+    }
+    pump.started = true;
+    val status: Status = submit_receive(pump);
+    if (status != OK) { pump.started = false; }
+    ret status;
+}
+
+fun begin_retire(bank: *AdmissionGeneration) bool {
+    if (bank == nil || !bank.live) { ret false; }
+    if (bank.retiring) { ret true; }
+    if (!quic_listener.begin_close(?bank.listener)) { ret false; }
+    bank.retiring = true;
+    ret true;
+}
+
+fun reap_admission(bank: *AdmissionGeneration) bool {
+    if (bank == nil || !bank.live || !bank.retiring
+     || bank.active_connections != 0) { ret false; }
+    if (!quic_listener.finish_close(?bank.listener)
+     || !admission.begin_close(?bank.admissions)
+     || !admission.finish_close(?bank.admissions)
+     || !token.begin_close(?bank.tokens)
+     || !token.finish_close(?bank.tokens)) { ret false; }
+    bank.live = false;
+    bank.retiring = false;
+    bank.source = 0;
+    ret true;
+}
+
+fun apply_pump_config(pump: *Pump, config: *PumpConfig) {
+    pump.tls_policy = config.tls_policy;
+    pump.plan = config.plan;
+    pump.budgets = config.budgets;
+    pump.limits = config.limits;
+    pump.listener_name = config.listener_name;
+    pump.handshake_timeout_ns = config.handshake_timeout_ns;
+    pump.request_timeout_ns = config.request_timeout_ns;
+    pump.idle_timeout_ms = config.idle_timeout_ms;
+    pump.drain_timeout_ns = config.drain_timeout_ns;
+    pump.connection_limit = config.connection_limit;
+    pump.max_connections_per_peer = config.max_connections_per_peer;
+    pump.max_requests = config.max_requests;
+}
+
+fun rollback_staged_updates(runtime: *Runtime, updates: *PumpUpdate,
+    count: usize, staged: *bool) bool {
+    var success: bool = true;
+    var i: usize = 0;
+    for (i < count) {
+        if (staged[i]) {
+            val pump: *Pump = ?runtime.pumps[updates[i].handle.index];
+            val target: usize = 1 - pump.active_admission;
+            val bank: *AdmissionGeneration = ?pump.admissions[target];
+            if (!begin_retire(bank) || !reap_admission(bank)) {
+                success = false;
+            }
+        }
+        i = i + 1;
+    }
+    ret success;
+}
+
+fun connection_superseded(runtime: *Runtime, value: *Connection) bool {
+    if (runtime == nil || value == nil || !value.live
+     || value.pump >= MAX_PUMPS) { ret false; }
+    val pump: *Pump = ?runtime.pumps[value.pump];
+    ret !pump.live || value.pump_generation != pump.generation
+        || value.admission_bank != pump.active_admission
+        || value.plan == nil || pump.plan == nil
+        || value.plan.generation != pump.plan.generation;
+}
+
+fun mark_superseded_graceful(runtime: *Runtime) {
+    var i: usize = 0;
+    for (i < runtime.connection_capacity) {
+        val value: *Connection = ?runtime.storage.connections[i];
+        if (value.state == CONNECTION_LIVE
+         && connection_superseded(runtime, value)) {
+            value.state = CONNECTION_GRACEFUL;
+        }
+        i = i + 1;
+    }
+}
+
+fun update_result(status: Status, committed: bool) UpdateResult {
+    ret UpdateResult{status: status, committed: committed};
+}
+
+fun update_transaction(runtime: *Runtime, updates: *PumpUpdate,
+    count: usize, require_all: bool) UpdateResult {
+    if (runtime == nil || !runtime.initialized || runtime.stopping
+     || count > MAX_PUMPS || (count != 0 && updates == nil)
+     || (require_all && count != runtime.pump_count)) {
+        ret update_result(INVALID, false);
+    }
+    if (count == 0) { ret update_result(OK, true); }
+    var changed: [MAX_PUMPS]bool;
+    var staged: [MAX_PUMPS]bool;
+    var i: usize = 0;
+    for (i < count) {
+        val update: *PumpUpdate = ?updates[i];
+        val pump: *Pump = pump_for(runtime, update.handle);
+        if (pump == nil || !pump_config_valid(?update.config)
+         || pump.draining || pump.cancelling
+         || update.config.connection_limit < pump.active_connections) {
+            ret update_result(INVALID, false);
+        }
+        var prior: usize = 0;
+        for (prior < i) {
+            if (updates[prior].handle.index == update.handle.index) {
+                ret update_result(INVALID, false);
+            }
+            prior = prior + 1;
+        }
+        val current: usize = pump.active_admission;
+        val old: *AdmissionGeneration = ?pump.admissions[current];
+        if (!old.live || old.retiring) {
+            ret update_result(INVALID, false);
+        }
+        changed[i] = update.config.admission_generation != old.source;
+        if (changed[i]) {
+            val next: *AdmissionGeneration =
+                ?pump.admissions[1 - current];
+            if (next.live
+             && (!next.retiring || next.active_connections != 0)) {
+                ret update_result(BLOCKED, false);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        if (changed[i]) {
+            val pump: *Pump = ?runtime.pumps[updates[i].handle.index];
+            val target: usize = 1 - pump.active_admission;
+            val next: *AdmissionGeneration = ?pump.admissions[target];
+            if (next.live && !reap_admission(next)) {
+                rollback_staged_updates(runtime, updates, count, ?staged[0]);
+                ret update_result(BLOCKED, false);
+            }
+            if (!initialize_admission(pump, target, ?updates[i].config,
+                next.storage)) {
+                rollback_staged_updates(runtime, updates, count, ?staged[0]);
+                ret update_result(FAILED, false);
+            }
+            staged[i] = true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        val pump: *Pump = ?runtime.pumps[updates[i].handle.index];
+        if (changed[i]) { pump.active_admission = 1 - pump.active_admission; }
+        apply_pump_config(pump, ?updates[i].config);
+        i = i + 1;
+    }
+    mark_superseded_graceful(runtime);
+    i = 0;
+    for (i < count) {
+        if (changed[i]) {
+            val pump: *Pump = ?runtime.pumps[updates[i].handle.index];
+            val old: *AdmissionGeneration =
+                ?pump.admissions[1 - pump.active_admission];
+            if (!begin_retire(old)) { ret update_result(FAILED, true); }
+        }
+        i = i + 1;
+    }
+    ret update_result(OK, true);
+}
+
+pub fun update(runtime: *Runtime, handle: PumpHandle,
+    config: PumpConfig) UpdateResult {
+    var updates: [1]PumpUpdate;
+    updates[0] = PumpUpdate{handle: handle, config: config};
+    ret update_transaction(runtime, ?updates[0], 1, false);
+}
+
+pub fun update_all(runtime: *Runtime, updates: *PumpUpdate,
+    count: usize) UpdateResult {
+    ret update_transaction(runtime, updates, count, true);
+}
+
+fun capacity_available(runtime: *Runtime, pump: *Pump) bool {
+    if (runtime == nil || pump == nil || runtime.external_live == nil) {
+        ret false;
+    }
+    val external_live: usize = runtime.external_live[0];
+    if (external_live >= runtime.max_connections
+     || runtime.live_connections >= runtime.max_connections - external_live
+     || pump.active_connections >= pump.connection_limit) { ret false; }
+    ret runtime.free_head != NO_CONNECTION;
+}
+
+fun acquire_connection(runtime: *Runtime, pump_index: usize,
+    admission_bank: usize) usize {
+    if (runtime == nil || runtime.free_head == NO_CONNECTION
+     || pump_index >= MAX_PUMPS || admission_bank >= ADMISSION_BANKS) {
+        ret NO_CONNECTION;
+    }
+    val index: usize = runtime.free_head;
+    val value: *Connection = ?runtime.storage.connections[index];
+    runtime.free_head = value.next_free;
+    value.next_free = NO_CONNECTION;
+    value.generation = next_generation(value.generation);
+    value.source = runtime.next_source;
+    runtime.next_source = next_generation(runtime.next_source);
+    value.pump = pump_index;
+    value.pump_generation = runtime.pumps[pump_index].generation;
+    value.admission_bank = admission_bank;
+    value.state = CONNECTION_ACCEPTING;
+    value.h3_session = h3_session.NO_SESSION;
+    value.scope_live = false;
+    value.charge_live = false;
+    value.h3_started = false;
+    value.h3_cancelled = false;
+    value.close_started = false;
+    value.transport_finished = false;
+    value.assembly_released = false;
+    value.live = true;
+    runtime.live_connections = runtime.live_connections + 1;
+    runtime.pumps[pump_index].active_connections =
+        runtime.pumps[pump_index].active_connections + 1;
+    runtime.pumps[pump_index].admissions[admission_bank].active_connections =
+        runtime.pumps[pump_index].admissions[admission_bank].active_connections + 1;
+    ret index;
+}
+
+fun return_connection(runtime: *Runtime, index: usize) {
+    val value: *Connection = ?runtime.storage.connections[index];
+    if (value.pump < MAX_PUMPS) {
+        val pump: *Pump = ?runtime.pumps[value.pump];
+        if (pump.active_connections != 0) {
+            pump.active_connections = pump.active_connections - 1;
+        }
+        if (value.admission_bank < ADMISSION_BANKS) {
+            val bank: *AdmissionGeneration =
+                ?pump.admissions[value.admission_bank];
+            if (bank.active_connections != 0) {
+                bank.active_connections = bank.active_connections - 1;
+            }
+        }
+    }
+    if (runtime.live_connections != 0) {
+        runtime.live_connections = runtime.live_connections - 1;
+    }
+    value.live = false;
+    value.state = CONNECTION_FREE;
+    value.next_free = runtime.free_head;
+    runtime.free_head = index;
+}
+
+fun connection_for(runtime: *Runtime, index: usize,
+    generation: u64) *Connection {
+    if (runtime == nil || !runtime.initialized
+     || index >= runtime.connection_capacity) { ret nil; }
+    val value: *Connection = ?runtime.storage.connections[index];
+    if (!value.live || value.generation != generation) { ret nil; }
+    ret value;
+}
+
+fun same_route_binding(left: routing.Binding,
+    right: routing.Binding) bool {
+    ret left.connection_slot == right.connection_slot
+        && left.connection_generation == right.connection_generation
+        && left.route_index == right.route_index
+        && left.route_generation == right.route_generation
+        && left.route_sequence == right.route_sequence
+        && left.pump_generation == right.pump_generation;
+}
+
+fun route_binding(value: *Connection, slot: usize,
+    route: assembly.Route) routing.Binding {
+    ret routing.Binding{connection_slot: slot,
+        connection_generation: value.generation,
+        route_index: route.index, route_generation: route.generation,
+        route_sequence: route.sequence,
+        pump_generation: value.pump_generation};
+}
+
+fun unpublish_route(runtime: *Runtime,
+    published: *PublishedRoute) bool {
+    if (!published.live) { ret true; }
+    val removed: routing.Status = routing.unpublish(?runtime.routes,
+        published.key, published.binding);
+    if (removed != routing.ROUTE_OK && removed != routing.ROUTE_MISSING) {
+        ret false;
+    }
+    published.live = false;
+    ret true;
+}
+
+fun route_matches(value: *Connection, published: *PublishedRoute,
+    route: assembly.Route, binding_value: routing.Binding) bool {
+    ret published.live && same_route_binding(published.binding, binding_value)
+        && route.active && route.id.length == published.key.length
+        && assembly.route_valid(?value.assembly, ?route);
+}
+
+# the copied table is reconciled after every operation that can mutate core state
+fun reconcile_routes(runtime: *Runtime, index: usize) bool {
+    val value: *Connection = ?runtime.storage.connections[index];
+    if (!value.live || !value.assembly.initialized) { ret false; }
+    val snapshot: assembly.RoutingSnapshot =
+        assembly.routing_snapshot(?value.assembly);
+    if (!snapshot.initialized
+     || snapshot.capacity > assembly.CONNECTION_ID_CAPACITY) { ret false; }
+    var i: usize = 0;
+    for (i < assembly.CONNECTION_ID_CAPACITY) {
+        val published: *PublishedRoute = ?value.published[i];
+        if (published.live) {
+            if (i >= snapshot.capacity) {
+                if (!unpublish_route(runtime, published)) { ret false; }
+            } or {
+                val current: assembly.Route =
+                    assembly.route_at(?value.assembly, i);
+                val current_binding: routing.Binding =
+                    route_binding(value, index, current);
+                if (!route_matches(value, published, current,
+                    current_binding)) {
+                    if (!unpublish_route(runtime, published)) { ret false; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < snapshot.capacity) {
+        val route: assembly.Route = assembly.route_at(?value.assembly, i);
+        if (route.active) {
+            if (!assembly.route_valid(?value.assembly, ?route)
+             || route.id.length == 0
+             || route.id.length > routing.MAX_CID_BYTES) { ret false; }
+            val key: routing.Key = routing.key(?route.id.data[0],
+                route.id.length);
+            val binding_value: routing.Binding =
+                route_binding(value, index, route);
+            val published: *PublishedRoute = ?value.published[i];
+            if (!published.live) {
+                if (routing.publish(?runtime.routes, key,
+                    binding_value) != routing.ROUTE_OK) { ret false; }
+                published.key = key;
+                published.binding = binding_value;
+                published.live = true;
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun remove_routes(runtime: *Runtime, value: *Connection) bool {
+    var i: usize = 0;
+    for (i < assembly.CONNECTION_ID_CAPACITY) {
+        if (!unpublish_route(runtime, ?value.published[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun refresh_timer(runtime: *Runtime, index: usize) bool {
+    val value: *Connection = ?runtime.storage.connections[index];
+    if (!value.live || !value.assembly.initialized) { ret false; }
+    ret timers.refresh(?runtime.timer_queue, index, value.generation,
+        qt.timer[binding.Binding](?value.assembly.driver)) == timers.TIMER_OK;
+}
+
+fun copy_listener_name(value: *Connection, name: str) bool {
+    val length: usize = str_len(name);
+    if (length == 0 || length >= schema.TEXT_CAP) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        value.listener_name[i] = name[i];
+        i = i + 1;
+    }
+    value.listener_name[length] = 0;
+    value.listener_name_length = length;
+    ret true;
+}
+
+fun connection_local(pump: *Pump, received: *net_types.Packet) ip.Endpoint {
+    var local: ip.Endpoint = pump.local;
+    if (received.has_local_destination) {
+        local.addr = received.local_destination;
+        if (local.addr.is_v6 != 0) {
+            local.scope = received.interface_index;
+        }
+    }
+    ret local;
+}
+
+fun initialize_tls(value: *Connection, parameters_length: usize) bool {
+    ret server.init(?value.tls, ?value.policy.configuration,
+        server.Storage{input: ?value.tls_input[0],
+            input_capacity: hedge_tls.HANDSHAKE_INPUT_BYTES,
+            output: ?value.tls_output[0],
+            output_capacity: hedge_tls.HANDSHAKE_OUTPUT_BYTES,
+            hello: ?value.tls_hello[0],
+            hello_capacity: hedge_tls.HELLO_BYTES,
+            certificates: ?value.tls_certificates[0],
+            certificate_capacity: hedge_tls.PEER_CERTIFICATES,
+            peer_parameters: ?value.tls_peer_parameters[0],
+            peer_parameters_capacity: assembly.PARAMETER_CAPACITY},
+        server.ExtraExtension{kind: server.QUIC_TRANSPORT_PARAMETERS,
+            data: contracts.Bytes{data: ?value.local_parameters[0],
+                len: parameters_length}},
+        server.QUIC_TRANSPORT_PARAMETERS);
+}
+
+fun abandon_before_assembly(runtime: *Runtime, index: usize,
+    tls_live: bool) bool {
+    val value: *Connection = ?runtime.storage.connections[index];
+    val pump: *Pump = ?runtime.pumps[value.pump];
+    val bank: *AdmissionGeneration = ?pump.admissions[value.admission_bank];
+    if (tls_live && !server.destroy(?value.tls)) { ret false; }
+    if (value.charge_live) {
+        if (quic_listener.release_connection(?bank.listener,
+            value.charge).action != quic_listener.ACTION_ACCEPT) { ret false; }
+        value.charge_live = false;
+    }
+    if (value.scope_live) {
+        if (!cancel.destroy(?value.scope)) { ret false; }
+        value.scope_live = false;
+    }
+    return_connection(runtime, index);
+    ret true;
+}
+
+fun abandon_failed_assembly(runtime: *Runtime, index: usize) bool {
+    if (runtime == nil || index >= runtime.connection_capacity
+     || !assembly.reusable(
+        ?runtime.storage.connections[index].assembly)) { ret false; }
+    ret abandon_before_assembly(runtime, index, true);
+}
+
+fun initialize_connection(runtime: *Runtime, pump_index: usize,
+    bank_index: usize, index: usize, accepted: *quic_listener.Accepted,
+    received: *net_types.Packet, wall: time.Time, now_ns: u64) bool {
+    val pump: *Pump = ?runtime.pumps[pump_index];
+    val value: *Connection = ?runtime.storage.connections[index];
+    value.charge = accepted.charge;
+    value.charge_live = true;
+    value.policy = pump.tls_policy;
+    value.plan = pump.plan;
+    value.budgets = pump.budgets;
+    value.limits = pump.limits;
+    value.peer = accepted.peer;
+    value.local = connection_local(pump, received);
+    value.max_requests = pump.max_requests;
+    value.request_timeout_ns = pump.request_timeout_ns;
+    if (!copy_listener_name(value, pump.listener_name)
+     || random.fill(?value.local_cid[0], CONNECTION_ID_BYTES) != 0
+     || !cancel.make_child(?value.scope, ?pump.scope, false,
+        time.Time{sec: 0, nsec: 0})) {
+        abandon_before_assembly(runtime, index, false);
+        ret false;
+    }
+    value.scope_live = true;
+    var config: assembly.Config = assembly.default_config(value.source,
+        value.local, value.peer);
+    config.local_source = ?value.local_cid[0];
+    config.local_source_length = CONNECTION_ID_BYTES;
+    config.alpn = "h3"::*u8;
+    config.alpn_length = 2;
+    config.server_name = nil;
+    config.server_name_length = 0;
+    config.max_idle_timeout_ms = pump.idle_timeout_ms;
+    config.drain_timeout_ns = pump.drain_timeout_ns;
+    config.verification_time_unix = time.time_unix_sec(wall);
+    config.tls_deadline_ns = saturated_add(now_ns,
+        pump.handshake_timeout_ns);
+    config.entropy_context_size = value.policy.configuration.entropy_context_size;
+    config.entropy_secret_context_size = 0;
+    config.enable_early_data = false;
+    if (!assembly.apply_server_acceptance(?config, accepted)) {
+        abandon_before_assembly(runtime, index, false);
+        ret false;
+    }
+    val encoded: transport_parameters.EncodeResult =
+        assembly.encode_parameters(?config, qt.SERVER,
+            ?value.local_parameters[0], assembly.PARAMETER_CAPACITY);
+    if (!encoded.ok || !initialize_tls(value, encoded.count)) {
+        abandon_before_assembly(runtime, index, false);
+        ret false;
+    }
+    val initialized: assembly.InitResult = assembly.init_server(
+        ?value.assembly, ?config, ?value.tls, ?value.scope, now_ns);
+    if (!initialized.ok) {
+        if (!abandon_failed_assembly(runtime, index)) {
+            value.state = CONNECTION_BROKEN;
+        }
+        ret false;
+    }
+    value.state = CONNECTION_LIVE;
+    if (!reconcile_routes(runtime, index)
+     || !refresh_timer(runtime, index)) {
+        qt.cancel_connection[binding.Binding](?value.assembly.driver);
+        value.state = CONNECTION_CANCELLING;
+        ret false;
+    }
+    ret true;
+}
+
+fun stateless_slot(pump: *Pump) usize {
+    var i: usize = 0;
+    for (i < STATELESS_SENDS) {
+        if (!pump.stateless[i].pending) { ret i; }
+        i = i + 1;
+    }
+    ret STATELESS_SENDS;
+}
+
+fun submit_stateless(runtime: *Runtime, pump_index: usize,
+    received: *net_types.Packet, data: *u8, length: usize) Status {
+    val pump: *Pump = ?runtime.pumps[pump_index];
+    val index: usize = stateless_slot(pump);
+    if (index == STATELESS_SENDS || data == nil || length == 0
+     || length > assembly.MAX_UDP_PAYLOAD) { ret BLOCKED; }
+    val operation: *StatelessSend = ?pump.stateless[index];
+    operation.generation = next_generation(operation.generation);
+    memory.raw_copy(?operation.buffer[0], data, length);
+    operation.packet.buffer = ?operation.buffer[0];
+    operation.packet.capacity = length;
+    operation.packet.length = length;
+    operation.packet.peer = received.peer;
+    operation.packet.local_destination = received.local_destination;
+    operation.packet.interface_index = received.interface_index;
+    operation.packet.has_local_destination = received.has_local_destination;
+    operation.packet.truncated = false;
+    operation.packet.zero_length = false;
+    if (!make_context(?operation.context, COMPLETION_STATELESS,
+        pump_index, pump.generation, NO_CONNECTION, 0, index,
+        operation.generation, no_token())) { ret FAILED; }
+    val submitted: Result[io_runtime.Token, io_error.Error] =
+        net_async.submit_send_batch(pump.driver, ?pump.scope, pump.socket,
+            ?operation.packet, 1, (?operation.context.route)::usize);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret FAILED; }
+    operation.pending = true;
+    ret OK;
+}
+
+fun retry_identity(request: *quic_listener.Request) bool {
+    var source: [CONNECTION_ID_BYTES]u8;
+    var nonce: u64 = 0;
+    if (random.fill(?source[0], CONNECTION_ID_BYTES) != 0
+     || random.fill((?nonce)::*u8, 8) != 0 || nonce == 0
+     || !quic_listener.set_retry_source(request, ?source[0],
+        CONNECTION_ID_BYTES)) { ret false; }
+    request.retry_nonce = nonce;
+    ret true;
+}
+
+fun handle_unknown(runtime: *Runtime, pump_index: usize,
+    received: *net_types.Packet, wall: time.Time, now_ns: u64) Status {
+    val pump: *Pump = ?runtime.pumps[pump_index];
+    if (pump.draining || pump.cancelling) { ret STOPPED; }
+    val bank_index: usize = pump.active_admission;
+    val bank: *AdmissionGeneration = ?pump.admissions[bank_index];
+    var request: quic_listener.Request;
+    request.peer = received.peer;
+    request.data = received.buffer;
+    request.length = received.length;
+    request.now_ns = now_ns;
+    request.version_negotiation_bits = 0x5a;
+    request.output = ?pump.preflight_output[0];
+    request.output_capacity = assembly.MAX_UDP_PAYLOAD;
+    if (!retry_identity(?request)) { ret FAILED; }
+    val result: quic_listener.Result =
+        quic_listener.preflight(?bank.listener, ?request);
+    if (result.action == quic_listener.ACTION_RETRY
+     || result.action == quic_listener.ACTION_VERSION_NEGOTIATION) {
+        ret submit_stateless(runtime, pump_index, received,
+            ?pump.preflight_output[0], result.output_count);
+    }
+    if (result.action == quic_listener.ACTION_DROP) { ret OK; }
+    if (result.action == quic_listener.ACTION_BLOCKED) { ret BLOCKED; }
+    if (result.action != quic_listener.ACTION_ACCEPT) { ret FAILED; }
+    if (!capacity_available(runtime, pump)) {
+        quic_listener.cancel(?bank.listener, result.acceptance);
+        ret BLOCKED;
+    }
+    val index: usize = acquire_connection(runtime, pump_index, bank_index);
+    if (index == NO_CONNECTION) {
+        quic_listener.cancel(?bank.listener, result.acceptance);
+        ret BLOCKED;
+    }
+    val accepted: quic_listener.Accepted =
+        quic_listener.commit(?bank.listener, result.acceptance);
+    if (accepted.action != quic_listener.ACTION_ACCEPT) {
+        return_connection(runtime, index);
+        ret FAILED;
+    }
+    if (!initialize_connection(runtime, pump_index, bank_index, index,
+        ?accepted, received, wall, now_ns)) { ret FAILED; }
+    val value: *Connection = ?runtime.storage.connections[index];
+    val delivered: qt.OperationResult = qt.receive_native[binding.Binding](
+        ?value.assembly.driver, received, value.local, now_ns, 0);
+    if (!reconcile_routes(runtime, index) || !refresh_timer(runtime, index)) {
+        qt.cancel_connection[binding.Binding](?value.assembly.driver);
+        value.state = CONNECTION_CANCELLING;
+        ret FAILED;
+    }
+    if (delivered.status == qt.STATUS_ERROR) {
+        qt.cancel_connection[binding.Binding](?value.assembly.driver);
+        value.state = CONNECTION_CANCELLING;
+        ret FAILED;
+    }
+    ret OK;
+}
+
+fun route_is_current(runtime: *Runtime, found: routing.Lookup) bool {
+    if (found.status != routing.ROUTE_OK
+     || found.binding.connection_slot >= runtime.connection_capacity) {
+        ret false;
+    }
+    val value: *Connection =
+        ?runtime.storage.connections[found.binding.connection_slot];
+    if (!value.live
+     || value.generation != found.binding.connection_generation
+     || value.pump >= MAX_PUMPS
+     || value.pump_generation != found.binding.pump_generation
+     || !runtime.pumps[value.pump].live
+     || runtime.pumps[value.pump].generation != value.pump_generation
+     || found.binding.route_index >= assembly.CONNECTION_ID_CAPACITY
+     || !value.published[found.binding.route_index].live
+     || !same_route_binding(value.published[found.binding.route_index].binding,
+        found.binding)) { ret false; }
+    val route: assembly.Route = assembly.route_at(?value.assembly,
+        found.binding.route_index);
+    ret route.active && route.generation == found.binding.route_generation
+        && route.sequence == found.binding.route_sequence
+        && assembly.route_valid(?value.assembly, ?route);
+}
+
+fun begin_transport_close(value: *Connection, code: u64,
+    now_ns: u64) bool {
+    if (value.close_started) { ret true; }
+    val result: qt.OperationResult = qt.begin_close[binding.Binding](
+        ?value.assembly.driver, code, nil, 0, now_ns);
+    if (result.status != qt.STATUS_OK && result.status != qt.STATUS_CLOSED) {
+        ret false;
+    }
+    value.close_started = true;
+    value.state = CONNECTION_RELEASING;
+    ret true;
+}
+
+fun endpoint_metadata(endpoint: ip.Endpoint, storage: *u8,
+    capacity: usize) message.Endpoint {
+    val length: usize = ip.endpoint_format(endpoint, storage, capacity);
+    if (length == 0) { ret message.unspecified_endpoint(); }
+    ret message.endpoint(message.ENDPOINT_IP,
+        view.view(storage, length), endpoint.port);
+}
+
+fun selected_h3(value: *Connection) bool {
+    val snapshot: engine.Snapshot = server.snapshot(?value.tls);
+    ret snapshot.status == engine.COMPLETE
+        && snapshot.selected_alpn.data != nil
+        && snapshot.selected_alpn.len == 2
+        && snapshot.selected_alpn.data[0] == 'h'::u8
+        && snapshot.selected_alpn.data[1] == '3'::u8;
+}
+
+fun start_h3(runtime: *Runtime, value: *Connection,
+    now: time.Time, now_ns: u64) bool {
+    if (value.h3_started) { ret true; }
+    val index: usize = h3_session.acquire(?runtime.sessions);
+    if (index == h3_session.NO_SESSION) { ret false; }
+    val session: *h3_session.Session =
+        h3_session.session_at(?runtime.sessions, index);
+    val peer: message.Endpoint = endpoint_metadata(value.peer,
+        ?value.peer_text[0], ENDPOINT_BYTES);
+    val local: message.Endpoint = endpoint_metadata(value.local,
+        ?value.local_text[0], ENDPOINT_BYTES);
+    if (session == nil || peer.kind == message.ENDPOINT_UNSPECIFIED
+     || local.kind == message.ENDPOINT_UNSPECIFIED
+     || !h3_session.begin(session, ?value.assembly.driver, ?value.scope,
+        value.plan, value.budgets, value.limits, value.max_requests,
+        (?value.listener_name[0])::str, peer, local,
+        value.request_timeout_ns, now_ns)) {
+        h3_session.abandon(?runtime.sessions, index);
+        ret false;
+    }
+    value.h3_session = index;
+    value.h3_started = true;
+    ret true;
+}
+
+fun drive_h3(runtime: *Runtime, value: *Connection,
+    now: time.Time, now_ns: u64) bool {
+    val transport: qt.Snapshot =
+        qt.snapshot[binding.Binding](?value.assembly.driver);
+    if (!value.h3_started && transport.state == qt.ACTIVE) {
+        if (!selected_h3(value) || !start_h3(runtime, value, now, now_ns)) {
+            ret begin_transport_close(value,
+                h3.H3_GENERAL_PROTOCOL_ERROR, now_ns);
+        }
+    }
+    if (value.h3_session == h3_session.NO_SESSION) { ret true; }
+    val session: *h3_session.Session = h3_session.session_at(
+        ?runtime.sessions, value.h3_session);
+    if (session == nil) { ret false; }
+    if (transport.state != qt.ACTIVE && !value.h3_cancelled
+     && session.state != h3_session.CLOSED) {
+        h3_session.cancel_session(session);
+        value.h3_cancelled = true;
+    }
+    if (value.state == CONNECTION_GRACEFUL
+     && session.state == h3_session.ACTIVE) {
+        if (!h3_session.begin_graceful(session)) { ret false; }
+    }
+    var attempts: usize = 0;
+    for (attempts < h3_session.MAX_STEPS) {
+        val progress: h3_session.Step =
+            h3_session.advance(session, now, now_ns);
+        if (progress == h3_session.STEP_DONE) {
+            val index: usize = value.h3_session;
+            if (!h3_session.release(?runtime.sessions, index)) { ret false; }
+            value.h3_session = h3_session.NO_SESSION;
+            value.h3_started = false;
+            if (value.state == CONNECTION_GRACEFUL) {
+                ret begin_transport_close(value, h3.H3_NO_ERROR, now_ns);
+            }
+            ret true;
+        }
+        # an h3 step error transitions the session into its drain path
+        if (progress == h3_session.STEP_BLOCKED
+         || progress == h3_session.STEP_IDLE) { ret true; }
+        attempts = attempts + 1;
+    }
+    ret true;
+}
+
+fun free_send(value: *Connection) usize {
+    var i: usize = 0;
+    for (i < assembly.SEND_CAPACITY) {
+        if (!value.sends[i].pending) { ret i; }
+        i = i + 1;
+    }
+    ret assembly.SEND_CAPACITY;
+}
+
+fun fill_send_packet(operation: *SendOperation,
+    generated: qt.Generated) {
+    operation.packet.buffer = generated.buffer;
+    operation.packet.capacity = generated.count;
+    operation.packet.length = generated.count;
+    operation.packet.peer = generated.peer;
+    operation.packet.local_destination = generated.local_destination;
+    operation.packet.interface_index = generated.interface_index;
+    operation.packet.has_local_destination = generated.has_local_destination;
+    operation.packet.truncated = false;
+    operation.packet.zero_length = false;
+}
+
+fun generate_sends(runtime: *Runtime, index: usize,
+    now_ns: u64) bool {
+    val value: *Connection = ?runtime.storage.connections[index];
+    val pump: *Pump = ?runtime.pumps[value.pump];
+    var attempts: usize = 0;
+    for (attempts < assembly.SEND_CAPACITY) {
+        val operation_index: usize = free_send(value);
+        if (operation_index == assembly.SEND_CAPACITY) { ret true; }
+        val operation: *SendOperation = ?value.sends[operation_index];
+        operation.generation = next_generation(operation.generation);
+        val generated: qt.Generated = qt.generate[binding.Binding](
+            ?value.assembly.driver, ?value.scope, ?operation.buffer[0],
+            assembly.MAX_UDP_PAYLOAD, now_ns, operation.generation::usize);
+        if (!reconcile_routes(runtime, index)
+         || !refresh_timer(runtime, index)) { ret false; }
+        if (generated.status == qt.STATUS_EMPTY
+         || generated.status == qt.STATUS_BLOCKED
+         || generated.status == qt.STATUS_CLOSED
+         || generated.status == qt.STATUS_CANCELLED) { ret true; }
+        if (generated.status != qt.STATUS_OK) { ret false; }
+        operation.token = generated.token;
+        fill_send_packet(operation, generated);
+        if (!make_context(?operation.context, COMPLETION_SEND,
+            value.pump, value.pump_generation, index, value.generation,
+            operation_index, operation.generation, generated.token)) {
+            qt.complete_send[binding.Binding](?value.assembly.driver,
+                generated.token, qt.SEND_FAILED, 0, now_ns);
+            ret false;
+        }
+        val submitted: Result[io_runtime.Token, io_error.Error] =
+            net_async.submit_send_batch(pump.driver, ?value.scope, pump.socket,
+                ?operation.packet, 1, (?operation.context.route)::usize);
+        if (is_err[io_runtime.Token, io_error.Error](submitted)) {
+            qt.complete_send[binding.Binding](?value.assembly.driver,
+                generated.token, qt.SEND_FAILED, 0, now_ns);
+            if (!reconcile_routes(runtime, index)
+             || !refresh_timer(runtime, index)) { ret false; }
+            ret false;
+        }
+        operation.pending = true;
+        attempts = attempts + 1;
+    }
+    ret true;
+}
+
+fun progress_connection(runtime: *Runtime, index: usize,
+    now: time.Time, now_ns: u64) bool {
+    val value: *Connection = ?runtime.storage.connections[index];
+    if (!value.live || value.state == CONNECTION_BROKEN) { ret false; }
+    if (!drive_h3(runtime, value, now, now_ns)
+     || !generate_sends(runtime, index, now_ns)
+     || !reconcile_routes(runtime, index)
+     || !refresh_timer(runtime, index)) { ret false; }
+    ret true;
+}
+
+fun deliver_known(runtime: *Runtime, received: *net_types.Packet,
+    found: routing.Lookup, now: time.Time, now_ns: u64) Status {
+    if (!route_is_current(runtime, found)) { ret STALE; }
+    val index: usize = found.binding.connection_slot;
+    val value: *Connection = ?runtime.storage.connections[index];
+    val delivered: qt.OperationResult = qt.receive_native[binding.Binding](
+        ?value.assembly.driver, received, value.local, now_ns, 0);
+    if (!reconcile_routes(runtime, index)
+     || !refresh_timer(runtime, index)) { ret FAILED; }
+    if (delivered.status == qt.STATUS_ERROR) {
+        qt.cancel_connection[binding.Binding](?value.assembly.driver);
+        value.state = CONNECTION_CANCELLING;
+    }
+    if (!progress_connection(runtime, index, now, now_ns)) { ret FAILED; }
+    ret OK;
+}
+
+fun process_datagram(runtime: *Runtime, pump_index: usize,
+    received: *net_types.Packet, now: time.Time, now_ns: u64) Status {
+    if (received == nil || received.truncated || received.zero_length
+     || received.length == 0
+     || received.length > assembly.MAX_UDP_PAYLOAD) { ret INVALID; }
+    val classified: quic_listener.ClassifiedDatagram =
+        quic_listener.classify_datagram(received.buffer, received.length,
+            CONNECTION_ID_BYTES);
+    if (classified.class == quic_listener.DATAGRAM_MALFORMED) { ret OK; }
+    val key: routing.Key = routing.key(?classified.destination.data[0],
+        classified.destination.length);
+    val found: routing.Lookup = routing.lookup(?runtime.routes, key);
+    if (found.status == routing.ROUTE_OK) {
+        ret deliver_known(runtime, received, found, now, now_ns);
+    }
+    if (classified.class == quic_listener.DATAGRAM_INITIAL
+     || classified.class == quic_listener.DATAGRAM_NEGOTIATE) {
+        ret handle_unknown(runtime, pump_index, received, now, now_ns);
+    }
+    ret OK;
+}
+
+fun context_current(runtime: *Runtime, context: *CompletionContext) bool {
+    if (runtime == nil || !runtime.initialized || context == nil
+     || context.pump >= MAX_PUMPS) { ret false; }
+    val pump: *Pump = ?runtime.pumps[context.pump];
+    if (!pump.live || pump.generation != context.pump_generation) {
+        ret false;
+    }
+    if (context.kind == COMPLETION_RECEIVE
+     || context.kind == COMPLETION_STATELESS) { ret true; }
+    ret context.kind == COMPLETION_SEND
+        && connection_for(runtime, context.connection,
+            context.connection_generation) != nil;
+}
+
+fun settle_receive(runtime: *Runtime, context: *CompletionContext,
+    completion: io_runtime.Completion, now: time.Time,
+    now_ns: u64) Status {
+    val pump: *Pump = ?runtime.pumps[context.pump];
+    if (!pump.receive_pending) { ret STALE; }
+    pump.receive_pending = false;
+    if (completion.kind != io_runtime.RECEIVE_FROM
+     || completion.items > RECEIVE_BATCH) { ret FAILED; }
+    var status: Status = OK;
+    if (!completion.has_error) {
+        var i: usize = 0;
+        for (i < completion.items) {
+            val applied: Status = process_datagram(runtime, context.pump,
+                ?pump.receive_packets[i], now, now_ns);
+            if (applied == FAILED) { status = FAILED; }
+            i = i + 1;
+        }
+    } or (cancel.reason(?pump.scope) == cancel.ACTIVE) {
+        status = FAILED;
+    }
+    var i: usize = 0;
+    for (i < RECEIVE_BATCH) {
+        reset_receive_packet(pump, i);
+        i = i + 1;
+    }
+    if (pump.started && !pump.cancelling && pump.scope_live
+     && cancel.reason(?pump.scope) == cancel.ACTIVE) {
+        if (submit_receive(pump) != OK) { status = FAILED; }
+    }
+    ret status;
+}
+
+fun token_matches(context: *CompletionContext, value: qt.Token) bool {
+    ret context.token_source == value.source
+        && context.token_index == value.index
+        && context.token_generation == value.generation;
+}
+
+fun settle_send(runtime: *Runtime, context: *CompletionContext,
+    completion: io_runtime.Completion, now: time.Time,
+    now_ns: u64) Status {
+    val value: *Connection = connection_for(runtime, context.connection,
+        context.connection_generation);
+    if (value == nil || context.operation >= assembly.SEND_CAPACITY) {
+        ret STALE;
+    }
+    val operation: *SendOperation = ?value.sends[context.operation];
+    if (!operation.pending || operation.generation != context.operation_generation
+     || !token_matches(context, operation.token)) { ret STALE; }
+    var send_status: qt.SendStatus = qt.SEND_SENT;
+    var count: usize = completion.bytes;
+    if (completion.kind != io_runtime.SEND_TO || completion.has_error
+     || completion.items != 1 || completion.end_of_stream
+     || completion.bytes != operation.packet.length) {
+        send_status = qt.SEND_FAILED;
+        count = 0;
+        if (cancel.reason(?value.scope) != cancel.ACTIVE) {
+            send_status = qt.SEND_CANCELLED;
+        }
+    }
+    val settled: qt.Completion = qt.complete_send[binding.Binding](
+        ?value.assembly.driver, operation.token, send_status, count, now_ns);
+    operation.pending = false;
+    if (!reconcile_routes(runtime, context.connection)
+     || !refresh_timer(runtime, context.connection)
+     || settled.status == qt.STATUS_ERROR
+     || !progress_connection(runtime, context.connection, now, now_ns)) {
+        ret FAILED;
+    }
+    ret OK;
+}
+
+fun settle_stateless(runtime: *Runtime, context: *CompletionContext,
+    completion: io_runtime.Completion) Status {
+    if (context.operation >= STATELESS_SENDS) { ret STALE; }
+    val pump: *Pump = ?runtime.pumps[context.pump];
+    val operation: *StatelessSend = ?pump.stateless[context.operation];
+    if (!operation.pending
+     || operation.generation != context.operation_generation) { ret STALE; }
+    operation.pending = false;
+    if (completion.kind != io_runtime.SEND_TO || completion.has_error
+     || completion.items != 1 || completion.end_of_stream
+     || completion.bytes != operation.packet.length) { ret FAILED; }
+    ret OK;
+}
+
+fun complete_at(runtime: *Runtime, context: *CompletionContext,
+    completion: io_runtime.Completion, now: time.Time,
+    now_ns: u64) Status {
+    if (!context_current(runtime, context)) { ret STALE; }
+    if (context.kind == COMPLETION_RECEIVE) {
+        ret settle_receive(runtime, context, completion, now, now_ns);
+    }
+    if (context.kind == COMPLETION_SEND) {
+        ret settle_send(runtime, context, completion, now, now_ns);
+    }
+    if (context.kind == COMPLETION_STATELESS) {
+        ret settle_stateless(runtime, context, completion);
+    }
+    ret INVALID;
+}
+
+pub fun bind_external_live(runtime: *Runtime, external_live: *usize) bool {
+    if (runtime == nil || !runtime.initialized || external_live == nil) {
+        ret false;
+    }
+    runtime.external_live = external_live;
+    ret true;
+}
+
+fun drain_completions(runtime: *Runtime, now: time.Time,
+    now_ns: u64) Status {
+    var status: Status = OK;
+    var pump_index: usize = 0;
+    for (pump_index < MAX_PUMPS) {
+        val pump: *Pump = ?runtime.pumps[pump_index];
+        if (pump.live && pump.receive_context.completion_pending) {
+            val completion: io_runtime.Completion =
+                pump.receive_context.completion;
+            pump.receive_context.completion_pending = false;
+            if (complete_at(runtime, ?pump.receive_context, completion,
+                now, now_ns) == FAILED) { status = FAILED; }
+        }
+        var stateless: usize = 0;
+        for (stateless < STATELESS_SENDS) {
+            val context: *CompletionContext =
+                ?pump.stateless[stateless].context;
+            if (pump.live && context.completion_pending) {
+                val completion: io_runtime.Completion = context.completion;
+                context.completion_pending = false;
+                if (complete_at(runtime, context, completion,
+                    now, now_ns) == FAILED) { status = FAILED; }
+            }
+            stateless = stateless + 1;
+        }
+        pump_index = pump_index + 1;
+    }
+    var index: usize = 0;
+    for (index < runtime.connection_capacity) {
+        val value: *Connection = ?runtime.storage.connections[index];
+        var send: usize = 0;
+        for (send < assembly.SEND_CAPACITY) {
+            val context: *CompletionContext = ?value.sends[send].context;
+            if (value.live && context.completion_pending) {
+                val completion: io_runtime.Completion = context.completion;
+                context.completion_pending = false;
+                if (complete_at(runtime, context, completion,
+                    now, now_ns) == FAILED) { status = FAILED; }
+            }
+            send = send + 1;
+        }
+        index = index + 1;
+    }
+    ret status;
+}
+
+fun send_operations_pending(value: *Connection) bool {
+    var i: usize = 0;
+    for (i < assembly.SEND_CAPACITY) {
+        if (value.sends[i].pending) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun observe_transport_close(value: *Connection) {
+    val snapshot: qt.Snapshot =
+        qt.snapshot[binding.Binding](?value.assembly.driver);
+    if (snapshot.state == qt.CLOSING || snapshot.state == qt.DRAINING
+     || snapshot.state == qt.CLOSED) {
+        value.close_started = true;
+        if (value.state != CONNECTION_CANCELLING) {
+            value.state = CONNECTION_RELEASING;
+        }
+    }
+}
+
+fun release_connection(runtime: *Runtime, index: usize,
+    now: time.Time, now_ns: u64) Status {
+    val value: *Connection = ?runtime.storage.connections[index];
+    if (!value.live || value.state == CONNECTION_BROKEN) { ret BLOCKED; }
+    observe_transport_close(value);
+    if (!value.close_started) { ret BLOCKED; }
+    if (value.h3_session != h3_session.NO_SESSION) {
+        if (!drive_h3(runtime, value, now, now_ns)
+         || value.h3_session != h3_session.NO_SESSION) { ret BLOCKED; }
+    }
+    if (send_operations_pending(value)) { ret BLOCKED; }
+    val snapshot: qt.Snapshot =
+        qt.snapshot[binding.Binding](?value.assembly.driver);
+    if (snapshot.state != qt.DRAINING && snapshot.state != qt.CLOSED) {
+        ret BLOCKED;
+    }
+    if (timers.disarm(?runtime.timer_queue, index,
+        value.generation) != timers.TIMER_OK) { ret FAILED; }
+    if (!value.transport_finished) {
+        val finished: qt.OperationResult =
+            qt.finish_close[binding.Binding](?value.assembly.driver);
+        if (finished.status == qt.STATUS_BLOCKED) { ret BLOCKED; }
+        if (finished.status != qt.STATUS_OK) { ret FAILED; }
+        value.transport_finished = true;
+    }
+    if (qt.snapshot[binding.Binding](?value.assembly.driver).state !=
+        qt.CLOSED) { ret BLOCKED; }
+    if (!reconcile_routes(runtime, index) || !remove_routes(runtime, value)) {
+        ret FAILED;
+    }
+    if (!value.assembly_released) {
+        if (!assembly.release_closed(?value.assembly)) { ret BLOCKED; }
+        value.assembly_released = true;
+    }
+    val pump: *Pump = ?runtime.pumps[value.pump];
+    val bank: *AdmissionGeneration = ?pump.admissions[value.admission_bank];
+    if (value.charge_live) {
+        if (quic_listener.release_connection(?bank.listener,
+            value.charge).action != quic_listener.ACTION_ACCEPT) { ret FAILED; }
+        value.charge_live = false;
+    }
+    if (value.scope_live) {
+        if (!cancel.destroy(?value.scope)) { ret BLOCKED; }
+        value.scope_live = false;
+    }
+    val bank_index: usize = value.admission_bank;
+    return_connection(runtime, index);
+    if (pump.admissions[bank_index].retiring
+     && pump.admissions[bank_index].active_connections == 0) {
+        reap_admission(?pump.admissions[bank_index]);
+    }
+    ret OK;
+}
+
+pub fun advance(runtime: *Runtime, now: time.Time,
+    now_ns: u64) Status {
+    if (runtime == nil || !runtime.initialized || now_ns == 0) { ret INVALID; }
+    var status: Status = drain_completions(runtime, now, now_ns);
+    var due: timers.Result = timers.take_due(?runtime.timer_queue, now_ns);
+    for (due.status == timers.TIMER_OK) {
+        val index: usize = due.node.connection_slot;
+        val value: *Connection = connection_for(runtime, index,
+            due.node.connection_generation);
+        if (value != nil) {
+            val timed: qt.OperationResult = qt.on_timeout[binding.Binding](
+                ?value.assembly.driver, due.node.timer, now_ns);
+            if (timed.status != qt.STATUS_STALE
+             && timed.status != qt.STATUS_CLOSED
+             && timed.status != qt.STATUS_CANCELLED
+             && timed.status != qt.STATUS_OK) { status = FAILED; }
+            if (!reconcile_routes(runtime, index)
+             || !refresh_timer(runtime, index)
+             || !progress_connection(runtime, index, now, now_ns)) {
+                status = FAILED;
+            }
+        }
+        due = timers.take_due(?runtime.timer_queue, now_ns);
+    }
+    var i: usize = 0;
+    for (i < runtime.connection_capacity) {
+        val value: *Connection = ?runtime.storage.connections[i];
+        if (value.live && value.state != CONNECTION_BROKEN) {
+            if (!progress_connection(runtime, i, now, now_ns)) {
+                status = FAILED;
+            }
+            val released: Status = release_connection(runtime, i, now, now_ns);
+            if (released == FAILED) { status = FAILED; }
+        }
+        i = i + 1;
+    }
+    ret status;
+}
+
+pub fun next_deadline(runtime: *Runtime, output: *u64) Status {
+    if (runtime == nil || !runtime.initialized || output == nil) { ret INVALID; }
+    val status: timers.Status = timers.next_deadline(?runtime.timer_queue,
+        output);
+    if (status == timers.TIMER_OK) { ret OK; }
+    if (status == timers.TIMER_EMPTY) { ret BLOCKED; }
+    ret FAILED;
+}
+
+pub fun graceful_pump(runtime: *Runtime, handle: PumpHandle,
+    now_ns: u64) Status {
+    val pump: *Pump = pump_for(runtime, handle);
+    if (pump == nil || now_ns == 0) { ret INVALID; }
+    pump.draining = true;
+    val active: usize = pump.active_admission;
+    if (pump.admissions[active].live
+     && !begin_retire(?pump.admissions[active])) { ret FAILED; }
+    var i: usize = 0;
+    for (i < runtime.connection_capacity) {
+        val value: *Connection = ?runtime.storage.connections[i];
+        if (value.live && value.pump == handle.index
+         && value.pump_generation == handle.generation
+         && value.state == CONNECTION_LIVE) {
+            value.state = CONNECTION_GRACEFUL;
+            if (value.h3_session == h3_session.NO_SESSION
+             && !begin_transport_close(value, h3.H3_NO_ERROR, now_ns)) {
+                ret FAILED;
+            }
+        }
+        i = i + 1;
+    }
+    ret OK;
+}
+
+pub fun graceful_all(runtime: *Runtime, now_ns: u64) Status {
+    if (runtime == nil || !runtime.initialized || now_ns == 0) { ret INVALID; }
+    var status: Status = OK;
+    var i: usize = 0;
+    for (i < MAX_PUMPS) {
+        if (runtime.pumps[i].live) {
+            val applied: Status = graceful_pump(runtime,
+                PumpHandle{index: i,
+                    generation: runtime.pumps[i].generation}, now_ns);
+            if (applied != OK) { status = applied; }
+        }
+        i = i + 1;
+    }
+    ret status;
+}
+
+pub fun cancel_all(runtime: *Runtime) Status {
+    if (runtime == nil || !runtime.initialized) { ret INVALID; }
+    var status: Status = OK;
+    var i: usize = 0;
+    for (i < runtime.connection_capacity) {
+        val value: *Connection = ?runtime.storage.connections[i];
+        if (value.live && value.state != CONNECTION_BROKEN) {
+            if (value.h3_session != h3_session.NO_SESSION
+             && !value.h3_cancelled) {
+                val session: *h3_session.Session = h3_session.session_at(
+                    ?runtime.sessions, value.h3_session);
+                if (session != nil) { h3_session.cancel_session(session); }
+                value.h3_cancelled = true;
+            }
+            if (!qt.cancel_connection[binding.Binding](
+                ?value.assembly.driver)) { status = FAILED; }
+            value.close_started = true;
+            value.state = CONNECTION_CANCELLING;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < MAX_PUMPS) {
+        val pump: *Pump = ?runtime.pumps[i];
+        if (pump.live) {
+            pump.draining = true;
+            pump.cancelling = true;
+            if (pump.scope_live) { cancel.cancel(?pump.scope); }
+            var bank: usize = 0;
+            for (bank < ADMISSION_BANKS) {
+                if (pump.admissions[bank].live
+                 && !begin_retire(?pump.admissions[bank])) { status = FAILED; }
+                bank = bank + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret status;
+}
+
+pub fun stop(runtime: *Runtime, now_ns: u64) Status {
+    if (runtime == nil || !runtime.initialized) { ret INVALID; }
+    runtime.stopping = true;
+    ret graceful_all(runtime, now_ns);
+}
+
+fun stateless_pending(pump: *Pump) bool {
+    var i: usize = 0;
+    for (i < STATELESS_SENDS) {
+        if (pump.stateless[i].pending) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun release_pump(runtime: *Runtime, handle: PumpHandle) Status {
+    val pump: *Pump = pump_for(runtime, handle);
+    if (pump == nil) { ret STALE; }
+    if (!pump.draining || pump.active_connections != 0) { ret BLOCKED; }
+    if (!pump.cancelling) {
+        pump.cancelling = true;
+        if (pump.scope_live) { cancel.cancel(?pump.scope); }
+    }
+    if (pump.receive_pending || stateless_pending(pump)) { ret BLOCKED; }
+    var i: usize = 0;
+    for (i < ADMISSION_BANKS) {
+        val bank: *AdmissionGeneration = ?pump.admissions[i];
+        if (bank.live) {
+            if (!begin_retire(bank) || !reap_admission(bank)) { ret BLOCKED; }
+        }
+        i = i + 1;
+    }
+    if (pump.scope_live) {
+        if (!cancel.destroy(?pump.scope)) { ret BLOCKED; }
+        pump.scope_live = false;
+    }
+    ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+    pump.driver = nil;
+    pump.socket = nil;
+    pump.root = nil;
+    pump.tls_policy = nil;
+    pump.plan = nil;
+    pump.budgets = nil;
+    pump.listener_name = nil;
+    pump.started = false;
+    pump.live = false;
+    if (runtime.pump_count != 0) { runtime.pump_count = runtime.pump_count - 1; }
+    ret OK;
+}
+
+pub fun release(runtime: *Runtime) Status {
+    if (runtime == nil || !runtime.initialized) { ret INVALID; }
+    if (runtime.live_connections != 0 || runtime.routes.len != 0
+     || runtime.timer_queue.len != 0) { ret BLOCKED; }
+    var i: usize = 0;
+    for (i < MAX_PUMPS) {
+        if (runtime.pumps[i].live) {
+            val released: Status = release_pump(runtime,
+                PumpHandle{index: i,
+                    generation: runtime.pumps[i].generation});
+            if (released != OK) { ret released; }
+        }
+        i = i + 1;
+    }
+    if (runtime.sessions.live != 0 || runtime.pump_count != 0) { ret BLOCKED; }
+    runtime.initialized = false;
+    ret OK;
+}
+
+pub fun live(runtime: *Runtime) usize {
+    if (runtime == nil || !runtime.initialized) { ret 0; }
+    ret runtime.live_connections;
+}
+
+pub fun superseded(runtime: *Runtime) usize {
+    if (runtime == nil || !runtime.initialized) { ret 0; }
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i < runtime.connection_capacity) {
+        val value: *Connection = ?runtime.storage.connections[i];
+        if (connection_superseded(runtime, value)) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+pub fun snapshot(runtime: *Runtime) Snapshot {
+    var value: Snapshot;
+    if (runtime == nil || !runtime.initialized) { ret value; }
+    value.pumps = runtime.pump_count;
+    value.live = runtime.live_connections;
+    value.superseded = superseded(runtime);
+    value.routes = runtime.routes.len;
+    value.timers = runtime.timer_queue.len;
+    value.stopping = runtime.stopping;
+    value.initialized = true;
+    var i: usize = 0;
+    for (i < runtime.connection_capacity) {
+        if (runtime.storage.connections[i].live
+         && runtime.storage.connections[i].state == CONNECTION_BROKEN) {
+            value.broken = value.broken + 1;
+        }
+        i = i + 1;
+    }
+    ret value;
+}
+
+fun test_policy(policy: *hedge_tls.Policy,
+    protocols: *tls_config.ProtocolName, bytes: *u8) {
+    protocols[0] = tls_config.ProtocolName{data: bytes, len: 2};
+    policy.configuration.alpn = protocols;
+    policy.configuration.alpn_len = 1;
+    policy.configuration.require_alpn = true;
+    policy.live = true;
+}
+
+fun test_pump_config(generation: u64, policy: *hedge_tls.Policy,
+    selected_plan: *plan.Plan, budgets: *budget.Set) PumpConfig {
+    var config: PumpConfig;
+    config.admission_generation = generation;
+    config.connection_limit = 1;
+    config.max_connections_per_peer = 1;
+    config.require_retry = false;
+    config.retry_max_age_ns = 1000000000;
+    config.address_max_age_ns = 1000000000;
+    config.tls_policy = policy;
+    config.plan = selected_plan;
+    config.budgets = budgets;
+    config.max_requests = 1;
+    config.listener_name = "quic-test";
+    config.handshake_timeout_ns = 1000000000;
+    config.request_timeout_ns = 1000000000;
+    config.idle_timeout_ms = 30000;
+    config.drain_timeout_ns = 1000000000;
+    ret config;
+}
+
+fun test_admission_storage(pending: *quic_listener.Pending,
+    peers: *admission.PeerSlot, charges: *admission.ChargeSlot,
+    replay: *token.ReplaySlot) AdmissionStorage {
+    ret AdmissionStorage{pending: pending, pending_capacity: 1,
+        peers: peers, peer_capacity: 1, charges: charges,
+        charge_capacity: 1, replay: replay, replay_capacity: 1};
+}
+
+fun test_prepare_pump(pump: *Pump, generation: u64,
+    config: *PumpConfig, first: AdmissionStorage,
+    second: AdmissionStorage) bool {
+    pump.generation = generation;
+    pump.token_generation = 1;
+    pump.live = true;
+    pump.active_admission = 0;
+    pump.active_connections = 0;
+    pump.draining = false;
+    pump.cancelling = false;
+    pump.admissions[0].live = false;
+    pump.admissions[0].retiring = false;
+    pump.admissions[0].storage = first;
+    pump.admissions[1].live = false;
+    pump.admissions[1].retiring = false;
+    pump.admissions[1].storage = second;
+    apply_pump_config(pump, config);
+    ret initialize_admission(pump, 0, config, first);
+}
+
+test "hedge.protocol.quic.runtime: caller storage is bounded and reusable" {
+    var connections: [2]Connection;
+    var sessions: [2]h3_session.Session;
+    var entries: [16]routing.Entry;
+    var nodes: [2]timers.Node;
+    var positions: [2]timers.Position;
+    var storage: Storage;
+    var runtime: Runtime;
+    var external_live: usize = 0;
+    if (make_storage(?storage, ?connections[0], 2, ?sessions[0], 2,
+            ?entries[0], 15, ?nodes[0], ?positions[0], 2)
+     || !make_storage(?storage, ?connections[0], 2, ?sessions[0], 2,
+            ?entries[0], 16, ?nodes[0], ?positions[0], 2)
+     || !make(?runtime, storage, RuntimeConfig{max_connections: 2,
+        external_live: ?external_live})
+     || runtime.free_head != 0 || runtime.routes.capacity != 16
+     || runtime.timer_queue.capacity != 2 || runtime.sessions.capacity != 2) {
+        ret 1;
+    }
+    val first: usize = acquire_connection(?runtime, 0, 0);
+    # the free-list primitive proves stable generations without a live pump
+    if (first != 0 || runtime.live_connections != 1) { ret 2; }
+    return_connection(?runtime, first);
+    val second: usize = acquire_connection(?runtime, 0, 0);
+    if (second != first || connections[second].generation == 0) { ret 3; }
+    return_connection(?runtime, second);
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: admission initialization rolls back" {
+    var pump: Pump;
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols: [1]tls_config.ProtocolName;
+    var policy: hedge_tls.Policy;
+    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
+    var selected_plan: plan.Plan;
+    selected_plan.generation = 1;
+    selected_plan.sealed = true;
+    var budgets: budget.Set;
+    val config: PumpConfig = test_pump_config(1, ?policy,
+        ?selected_plan, ?budgets);
+    var peers: [1]admission.PeerSlot;
+    var charges: [1]admission.ChargeSlot;
+    var replay: [1]token.ReplaySlot;
+    pump.token_generation = 1;
+    val overlapping: AdmissionStorage = test_admission_storage(
+        (?pump.admissions[0].admissions)::*quic_listener.Pending,
+        ?peers[0], ?charges[0], ?replay[0]);
+    if (initialize_admission(?pump, 0, ?config, overlapping)
+     || pump.admissions[0].live
+     || pump.admissions[0].admissions.initialized
+     || pump.admissions[0].tokens.initialized
+     || pump.admissions[0].listener.initialized) { ret 1; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: multi-pump update rolls back staging" {
+    var runtime: Runtime;
+    runtime.initialized = true;
+    runtime.pump_count = 2;
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols: [1]tls_config.ProtocolName;
+    var policy: hedge_tls.Policy;
+    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
+    var selected_plan: plan.Plan;
+    selected_plan.generation = 1;
+    selected_plan.sealed = true;
+    var budgets: budget.Set;
+    val first_old: PumpConfig = test_pump_config(10, ?policy,
+        ?selected_plan, ?budgets);
+    val second_old: PumpConfig = test_pump_config(20, ?policy,
+        ?selected_plan, ?budgets);
+    val first_new: PumpConfig = test_pump_config(11, ?policy,
+        ?selected_plan, ?budgets);
+    val second_new: PumpConfig = test_pump_config(21, ?policy,
+        ?selected_plan, ?budgets);
+    var pending: [2][2][1]quic_listener.Pending;
+    var peers: [2][2][1]admission.PeerSlot;
+    var charges: [2][2][1]admission.ChargeSlot;
+    var replay: [2][2][1]token.ReplaySlot;
+    val first_zero: AdmissionStorage = test_admission_storage(
+        ?pending[0][0][0], ?peers[0][0][0], ?charges[0][0][0],
+        ?replay[0][0][0]);
+    val first_one: AdmissionStorage = test_admission_storage(
+        ?pending[0][1][0], ?peers[0][1][0], ?charges[0][1][0],
+        ?replay[0][1][0]);
+    val second_zero: AdmissionStorage = test_admission_storage(
+        ?pending[1][0][0], ?peers[1][0][0], ?charges[1][0][0],
+        ?replay[1][0][0]);
+    var second_one: AdmissionStorage = test_admission_storage(
+        ?pending[1][1][0], ?peers[1][1][0], ?charges[1][1][0],
+        ?replay[1][1][0]);
+    if (!test_prepare_pump(?runtime.pumps[0], 1, ?first_old,
+            first_zero, first_one)
+     || !test_prepare_pump(?runtime.pumps[1], 2, ?second_old,
+            second_zero, second_one)) { ret 1; }
+    second_one.pending = nil;
+    runtime.pumps[1].admissions[1].storage = second_one;
+    var updates: [2]PumpUpdate;
+    updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 1},
+        config: first_new};
+    updates[1] = PumpUpdate{handle: PumpHandle{index: 1, generation: 2},
+        config: second_new};
+    val updated: UpdateResult = update_all(?runtime, ?updates[0], 2);
+    if (updated.status != FAILED || updated.committed
+     || runtime.pumps[0].active_admission != 0
+     || runtime.pumps[1].active_admission != 0
+     || runtime.pumps[0].admissions[1].live
+     || runtime.pumps[0].admissions[0].retiring
+     || runtime.pumps[1].admissions[0].retiring) { ret 2; }
+    if (!begin_retire(?runtime.pumps[0].admissions[0])
+     || !reap_admission(?runtime.pumps[0].admissions[0])
+     || !begin_retire(?runtime.pumps[1].admissions[0])
+     || !reap_admission(?runtime.pumps[1].admissions[0])) { ret 3; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: update reports committed retirement failure" {
+    var runtime: Runtime;
+    runtime.initialized = true;
+    runtime.pump_count = 1;
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols: [1]tls_config.ProtocolName;
+    var policy: hedge_tls.Policy;
+    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
+    var old_plan: plan.Plan;
+    old_plan.generation = 1;
+    old_plan.sealed = true;
+    var new_plan: plan.Plan;
+    new_plan.generation = 2;
+    new_plan.sealed = true;
+    var budgets: budget.Set;
+    val old_config: PumpConfig = test_pump_config(40, ?policy,
+        ?old_plan, ?budgets);
+    val new_config: PumpConfig = test_pump_config(41, ?policy,
+        ?new_plan, ?budgets);
+    var pending: [2][1]quic_listener.Pending;
+    var peers: [2][1]admission.PeerSlot;
+    var charges: [2][1]admission.ChargeSlot;
+    var replay: [2][1]token.ReplaySlot;
+    val first: AdmissionStorage = test_admission_storage(?pending[0][0],
+        ?peers[0][0], ?charges[0][0], ?replay[0][0]);
+    val second: AdmissionStorage = test_admission_storage(?pending[1][0],
+        ?peers[1][0], ?charges[1][0], ?replay[1][0]);
+    if (!test_prepare_pump(?runtime.pumps[0], 5, ?old_config,
+        first, second)) { ret 1; }
+    runtime.pumps[0].admissions[0].listener.closing = true;
+    var updates: [1]PumpUpdate;
+    updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 5},
+        config: new_config};
+    val updated: UpdateResult = update_all(?runtime, ?updates[0], 1);
+    if (updated.status != FAILED || !updated.committed
+     || runtime.pumps[0].active_admission != 1
+     || runtime.pumps[0].plan != ?new_plan
+     || !runtime.pumps[0].admissions[1].live
+     || runtime.pumps[0].admissions[0].retiring) { ret 2; }
+    runtime.pumps[0].admissions[0].listener.closing = false;
+    if (!begin_retire(?runtime.pumps[0].admissions[0])
+     || !reap_admission(?runtime.pumps[0].admissions[0])
+     || !begin_retire(?runtime.pumps[0].admissions[1])
+     || !reap_admission(?runtime.pumps[0].admissions[1])) { ret 3; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: update gracefully retires superseded" {
+    var runtime: Runtime;
+    var connection: Connection;
+    runtime.initialized = true;
+    runtime.pump_count = 1;
+    runtime.connection_capacity = 1;
+    runtime.storage.connections = ?connection;
+    runtime.free_head = 0;
+    runtime.next_source = 1;
+    connection.next_free = NO_CONNECTION;
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols: [1]tls_config.ProtocolName;
+    var policy: hedge_tls.Policy;
+    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
+    var old_plan: plan.Plan;
+    old_plan.generation = 1;
+    old_plan.sealed = true;
+    var new_plan: plan.Plan;
+    new_plan.generation = 2;
+    new_plan.sealed = true;
+    var old_budgets: budget.Set;
+    var new_budgets: budget.Set;
+    val old_config: PumpConfig = test_pump_config(30, ?policy,
+        ?old_plan, ?old_budgets);
+    val new_config: PumpConfig = test_pump_config(31, ?policy,
+        ?new_plan, ?new_budgets);
+    var pending: [2][1]quic_listener.Pending;
+    var peers: [2][1]admission.PeerSlot;
+    var charges: [2][1]admission.ChargeSlot;
+    var replay: [2][1]token.ReplaySlot;
+    val first: AdmissionStorage = test_admission_storage(?pending[0][0],
+        ?peers[0][0], ?charges[0][0], ?replay[0][0]);
+    val second: AdmissionStorage = test_admission_storage(?pending[1][0],
+        ?peers[1][0], ?charges[1][0], ?replay[1][0]);
+    if (!test_prepare_pump(?runtime.pumps[0], 4, ?old_config,
+        first, second)) { ret 1; }
+    val index: usize = acquire_connection(?runtime, 0, 0);
+    connection.plan = ?old_plan;
+    connection.state = CONNECTION_LIVE;
+    var updates: [1]PumpUpdate;
+    updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 4},
+        config: new_config};
+    val updated: UpdateResult = update_all(?runtime, ?updates[0], 1);
+    if (index != 0 || updated.status != OK || !updated.committed
+     || runtime.pumps[0].active_admission != 1
+     || !runtime.pumps[0].admissions[0].retiring
+     || connection.state != CONNECTION_GRACEFUL
+     || superseded(?runtime) != 1) { ret 2; }
+    return_connection(?runtime, index);
+    if (!reap_admission(?runtime.pumps[0].admissions[0])
+     || superseded(?runtime) != 0
+     || !begin_retire(?runtime.pumps[0].admissions[1])
+     || !reap_admission(?runtime.pumps[0].admissions[1])) { ret 3; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
+    var connections: [1]Connection;
+    var sessions: [1]h3_session.Session;
+    var entries: [8]routing.Entry;
+    var nodes: [1]timers.Node;
+    var positions: [1]timers.Position;
+    var storage: Storage;
+    var runtime: Runtime;
+    var external_live: usize = 0;
+    if (!make_storage(?storage, ?connections[0], 1, ?sessions[0], 1,
+            ?entries[0], 8, ?nodes[0], ?positions[0], 1)
+     || !make(?runtime, storage, RuntimeConfig{max_connections: 1,
+        external_live: ?external_live})) { ret 1; }
+    val index: usize = acquire_connection(?runtime, 0, 0);
+    if (index != 0) { ret 2; }
+    val value: *Connection = ?connections[index];
+
+    var owner: secret.Allocator = secret.system_allocator();
+    var chain: [1]cert.Certificate;
+    var key: keys.PrivateKey;
+    var identity: credentials.Identity;
+    if (!test_credentials.load_credentials(?identity, ?chain[0], ?key,
+        ?owner)) { ret 3; }
+    var generation: credentials.Generation = credentials.empty_generation();
+    var store: credentials.Store = credentials.empty_store();
+    if (credentials.initialize(?generation, ?identity, 1, 0, nil,
+            false) != contracts.OK
+     || credentials.initialize_store(?store, ?generation) != contracts.OK) {
+        ret 3;
+    }
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols: [1]tls_config.ProtocolName = [1]tls_config.ProtocolName{
+        tls_config.ProtocolName{data: ?protocol_bytes[0], len: 2}};
+    var versions: [1]u16 = [1]u16{tls13.VERSION};
+    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256};
+    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+    var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
+        tls13.ED25519};
+    var entropy: secret.Entropy = secret.system_entropy();
+    var tls_configuration: tls_config.ServerConfig;
+    tls_configuration.credentials = ?store;
+    tls_configuration.alpn = ?protocols[0];
+    tls_configuration.alpn_len = 1;
+    tls_configuration.require_alpn = true;
+    tls_configuration.versions = ?versions[0];
+    tls_configuration.version_len = 1;
+    tls_configuration.suites = ?suites[0];
+    tls_configuration.suite_len = 1;
+    tls_configuration.groups = ?groups[0];
+    tls_configuration.group_len = 1;
+    tls_configuration.signatures = ?signatures[0];
+    tls_configuration.signature_len = 1;
+    tls_configuration.entropy = ?entropy;
+    tls_configuration.entropy_context_size = 0;
+    tls_configuration.limits = hedge_tls.listener_limits();
+
+    var local_id: [8]u8 = [8]u8{1, 2, 3, 4, 5, 6, 7, 8};
+    var peer_id: [8]u8 = [8]u8{9, 10, 11, 12, 13, 14, 15, 16};
+    var initial_id: [8]u8 = [8]u8{17, 18, 19, 20, 21, 22, 23, 24};
+    val local: ip.Endpoint = ip.endpoint(192, 0, 2, 1, 4433);
+    val peer: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
+    var config: assembly.Config = assembly.default_config(81, local, peer);
+    config.local_source = ?local_id[0];
+    config.local_source_length = 8;
+    config.alpn = ?protocol_bytes[0];
+    config.alpn_length = 2;
+    config.entropy_context_size = 0;
+    var accepted: quic_listener.Accepted;
+    accepted.action = quic_listener.ACTION_ACCEPT;
+    packet.set_connection_id(?accepted.original_destination, ?initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_destination, ?initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_source, ?peer_id[0], 8);
+    accepted.peer = peer;
+    accepted.version = packet.VERSION_1;
+    accepted.peer_validated = true;
+    if (!assembly.apply_server_acceptance(?config, ?accepted)) { ret 4; }
+    val encoded: transport_parameters.EncodeResult =
+        assembly.encode_parameters(?config, qt.SERVER,
+            ?value.local_parameters[0], assembly.PARAMETER_CAPACITY);
+    if (!encoded.ok || !server.init(?value.tls, ?tls_configuration,
+            server.Storage{input: ?value.tls_input[0],
+                input_capacity: hedge_tls.HANDSHAKE_INPUT_BYTES,
+                output: ?value.tls_output[0],
+                output_capacity: hedge_tls.HANDSHAKE_OUTPUT_BYTES,
+                hello: ?value.tls_hello[0],
+                hello_capacity: hedge_tls.HELLO_BYTES,
+                certificates: ?value.tls_certificates[0],
+                certificate_capacity: hedge_tls.PEER_CERTIFICATES,
+                peer_parameters: ?value.tls_peer_parameters[0],
+                peer_parameters_capacity: assembly.PARAMETER_CAPACITY},
+            server.ExtraExtension{kind: server.QUIC_TRANSPORT_PARAMETERS,
+                data: contracts.Bytes{data: ?value.local_parameters[0],
+                    len: encoded.count}},
+            server.QUIC_TRANSPORT_PARAMETERS)
+     || !cancel.make_root(?value.scope, false,
+        time.Time{sec: 0, nsec: 0})) { ret 5; }
+    value.scope_live = true;
+    cancel.cancel(?value.scope);
+    val initialized: assembly.InitResult = assembly.init_server(
+        ?value.assembly, ?config, ?value.tls, ?value.scope, 1);
+    if (initialized.ok) { ret 6; }
+    if (initialized.stage != assembly.STAGE_DRIVER) {
+        ret (20 + initialized.stage::usize)::i32;
+    }
+    if (!assembly.reusable(?value.assembly)) { ret 7; }
+    if (!abandon_failed_assembly(?runtime, index)) { ret 8; }
+    if (runtime.live_connections != 0 || runtime.free_head != index
+     || value.live || value.scope_live) { ret 9; }
+    val reused: usize = acquire_connection(?runtime, 0, 0);
+    if (reused != index || runtime.live_connections != 1) { ret 10; }
+    return_connection(?runtime, reused);
+    var retired: *credentials.Generation = nil;
+    if (credentials.withdraw_store(?store, ?retired) != contracts.OK
+     || retired != ?generation || !credentials.reclaimable(?generation)
+     || keys.destroy_private(?key) != contracts.OK) { ret 11; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: combined capacity includes external owners" {
+    var runtime: Runtime;
+    var pump: Pump;
+    runtime.max_connections = 3;
+    var external_live: usize = 1;
+    runtime.external_live = ?external_live;
+    runtime.connection_capacity = 3;
+    runtime.free_head = 0;
+    runtime.live_connections = 1;
+    pump.connection_limit = 2;
+    pump.active_connections = 1;
+    if (!capacity_available(?runtime, ?pump)) { ret 1; }
+    external_live = 2;
+    if (capacity_available(?runtime, ?pump)) { ret 2; }
+    pump.active_connections = 2;
+    external_live = 0;
+    if (capacity_available(?runtime, ?pump)) { ret 3; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: stale completion generations are inert" {
+    var runtime: Runtime;
+    runtime.initialized = true;
+    var context: CompletionContext;
+    context.pump = 0;
+    context.pump_generation = 9;
+    context.kind = COMPLETION_RECEIVE;
+    runtime.pumps[0].live = true;
+    runtime.pumps[0].generation = 10;
+    if (context_current(?runtime, ?context)) { ret 1; }
+    context.pump_generation = 10;
+    if (!context_current(?runtime, ?context)) { ret 2; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: copied route ownership retires exactly once" {
+    var entries: [2]routing.Entry;
+    var runtime: Runtime;
+    if (!routing.make(?runtime.routes, ?entries[0], 2)) { ret 1; }
+    var bytes: [4]u8 = [4]u8{1, 2, 3, 4};
+    var published: PublishedRoute;
+    published.key = routing.key(?bytes[0], 4);
+    published.binding = routing.Binding{connection_slot: 0,
+        connection_generation: 1, route_index: 0, route_generation: 1,
+        route_sequence: 1, pump_generation: 1};
+    if (routing.publish(?runtime.routes, published.key,
+            published.binding) != routing.ROUTE_OK) { ret 2; }
+    published.live = true;
+    bytes[0] = 99;
+    if (!unpublish_route(?runtime, ?published) || published.live
+     || runtime.routes.len != 0 || !unpublish_route(?runtime, ?published)) {
+        ret 3;
+    }
+    ret 0;
+}
