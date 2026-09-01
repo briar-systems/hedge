@@ -289,6 +289,7 @@ rec PublishedRoute {
 
 rec AdmissionGeneration {
     listener: quic_listener.Listener;
+    lease: quic_listener.LeaseHandle;
     admissions: admission.Manager;
     tokens: token.Manager;
     storage: AdmissionStorage;
@@ -297,6 +298,9 @@ rec AdmissionGeneration {
     queued_initials: usize;
     live: bool;
     retiring: bool;
+    listener_owned: bool;
+    listener_published: bool;
+    listener_cleanup_retained: bool;
 }
 
 pub rec Connection {
@@ -673,13 +677,37 @@ fun reset_receive_packet(pump: *Pump, index: usize) {
     packet.zero_length = false;
 }
 
+# an unpublished listener is aborted rather than closed, and a cleanup that
+# reported retained ownership is retried under the same handle
+fun release_listener_lease(bank: *AdmissionGeneration) bool {
+    if (bank == nil || !bank.listener_owned) { ret true; }
+    var result: quic_listener.LeaseCleanupResult;
+    if (bank.listener_cleanup_retained) {
+        result = quic_listener.retry_initialization_cleanup(?bank.listener,
+            bank.lease);
+    } or (!bank.listener_published) {
+        result = quic_listener.abort_initialize(?bank.listener, bank.lease);
+    } or {
+        if (!quic_listener.begin_close(?bank.listener)) { ret false; }
+        result = quic_listener.finish_close_result(?bank.listener);
+    }
+    if (result.status == quic_listener.CLEANUP_RETAINED) {
+        bank.listener_cleanup_retained = true;
+        ret false;
+    }
+    if (result.status != quic_listener.CLEANUP_COMPLETE) { ret false; }
+    bank.listener_cleanup_retained = false;
+    bank.listener_published = false;
+    bank.listener_owned = false;
+    ret true;
+}
+
 fun abandon_admission_parts(bank: *AdmissionGeneration,
     listener_live: bool, admissions_live: bool, tokens_live: bool) bool {
     if (bank == nil) { ret false; }
     var success: bool = true;
     if (listener_live) {
-        if (!quic_listener.begin_close(?bank.listener)
-         || !quic_listener.finish_close(?bank.listener)) { success = false; }
+        if (!release_listener_lease(bank)) { success = false; }
     }
     if (admissions_live) {
         if (!admission.begin_close(?bank.admissions)
@@ -723,17 +751,28 @@ fun initialize_admission_inner(pump: *Pump, bank_index: usize,
     }
     pump.storage.versions[0] = 0x00000001;
     pump.storage.versions[1] = 0x6b3343cf;
-    if (!quic_listener.initialize(?bank.listener, quic_listener.Config{
-            source: config.admission_generation,
-            supported_versions: ?pump.storage.versions[0],
-            supported_version_count: 2, minimum_initial_size: 1200,
-            require_retry: config.require_retry},
-        quic_listener.Storage{pending: storage.pending,
-            pending_capacity: storage.pending_capacity},
-        ?bank.admissions, ?bank.tokens)) {
+    val opened: quic_listener.InitializeResult =
+        quic_listener.initialize_result(?bank.listener, quic_listener.Config{
+                source: config.admission_generation,
+                supported_versions: ?pump.storage.versions[0],
+                supported_version_count: 2, minimum_initial_size: 1200,
+                require_retry: config.require_retry},
+            quic_listener.Storage{pending: storage.pending,
+                pending_capacity: storage.pending_capacity},
+            ?bank.admissions, ?bank.tokens);
+    if (!opened.ok) {
+        bank.lease = opened.handle;
+        bank.listener_owned =
+            opened.cleanup.status == quic_listener.CLEANUP_RETAINED;
+        bank.listener_cleanup_retained = bank.listener_owned;
+        bank.listener_published = false;
         abandon_admission_parts(bank, false, true, true);
         ret false;
     }
+    bank.lease = opened.handle;
+    bank.listener_owned = true;
+    bank.listener_published = false;
+    bank.listener_cleanup_retained = false;
     bank.storage = storage;
     bank.source = config.admission_generation;
     bank.active_connections = 0;
@@ -891,22 +930,49 @@ pub fun start(controls: *ControlView, runtime: *Runtime, handle: PumpHandle) Sta
     }
     pump.started = true;
     val status: Status = submit_receive(pump);
-    if (status != OK) { pump.started = false; }
+    if (status != OK) { pump.started = false; ret status; }
+    val bank: *AdmissionGeneration = ?pump.admissions[pump.active_admission];
+    if (bank.live) { bank.listener_published = true; }
     ret status;
 }
 
 fun begin_retire(bank: *AdmissionGeneration) bool {
     if (bank == nil || !bank.live) { ret false; }
     if (bank.retiring) { ret true; }
+    if (!bank.listener_published) { bank.retiring = true; ret true; }
     if (!quic_listener.begin_close(?bank.listener)) { ret false; }
     bank.retiring = true;
+    ret true;
+}
+
+# begin_close already ran for a published listener, so the terminal step is the
+# lease-reporting close; an unpublished one is aborted instead
+fun finish_listener_close(bank: *AdmissionGeneration) bool {
+    if (bank == nil || !bank.listener_owned) { ret true; }
+    var result: quic_listener.LeaseCleanupResult;
+    if (bank.listener_cleanup_retained) {
+        result = quic_listener.retry_initialization_cleanup(?bank.listener,
+            bank.lease);
+    } or (!bank.listener_published) {
+        result = quic_listener.abort_initialize(?bank.listener, bank.lease);
+    } or {
+        result = quic_listener.finish_close_result(?bank.listener);
+    }
+    if (result.status == quic_listener.CLEANUP_RETAINED) {
+        bank.listener_cleanup_retained = true;
+        ret false;
+    }
+    if (result.status != quic_listener.CLEANUP_COMPLETE) { ret false; }
+    bank.listener_cleanup_retained = false;
+    bank.listener_published = false;
+    bank.listener_owned = false;
     ret true;
 }
 
 fun reap_admission(bank: *AdmissionGeneration) bool {
     if (bank == nil || !bank.live || !bank.retiring
      || bank.active_connections != 0 || bank.queued_initials != 0) { ret false; }
-    if (!quic_listener.finish_close(?bank.listener)
+    if (!finish_listener_close(bank)
      || !admission.begin_close(?bank.admissions)
      || !admission.finish_close(?bank.admissions)
      || !token.begin_close(?bank.tokens)
@@ -1530,8 +1596,12 @@ fun retry_identity(request: *quic_listener.Request) bool {
 
 fun cancel_acceptance(bank: *AdmissionGeneration,
     value: quic_listener.Acceptance) bool {
-    ret quic_listener.cancel(?bank.listener, value).action
-        == quic_listener.ACTION_ACCEPT;
+    val result: quic_listener.Result =
+        quic_listener.cancel(?bank.listener, value);
+    if (result.action != quic_listener.ACTION_ACCEPT) { ret false; }
+    if (result.cleanup.status != quic_listener.CLEANUP_RETAINED) { ret true; }
+    ret quic_listener.retry_cleanup(?bank.listener,
+        result.cleanup.acceptance).status == quic_listener.CLEANUP_COMPLETE;
 }
 
 fun free_pending_initial(runtime: *Runtime) usize {
@@ -2909,7 +2979,13 @@ fun test_prepare_pump(pump: *Pump, storage: *PumpStorage, generation: u64,
     pump.admissions[1].retiring = false;
     pump.admissions[1].storage = second;
     apply_pump_config(pump, config);
-    ret initialize_admission_inner(pump, 0, config, first, false);
+    if (!initialize_admission_inner(pump, 0, config, first, false)) {
+        ret false;
+    }
+    # a prepared pump stands in for one that is receiving, so its active bank
+    # is published exactly as start() would have left it
+    pump.admissions[0].listener_published = true;
+    ret true;
 }
 
 fun test_update_all(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
