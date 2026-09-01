@@ -57,6 +57,7 @@ pub val STREAMING: State = 5;
 pub val DONE: State = 6;
 pub val FAILED: State = 7;
 pub val CLOSED: State = 8;
+pub val CLOSING: State = 10;
 
 pub def Step: u8;
 pub val STEP_IDLE: Step = 1;
@@ -108,6 +109,9 @@ pub rec Link {
     inbound_complete: bool;
     configured: engine_h1.Config;
     initialized: bool;
+    close_started: bool;
+    close_failed: bool;
+    engine_close_owned: bool;
 }
 
 fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion) {
@@ -115,8 +119,10 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
     if (link == nil || !link.initialized) { ret; }
     var settled: transport.Completion;
     if (!connection.translate(?settled, completion, token_context)) { ret; }
+    val was_closing: bool = link.state == CLOSING;
     val event: engine_h1.Event = engine_h1.complete_io(?link.engine, ?settled, time.now());
     absorb(link, event);
+    if (was_closing) { link.state = CLOSING; }
 }
 
 fun rejected() Result[io_runtime.Token, io_error.Error] {
@@ -166,17 +172,18 @@ fun submit_close(context: ptr, scope: *cancel.Scope,
     val index: usize = operation_for(link, token_context);
     if (index >= LINK_TRANSPORT_SLOTS) { ret rejected(); }
     ret net_async.submit_stream_close(link.driver, scope, ?link.stream,
-        io_lifecycle.EXPLICIT, (?link.contexts[index])::usize);
+        io_lifecycle.ABORTIVE, (?link.contexts[index])::usize);
 }
 
 # the connect completion carries the socket this link owns from then on
 fun connect_settled(context: ptr, token_context: usize, completion: io_runtime.Completion) {
     val link: *Link = context::*Link;
-    if (link == nil || !link.connect_pending) { ret; }
+    if (link == nil || !link.connect_pending
+     || token_context::u64 != link.generation) { ret; }
     link.connect_pending = false;
     if (completion.has_error) {
         link.connect_failed = true;
-        link.state = FAILED;
+        if (link.state != CLOSING) { link.state = FAILED; }
         ret;
     }
     link.stream = tcp.Stream{handle: io_handle.SocketHandle{value: completion.resource}};
@@ -271,6 +278,9 @@ pub fun make(link: *Link, driver: *net_async.Driver, upstream: usize,
     link.connect_failed = false;
     link.scopes_live = false;
     link.initialized = false;
+    link.close_started = false;
+    link.close_failed = false;
+    link.engine_close_owned = false;
     link.slot = engine_h1.NO_SLOT;
     link.have_headers = false;
     link.body_offset = 0;
@@ -278,7 +288,7 @@ pub fun make(link: *Link, driver: *net_async.Driver, upstream: usize,
     link.body_final = false;
     link.inbound_complete = false;
     if (!connection.bind_operation(?link.connect_operation, ?link.connect_context,
-        (link)::ptr, connect_settled, 0)) { ret false; }
+        (link)::ptr, connect_settled, link.generation::usize)) { ret false; }
     if (!cancel.make_root(?link.operation_root, false, time.Time{sec: 0, nsec: 0})
      || !cancel.make_root(?link.control_scope, false, time.Time{sec: 0, nsec: 0})
      || !cancel.make_child(?link.engine_scope, ?link.operation_root, false,
@@ -386,6 +396,11 @@ pub fun response(link: *Link) *parser.Parsed {
 # drive the upstream leg one step
 pub fun step(link: *Link, now: time.Time) Step {
     if (link == nil) { ret STEP_ERROR; }
+    if (link.state == CLOSING) {
+        if (close(link)) { ret STEP_DONE; }
+        if (link.close_failed && link.state == FREE) { ret STEP_ERROR; }
+        ret STEP_BLOCKED;
+    }
     if (link.state == FAILED) { ret STEP_ERROR; }
     if (link.state == CONNECTING) {
         if (link.connect_pending) { ret STEP_BLOCKED; }
@@ -470,19 +485,58 @@ pub fun release(link: *Link) bool {
 
 pub fun close(link: *Link) bool {
     if (link == nil || link.state == FREE) { ret false; }
-    if (link.initialized) { engine_h1.cancel_connection(?link.engine); }
+    if (!link.close_started) {
+        link.close_started = true;
+        link.state = CLOSING;
+        if (link.connect_pending) { cancel.cancel(?link.operation_root); }
+        if (link.initialized) {
+            link.engine_close_owned = link.engine_close_owned
+                || link.engine.state == engine_h1.CLOSED
+                || link.engine.close_pending;
+            if (!engine_h1.cancel_connection(?link.engine)
+             && link.engine.state != engine_h1.CLOSED) {
+                link.close_failed = true;
+            }
+            link.engine_close_owned = link.engine_close_owned
+                || link.engine.state == engine_h1.CLOSED
+                || link.engine.close_pending;
+        }
+    }
+    if (link.connect_pending) { ret false; }
+    if (link.initialized) {
+        if (link.slot != engine_h1.NO_SLOT
+         && link.engine_slots[link.slot].state != engine_h1.SLOT_FREE
+         && !link.engine_slots[link.slot].released) {
+            val sequence: u64 = link.engine_slots[link.slot].sequence;
+            if (sequence == 0
+             || !engine_h1.abandon(?link.engine, link.slot, sequence)) {
+                link.close_failed = true;
+            }
+        }
+        if (!engine_h1.destroy(?link.engine)) { ret false; }
+        link.initialized = false;
+        if (link.engine_close_owned) { link.has_stream = false; }
+    }
     if (link.has_stream) {
-        tcp.stream_close(?link.stream);
+        val closed: Result[bool, io_error.Error] = tcp.stream_close(?link.stream);
+        if (is_err[bool, io_error.Error](closed)) { link.close_failed = true; }
         link.has_stream = false;
     }
     if (link.scopes_live) {
-        cancel.destroy(?link.engine_scope);
-        cancel.destroy(?link.control_scope);
-        cancel.destroy(?link.operation_root);
+        if (!cancel.destroy(?link.engine_scope)
+         || !cancel.destroy(?link.control_scope)
+         || !cancel.destroy(?link.operation_root)) { link.close_failed = true; }
         link.scopes_live = false;
     }
-    link.initialized = false;
     link.leased = false;
     link.state = FREE;
-    ret true;
+    ret !link.close_failed;
+}
+
+pub fun closing(link: *Link) bool {
+    ret link != nil && link.state == CLOSING;
+}
+
+pub fun teardown_failed(link: *Link) bool {
+    ret link != nil && link.close_failed;
 }

@@ -137,6 +137,14 @@ authoritative response status, transfer counters, and cancellation reason. A
 finalizer failure does not prevent memory or transport cleanup, but it fails the
 owning connection or stream so the lifecycle error remains observable.
 
+A service layer may also attach one pre-commit response interceptor. It runs once
+after the inner service has resolved ownership of the request body and before the
+response becomes visible to a protocol engine. The interceptor may continue with
+the proposed response or replace a proposal whose body is absent or can be
+cancelled to a terminal state synchronously. Replacement resets only the response
+builder. It preserves the inner service's request-body disposition and returns to
+the same outer commit, so neither ownership nor commitment is repeated.
+
 HTTP/1.1 processes ordered exchanges while respecting pipeline bounds. HTTP/2 and HTTP/3 process independent streams subject to connection and stream flow control. The service API does not expose those differences as mutable connection operations.
 
 ## Service dispatch
@@ -182,6 +190,24 @@ Retries are allowed only when request replay safety is known. Body buffering is 
 ## Cache
 
 Caching is an optional service layer with independent memory and disk stores. It implements HTTP cache semantics rather than path-based object reuse. Cache keys include the selected representation dimensions. Revalidation, stale policies, range handling, and authorization behavior are explicit.
+
+A stale stored response with a validator adds a conditional field only for the
+origin attempt and only when the client supplied no precondition. The field is
+removed before response policy or recording observes the request. An origin 304
+is consumed by the pre-commit interceptor. Forwardable fields present on the 304
+replace the corresponding stored fields, absent fields remain, and qualified
+private or no-cache fields are removed. The merged response must still satisfy
+shared-cache storage policy before metadata and selecting dimensions change. The
+unconditional client receives the refreshed stored representation, never the 304.
+
+Transport and origin failures represented by 500, 502, 503, or 504 may be replaced
+with the stale stored response only while its stale-if-error interval covers the
+current age. A missing or expired interval leaves the failure response unchanged.
+
+The cache serves one satisfiable byte range as 206. It deliberately does not build
+multipart/byteranges for a request containing several ranges. Such a request gets
+the complete stored representation as 200, which is the permitted full-response
+choice and keeps multipart boundary generation out of the bounded cache reader.
 
 When caching is disabled, composition does not allocate a layer, entry table, or
 body arena and does not install a wrapper. It opens no cache root and starts no
@@ -255,6 +281,11 @@ Shutdown proceeds through explicit states:
 7. Close resources and exit with a reasoned status.
 
 HTTP/2 uses GOAWAY. HTTP/3 closes request acceptance through its control and QUIC state. HTTP/1.1 marks responses for connection close and stops reading new requests.
+
+After the last downstream connection retires, transport-neutral service planes
+quiesce while the listener network driver is still live. Their connect, body,
+and close completions retain their owners until terminal settlement. Only then
+may listener teardown destroy the shared driver and make pool storage reusable.
 
 ## Telemetry ownership
 

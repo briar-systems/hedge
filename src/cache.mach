@@ -50,10 +50,26 @@ rec Recording {
     active: bool;
     owner: *call.Call;
     generation: u64;
+    requested_at: time.Time;
     writer: store.Writer;
     declared: usize;
     written: usize;
     revalidating_index: usize;
+    conditioned: bool;
+    request_field_len: usize;
+    request_field_bytes: usize;
+    condition_name: view.View;
+    condition_value: view.View;
+}
+
+rec RefreshedFields {
+    names: [store.MAX_STORED_FIELDS]usize;
+    name_lengths: [store.MAX_STORED_FIELDS]usize;
+    values: [store.MAX_STORED_FIELDS]usize;
+    value_lengths: [store.MAX_STORED_FIELDS]usize;
+    count: usize;
+    bytes: [store.MAX_FIELD_BYTES]u8;
+    length: usize;
 }
 
 # the body reader that serves a hit out of the store
@@ -64,6 +80,7 @@ rec StoredBody {
     index: usize;
     offset: usize;
     limit: usize;
+    pinned: bool;
     reader: body.Reader;
 }
 
@@ -113,6 +130,7 @@ pub fun make(layer: *Layer, entries: *store.Entry, capacity: usize, body_storage
     var i: usize = 0;
     for (i < MAX_RECORDERS) {
         layer.recorders[i].active = false;
+        layer.recorders[i].owner = nil;
         i = i + 1;
     }
     if (!store.make(?layer.backing, entries, capacity, body_storage, body_capacity, limits)) {
@@ -201,6 +219,10 @@ fun stored_complete(context: ptr, token: u64, trailers: *field.Fields) body.Prog
 }
 
 fun stored_release(context: ptr) {
+    val state: *StoredBody = context::*StoredBody;
+    if (state == nil || !state.pinned) { ret; }
+    store.unpin(?state.layer.backing, state.index);
+    state.pinned = false;
 }
 
 fun field_name(entry: *store.Entry, index: usize) view.View {
@@ -248,6 +270,121 @@ fun stored_validators(entry: *store.Entry) validator.Validators {
     ret current;
 }
 
+fun response_validators(fields: *field.Fields) validator.Validators {
+    var current: validator.Validators = validator.none();
+    val etag: *field.Field = field.find_first(fields,
+        view.view(field.ETAG, 4));
+    if (etag != nil) { current.etag = etag.value; }
+    val modified: *field.Field = field.find_first(fields,
+        view.view(field.LAST_MODIFIED, 13));
+    if (modified != nil) {
+        current.has_modified = http_date.parse(modified.value,
+            ?current.modified);
+    }
+    ret current;
+}
+
+fun weak_etag(value: view.View) bool {
+    ret value.data != nil && value.len >= 2
+        && value.data[0] == 'W' && value.data[1] == '/';
+}
+
+fun initially_selectable(candidate: *store.Entry, selected: *store.Entry,
+    request: *message.Request) bool {
+    ret candidate != nil && selected != nil && request != nil
+        && key.equal(?candidate.identity, ?selected.identity)
+        && key.matches(?candidate.dimensions, request);
+}
+
+fun response_time(entry: *store.Entry) time.Time {
+    if (entry.metadata.has_date) { ret entry.metadata.date; }
+    ret entry.metadata.received_at;
+}
+
+fun refresh_targets(layer: *Layer, selected: *store.Entry,
+    request: *message.Request, response: *message.Response,
+    targets: *usize) usize {
+    if (layer == nil || selected == nil || request == nil
+     || response == nil || targets == nil) { ret 0; }
+    val received: validator.Validators = response_validators(?response.fields);
+    val selected_validators: validator.Validators = stored_validators(selected);
+    var count: usize = 0;
+    var i: usize = 0;
+    if (received.etag.data != nil && received.etag.len != 0
+     && !weak_etag(received.etag)) {
+        var includes_selected: bool = false;
+        for (i < layer.backing.capacity) {
+            val candidate: *store.Entry = store.entry_at(?layer.backing, i);
+            var matches: bool = false;
+            if (initially_selectable(candidate, selected, request)) {
+                val stored: validator.Validators = stored_validators(candidate);
+                matches = validator.strong_match(received.etag, stored.etag);
+            }
+            if (matches) {
+                targets[count] = i;
+                count = count + 1;
+                if (candidate == selected) { includes_selected = true; }
+            }
+            i = i + 1;
+        }
+        if (!includes_selected) { ret 0; }
+        ret count;
+    }
+    if ((received.etag.data != nil && received.etag.len != 0)
+     || received.has_modified) {
+        var chosen: usize = store.NO_ENTRY;
+        var newest_time: time.Time = time.Time{sec: 0, nsec: 0};
+        var newest_sequence: u64 = 0;
+        for (i < layer.backing.capacity) {
+            val candidate: *store.Entry = store.entry_at(?layer.backing, i);
+            if (initially_selectable(candidate, selected, request)) {
+                val stored: validator.Validators = stored_validators(candidate);
+                var matches: bool = false;
+                if (received.etag.data != nil && received.etag.len != 0) {
+                    matches = validator.weak_match(received.etag, stored.etag);
+                } or {
+                    matches = stored.has_modified
+                        && time.time_equal(stored.modified, received.modified);
+                }
+                val candidate_time: time.Time = response_time(candidate);
+                if (matches && (chosen == store.NO_ENTRY
+                 || time.time_after(candidate_time, newest_time)
+                 || (time.time_equal(candidate_time, newest_time)
+                    && candidate.stored_at > newest_sequence))) {
+                    chosen = i;
+                    newest_time = candidate_time;
+                    newest_sequence = candidate.stored_at;
+                }
+            }
+            i = i + 1;
+        }
+        if (chosen == store.NO_ENTRY
+         || store.entry_at(?layer.backing, chosen) != selected) { ret 0; }
+        targets[0] = chosen;
+        ret 1;
+    }
+    if (selected_validators.etag.data != nil || selected_validators.has_modified) {
+        ret 0;
+    }
+    var selected_count: usize = 0;
+    for (i < layer.backing.capacity) {
+        if (initially_selectable(store.entry_at(?layer.backing, i),
+            selected, request)) {
+            selected_count = selected_count + 1;
+        }
+        i = i + 1;
+    }
+    if (selected_count != 1) { ret 0; }
+    for (i < layer.backing.capacity) {
+        if (store.entry_at(?layer.backing, i) == selected) {
+            targets[0] = i;
+            ret 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 # RFC 9110 section 15.4.5: a 304 carries the metadata a cache would have updated,
 # and nothing that describes a body it is not sending
 fun metadata_field(name: view.View) bool {
@@ -256,7 +393,161 @@ fun metadata_field(name: view.View) bool {
      || name_is(name, field.DATE)
      || name_is(name, field.ETAG)
      || name_is(name, "expires")
+     || name_is(name, field.LAST_MODIFIED)
      || name_is(name, field.VARY);
+}
+
+fun add_refreshed(fields: *RefreshedFields, name: view.View, value: view.View) bool {
+    if (fields.count >= store.MAX_STORED_FIELDS
+     || name.len > store.MAX_FIELD_BYTES
+     || value.len > store.MAX_FIELD_BYTES - name.len
+     || fields.length > store.MAX_FIELD_BYTES - name.len - value.len) { ret false; }
+    fields.names[fields.count] = fields.length;
+    fields.name_lengths[fields.count] = name.len;
+    var i: usize = 0;
+    for (i < name.len) {
+        fields.bytes[fields.length + i] = name.data[i];
+        i = i + 1;
+    }
+    fields.length = fields.length + name.len;
+    fields.values[fields.count] = fields.length;
+    fields.value_lengths[fields.count] = value.len;
+    i = 0;
+    for (i < value.len) {
+        fields.bytes[fields.length + i] = value.data[i];
+        i = i + 1;
+    }
+    fields.length = fields.length + value.len;
+    fields.count = fields.count + 1;
+    ret true;
+}
+
+fun refresh_candidate(fields: *field.Fields, item: *field.Field) bool {
+    ret item != nil && !name_is(item.name, field.CONTENT_LENGTH)
+        && forward.forwardable(fields, item.name);
+}
+
+fun response_replaces(fields: *field.Fields, name: view.View) bool {
+    var i: usize = 0;
+    for (i < fields.len) {
+        val item: *field.Field = ?fields.items[i];
+        if (refresh_candidate(fields, item) && field.name_equal(item.name, name)) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun merge_refreshed(entry: *store.Entry, response_fields: *field.Fields,
+    response_directives: directives.Directives, output: *RefreshedFields) bool {
+    output.count = 0;
+    output.length = 0;
+    var i: usize = 0;
+    for (i < entry.field_count) {
+        val name: view.View = field_name(entry, i);
+        if (!response_replaces(response_fields, name)
+         && !policy.excluded_field(response_directives, name)
+         && !add_refreshed(output, name, field_value(entry, i))) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < response_fields.len) {
+        val item: *field.Field = ?response_fields.items[i];
+        if (refresh_candidate(response_fields, item)
+         && !policy.excluded_field(response_directives, item.name)
+         && !add_refreshed(output, item.name, item.value)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun refreshed_fields(merged: *RefreshedFields, items: *field.Field) field.Fields {
+    var fields: field.Fields = field.init(items, store.MAX_STORED_FIELDS,
+        field.limits(store.MAX_STORED_FIELDS, store.MAX_FIELD_BYTES,
+            store.MAX_FIELD_BYTES, store.MAX_FIELD_BYTES));
+    var i: usize = 0;
+    for (i < merged.count) {
+        field.append(?fields, field.Field{
+            name: view.view(?merged.bytes[merged.names[i]], merged.name_lengths[i]),
+            value: view.view(?merged.bytes[merged.values[i]], merged.value_lengths[i]),
+            sensitive: false,
+        });
+        i = i + 1;
+    }
+    ret fields;
+}
+
+def RefreshStatus: u8;
+val REFRESH_UPDATED: RefreshStatus = 1;
+val REFRESH_INVALIDATED: RefreshStatus = 2;
+val REFRESH_FAILED: RefreshStatus = 3;
+
+fun invalidate_refreshed(state: *Recording, index: usize) RefreshStatus {
+    if (!store.discard_entry(?state.layer.backing, index)) {
+        ret REFRESH_FAILED;
+    }
+    if (index == state.revalidating_index) {
+        state.revalidating_index = store.NO_ENTRY;
+    }
+    ret REFRESH_INVALIDATED;
+}
+
+fun refresh_entry(state: *Recording, active: *call.Call,
+    now: time.Time, index: usize, apply: bool) RefreshStatus {
+    val entry: *store.Entry = store.entry_at(?state.layer.backing, index);
+    val response: *message.Response = call.response(active);
+    val request: *message.Request = call.request(active);
+    if (entry == nil || response == nil || request == nil) { ret REFRESH_FAILED; }
+    val refresh_directives: directives.Directives = directives.parse(?response.fields);
+    if (policy.set_cookie_unsafe(?response.fields, refresh_directives)) {
+        if (!apply) { ret REFRESH_INVALIDATED; }
+        ret invalidate_refreshed(state, index);
+    }
+    var merged: RefreshedFields;
+    if (!merge_refreshed(entry, ?response.fields, refresh_directives, ?merged)) {
+        ret REFRESH_FAILED;
+    }
+    var items: [store.MAX_STORED_FIELDS]field.Field;
+    var fields: field.Fields = refreshed_fields(?merged, ?items[0]);
+    if (!field.validate(?fields, fields.limits, false)) { ret REFRESH_FAILED; }
+    val response_directives: directives.Directives = directives.parse(?fields);
+    val request_directives: directives.Directives = directives.parse(?request.fields);
+    if (policy.storable(request, ?fields, entry.status, request_directives,
+        response_directives, state.layer.limits) != policy.STORE) {
+        if (!apply) { ret REFRESH_INVALIDATED; }
+        ret invalidate_refreshed(state, index);
+    }
+    var dimensions: key.Dimensions;
+    if (!key.select(request, ?fields, ?dimensions) || !dimensions.valid) {
+        ret REFRESH_FAILED;
+    }
+    val metadata: policy.Metadata = policy.describe(?fields, entry.status,
+        response_directives, state.requested_at, now, state.layer.limits);
+    if (!apply) { ret REFRESH_UPDATED; }
+    var i: usize = 0;
+    for (i < merged.count) {
+        entry.field_names[i] = merged.names[i];
+        entry.field_name_lengths[i] = merged.name_lengths[i];
+        entry.field_values[i] = merged.values[i];
+        entry.field_value_lengths[i] = merged.value_lengths[i];
+        i = i + 1;
+    }
+    i = 0;
+    for (i < merged.length) {
+        entry.field_bytes[i] = merged.bytes[i];
+        i = i + 1;
+    }
+    entry.field_count = merged.count;
+    entry.field_length = merged.length;
+    entry.dimensions = dimensions;
+    entry.metadata = metadata;
+    if (!store.mark_refreshed(?state.layer.backing, index)) {
+        ret REFRESH_FAILED;
+    }
+    ret REFRESH_UPDATED;
 }
 
 fun copy_stored_fields(entry: *store.Entry, response: *message.Response,
@@ -266,6 +557,7 @@ fun copy_stored_fields(entry: *store.Entry, response: *message.Response,
         val name: view.View = field_name(entry, i);
         var wanted: bool = true;
         if (only_metadata) { wanted = metadata_field(name); }
+        if (name_is(name, "age")) { wanted = false; }
         if (skip_length && name_is(name, field.CONTENT_LENGTH)) { wanted = false; }
         if (wanted && message.add_field(response, field.Field{
             name: name,
@@ -302,12 +594,23 @@ fun attach_stored_body(layer: *Layer, active: *call.Call, index: usize, first: u
     state.index = index;
     state.offset = first;
     state.limit = last_exclusive;
+    state.pinned = false;
+    if (!store.pin(?layer.backing, index)) { ret false; }
+    state.pinned = true;
     val response: *message.Response = call.response(active);
     val configured: message.Limits = call.limits(active);
     val count: usize = last_exclusive - first;
     val measured: str = service.arena_number(active, count::u64);
-    if (measured == nil) { ret false; }
-    if (!service.add_field(active, field.CONTENT_LENGTH, measured)) { ret false; }
+    if (measured == nil) {
+        store.unpin(?layer.backing, index);
+        state.pinned = false;
+        ret false;
+    }
+    if (!service.add_field(active, field.CONTENT_LENGTH, measured)) {
+        store.unpin(?layer.backing, index);
+        state.pinned = false;
+        ret false;
+    }
     state.reader = body.init_reader(
         (state)::ptr,
         stored_read,
@@ -322,8 +625,14 @@ fun attach_stored_body(layer: *Layer, active: *call.Call, index: usize, first: u
         nil,
         call.scope(active),
     );
-    if (!state.reader.valid) { ret false; }
+    if (!state.reader.valid) {
+        store.unpin(?layer.backing, index);
+        state.pinned = false;
+        ret false;
+    }
     if (message.set_body_reader(response, ?state.reader, configured) != message.RESPONSE_OK) {
+        store.unpin(?layer.backing, index);
+        state.pinned = false;
         ret false;
     }
     ret true;
@@ -335,27 +644,39 @@ fun attach_stored_body(layer: *Layer, active: *call.Call, index: usize, first: u
 # against the stored validators, and a byte range is served out of the stored
 # bytes. Going to the origin for either would make a cache hit cost an origin
 # request, which is the one thing a cache exists to avoid.
-fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
-    now: time.Time) exchange.ServiceStatus {
+fun prepare_bodyless(active: *call.Call) bool {
+    val response: *message.Response = call.response(active);
+    val request: *message.Request = call.request(active);
+    if (response == nil || request == nil) { ret false; }
+    if (status.permits_content(request.method.kind, response.status)
+     && field.find_first(?response.fields, service.text_view(field.CONTENT_LENGTH)) == nil
+     && !service.add_field(active, field.CONTENT_LENGTH, "0")) { ret false; }
+    ret true;
+}
+
+fun prepare_stored(layer: *Layer, active: *call.Call, index: usize,
+    now: time.Time) bool {
     val entry: *store.Entry = store.entry_at(?layer.backing, index);
     val response: *message.Response = call.response(active);
     val request: *message.Request = call.request(active);
-    if (entry == nil || response == nil || request == nil) { ret exchange.SERVICE_FAILED; }
+    if (entry == nil || response == nil || request == nil) { ret false; }
     store.touch(?layer.backing, index);
     store.record_hit(?layer.backing);
 
     val current: validator.Validators = stored_validators(entry);
     val precondition: validator.Outcome = validator.evaluate(request, current);
     if (precondition == validator.PRECONDITION_FAILED) {
-        ret service.respond(active, status.PRECONDITION_FAILED);
+        if (message.set_status(response, status.PRECONDITION_FAILED)
+         != message.RESPONSE_OK) { ret false; }
+        ret prepare_bodyless(active);
     }
     if (precondition == validator.NOT_MODIFIED) {
         if (message.set_status(response, status.NOT_MODIFIED) != message.RESPONSE_OK) {
-            ret exchange.SERVICE_FAILED;
+            ret false;
         }
-        if (!copy_stored_fields(entry, response, true, true)) { ret exchange.SERVICE_FAILED; }
-        if (!add_age(layer, active, entry, now)) { ret exchange.SERVICE_FAILED; }
-        ret service.commit_bodyless(active, call.BODY_DRAIN);
+        if (!copy_stored_fields(entry, response, true, true)) { ret false; }
+        if (!add_age(layer, active, entry, now)) { ret false; }
+        ret prepare_bodyless(active);
     }
 
     val bodyless: bool = !status.permits_content(request.method.kind, entry.status)
@@ -372,49 +693,49 @@ fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
         val length: usize = range.format_unsatisfied(entry.body_length::u64, ?text[0],
             range.CONTENT_RANGE_CAPACITY);
         if (message.set_status(response, status.RANGE_NOT_SATISFIABLE) != message.RESPONSE_OK) {
-            ret exchange.SERVICE_FAILED;
+            ret false;
         }
         val stored_text: *u8 = service.arena_bytes(active, length);
-        if (stored_text == nil) { ret exchange.SERVICE_FAILED; }
+        if (stored_text == nil) { ret false; }
         var i: usize = 0;
         for (i < length) { stored_text[i] = text[i]; i = i + 1; }
         if (message.add_field(response, field.Field{
             name: view.view("content-range", 13),
             value: view.view(stored_text, length),
             sensitive: false,
-        }) != field.ADD_OK) { ret exchange.SERVICE_FAILED; }
-        ret service.commit_bodyless(active, call.BODY_DRAIN);
+        }) != field.ADD_OK) { ret false; }
+        ret prepare_bodyless(active);
     }
 
     val partial: bool = span.outcome == range.SATISFIABLE;
     var code: status.Status = entry.status;
     if (partial) { code = status.PARTIAL_CONTENT; }
     if (message.set_status(response, code) != message.RESPONSE_OK) {
-        ret exchange.SERVICE_FAILED;
+        ret false;
     }
-    if (!copy_stored_fields(entry, response, false, true)) { ret exchange.SERVICE_FAILED; }
-    if (!add_age(layer, active, entry, now)) { ret exchange.SERVICE_FAILED; }
+    if (!copy_stored_fields(entry, response, false, true)) { ret false; }
+    if (!add_age(layer, active, entry, now)) { ret false; }
     if (partial) {
         var text: [range.CONTENT_RANGE_CAPACITY]u8;
         val length: usize = range.format_content_range(span, entry.body_length::u64, ?text[0],
             range.CONTENT_RANGE_CAPACITY);
-        if (length == 0) { ret exchange.SERVICE_FAILED; }
+        if (length == 0) { ret false; }
         val stored_text: *u8 = service.arena_bytes(active, length);
-        if (stored_text == nil) { ret exchange.SERVICE_FAILED; }
+        if (stored_text == nil) { ret false; }
         var i: usize = 0;
         for (i < length) { stored_text[i] = text[i]; i = i + 1; }
         if (message.add_field(response, field.Field{
             name: view.view("content-range", 13),
             value: view.view(stored_text, length),
             sensitive: false,
-        }) != field.ADD_OK) { ret exchange.SERVICE_FAILED; }
+        }) != field.ADD_OK) { ret false; }
     }
     if (bodyless) {
         if (!service.add_field(active, field.CONTENT_LENGTH,
             service.arena_number(active, entry.body_length::u64))) {
-            ret exchange.SERVICE_FAILED;
+            ret false;
         }
-        ret service.commit_bodyless(active, call.BODY_DRAIN);
+        ret prepare_bodyless(active);
     }
     var first: usize = 0;
     var last_exclusive: usize = entry.body_length;
@@ -423,8 +744,14 @@ fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
         last_exclusive = (span.last + 1)::usize;
     }
     if (!attach_stored_body(layer, active, index, first, last_exclusive)) {
-        ret exchange.SERVICE_FAILED;
+        ret false;
     }
+    ret true;
+}
+
+fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
+    now: time.Time) exchange.ServiceStatus {
+    if (!prepare_stored(layer, active, index, now)) { ret exchange.SERVICE_FAILED; }
     if (!call.resolve_body(active, call.BODY_DRAIN)) { ret exchange.SERVICE_FAILED; }
     if (service.commit(active) != message.RESPONSE_OK) { ret exchange.SERVICE_FAILED; }
     ret exchange.SERVICE_COMPLETE;
@@ -435,14 +762,84 @@ fun serve_stored(layer: *Layer, active: *call.Call, index: usize,
 fun free_recording(layer: *Layer) *Recording {
     var i: usize = 0;
     for (i < MAX_RECORDERS) {
-        if (!layer.recorders[i].active) { ret ?layer.recorders[i]; }
+        if (layer.recorders[i].owner == nil) { ret ?layer.recorders[i]; }
         i = i + 1;
     }
     ret nil;
 }
 
-fun finish_recording(state: *Recording, keep: bool) {
+fun restore_request_fields(state: *Recording) bool {
+    if (!state.conditioned) { ret true; }
+    val request: *message.Request = call.request(state.owner);
+    val condition_bytes: usize = state.condition_name.len + state.condition_value.len;
+    if (request == nil || request.fields.len <= state.request_field_len
+     || request.fields.bytes < state.request_field_bytes + condition_bytes) {
+        ret false;
+    }
+    var found: usize = store.NO_ENTRY;
+    var i: usize = state.request_field_len;
+    for (i < request.fields.len) {
+        val item: *field.Field = ?request.fields.items[i];
+        if (item.name.data == state.condition_name.data
+         && item.name.len == state.condition_name.len
+         && item.value.data == state.condition_value.data
+         && item.value.len == state.condition_value.len) {
+            found = i;
+            i = request.fields.len;
+        } or { i = i + 1; }
+    }
+    if (found == store.NO_ENTRY) { ret false; }
+    i = found;
+    for (i + 1 < request.fields.len) {
+        request.fields.items[i] = request.fields.items[i + 1];
+        i = i + 1;
+    }
+    request.fields.len = request.fields.len - 1;
+    request.fields.bytes = request.fields.bytes - condition_bytes;
+    state.conditioned = false;
+    ret true;
+}
+
+fun has_client_precondition(request: *message.Request) bool {
+    ret request_header(request, field.IF_MATCH, 8).data != nil
+        || request_header(request, "if-unmodified-since", 19).data != nil
+        || request_header(request, field.IF_NONE_MATCH, 13).data != nil
+        || request_header(request, field.IF_MODIFIED_SINCE, 17).data != nil;
+}
+
+fun has_origin_precondition(request: *message.Request) bool {
+    ret request_header(request, field.IF_MATCH, 8).data != nil
+        || request_header(request, "if-unmodified-since", 19).data != nil;
+}
+
+fun condition_request(state: *Recording, entry: *store.Entry) bool {
+    val request: *message.Request = call.request(state.owner);
+    if (request == nil || has_client_precondition(request)) { ret false; }
+    var name: view.View = view.view(nil, 0);
+    var value: view.View = stored_field(entry, field.ETAG);
+    if (value.data != nil && value.len != 0) {
+        name = view.view(field.IF_NONE_MATCH, 13);
+    } or {
+        value = stored_field(entry, field.LAST_MODIFIED);
+        if (value.data == nil || value.len == 0) { ret false; }
+        name = view.view(field.IF_MODIFIED_SINCE, 17);
+    }
+    state.request_field_len = request.fields.len;
+    state.request_field_bytes = request.fields.bytes;
+    if (field.append(?request.fields, field.Field{
+        name: name,
+        value: value,
+        sensitive: false,
+    }) != field.ADD_OK) { ret false; }
+    state.condition_name = name;
+    state.condition_value = value;
+    state.conditioned = true;
+    ret true;
+}
+
+fun stop_recording(state: *Recording, keep: bool) {
     if (!state.active) { ret; }
+    restore_request_fields(state);
     if (state.revalidating_index != store.NO_ENTRY) {
         val entry: *store.Entry = store.entry_at(?state.layer.backing,
             state.revalidating_index);
@@ -454,7 +851,89 @@ fun finish_recording(state: *Recording, keep: bool) {
         or { store.abandon(?state.writer); }
     }
     state.active = false;
+}
+
+fun release_recording(state: *Recording, keep: bool) {
+    if (state == nil) { ret; }
+    stop_recording(state, keep);
     state.owner = nil;
+}
+
+fun fail_interception(state: *Recording) call.Interception {
+    stop_recording(state, false);
+    ret call.INTERCEPT_FAILED;
+}
+
+fun intercept(context: ptr, active: *call.Call) call.Interception {
+    val state: *Recording = context::*Recording;
+    if (state == nil || !state.active || state.owner != active
+     || state.revalidating_index == store.NO_ENTRY) { ret call.INTERCEPT_FAILED; }
+    val internal_condition: bool = state.conditioned;
+    if (!restore_request_fields(state)) { ret fail_interception(state); }
+    val response: *message.Response = call.response(active);
+    val entry: *store.Entry = store.entry_at(?state.layer.backing,
+        state.revalidating_index);
+    if (response == nil || entry == nil) { ret fail_interception(state); }
+    val now: time.Time = time.now();
+    # a 304 belongs to the party that supplied its condition. cache conditions
+    # are consumed here, client conditions are forwarded, and no-condition 304s
+    # fail closed rather than changing an unconditional request's semantics.
+    val client_condition: bool = has_client_precondition(call.request(active));
+    if (response.status == status.NOT_MODIFIED
+     && !internal_condition && !client_condition) {
+        ret fail_interception(state);
+    }
+    val client_matches: bool = client_condition
+        && validator.evaluate(call.request(active), stored_validators(entry))
+            == validator.NOT_MODIFIED;
+    val refresh: bool = response.status == status.NOT_MODIFIED
+        && (internal_condition || client_matches);
+    if (refresh) {
+        var targets: [store.MAX_ENTRIES]usize;
+        val target_count: usize = refresh_targets(state.layer, entry,
+            call.request(active), response, ?targets[0]);
+        if (target_count == 0) { ret fail_interception(state); }
+        var selected_result: RefreshStatus = REFRESH_FAILED;
+        var i: usize = 0;
+        for (i < target_count) {
+            val selected_target: bool = targets[i] == state.revalidating_index;
+            val planned: RefreshStatus = refresh_entry(state, active, now,
+                targets[i], false);
+            if (planned == REFRESH_FAILED) { ret fail_interception(state); }
+            if (selected_target) { selected_result = planned; }
+            i = i + 1;
+        }
+        i = 0;
+        for (i < target_count) {
+            val applied: RefreshStatus = refresh_entry(state, active, now,
+                targets[i], true);
+            if (applied == REFRESH_FAILED) { ret fail_interception(state); }
+            i = i + 1;
+        }
+        # the client's condition still earned this 304 even when its metadata
+        # makes the matching stored response unusable. only a synthetic cache
+        # condition must consume the 304 rather than forwarding it.
+        if (selected_result == REFRESH_INVALIDATED && client_condition) {
+            stop_recording(state, false);
+            ret call.INTERCEPT_CONTINUE;
+        }
+        if (selected_result != REFRESH_UPDATED) { ret fail_interception(state); }
+        if (client_condition) {
+            stop_recording(state, false);
+            ret call.INTERCEPT_CONTINUE;
+        }
+    }
+    var replace: bool = internal_condition && response.status == status.NOT_MODIFIED;
+    if (!replace && policy.revalidation_failure(response.status)
+     && policy.servable_on_error(entry.metadata, now)) { replace = true; }
+    if (!replace) { ret call.INTERCEPT_CONTINUE; }
+    val index: usize = state.revalidating_index;
+    stop_recording(state, false);
+    if (!call.reset_response_for_interceptor(active)
+     || !prepare_stored(state.layer, active, index, now)) {
+        ret fail_interception(state);
+    }
+    ret call.INTERCEPT_REPLACED;
 }
 
 fun on_head(context: ptr, active: *call.Call) bool {
@@ -528,7 +1007,7 @@ fun on_body(context: ptr, data: *u8, length: usize) bool {
 fun on_end(context: ptr, complete: bool) {
     val state: *Recording = context::*Recording;
     if (state == nil) { ret; }
-    finish_recording(state, complete);
+    release_recording(state, complete);
 }
 
 # --- the handler ---
@@ -543,6 +1022,17 @@ fun forward_to_inner(binding: *Binding, active: *call.Call) exchange.ServiceStat
     ret binding.inner.serve(binding.inner.ctx, active);
 }
 
+fun owns_recording(layer: *Layer, active: *call.Call) bool {
+    if (layer == nil || active == nil) { ret false; }
+    var i: usize = 0;
+    for (i < MAX_RECORDERS) {
+        val state: *Recording = ?layer.recorders[i];
+        if (state.active && state.owner == active) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     val binding: *Binding = context::*Binding;
     if (binding == nil || !service.has_handler(binding.inner)) {
@@ -551,6 +1041,8 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     val layer: *Layer = binding.layer;
     # a route with no cache runs the service and nothing else
     if (!enabled(layer)) { ret forward_to_inner(binding, active); }
+    # a resumed call keeps its existing cache selection and resumes only its inner service
+    if (owns_recording(layer, active)) { ret forward_to_inner(binding, active); }
     val request: *message.Request = call.request(active);
     if (request == nil) { ret forward_to_inner(binding, active); }
     val now: time.Time = time.now();
@@ -581,32 +1073,46 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     # taking the first match instead would serve a representation negotiated for
     # somebody else, and would leave every other variant permanently unreachable.
     var index: usize = store.NO_ENTRY;
+    var newest_time: time.Time = time.Time{sec: 0, nsec: 0};
+    var newest_sequence: u64 = 0;
     var candidate: usize = store.find_from(?layer.backing, ?identity, 0);
     for (candidate != store.NO_ENTRY) {
         val held: *store.Entry = store.entry_at(?layer.backing, candidate);
         if (held != nil && key.matches(?held.dimensions, request)) {
-            index = candidate;
-            candidate = store.NO_ENTRY;
-        } or {
-            candidate = store.find_from(?layer.backing, ?identity, candidate + 1);
+            val held_time: time.Time = response_time(held);
+            if (index == store.NO_ENTRY
+             || time.time_after(held_time, newest_time)
+             || (time.time_equal(held_time, newest_time)
+                && held.stored_at > newest_sequence)) {
+                index = candidate;
+                newest_time = held_time;
+                newest_sequence = held.stored_at;
+            }
         }
+        candidate = store.find_from(?layer.backing, ?identity, candidate + 1);
     }
     if (index != store.NO_ENTRY) {
         val entry: *store.Entry = store.entry_at(?layer.backing, index);
+        # a shared cache is not the origin authority for state-changing
+        # preconditions, even when it has a fresh representation.
+        if (has_origin_precondition(request)) {
+            store.record_miss(?layer.backing);
+            ret forward_to_inner(binding, active);
+        }
         val decision: policy.Reuse = policy.reuse(entry.metadata, request_directives, now);
         if (decision == policy.FRESH || decision == policy.STALE_SERVABLE) {
             ret serve_stored(layer, active, index, now);
         }
         if (decision == policy.REVALIDATE) {
-            # one revalidation at a time: a second request for the same stale
-            # entry is served stale rather than starting its own fetch
-            if (entry.revalidating && policy.servable_on_error(entry.metadata, now)) {
-                ret serve_stored(layer, active, index, now);
+            if (entry.revalidating) {
+                if (policy.servable_on_error(entry.metadata, now)) {
+                    ret serve_stored(layer, active, index, now);
+                }
+                store.record_miss(?layer.backing);
+                ret forward_to_inner(binding, active);
             }
-            if (!entry.revalidating) {
-                entry.revalidating = true;
-                revalidating_index = index;
-            }
+            entry.revalidating = true;
+            revalidating_index = index;
         }
     }
     store.record_miss(?layer.backing);
@@ -616,9 +1122,15 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
         state.active = true;
         state.owner = active;
         state.generation = binding.generation;
+        state.requested_at = now;
         state.declared = 0;
         state.written = 0;
         state.revalidating_index = revalidating_index;
+        state.conditioned = false;
+        state.request_field_len = 0;
+        state.request_field_bytes = 0;
+        state.condition_name = view.view(nil, 0);
+        state.condition_value = view.view(nil, 0);
         state.writer = store.Writer{store: nil, index: store.NO_ENTRY, active: false};
         if (!call.attach_recorder(active, call.Recorder{
             ctx: (state)::ptr,
@@ -626,7 +1138,22 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
             on_body: on_body,
             on_end: on_end,
         })) {
-            state.active = false;
+            release_recording(state, false);
+        } or (revalidating_index != store.NO_ENTRY) {
+            val entry: *store.Entry = store.entry_at(?layer.backing,
+                revalidating_index);
+            if (entry != nil) {
+                if (!call.attach_interceptor(active, call.Interceptor{
+                    ctx: (state)::ptr,
+                    intercept: intercept,
+                })) {
+                    stop_recording(state, false);
+                } or {
+                    condition_request(state, entry);
+                }
+            } or {
+                stop_recording(state, false);
+            }
         }
     } or (revalidating_index != store.NO_ENTRY) {
         val entry: *store.Entry = store.entry_at(?layer.backing, revalidating_index);

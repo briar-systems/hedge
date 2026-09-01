@@ -48,6 +48,11 @@ pub val ATTEMPT_NUMERATOR: u64 = 1;
 pub val ATTEMPT_DENOMINATOR: u64 = 2;
 pub val MIN_ATTEMPT_NS: u64 = 100000000;
 
+pub def QuiesceStatus: u8;
+pub val QUIESCED: QuiesceStatus = 1;
+pub val QUIESCE_PENDING: QuiesceStatus = 2;
+pub val QUIESCE_FAILED: QuiesceStatus = 3;
+
 pub def Phase: u8;
 pub val PHASE_SELECT: Phase = 1;
 pub val PHASE_CONNECT: Phase = 2;
@@ -90,6 +95,8 @@ pub rec Attempt {
 rec ResponseBody {
     attempt: *Attempt;
     reader: body.Reader;
+    pending_output: *u8;
+    pending_capacity: usize;
     pending_token: u64;
     next_token: u64;
 }
@@ -123,6 +130,7 @@ pub rec Runtime {
     total_served: u64;
     total_reused: u64;
     live: bool;
+    quiescing: bool;
 }
 
 pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: str,
@@ -141,12 +149,16 @@ pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: st
         runtime.links[i].state = link.FREE;
         runtime.links[i].leased = false;
         runtime.links[i].generation = 0;
+        runtime.links[i].close_started = false;
+        runtime.links[i].close_failed = false;
+        runtime.links[i].engine_close_owned = false;
         runtime.link_registries[i] = nil;
         runtime.attempts[i].live = false;
         runtime.attempts[i].registry = nil;
         i = i + 1;
     }
     runtime.live = true;
+    runtime.quiescing = false;
     ret true;
 }
 
@@ -160,16 +172,34 @@ pub fun attach_driver(runtime: *Runtime, driver: *net_async.Driver) bool {
 
 pub fun close_runtime(runtime: *Runtime) bool {
     if (runtime == nil) { ret false; }
+    if (quiesce(runtime, time.now()) != QUIESCED) { ret false; }
     var i: usize = 0;
     for (i < MAX_LINKS) {
-        if (runtime.links[i].state != link.FREE) { link.close(?runtime.links[i]); }
         runtime.link_registries[i] = nil;
-        runtime.attempts[i].live = false;
         runtime.attempts[i].registry = nil;
         i = i + 1;
     }
     runtime.live = false;
     ret true;
+}
+
+pub fun quiesce(runtime: *Runtime, now: time.Time) QuiesceStatus {
+    if (runtime == nil || !runtime.live) { ret QUIESCE_FAILED; }
+    runtime.quiescing = true;
+    var pending: bool = false;
+    var i: usize = 0;
+    for (i < MAX_LINKS) {
+        if (runtime.attempts[i].live) { ret QUIESCE_FAILED; }
+        if (runtime.links[i].state != link.FREE) {
+            link.close(?runtime.links[i]);
+            if (runtime.links[i].state != link.FREE) { pending = true; }
+        }
+        if (runtime.links[i].state == link.FREE
+         && link.teardown_failed(?runtime.links[i])) { ret QUIESCE_FAILED; }
+        i = i + 1;
+    }
+    if (pending) { ret QUIESCE_PENDING; }
+    ret QUIESCED;
 }
 
 pub fun make_registry(registry: *Registry, generation: u64) bool {
@@ -194,7 +224,11 @@ pub fun close_registry(runtime: *Runtime, registry: *Registry) bool {
     i = 0;
     for (i < MAX_LINKS) {
         if (runtime.link_registries[i] == registry) {
-            if (runtime.links[i].state != link.FREE) { link.close(?runtime.links[i]); }
+            if (runtime.links[i].state != link.FREE) {
+                link.close(?runtime.links[i]);
+                if (runtime.links[i].state != link.FREE) { ret false; }
+            }
+            if (link.teardown_failed(?runtime.links[i])) { ret false; }
             runtime.link_registries[i] = nil;
         }
         i = i + 1;
@@ -229,15 +263,16 @@ pub fun poll(context: ptr, now: time.Time) bool {
         }
         i = i + 1;
     }
-    # an attempt whose response body has finished releases its link and its slot
+    # a terminal body releases its link immediately. the attempt remains owned by
+    # the call until exchange completion because the reader is embedded in it.
     i = 0;
     for (i < MAX_LINKS) {
         val attempt: *Attempt = ?runtime.attempts[i];
         if (attempt.live && attempt.phase == PHASE_STREAM && attempt.link != nil
          && body.reader_terminal_state(?attempt.body.reader)) {
-            if (!link.release_idle(attempt.link, now)) { link.close(attempt.link); }
+            if (attempt.body.reader.reuse != body.REUSE_ALLOWED
+             || !link.release_idle(attempt.link, now)) { link.close(attempt.link); }
             attempt.link = nil;
-            attempt.live = false;
             progressed = true;
         }
         i = i + 1;
@@ -279,6 +314,7 @@ fun acquire_link(runtime: *Runtime, registry: *Registry, upstream_index: usize) 
     for (i < MAX_LINKS) {
         if (runtime.links[i].state == link.IDLE && !runtime.links[i].leased) {
             link.close(?runtime.links[i]);
+            if (!link.free(?runtime.links[i])) { i = i + 1; cnt; }
             runtime.link_registries[i] = registry;
             ret ?runtime.links[i];
         }
@@ -299,11 +335,23 @@ fun upstream_read(context: ptr, output: *u8, capacity: usize, trailers: *field.F
     if (!link.take_body(state.attempt.link, output, capacity, ?produced, ?complete)) {
         ret body.failed("upstream body could not be consumed", body.REUSE_FORBIDDEN);
     }
-    if (produced != 0) { ret body.data(produced); }
-    if (complete) { ret body.complete(body.REUSE_ALLOWED); }
+    if (produced != 0) {
+        state.pending_output = nil;
+        state.pending_capacity = 0;
+        ret body.data(produced);
+    }
+    if (complete) {
+        state.pending_output = nil;
+        state.pending_capacity = 0;
+        ret body.complete(body.REUSE_ALLOWED);
+    }
     if (state.attempt.link.state == link.FAILED) {
+        state.pending_output = nil;
+        state.pending_capacity = 0;
         ret body.failed("upstream ended before its declared length", body.REUSE_FORBIDDEN);
     }
+    state.pending_output = output;
+    state.pending_capacity = capacity;
     state.next_token = state.next_token + 1;
     state.pending_token = state.next_token;
     ret body.pending(state.pending_token);
@@ -324,10 +372,33 @@ fun upstream_complete(context: ptr, token: u64, trailers: *field.Fields) body.Pr
         ret body.failed("unknown proxy body completion", body.REUSE_FORBIDDEN);
     }
     state.pending_token = 0;
-    ret upstream_read(context, nil, 0, trailers);
+    ret upstream_read(context, state.pending_output, state.pending_capacity, trailers);
+}
+
+fun release_response_link(attempt: *Attempt, reuse: body.Reuse, now: time.Time) {
+    if (attempt == nil || attempt.link == nil) { ret; }
+    if (reuse != body.REUSE_ALLOWED
+     || !link.release_idle(attempt.link, now)) { link.close(attempt.link); }
+    attempt.link = nil;
 }
 
 fun upstream_release(context: ptr) {
+    val state: *ResponseBody = context::*ResponseBody;
+    if (state == nil || state.attempt == nil) { ret; }
+    val attempt: *Attempt = state.attempt;
+    if (!attempt.live || attempt.phase != PHASE_STREAM) { ret; }
+    release_response_link(attempt, state.reader.reuse, time.now());
+}
+
+test "proxy: response release retains embedded reader storage until call finalization" {
+    var attempt: Attempt;
+    attempt.live = true;
+    attempt.phase = PHASE_STREAM;
+    attempt.link = nil;
+    attempt.body.attempt = ?attempt;
+    upstream_release((?attempt.body)::ptr);
+    if (!attempt.live || attempt.phase != PHASE_STREAM) { ret 1; }
+    ret 0;
 }
 
 # --- deadlines ---
@@ -458,12 +529,11 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
     val chosen: *upstream.Upstream = ?attempt.route.pool.items[selection.index];
     attempt.link = acquire_link(runtime, attempt.registry, selection.index);
     if (attempt.link == nil) {
-        upstream.release(?attempt.route.pool, selection.index, upstream.FAILURE, now);
+        settle_attempt(attempt, upstream.FAILURE, now);
         ret bad_gateway(active, status.SERVICE_UNAVAILABLE);
     }
     if (!build_outbound(attempt, active, runtime, chosen.authority)) {
-        upstream.release(?attempt.route.pool, selection.index, upstream.FAILURE, now);
-        attempt.link = nil;
+        settle_attempt(attempt, upstream.FAILURE, now);
         ret bad_gateway(active, status.BAD_GATEWAY);
     }
     if (attempt.link.state != link.READY
@@ -472,6 +542,7 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
         link.close(attempt.link);
         attempt.link = nil;
         upstream.release(?attempt.route.pool, selection.index, upstream.FAILURE, now);
+        attempt.selection.admission = upstream.NO_UPSTREAM;
         ret bad_gateway(active, status.BAD_GATEWAY);
     }
     attempt.phase = PHASE_CONNECT;
@@ -490,6 +561,30 @@ fun settle_attempt(attempt: *Attempt, outcome: upstream.Outcome, now: time.Time)
         link.close(attempt.link);
         attempt.link = nil;
     }
+}
+
+fun finish_attempt(context: ptr, active: *call.Call) bool {
+    val attempt: *Attempt = context::*Attempt;
+    if (attempt == nil || !attempt.live) { ret false; }
+    val owned: bool = attempt.owner_call == active
+        && active != nil && active.exchange != nil
+        && attempt.owner_generation == active.exchange.generation;
+    if (attempt.selection.admission == upstream.ADMITTED) {
+        upstream.release(?attempt.route.pool, attempt.selection.index,
+            upstream.FAILURE, time.now());
+        attempt.selection.admission = upstream.NO_UPSTREAM;
+    }
+    var reuse: body.Reuse = body.REUSE_FORBIDDEN;
+    if (attempt.body.reader.valid
+     && body.reader_terminal_state(?attempt.body.reader)) {
+        reuse = attempt.body.reader.reuse;
+    }
+    release_response_link(attempt, reuse, time.now());
+    attempt.phase = PHASE_SETTLED;
+    attempt.owner_call = nil;
+    attempt.owner_generation = 0;
+    attempt.live = false;
+    ret owned;
 }
 
 fun commit_response(attempt: *Attempt, active: *call.Call) exchange.ServiceStatus {
@@ -525,6 +620,8 @@ fun commit_response(attempt: *Attempt, active: *call.Call) exchange.ServiceStatu
         }
     }
     attempt.body.attempt = attempt;
+    attempt.body.pending_output = nil;
+    attempt.body.pending_capacity = 0;
     attempt.body.pending_token = 0;
     attempt.body.next_token = 0;
     attempt.body.reader = body.init_reader(
@@ -559,7 +656,8 @@ fun may_replay(attempt: *Attempt, active: *call.Call) bool {
 
 pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     val binding: *Binding = context::*Binding;
-    if (binding == nil || binding.runtime == nil || !binding.runtime.live) {
+    if (binding == nil || binding.runtime == nil || !binding.runtime.live
+     || binding.runtime.quiescing) {
         ret bad_gateway(active, status.INTERNAL_SERVER_ERROR);
     }
     val runtime: *Runtime = binding.runtime;
@@ -585,6 +683,16 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
             call.request(active).metadata.deadline, ?attempt.attempt_deadline);
         attempt.owner_call = active;
         attempt.owner_generation = active.exchange.generation;
+        attempt.body.reader.valid = false;
+        if (!call.attach_finalizer(active, call.Finalizer{
+            ctx: (attempt)::ptr,
+            finish: finish_attempt,
+        })) {
+            attempt.owner_call = nil;
+            attempt.owner_generation = 0;
+            attempt.live = false;
+            ret exchange.SERVICE_FAILED;
+        }
         ret begin_attempt(attempt, active, runtime, now);
     }
     ret advance(attempt, active, runtime, now);
@@ -603,7 +711,6 @@ fun advance(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
     if (attempt.has_deadline && remaining_ns(now, attempt.attempt_deadline) == 0) {
         settle_attempt(attempt, upstream.TIMEOUT, now);
         attempt.phase = PHASE_SETTLED;
-        attempt.live = false;
         ret bad_gateway(active, status.GATEWAY_TIMEOUT);
     }
     var steps: usize = 0;
@@ -613,7 +720,6 @@ fun advance(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
             if (committed != exchange.SERVICE_COMPLETE) {
                 settle_attempt(attempt, upstream.FAILURE, now);
                 attempt.phase = PHASE_SETTLED;
-                attempt.live = false;
                 ret exchange.SERVICE_FAILED;
             }
             upstream.release(?attempt.route.pool, attempt.selection.index,
@@ -632,7 +738,6 @@ fun advance(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
                 ret begin_attempt(attempt, active, runtime, now);
             }
             attempt.phase = PHASE_SETTLED;
-            attempt.live = false;
             ret bad_gateway(active, status.BAD_GATEWAY);
         }
         # a connected link is only useful once this request has been written to
@@ -642,7 +747,6 @@ fun advance(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
                 outbound_target(active), ?attempt.outbound, now)) {
                 settle_attempt(attempt, upstream.FAILURE, now);
                 attempt.phase = PHASE_SETTLED;
-                attempt.live = false;
                 ret bad_gateway(active, status.BAD_GATEWAY);
             }
             attempt.phase = PHASE_SEND;
@@ -694,6 +798,8 @@ pub rec Snapshot {
     total_served: u64;
     total_reused: u64;
     idle_links: usize;
+    body_read_pending: bool;
+    body_buffer_retained: bool;
 }
 
 pub fun snapshot(runtime: *Runtime, registry: *Registry) Snapshot {
@@ -702,7 +808,8 @@ pub fun snapshot(runtime: *Runtime, registry: *Registry) Snapshot {
         attempts: 0, route_inflight: 0, route_refusals: 0, unhealthy_refusals: 0,
         connect_pending: false, connect_failed: false, has_stream: false,
         link_initialized: false, total_attempts: 0, total_failures: 0, total_served: 0,
-        total_reused: 0, idle_links: 0,
+        total_reused: 0, idle_links: 0, body_read_pending: false,
+        body_buffer_retained: false,
     };
     if (runtime == nil) { ret view; }
     var i: usize = 0;
@@ -711,6 +818,10 @@ pub fun snapshot(runtime: *Runtime, registry: *Registry) Snapshot {
             view.live_attempts = view.live_attempts + 1;
             view.phase = runtime.attempts[i].phase;
             view.attempts = runtime.attempts[i].attempts;
+            view.body_read_pending = runtime.attempts[i].body.reader.pending_kind
+                == body.OP_READ;
+            view.body_buffer_retained = runtime.attempts[i].body.pending_output != nil
+                && runtime.attempts[i].body.pending_capacity != 0;
             if (runtime.attempts[i].link != nil) {
                 view.link_state = runtime.attempts[i].link.state;
                 view.connect_pending = runtime.attempts[i].link.connect_pending;

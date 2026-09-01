@@ -32,6 +32,7 @@ pub val STOPPED: State = 4;
 
 pub rec Slot {
     live: bool;
+    retiring: bool;
     # accepted and holding a place in its budget's queue, not yet being served
     waiting: bool;
     token: listener.ConnectionToken;
@@ -54,10 +55,17 @@ fun timeout_nanoseconds(milliseconds: u64, output: *u64) bool {
 # a service plane the serving loop must drive alongside connections
 pub def PlaneFun: fun(ptr, time.Time) bool;
 
+pub def PlaneQuiesceStatus: u8;
+pub val PLANE_QUIESCED: PlaneQuiesceStatus = 1;
+pub val PLANE_PENDING: PlaneQuiesceStatus = 2;
+pub val PLANE_FAILED: PlaneQuiesceStatus = 3;
+pub def PlaneQuiesceFun: fun(ptr, time.Time) PlaneQuiesceStatus;
+
 pub rec Runtime {
     state: State;
     plane_ctx: ptr;
     plane: PlaneFun;
+    plane_quiesce: PlaneQuiesceFun;
     generation: u64;
     owner: listener.Owner;
     slots: *Slot;
@@ -126,6 +134,7 @@ pub fun make(
     runtime.observability = nil;
     runtime.plane_ctx = nil;
     runtime.plane = (0::usize)::PlaneFun;
+    runtime.plane_quiesce = (0::usize)::PlaneQuiesceFun;
     runtime.served = 0;
     runtime.accepted = 0;
     runtime.rejected = 0;
@@ -140,6 +149,7 @@ pub fun make(
     var i: usize = 0;
     for (i < capacity) {
         slots[i].live = false;
+        slots[i].retiring = false;
         slots[i].waiting = false;
         slots[i].budgets = nil;
         slots[i].charge = budget.no_charge();
@@ -153,6 +163,16 @@ pub fun attach_plane(runtime: *Runtime, context: ptr, plane: PlaneFun) bool {
     if (runtime == nil || plane::usize == 0) { ret false; }
     runtime.plane_ctx = context;
     runtime.plane = plane;
+    runtime.plane_quiesce = (0::usize)::PlaneQuiesceFun;
+    ret true;
+}
+
+pub fun attach_plane_lifecycle(runtime: *Runtime, context: ptr, plane: PlaneFun,
+    quiesce: PlaneQuiesceFun) bool {
+    if (runtime == nil || plane::usize == 0 || quiesce::usize == 0) { ret false; }
+    runtime.plane_ctx = context;
+    runtime.plane = plane;
+    runtime.plane_quiesce = quiesce;
     ret true;
 }
 
@@ -281,6 +301,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
             cnt;
         }
         slot.live = true;
+        slot.retiring = false;
         slot.waiting = false;
         slot.budgets = runtime.active_budgets;
         slot.token = token;
@@ -335,19 +356,24 @@ fun retire(runtime: *Runtime, index: usize) {
     if (index >= runtime.capacity) { ret; }
     val slot: *Slot = ?runtime.slots[index];
     if (!slot.live) { ret; }
-    budget.release(slot.budgets, ?slot.charge);
-    slot.budgets = nil;
-    slot.waiting = false;
-    runtime.served = runtime.served + slot.handle.requests;
-    # both of these can fail, and a failed release means the listener never
-    # reclaims the slot, so the pool shrinks for the life of the process
+    if (!slot.retiring) {
+        slot.retiring = true;
+        slot.waiting = false;
+    }
+    # an H2 body or transport cancellation may need a later completion. the
+    # listener token and pool slot stay owned until that close phase settles.
     if (!connection.close(slot.handle)) {
+        if (connection.close_waiting(slot.handle)) { ret; }
         runtime.teardown_failures = runtime.teardown_failures + 1;
     }
+    if (slot.charge.live) { budget.release(slot.budgets, ?slot.charge); }
+    slot.budgets = nil;
+    runtime.served = runtime.served + slot.handle.requests;
     if (!listener.release_connection(?runtime.owner, slot.token)) {
         runtime.teardown_failures = runtime.teardown_failures + 1;
     }
     slot.live = false;
+    slot.retiring = false;
     if (runtime.live > 0) { runtime.live = runtime.live - 1; }
 }
 
@@ -374,7 +400,8 @@ pub fun poll(runtime: *Runtime, timeout_ms: i32) bool {
         # a connection still waiting for its budget is not driven, which is what
         # makes the queue a queue rather than a label
         if (runtime.slots[i].live && !runtime.slots[i].waiting) {
-            drive(runtime, i, now);
+            if (runtime.slots[i].retiring) { retire(runtime, i); }
+            or { drive(runtime, i, now); }
         }
         i = i + 1;
     }
@@ -643,18 +670,38 @@ pub fun stop(runtime: *Runtime) bool {
     if (lifecycle.serving(?runtime.shutdown)) {
         run_action(runtime, lifecycle.begin(?runtime.shutdown, now, 0));
     }
-    var guard: usize = 0;
-    for (guard < 8 && !lifecycle.closed(?runtime.shutdown)) {
-        val action: lifecycle.Action = lifecycle.step(?runtime.shutdown,
-            runtime.live, now);
-        # a drain still inside its deadline would otherwise wait here forever
-        if (action == lifecycle.NOTHING) {
-            run_action(runtime, lifecycle.CANCEL);
-            lifecycle.cancel_now(?runtime.shutdown, runtime.live);
-        } or { run_action(runtime, action); }
-        guard = guard + 1;
+    # a synchronous stop owns cancellation until every retained transport and
+    # body completion has crossed the ordinary listener completion path.
+    lifecycle.cancel_now(?runtime.shutdown, runtime.live);
+    run_action(runtime, lifecycle.CANCEL);
+    for (runtime.live != 0) {
+        if (!poll(runtime, -1)) {
+            lifecycle.fail(?runtime.shutdown, lifecycle.CANCEL);
+            ret false;
+        }
     }
-    ret lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED
+    if (runtime.plane_quiesce::usize != 0) {
+        var status: PlaneQuiesceStatus = runtime.plane_quiesce(
+            runtime.plane_ctx, time.now());
+        for (status == PLANE_PENDING) {
+            if (!listener.poll(?runtime.owner, -1)) {
+                lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
+                ret false;
+            }
+            val settled: time.Time = time.now();
+            if (runtime.plane::usize != 0) {
+                runtime.plane(runtime.plane_ctx, settled);
+            }
+            status = runtime.plane_quiesce(runtime.plane_ctx, settled);
+        }
+        if (status != PLANE_QUIESCED) {
+            lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
+            ret false;
+        }
+    }
+    advance_shutdown(runtime, time.now(), true);
+    ret lifecycle.closed(?runtime.shutdown)
+        && lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED
         && runtime.teardown_failures == 0;
 }
 
