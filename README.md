@@ -4,13 +4,13 @@ Hedge is a lightweight production web server written in Mach.
 
 Hedge is the deployable product in the Mach web stack. It will serve static files, Mach web applications, and upstream services over HTTP/1.1, HTTP/2, and HTTP/3 with native Mach TLS and QUIC.
 
-Hedge serves HTTP/1.1 and HTTP/2 over TLS 1.2 and TLS 1.3 today, with SNI, ALPN and
-client certificates, qualified against curl, OpenSSL and GnuTLS in
-[`test/interop`](test/interop/README.md). Static files, reverse proxying, the
-bounded caches, virtual host dispatch and ACME over authenticated TLS against
-a compatible authority are implemented. HTTP/3 is not yet served (#32), the
-current Let's Encrypt chain uses certificate algorithms mach-tls cannot verify
-(#38), and a listener's credential generation cannot yet be replaced (#37).
+Hedge serves HTTP/1.1, HTTP/2, and HTTP/3 over native TLS and QUIC, with SNI,
+ALPN, and client certificates, qualified against curl, OpenSSL, and GnuTLS in
+[`test/interop`](test/interop/README.md). Static files, reverse proxying,
+bounded caches, virtual host dispatch, and ACME over authenticated TLS are
+implemented. The current Let's Encrypt chain uses certificate algorithms
+mach-tls cannot verify (#38), and a listener's credential generation cannot yet
+be replaced (#37).
 
 ## Product goals
 

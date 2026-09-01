@@ -32,6 +32,7 @@ use hedge_tls: hedge.protocol.tls;
 use lifecycle: hedge.lifecycle;
 use hedge.listener;
 use hedge.serve;
+use quic_runtime: hedge.protocol.quic.runtime;
 use composition: hedge.composition;
 
 val EXIT_OK: i64 = 0;
@@ -78,11 +79,9 @@ fun report_count(value: usize) {
     print.eprintln((?text[0])::str);
 }
 
-# QUIC is refused rather than advertised: hedge composes no QUIC connection
-# driver, so a datagram listener would bind and then serve nothing
 fun capabilities() loader.Capabilities {
     ret loader.Capabilities{
-        quic: false,
+        quic: true,
         local_transport: true,
         environment_secrets: true,
         file_secrets: true,
@@ -128,10 +127,11 @@ rec Reloader {
     next_id: u64;
 }
 
-fun reload(state: *Reloader) bool {
+fun reload(state: *Reloader, controls: *composition.Controls,
+    quic_controls: *quic_runtime.ControlView) bool {
     # only one superseded generation may exist at a time: the spare slot is
     # still holding the last one until its connections finish
-    if (serve.superseded(state.runtime) != 0) { ret false; }
+    if (serve.superseded(quic_controls, state.runtime) != 0) { ret false; }
     val target: usize = 1 - state.slot;
     val loaded: Result[str, str] = filesystem.read_string(state.heap, state.path);
     if (is_err[str, str](loaded)) {
@@ -155,7 +155,7 @@ fun reload(state: *Reloader) bool {
         print.eprintln("hedge: reload rejected, generation did not seal");
         ret false;
     }
-    val rebuilt: composition.StartReport = composition.reload(state.composition,
+    val rebuilt: composition.StartReport = composition.reload(state.composition, controls,
         ?candidate.graph, candidate.id, ?state.storages[target], state.diagnostics);
     if (rebuilt.status != composition.START_OK) {
         print.eprint("hedge: reload rejected, service generation failed: ");
@@ -241,8 +241,19 @@ fun main(argc: i64, argv: **u8) i64 {
 
     val composed: *composition.Runtime =
         unwrap_ok[*composition.Runtime, *u8](composition_storage);
-    val started: composition.StartReport = composition.start(composed, ?heap,
-        ?candidate.graph, candidate.id, storage, diagnostics, composition.default_options());
+    var controls: composition.Controls;
+    var quic_controls: quic_runtime.ControlView;
+    val quic_capacity: usize =
+        composition.quic_capacity_required(?candidate.graph);
+    if (quic_capacity != 0
+     && !composition.make_controls(?controls, quic_capacity)) {
+        print.eprintln("hedge: QUIC control storage allocation failed");
+        ret EXIT_RUNTIME;
+    }
+    composition.controls_view(?controls, ?quic_controls);
+    val started: composition.StartReport = composition.start(composed, ?controls,
+        ?heap, ?candidate.graph, candidate.id, storage, diagnostics,
+        composition.default_options());
     if (started.status != composition.START_OK) {
         report_diagnostics(diagnostics);
         print.eprint("hedge: startup composition failed: ");
@@ -274,17 +285,18 @@ fun main(argc: i64, argv: **u8) i64 {
     reloader.slot = 0;
     reloader.next_id = candidate.id + 1;
     for (true) {
-        serve.poll(runtime, serve.DEFAULT_POLL_MS);
-        if (serve.superseded(runtime) == 0
-         && !composition.reclaim_superseded(composed)) {
+        serve.poll(?quic_controls, runtime, serve.DEFAULT_POLL_MS);
+        if (serve.superseded(?quic_controls, runtime) == 0
+         && !composition.reclaim_superseded(composed, ?controls)) {
             print.eprintln("hedge: superseded service generation could not be released");
-            serve.begin_shutdown(runtime, time.now());
+            serve.begin_shutdown(?quic_controls, runtime, time.now());
         }
         # a reload request is taken once the previous generation has finished
         # draining, so the spare slot is free to build into
-        if (runtime.owner.reload_requested && serve.superseded(runtime) == 0) {
+        if (runtime.owner.reload_requested
+         && serve.superseded(?quic_controls, runtime) == 0) {
             listener.clear_reload_request(?runtime.owner);
-            reload(?reloader);
+            reload(?reloader, ?controls, ?quic_controls);
         }
         if (certificates != nil && acme.installation_ready(certificates)) {
             val installed: hedge_tls.Status = composition.install_certificate(
@@ -297,7 +309,13 @@ fun main(argc: i64, argv: **u8) i64 {
         }
         if (serve.drained(runtime)) { brk; }
     }
-    val stopped: composition.StopReport = composition.stop(composed);
+    val stopped: composition.StopReport = composition.stop(composed, ?controls);
+    # a failed destroy retains wiped ownership, so this reports rather than leaks
+    var control_release_failed: bool = false;
+    if (quic_capacity != 0 && !composition.release_controls(?controls)) {
+        print.eprintln("hedge: QUIC control storage was not released");
+        control_release_failed = true;
+    }
     if (stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
         print.eprint("hedge: teardown calls failed during shutdown: ");
         report_count((stopped.serve_failures + stopped.cleanup_failures)::usize);
@@ -308,7 +326,7 @@ fun main(argc: i64, argv: **u8) i64 {
         ret EXIT_DRAIN_INCOMPLETE;
     }
     if (!stopped.stopped || stopped.reason == lifecycle.FAILED
-     || stopped.cleanup_failures != 0) {
+     || stopped.cleanup_failures != 0 || control_release_failed) {
         print.eprintln("hedge: shutdown did not complete cleanly");
         ret EXIT_RUNTIME;
     }
