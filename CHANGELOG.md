@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Removed
+
+- `tools/check-version.sh` and `tools/partial_literal_sweep.py`. The version
+  check belongs to the release process rather than a script in the tree, and
+  the literal sweep was a workaround for briar-systems/mach#3108, which is
+  being fixed in the compiler.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added
