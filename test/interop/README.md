@@ -15,12 +15,13 @@ material only.
 
 ## Configurations
 
-`hedge.toml` binds four listeners:
+`hedge.toml` binds five listeners:
 
 | listener | address | protocols | notes |
 | --- | --- | --- | --- |
 | `cleartext` | 127.0.0.1:9080 | http/1.1, h2 | HTTP/2 by prior knowledge |
 | `secure` | 127.0.0.1:9443 | http/1.1, h2 | TLS with three SNI identities |
+| `quic` | 127.0.0.1:9443/udp | h3 | QUIC with the same public identity policy |
 | `proxied` | 127.0.0.1:9081 | http/1.1, h2 | PROXY protocol required from 127.0.0.1 |
 | `h2only` | 127.0.0.1:9082 | h2 | refuses anything that is not the preface |
 
@@ -48,10 +49,13 @@ Serving:
 - cleartext HTTP/1.1
 - cleartext HTTP/2 by prior knowledge, with and without a request body
 - TLS with ALPN selecting `http/1.1` and `h2`
+- QUIC with TLS ALPN selecting `h3`
 - request bodies of 100000 bytes over HTTP/1.1 and HTTP/2, both over TLS
+- a request body of 100000 bytes over HTTP/3
 - a 156000-byte response over HTTP/1.1 and HTTP/2, compared byte for byte, which
   is what exercises multi-frame DATA, HTTP/2 flow control, and the record layer
   under a response larger than any single buffer
+- the same 156000-byte response over HTTP/3, compared byte for byte
 - six requests multiplexed on one HTTP/2 connection, two of them large
 - twenty requests on one HTTP/1.1 connection
 
@@ -104,9 +108,11 @@ HTTP/2 preface selects HTTP/2.
 
 ## Qualification for this revision
 
-41 legs passed, 0 failed, on linux-x86_64 against:
+The runner records the exact passing leg count for each qualification run on
+linux-x86_64 against:
 
-- curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0)
+- curl 8.21.0 (libcurl/8.21.0, OpenSSL/3.6.3, nghttp2/1.70.0,
+  ngtcp2/1.25.0, nghttp3/1.18.0)
 - OpenSSL 3.6.3
 - GnuTLS 3.8.13
 
@@ -119,11 +125,6 @@ two-stage HTTP/2 GOAWAY, and a superseded generation draining while its
 replacement serves.
 
 ## What this does not cover
-
-- HTTP/3. hedge has no QUIC listener, because its listener plane has no
-  datagram receive path. A QUIC listener is rejected at configuration time.
-  `mach-quic` now ships the production binding from its connection core to its
-  driver contract, so that half of the blocker is gone. See issue #32.
 - Browser interoperability. This machine has no browser harness, so the ALPN and
   certificate paths are exercised only through the clients above.
 - TLS 1.2. hedge configures its listeners for TLS 1.3 only, and the matrix

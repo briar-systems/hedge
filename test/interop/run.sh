@@ -134,6 +134,24 @@ check "TLS http/1.1 request body" 200 \
         --resolve api.example.com:9443:127.0.0.1 --data-binary @"$work/upload.bin" \
         https://api.example.com:9443/echo)"
 
+check "QUIC TLS ALPN selects h3" 200 \
+    "$(curl_code --http3-only --cacert $fixtures/root.pem \
+        --resolve api.example.com:9443:127.0.0.1 \
+        https://api.example.com:9443/hello)"
+check "HTTP/3 request body" 200 \
+    "$(curl_code --http3-only --cacert $fixtures/root.pem \
+        --resolve api.example.com:9443:127.0.0.1 \
+        --data-binary @"$work/upload.bin" https://api.example.com:9443/echo)"
+
+timeout 30 curl -sS --http3-only --cacert $fixtures/root.pem \
+    --resolve api.example.com:9443:127.0.0.1 -o "$work/h3-large" \
+    https://api.example.com:9443/files/large.txt >/dev/null 2>&1
+if cmp -s "$large" "$work/h3-large"; then
+    check "HTTP/3 multi-frame response is byte-identical" ok ok
+else
+    check "HTTP/3 multi-frame response is byte-identical" ok differs
+fi
+
 timeout 30 curl -sS --http2 --cacert $fixtures/root.pem \
     --resolve api.example.com:9443:127.0.0.1 -o "$work/h2-large" \
     https://api.example.com:9443/files/large.txt >/dev/null 2>&1

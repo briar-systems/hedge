@@ -1,0 +1,146 @@
+# binds the http/3 stream adapter to the real quic connection driver
+
+use h3: http.h3.connection;
+use qt: quic.transport;
+use binding: quic.transport.binding;
+use std.types.bool.bool;
+use std.types.size.usize;
+
+# the engine's close hook carries no clock, so the session publishes its
+# current monotonic instant before processing
+pub rec Adapter {
+    driver: *qt.Driver[binding.Binding];
+    clock: *u64;
+    close_error: u64;
+    close_calls: usize;
+    partial_writes: usize;
+    blocked_writes: usize;
+    short_reads: usize;
+}
+
+fun status(value: qt.Status) h3.TransportStatus {
+    if (value == qt.STATUS_OK) { ret h3.TRANSPORT_OK; }
+    if (value == qt.STATUS_EMPTY) { ret h3.TRANSPORT_EMPTY; }
+    if (value == qt.STATUS_BLOCKED) { ret h3.TRANSPORT_BLOCKED; }
+    if (value == qt.STATUS_STALE) { ret h3.TRANSPORT_STALE; }
+    if (value == qt.STATUS_CANCELLED) { ret h3.TRANSPORT_CANCELLED; }
+    if (value == qt.STATUS_CLOSED) { ret h3.TRANSPORT_CLOSED; }
+    ret h3.TRANSPORT_ERROR;
+}
+
+fun to_quic(value: h3.StreamHandle) qt.Stream {
+    ret qt.Stream{source: value.source, index: value.index,
+        generation: value.generation, id: value.id};
+}
+
+fun to_h3(value: qt.Stream) h3.StreamHandle {
+    ret h3.StreamHandle{source: value.source, index: value.index,
+        generation: value.generation, id: value.id};
+}
+
+fun operation(value: qt.OperationResult) h3.TransportOperation {
+    ret h3.TransportOperation{status: status(value.status),
+        error: value.error::u64};
+}
+
+fun adapter_open(self: *Adapter, direction: u8) h3.TransportOpen {
+    var wanted: qt.Direction = qt.BIDIRECTIONAL;
+    if (direction == h3.UNIDIRECTIONAL) { wanted = qt.UNIDIRECTIONAL; }
+    val opened: qt.OpenResult = qt.open_stream[binding.Binding](self.driver, wanted);
+    ret h3.TransportOpen{status: status(opened.status),
+        stream: to_h3(opened.stream),
+        stream_limit_blocked: opened.stream_limit_blocked,
+        storage_blocked: opened.storage_blocked, error: opened.error::u64};
+}
+
+fun adapter_accept(self: *Adapter) h3.TransportOpen {
+    val opened: qt.OpenResult = qt.accept_stream[binding.Binding](self.driver);
+    ret h3.TransportOpen{status: status(opened.status),
+        stream: to_h3(opened.stream),
+        stream_limit_blocked: opened.stream_limit_blocked,
+        storage_blocked: opened.storage_blocked, error: opened.error::u64};
+}
+
+# delivery only; the driver accumulates the uncredited total for credit to release
+fun adapter_read(self: *Adapter, value: h3.StreamHandle, output: *u8,
+    capacity: usize) h3.TransportRead {
+    val read: qt.ReadResult = qt.read_stream[binding.Binding](self.driver, to_quic(value),
+        output, capacity);
+    if (read.count != 0 && read.count < capacity) {
+        self.short_reads = self.short_reads + 1;
+    }
+    ret h3.TransportRead{status: status(read.status), count: read.count,
+        final_size: read.final_size, application_error: read.application_error,
+        fin: read.fin, error: read.error::u64};
+}
+
+fun adapter_credit(self: *Adapter, value: h3.StreamHandle,
+    count: usize) h3.TransportOperation {
+    ret operation(qt.credit_stream[binding.Binding](self.driver, to_quic(value), count::u64));
+}
+
+# quic's status answers whether the whole write was accepted, http/3's answers
+# whether the call made progress. a positive count is therefore always OK, and
+# BLOCKED is reserved for the write that accepted nothing.
+fun adapter_write(self: *Adapter, value: h3.StreamHandle, input: *u8,
+    length: usize) h3.TransportWrite {
+    val written: qt.WriteResult = qt.write_stream[binding.Binding](self.driver, to_quic(value),
+        input, length);
+    var mapped: h3.TransportStatus = status(written.status);
+    if (written.status == qt.STATUS_BLOCKED) {
+        if (written.count != 0) {
+            mapped = h3.TRANSPORT_OK;
+            self.partial_writes = self.partial_writes + 1;
+        } or { self.blocked_writes = self.blocked_writes + 1; }
+    }
+    ret h3.TransportWrite{status: mapped, count: written.count,
+        connection_blocked: written.connection_blocked,
+        stream_blocked: written.stream_blocked,
+        storage_blocked: written.storage_blocked, error: written.error::u64};
+}
+
+fun adapter_finish(self: *Adapter, value: h3.StreamHandle) h3.TransportOperation {
+    ret operation(qt.finish_stream[binding.Binding](self.driver, to_quic(value)));
+}
+
+fun adapter_cancel_send(self: *Adapter, value: h3.StreamHandle,
+    code: u64) h3.TransportOperation {
+    ret operation(qt.cancel_stream_send[binding.Binding](self.driver, to_quic(value), code));
+}
+
+fun adapter_cancel_receive(self: *Adapter, value: h3.StreamHandle,
+    code: u64) h3.TransportOperation {
+    ret operation(qt.cancel_stream_receive[binding.Binding](self.driver, to_quic(value), code));
+}
+
+fun adapter_release(self: *Adapter, value: h3.StreamHandle) h3.TransportOperation {
+    val released: qt.OperationResult = qt.release_stream[binding.Binding](self.driver,
+        to_quic(value));
+    ret operation(released);
+}
+
+fun adapter_close(self: *Adapter, code: u64) h3.TransportOperation {
+    self.close_calls = self.close_calls + 1;
+    self.close_error = code;
+    ret operation(qt.begin_close[binding.Binding](self.driver, code, nil, 0, self.clock[0]));
+}
+
+pub fun stream_snapshot(self: *Adapter, value: h3.StreamHandle) qt.StreamSnapshot {
+    ret qt.stream_snapshot[binding.Binding](self.driver, to_quic(value));
+}
+
+pub fun bind(self: *Adapter, driver: *qt.Driver[binding.Binding],
+    clock: *u64) h3.Transport[Adapter] {
+    self.driver = driver;
+    self.clock = clock;
+    self.close_error = 0;
+    self.close_calls = 0;
+    self.partial_writes = 0;
+    self.blocked_writes = 0;
+    self.short_reads = 0;
+    ret h3.Transport[Adapter]{context: self, open: adapter_open,
+        accept: adapter_accept, read: adapter_read, credit: adapter_credit,
+        write: adapter_write, finish: adapter_finish,
+        cancel_send: adapter_cancel_send, cancel_receive: adapter_cancel_receive,
+        release: adapter_release, close: adapter_close};
+}

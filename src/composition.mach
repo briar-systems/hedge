@@ -20,6 +20,12 @@ use http_cache: hedge.cache;
 use cache_store: hedge.cache.store;
 use upstream: hedge.proxy.upstream;
 use engine_h1: http.h1.connection;
+use crypto.secret;
+use contracts: crypto.contracts;
+use assembly: quic.connection.assembly;
+use quic_admission: quic.connection.admission;
+use quic_listener: quic.connection.listener;
+use quic_token: quic.connection.token;
 use acme: hedge.acme.manager;
 use handler: hedge.acme.handler;
 use tlsalpn: hedge.acme.tlsalpn;
@@ -27,6 +33,10 @@ use hedge_tls: hedge.protocol.tls;
 use lifecycle: hedge.lifecycle;
 use hedge.serve;
 use hedge.connection;
+use h3_session: hedge.protocol.h3.session;
+use quic_runtime: hedge.protocol.quic.runtime;
+use quic_routing: hedge.protocol.quic.routing;
+use quic_timers: hedge.protocol.quic.timers;
 use plan: hedge.dispatch.plan;
 use middleware: hedge.dispatch.middleware;
 use router: http.router.router;
@@ -40,7 +50,6 @@ pub val MAX_MIDDLEWARE: usize = 16;
 pub val MAX_STATIC_ROOTS: usize = 16;
 pub val CACHE_ENTRIES: usize = 128;
 pub val PLAN_TEXT_BYTES: usize = 16384;
-pub val DEFAULT_CONNECTIONS: usize = 64;
 
 pub rec PlanStorage {
     routes: [MAX_ROUTES]router.CompiledRoute;
@@ -124,6 +133,18 @@ pub rec Runtime {
     serving: serve.Runtime;
     slots: *serve.Slot;
     connections: *connection.Connection;
+    quic: quic_runtime.Runtime;
+    quic_pumps: [quic_runtime.MAX_PUMPS]quic_runtime.PumpStorage;
+    quic_connection_storages: *quic_runtime.ConnectionStorage;
+    quic_session_storages: *h3_session.SessionStorage;
+    quic_routes: *quic_routing.Entry;
+    quic_timer_nodes: *quic_timers.Node;
+    quic_timer_positions: *quic_timers.Position;
+    quic_initials: *quic_runtime.PendingInitial;
+    quic_pending: *quic_listener.Pending;
+    quic_peers: *quic_admission.PeerSlot;
+    quic_charges: *quic_admission.ChargeSlot;
+    quic_replay: *quic_token.ReplaySlot;
     planes: Planes;
     options: Options;
     active_generation: usize;
@@ -134,8 +155,108 @@ pub rec Runtime {
     tls_live: bool;
     telemetry_live: bool;
     serve_live: bool;
+    quic_live: bool;
     events: [16]Event;
     event_count: usize;
+}
+
+# every welded quic record is owned by a typed secret array. Controls is held by
+# main for the process lifetime and is never retained by a public record.
+pub rec Controls {
+    pump_allocator: secret.ArrayAllocator[quic_runtime.Pump];
+    connection_allocator: secret.ArrayAllocator[quic_runtime.Connection];
+    secret_storage_allocator: secret.ArrayAllocator[assembly.SecretStorage];
+    session_allocator: secret.ArrayAllocator[h3_session.Session];
+    pumps: secret.SecretArray[quic_runtime.Pump];
+    connections: secret.SecretArray[quic_runtime.Connection];
+    secret_storages: secret.SecretArray[assembly.SecretStorage];
+    sessions: secret.SecretArray[h3_session.Session];
+    capacity: usize;
+    live: bool;
+}
+
+# the control owner is sized only when a quic listener exists to need it
+pub fun quic_capacity_required(graph: *schema.Graph) usize {
+    if (graph == nil) { ret 0; }
+    var i: usize = 0;
+    for (i < graph.listener_count) {
+        if (graph.listeners[i].transport == schema.TRANSPORT_QUIC) {
+            ret graph.limits.max_connections;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+pub fun make_controls(controls: *Controls, capacity: usize) bool {
+    if (controls == nil || controls.live || capacity == 0) { ret false; }
+    controls.pump_allocator =
+        secret.system_array_allocator[quic_runtime.Pump]();
+    controls.connection_allocator =
+        secret.system_array_allocator[quic_runtime.Connection]();
+    controls.secret_storage_allocator =
+        secret.system_array_allocator[assembly.SecretStorage]();
+    controls.session_allocator =
+        secret.system_array_allocator[h3_session.Session]();
+    if (secret.init_array[quic_runtime.Pump](?controls.pumps,
+            ?controls.pump_allocator, quic_runtime.MAX_PUMPS) != contracts.OK
+     || secret.init_array[quic_runtime.Connection](?controls.connections,
+            ?controls.connection_allocator, capacity) != contracts.OK
+     || secret.init_array[assembly.SecretStorage](?controls.secret_storages,
+            ?controls.secret_storage_allocator, capacity) != contracts.OK
+     || secret.init_array[h3_session.Session](?controls.sessions,
+            ?controls.session_allocator, capacity) != contracts.OK) {
+        release_controls(controls);
+        ret false;
+    }
+    controls.capacity = capacity;
+    controls.live = true;
+    ret true;
+}
+
+# a failed destroy retains wiped ownership, so a later call retries the same
+# owner rather than abandoning it
+pub fun release_controls(controls: *Controls) bool {
+    if (controls == nil) { ret false; }
+    var released: bool = true;
+    if (secret.destroy_array[h3_session.Session](?controls.sessions)
+        != contracts.OK) { released = false; }
+    if (secret.destroy_array[assembly.SecretStorage](?controls.secret_storages)
+        != contracts.OK) { released = false; }
+    if (secret.destroy_array[quic_runtime.Connection](?controls.connections)
+        != contracts.OK) { released = false; }
+    if (secret.destroy_array[quic_runtime.Pump](?controls.pumps)
+        != contracts.OK) { released = false; }
+    if (released) { controls.live = false; controls.capacity = 0; }
+    ret released;
+}
+
+pub fun controls_cleanup_pending(controls: *Controls) bool {
+    if (controls == nil) { ret false; }
+    ret secret.array_cleanup_pending[quic_runtime.Pump](?controls.pumps)
+     || secret.array_cleanup_pending[quic_runtime.Connection](
+        ?controls.connections)
+     || secret.array_cleanup_pending[assembly.SecretStorage](
+        ?controls.secret_storages)
+     || secret.array_cleanup_pending[h3_session.Session](?controls.sessions);
+}
+
+# the view is borrowed by one call and never outlives it
+pub fun controls_view(controls: *Controls,
+    output: *quic_runtime.ControlView) bool {
+    if (controls == nil || output == nil || !controls.live) { ret false; }
+    output.pumps = secret.array_data[quic_runtime.Pump](?controls.pumps);
+    output.connections =
+        secret.array_data[quic_runtime.Connection](?controls.connections);
+    output.secret_storages =
+        secret.array_data[assembly.SecretStorage](?controls.secret_storages);
+    output.sessions =
+        secret.array_data[h3_session.Session](?controls.sessions);
+    output.pump_capacity = quic_runtime.MAX_PUMPS;
+    output.connection_capacity = controls.capacity;
+    output.session_capacity = controls.capacity;
+    ret output.pumps != nil && output.connections != nil
+     && output.secret_storages != nil && output.sessions != nil;
 }
 
 pub rec StopReport {
@@ -232,19 +353,41 @@ fun close_service_generation(runtime: *Runtime, slot: usize) bool {
     ret ok;
 }
 
-fun clean(runtime: *Runtime) StopReport {
+fun clean(runtime: *Runtime, controls: *Controls) StopReport {
+    var quic_controls: quic_runtime.ControlView;
+    controls_view(controls, ?quic_controls);
     var stopped: bool = true;
     var reason: lifecycle.Reason = lifecycle.IMMEDIATE;
     var abandoned: usize = 0;
     var serve_failures: u64 = 0;
     var cleanup_failures: u64 = 0;
     if (runtime.serve_live) {
-        stopped = serve.stop(?runtime.serving);
+        stopped = serve.stop(?quic_controls, ?runtime.serving);
         reason = serve.shutdown_reason(?runtime.serving);
         abandoned = serve.shutdown_cancelled(?runtime.serving);
         serve_failures = serve.teardown_failures(?runtime.serving);
+        if (!stopped) {
+            ret StopReport{stopped: false, reason: reason,
+                abandoned: abandoned, serve_failures: serve_failures,
+                cleanup_failures: cleanup_failures};
+        }
         runtime.serve_live = false;
         event(runtime, SERVE_STOPPED);
+    }
+    if (runtime.quic_live) {
+        if (quic_controls.connections == nil) {
+            cleanup_failures = cleanup_failures + 1;
+        } or {
+            val snapshot: quic_runtime.Snapshot =
+                quic_runtime.snapshot(?quic_controls, ?runtime.quic);
+            if (snapshot.initialized
+             && quic_runtime.release(?quic_controls, ?runtime.quic)
+                != quic_runtime.OK) {
+                cleanup_failures = cleanup_failures + 1;
+            } or {
+                runtime.quic_live = false;
+            }
+        }
     }
     if (runtime.telemetry_live) {
         if (!telemetry_production.close(?runtime.observability)) {
@@ -316,8 +459,9 @@ fun clean(runtime: *Runtime) StopReport {
     };
 }
 
-fun fail(runtime: *Runtime, status: StartStatus, detail: str) StartReport {
-    clean(runtime);
+fun fail(runtime: *Runtime, controls: *Controls, status: StartStatus,
+    detail: str) StartReport {
+    clean(runtime, controls);
     ret StartReport{status: status, detail: detail};
 }
 
@@ -408,9 +552,11 @@ fun build_service_generation(runtime: *Runtime, slot: usize,
     ret StartReport{status: START_OK, detail: nil};
 }
 
-pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema.Graph,
+pub fun start(runtime: *Runtime, controls: *Controls,
+    heap: *allocator.Allocator, configured: *schema.Graph,
     generation_id: u64, storage: *PlanStorage, diagnostics: *schema.Diagnostics,
     options: Options) StartReport {
+    var quic_controls: quic_runtime.ControlView;
     if (runtime == nil || heap == nil || configured == nil || storage == nil
      || diagnostics == nil) {
         ret StartReport{status: START_RUNTIME, detail: "composition input is invalid"};
@@ -421,6 +567,16 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
     runtime.certificates = nil;
     runtime.slots = nil;
     runtime.connections = nil;
+    runtime.quic_connection_storages = nil;
+    runtime.quic_session_storages = nil;
+    runtime.quic_routes = nil;
+    runtime.quic_timer_nodes = nil;
+    runtime.quic_timer_positions = nil;
+    runtime.quic_initials = nil;
+    runtime.quic_pending = nil;
+    runtime.quic_peers = nil;
+    runtime.quic_charges = nil;
+    runtime.quic_replay = nil;
     runtime.options = options;
     runtime.active_generation = 0;
     runtime.proxy_live = false;
@@ -430,6 +586,9 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
     runtime.tls_live = false;
     runtime.telemetry_live = false;
     runtime.serve_live = false;
+    runtime.quic_live = false;
+    runtime.quic.initialized = false;
+    runtime.quic.generation = 0;
     runtime.event_count = 0;
     runtime.certificate_policy = hedge_tls.NO_POLICY;
     var generation_slot: usize = 0;
@@ -444,11 +603,11 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
 
     if (!service.make_applications(?runtime.applications,
         ?runtime.application_slots[0], service.MAX_APPLICATIONS)) {
-        ret fail(runtime, START_RUNTIME, "application registry could not be constructed");
+        ret fail(runtime, controls, START_RUNTIME, "application registry could not be constructed");
     }
     if (!proxy.make_runtime(?runtime.proxying, nil, options.pseudonym,
         engine_h1.config_default(), upstream.default_limits())) {
-        ret fail(runtime, START_RUNTIME, "proxy runtime could not be constructed");
+        ret fail(runtime, controls, START_RUNTIME, "proxy runtime could not be constructed");
     }
     runtime.proxy_live = true;
 
@@ -462,13 +621,13 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
         if (is_err[*http_cache.Layer, *u8](layer_memory)
          || is_err[*cache_store.Entry, *u8](entry_memory)
          || is_err[*u8, *u8](body_memory)) {
-            ret fail(runtime, START_RUNTIME, "cache allocation failed");
+            ret fail(runtime, controls, START_RUNTIME, "cache allocation failed");
         }
         runtime.caching = unwrap_ok[*http_cache.Layer, *u8](layer_memory);
         if (!http_cache.from_config(runtime.caching, ?configured.cache,
             unwrap_ok[*cache_store.Entry, *u8](entry_memory), CACHE_ENTRIES,
             unwrap_ok[*u8, *u8](body_memory), configured.cache.memory_bytes, heap)) {
-            ret fail(runtime, START_CONFIG, "cache could not be constructed");
+            ret fail(runtime, controls, START_CONFIG, "cache could not be constructed");
         }
         runtime.cache_live = true;
     }
@@ -477,13 +636,13 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
         val manager_memory: Result[*acme.Manager, *u8] =
             allocator.allocate[acme.Manager](heap, 1);
         if (is_err[*acme.Manager, *u8](manager_memory)) {
-            ret fail(runtime, START_RUNTIME, "certificate manager allocation failed");
+            ret fail(runtime, controls, START_RUNTIME, "certificate manager allocation failed");
         }
         runtime.certificates = unwrap_ok[*acme.Manager, *u8](manager_memory);
         var opened: acme.Status = acme.INVALID;
         if (configured.acme.challenge == schema.CHALLENGE_TLS_ALPN_01) {
             if (!tlsalpn.make(?runtime.alpn_challenge)) {
-                ret fail(runtime, START_RUNTIME,
+                ret fail(runtime, controls, START_RUNTIME,
                     "TLS-ALPN challenge state could not be constructed");
             }
             runtime.alpn_challenge_live = true;
@@ -493,27 +652,27 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
             opened = acme.open(runtime.certificates, heap, configured);
         }
         if (opened != acme.OK) {
-            ret fail(runtime, START_CONFIG, "certificate manager could not open its state");
+            ret fail(runtime, controls, START_CONFIG, "certificate manager could not open its state");
         }
         runtime.acme_live = true;
         if (configured.acme.challenge == schema.CHALLENGE_HTTP_01 &&
             !handler.bind(?runtime.challenge_binding,
                 acme.challenge_table(runtime.certificates))) {
-            ret fail(runtime, START_RUNTIME,
+            ret fail(runtime, controls, START_RUNTIME,
                 "challenge route could not be bound");
         }
     }
 
     if (!telemetry_production.make(?runtime.observability, heap, configured,
         options.telemetry)) {
-        ret fail(runtime, START_CONFIG, "telemetry could not be constructed");
+        ret fail(runtime, controls, START_CONFIG, "telemetry could not be constructed");
     }
     runtime.telemetry_live = true;
 
     val services_built: StartReport = build_service_generation(runtime, 0,
         configured, generation_id, storage, true);
     if (services_built.status != START_OK) {
-        ret fail(runtime, services_built.status, services_built.detail);
+        ret fail(runtime, controls, services_built.status, services_built.detail);
     }
 
     hedge_tls.reset();
@@ -526,7 +685,7 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
         val policy: *schema.TlsPolicy = schema.find_tls_policy(configured,
             schema.text(?selected.tls_policy));
         if (policy == nil) {
-            ret fail(runtime, START_CONFIG, "listener references an unknown TLS policy");
+            ret fail(runtime, controls, START_CONFIG, "listener references an unknown TLS policy");
         }
         var tls_options: hedge_tls.PublishOptions = hedge_tls.publish_options();
         tls_options.tls_alpn_challenge = configured.acme.enabled &&
@@ -535,63 +694,174 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
                 schema.text(?configured.acme.listener));
         if (hedge_tls.publish_with_options(schema.text(?selected.name), policy,
             selected.protocols, tls_options) != hedge_tls.OK) {
-            ret fail(runtime, START_CONFIG, "TLS policy could not be published");
+            ret fail(runtime, controls, START_CONFIG, "TLS policy could not be published");
         }
     }
     if (runtime.acme_live) {
         runtime.certificate_policy = hedge_tls.find(
             schema.text(?configured.acme.listener));
         if (runtime.certificate_policy == hedge_tls.NO_POLICY) {
-            ret fail(runtime, START_CONFIG,
+            ret fail(runtime, controls, START_CONFIG,
                 "ACME listener has no published TLS policy");
         }
         if (runtime.alpn_challenge_live &&
             !tlsalpn.bind_listener(?runtime.alpn_challenge,
                 runtime.certificate_policy)) {
-            ret fail(runtime, START_CONFIG,
+            ret fail(runtime, controls, START_CONFIG,
                 "TLS-ALPN challenge could not bind its listener");
         }
         if (acme.certificate_ready(runtime.certificates) &&
             hedge_tls.install_acme(runtime.certificate_policy,
                 runtime.certificates) != hedge_tls.OK) {
-            ret fail(runtime, START_CONFIG,
+            ret fail(runtime, controls, START_CONFIG,
                 "stored ACME certificate could not be installed");
         }
     }
 
-    var pool_size: usize = configured.limits.max_connections;
-    if (pool_size > DEFAULT_CONNECTIONS) { pool_size = DEFAULT_CONNECTIONS; }
-    if (pool_size == 0) { pool_size = 1; }
+    val pool_size: usize = configured.limits.max_connections;
     val slots_memory: Result[*serve.Slot, *u8] = allocator.allocate[serve.Slot](heap, pool_size);
     val connection_memory: Result[*connection.Connection, *u8] =
         allocator.allocate[connection.Connection](heap, pool_size);
     if (is_err[*serve.Slot, *u8](slots_memory)
      || is_err[*connection.Connection, *u8](connection_memory)) {
-        ret fail(runtime, START_RUNTIME, "connection pool allocation failed");
+        ret fail(runtime, controls, START_RUNTIME, "connection pool allocation failed");
     }
     runtime.slots = unwrap_ok[*serve.Slot, *u8](slots_memory);
     runtime.connections = unwrap_ok[*connection.Connection, *u8](connection_memory);
     if (!serve.make(?runtime.serving, runtime.slots, runtime.connections, pool_size,
         ?runtime.plans[0], configured)) {
-        ret fail(runtime, START_RUNTIME, "serving runtime initialization failed");
+        ret fail(runtime, controls, START_RUNTIME, "serving runtime initialization failed");
+    }
+    var quic_listeners: usize = 0;
+    listener_index = 0;
+    for (listener_index < configured.listener_count) {
+        if (configured.listeners[listener_index].transport
+            == schema.TRANSPORT_QUIC) { quic_listeners = quic_listeners + 1; }
+        listener_index = listener_index + 1;
+    }
+    if (quic_listeners != 0) {
+        val route_capacity: usize = quic_runtime.route_capacity_required(pool_size);
+        val admission_capacity: usize =
+            quic_runtime.admission_capacity_required(pool_size,
+                quic_listeners);
+        val quic_connection_storages: Result[*quic_runtime.ConnectionStorage,
+            *u8] = allocator.allocate[quic_runtime.ConnectionStorage](heap,
+                pool_size);
+        val quic_session_storages: Result[*h3_session.SessionStorage, *u8] =
+            allocator.allocate[h3_session.SessionStorage](heap, pool_size);
+        val quic_routes: Result[*quic_routing.Entry, *u8] =
+            allocator.allocate[quic_routing.Entry](heap, route_capacity);
+        val quic_timer_nodes: Result[*quic_timers.Node, *u8] =
+            allocator.allocate[quic_timers.Node](heap, pool_size);
+        val quic_timer_positions: Result[*quic_timers.Position, *u8] =
+            allocator.allocate[quic_timers.Position](heap, pool_size);
+        val quic_initials: Result[*quic_runtime.PendingInitial, *u8] =
+            allocator.allocate[quic_runtime.PendingInitial](heap, pool_size);
+        val quic_pending: Result[*quic_listener.Pending, *u8] =
+            allocator.allocate[quic_listener.Pending](heap, admission_capacity);
+        val quic_peers: Result[*quic_admission.PeerSlot, *u8] =
+            allocator.allocate[quic_admission.PeerSlot](heap, admission_capacity);
+        val quic_charges: Result[*quic_admission.ChargeSlot, *u8] =
+            allocator.allocate[quic_admission.ChargeSlot](heap, admission_capacity);
+        val quic_replay: Result[*quic_token.ReplaySlot, *u8] =
+            allocator.allocate[quic_token.ReplaySlot](heap, admission_capacity);
+        if (route_capacity == 0 || admission_capacity == 0
+         || is_err[*quic_runtime.ConnectionStorage, *u8](
+            quic_connection_storages)
+         || is_err[*h3_session.SessionStorage, *u8](quic_session_storages)
+         || is_err[*quic_routing.Entry, *u8](quic_routes)
+         || is_err[*quic_timers.Node, *u8](quic_timer_nodes)
+         || is_err[*quic_timers.Position, *u8](quic_timer_positions)
+         || is_err[*quic_runtime.PendingInitial, *u8](quic_initials)
+         || is_err[*quic_listener.Pending, *u8](quic_pending)
+         || is_err[*quic_admission.PeerSlot, *u8](quic_peers)
+         || is_err[*quic_admission.ChargeSlot, *u8](quic_charges)
+         || is_err[*quic_token.ReplaySlot, *u8](quic_replay)) {
+            ret fail(runtime, controls, START_RUNTIME, "QUIC runtime allocation failed");
+        }
+        runtime.quic_connection_storages =
+            unwrap_ok[*quic_runtime.ConnectionStorage, *u8](
+                quic_connection_storages);
+        runtime.quic_session_storages =
+            unwrap_ok[*h3_session.SessionStorage, *u8](quic_session_storages);
+        runtime.quic_routes = unwrap_ok[*quic_routing.Entry, *u8](quic_routes);
+        runtime.quic_timer_nodes = unwrap_ok[*quic_timers.Node, *u8](
+            quic_timer_nodes);
+        runtime.quic_timer_positions = unwrap_ok[*quic_timers.Position, *u8](
+            quic_timer_positions);
+        runtime.quic_initials = unwrap_ok[*quic_runtime.PendingInitial, *u8](
+            quic_initials);
+        runtime.quic_pending = unwrap_ok[*quic_listener.Pending, *u8](quic_pending);
+        runtime.quic_peers = unwrap_ok[*quic_admission.PeerSlot, *u8](quic_peers);
+        runtime.quic_charges = unwrap_ok[*quic_admission.ChargeSlot, *u8](
+            quic_charges);
+        runtime.quic_replay = unwrap_ok[*quic_token.ReplaySlot, *u8](quic_replay);
+        var pump: usize = 0;
+        listener_index = 0;
+        for (listener_index < configured.listener_count) {
+            if (configured.listeners[listener_index].transport
+                != schema.TRANSPORT_QUIC) {
+                listener_index = listener_index + 1;
+                cnt;
+            }
+            var bank: usize = 0;
+            for (bank < quic_runtime.ADMISSION_BANKS) {
+                val offset: usize = (pump * quic_runtime.ADMISSION_BANKS + bank)
+                    * pool_size;
+                runtime.quic_pumps[listener_index].admissions[bank] =
+                    quic_runtime.AdmissionStorage{
+                        pending: ?runtime.quic_pending[offset],
+                        pending_capacity: pool_size,
+                        peers: ?runtime.quic_peers[offset],
+                        peer_capacity: pool_size,
+                        charges: ?runtime.quic_charges[offset],
+                        charge_capacity: pool_size,
+                        replay: ?runtime.quic_replay[offset],
+                        replay_capacity: pool_size,
+                    };
+                bank = bank + 1;
+            }
+            pump = pump + 1;
+            listener_index = listener_index + 1;
+        }
+        var quic_storage: quic_runtime.Storage;
+        if (!controls_view(controls, ?quic_controls)
+         || controls.capacity < pool_size
+         || !quic_runtime.make_storage(?quic_storage,
+                runtime.quic_connection_storages, pool_size,
+                runtime.quic_session_storages, pool_size,
+                runtime.quic_routes, route_capacity,
+                runtime.quic_timer_nodes, runtime.quic_timer_positions,
+                pool_size, runtime.quic_initials, pool_size)
+         || !quic_runtime.make(?quic_controls, ?runtime.quic, quic_storage,
+                quic_runtime.RuntimeConfig{max_connections: pool_size})) {
+            ret fail(runtime, controls, START_RUNTIME, "QUIC runtime initialization failed");
+        }
+        runtime.quic_live = true;
+        if (!serve.attach_quic(?runtime.serving, ?runtime.quic,
+            ?runtime.quic_pumps[0])) {
+            ret fail(runtime, controls, START_RUNTIME, "QUIC runtime could not be attached");
+        }
     }
     if (!serve.attach_telemetry(?runtime.serving,
         ?runtime.observability.runtime)) {
-        ret fail(runtime, START_RUNTIME, "telemetry runtime could not be attached");
+        ret fail(runtime, controls, START_RUNTIME, "telemetry runtime could not be attached");
     }
     schema.reset_diagnostics(diagnostics);
-    if (!serve.start(?runtime.serving, generation_id, configured, diagnostics)) {
-        ret fail(runtime, START_RUNTIME, "listeners did not become ready");
+    if (!serve.start(?quic_controls, ?runtime.serving, generation_id, configured, diagnostics)) {
+        runtime.serve_live = runtime.serving.state != serve.NEW
+            && runtime.serving.state != serve.STOPPED;
+        ret fail(runtime, controls, START_RUNTIME, "listeners did not become ready");
     }
     runtime.serve_live = true;
     if (!proxy.attach_driver(?runtime.proxying, ?runtime.serving.owner.network)) {
-        ret fail(runtime, START_RUNTIME, "proxy driver could not be attached");
+        ret fail(runtime, controls, START_RUNTIME, "proxy driver could not be attached");
     }
     runtime.planes.proxying = ?runtime.proxying;
     runtime.planes.certificates = runtime.certificates;
     if (!serve.attach_plane_lifecycle(?runtime.serving, (?runtime.planes)::ptr,
         drive_planes, quiesce_planes)) {
-        ret fail(runtime, START_RUNTIME, "service planes could not be attached");
+        ret fail(runtime, controls, START_RUNTIME, "service planes could not be attached");
     }
     if (runtime.acme_live) {
         acme.attach_telemetry(runtime.certificates, runtime.serving.observability);
@@ -599,12 +869,12 @@ pub fun start(runtime: *Runtime, heap: *allocator.Allocator, configured: *schema
     ret StartReport{status: START_OK, detail: nil};
 }
 
-pub fun stop(runtime: *Runtime) StopReport {
+pub fun stop(runtime: *Runtime, controls: *Controls) StopReport {
     if (runtime == nil) {
         ret StopReport{stopped: false, reason: lifecycle.FAILED, abandoned: 0,
             serve_failures: 0, cleanup_failures: 0};
     }
-    ret clean(runtime);
+    ret clean(runtime, controls);
 }
 
 pub fun install_certificate(runtime: *Runtime, now: time.Time)
@@ -650,8 +920,10 @@ pub fun active_service_generation(runtime: *Runtime) usize {
     ret runtime.active_generation;
 }
 
-pub fun reclaim_superseded(runtime: *Runtime) bool {
-    if (runtime == nil || !runtime.serve_live || serve.superseded(?runtime.serving) != 0) {
+pub fun reclaim_superseded(runtime: *Runtime, controls: *Controls) bool {
+    var quic_controls: quic_runtime.ControlView;
+    controls_view(controls, ?quic_controls);
+    if (runtime == nil || !runtime.serve_live || serve.superseded(?quic_controls, ?runtime.serving) != 0) {
         ret false;
     }
     val retired: usize = 1 - runtime.active_generation;
@@ -659,19 +931,22 @@ pub fun reclaim_superseded(runtime: *Runtime) bool {
     ret close_service_generation(runtime, retired);
 }
 
-pub fun reload(runtime: *Runtime, configured: *schema.Graph, generation_id: u64,
+pub fun reload(runtime: *Runtime, controls: *Controls,
+    configured: *schema.Graph, generation_id: u64,
     storage: *PlanStorage, diagnostics: *schema.Diagnostics) StartReport {
+    var quic_controls: quic_runtime.ControlView;
+    controls_view(controls, ?quic_controls);
     if (runtime == nil || configured == nil || generation_id == 0 || storage == nil
      || diagnostics == nil || !runtime.serve_live
      || generation_id <= runtime.service_generations[runtime.active_generation].generation
-     || serve.superseded(?runtime.serving) != 0) {
+     || serve.superseded(?quic_controls, ?runtime.serving) != 0) {
         ret StartReport{status: START_RUNTIME, detail: "service generation is not reclaimable"};
     }
     if (!plan.reload_compatible(runtime.graph, configured)) {
         ret StartReport{status: START_CONFIG,
             detail: "startup-owned configuration changed; restart required"};
     }
-    if (!reclaim_superseded(runtime)) {
+    if (!reclaim_superseded(runtime, controls)) {
         ret StartReport{status: START_RUNTIME,
             detail: "superseded service generation could not be released"};
     }
@@ -679,7 +954,7 @@ pub fun reload(runtime: *Runtime, configured: *schema.Graph, generation_id: u64,
     val built: StartReport = build_service_generation(runtime, target, configured,
         generation_id, storage, false);
     if (built.status != START_OK) { ret built; }
-    if (!serve.reload(?runtime.serving, generation_id, ?runtime.plans[target],
+    if (!serve.reload(?quic_controls, ?runtime.serving, generation_id, ?runtime.plans[target],
         configured, diagnostics)) {
         close_service_generation(runtime, target);
         ret StartReport{status: START_RUNTIME, detail: "listeners did not republish"};

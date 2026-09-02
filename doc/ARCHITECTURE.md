@@ -38,11 +38,18 @@ The control plane publishes immutable runtime generations. A listener and every 
 
 The executable and runtime tests enter those planes through one production
 composition module. Its runtime record owns every binding array and compiled
-plan for the process lifetime. Startup constructs cache bindings before the
-resolver and compiles only after both are stable. Teardown stops serving first,
-closes certificate management, destroys TLS credentials, closes proxy state,
-then closes cache and static storage. Partial startup follows the same ordering
-for every resource it acquired.
+plan for the process lifetime. It also owns the public QUIC backing: the
+connection-ID route, timer, pending-initial, and per-listener admission pools,
+and the public connection and session storage. The welded control records for
+the pump, the connection, its deep-secret assembly storage, and the HTTP/3
+session are owned separately by a typed secret owner the executable holds for
+the process lifetime. No public record retains one; code that needs them
+borrows a stack-local view for the duration of a call. Startup
+constructs cache bindings before the resolver and compiles only after both are
+stable. Teardown cancels and releases QUIC operations before closing their UDP
+sockets, then closes certificate management, TLS credentials, proxy state,
+cache storage, and static storage. Partial startup follows the same ordering for
+every resource it acquired.
 
 ## Runtime generation
 
@@ -110,7 +117,11 @@ QUIC exposes connection and stream operations rather than pretending to be one b
 
 TCP connections pass through optional PROXY protocol decoding, optional TLS, and application protocol selection. Cleartext listeners select HTTP/1.1 or an explicit HTTP/2 prior-knowledge policy. TLS uses ALPN for HTTP/1.1 and HTTP/2.
 
-QUIC listeners select HTTP/3 through TLS ALPN inside QUIC.
+QUIC listeners select HTTP/3 through TLS ALPN inside QUIC. Their receive pumps
+share the listener completion driver with TCP while retaining independent
+connection ownership. The serving loop bounds its wait by the next QUIC timer
+deadline. Reload stages every QUIC admission generation before publishing the
+new request plan, then gracefully retires connections pinned to the old plan.
 
 Each protocol engine translates its connection-specific state into the common HTTP service exchange. The common exchange supports streaming bodies, informational responses, trailers, cancellation, upgrades where the protocol permits them, and peer metadata.
 
@@ -228,7 +239,10 @@ Configuration processing has four stages:
 3. Validate the complete graph and resource budgets.
 4. Construct a sealed runtime generation.
 
-Only the sealed generation is published. A failed reload leaves the current generation untouched. Listener transitions are planned before publication so address conflicts and unsupported socket options fail safely.
+Only the sealed generation is published. A failed reload leaves the current
+generation untouched. Listener identity and socket configuration are
+startup-owned, so a hot reload requires the exact active listener set and a
+listener change requires a process restart.
 
 ## Certificate management
 

@@ -4,13 +4,16 @@ Hedge is a lightweight production web server written in Mach.
 
 Hedge is the deployable product in the Mach web stack. It will serve static files, Mach web applications, and upstream services over HTTP/1.1, HTTP/2, and HTTP/3 with native Mach TLS and QUIC.
 
-Hedge serves HTTP/1.1 and HTTP/2 over TLS 1.2 and TLS 1.3 today, with SNI, ALPN and
+Hedge serves HTTP/1.1 and HTTP/2 over TLS 1.2 and TLS 1.3, with SNI, ALPN and
 client certificates, qualified against curl, OpenSSL and GnuTLS in
-[`test/interop`](test/interop/README.md). Static files, reverse proxying, the
-bounded caches, virtual host dispatch and ACME over authenticated TLS against
-a compatible authority are implemented. HTTP/3 is not yet served (#32), the
-current Let's Encrypt chain uses certificate algorithms mach-tls cannot verify
-(#38), and a listener's credential generation cannot yet be replaced (#37).
+[`test/interop`](test/interop/README.md). Static files, reverse proxying,
+bounded caches, virtual host dispatch, and ACME over authenticated TLS are
+implemented. A `transport = "quic"` listener becomes ready and serves HTTP/3,
+with ALPN inside QUIC selecting `h3`, qualified against curl 8.21.0 over
+ngtcp2 in the same interoperability matrix: request bodies, large responses,
+and prompt shutdown included. The current Let's Encrypt chain uses certificate algorithms
+mach-tls cannot verify (#38), and a listener's credential generation cannot
+yet be replaced (#37).
 
 ## Product goals
 
@@ -61,5 +64,19 @@ mach dep pull
 mach test .
 mach build .
 ```
+
+The runtime harness in `test/runtime` composes the whole server into one test
+binary and is run separately:
+
+```sh
+mach dep pull test/runtime
+mach test test/runtime
+```
+
+Its debug profile carries no debug info because the compilation peaks near
+18 GiB; on a 32 GiB machine the harness passes in the debug profile and is
+killed in the release profile, so the release run needs more memory than
+that.
+
 
 Build output uses Mach's default `out/` directory.
