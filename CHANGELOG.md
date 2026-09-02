@@ -7,9 +7,11 @@
 - HTTP/3 serving. A `transport = "quic"` listener becomes ready and serves
   instead of refusing before readiness. ALPN inside QUIC selects `h3` per
   listener policy, and an HTTP/3 request reaches the same dispatch
-  boundary as HTTP/1 and HTTP/2. Verified against curl 8.21.0 over
-  ngtcp2: 30 consecutive `GET` requests returned 200 over HTTP/3 against
-  one server process.
+  boundary as HTTP/1 and HTTP/2. Qualified against curl 8.21.0 over
+  ngtcp2: the interoperability matrix gains three HTTP/3 legs (ALPN
+  selection, a 100000-byte request body, and a byte-identical 156000-byte
+  response) alongside its existing legs, and ten consecutive rounds of all
+  three against one server process pass.
 - `composition.Controls`, a typed secret owner for every welded QUIC
   record. The pump, connection, assembly secret storage, and HTTP/3
   session control records are allocated through `mach-crypto`
@@ -19,9 +21,10 @@
 
 ### Changed
 
-- Dependency graph moved to the released QUIC storage split: mach-std
-  v0.34.0, mach-http v0.7.3, laurel v0.8.5, mach-tls v0.2.2, mach-quic
-  v0.5.1, mach-acme v0.1.6, and mach-crypto pinned explicitly at v0.8.1.
+- Dependency graph moved to the released QUIC storage split and the
+  patches this work surfaced upstream: mach-std v0.34.0, mach-http v0.7.5,
+  laurel v0.8.8, mach-tls v0.2.3, mach-quic v0.5.7, mach-acme v0.1.8, and
+  mach-crypto pinned explicitly at v0.8.1.
 - QUIC connection and pump backing is split between public storage and
   deep-secret storage. `ConnectionStorage` carries the public
   `assembly.Storage`; the deep-secret `assembly.SecretStorage` is owned
@@ -51,14 +54,20 @@
 - Stream scratch was sized at one maximum field where the HTTP/3 engine
   requires two, so every session failed to start and the connection was
   closed as a protocol error.
-
-### Known limitations
-
-- A served QUIC connection is not released after its exchange.
-  `transport.finish_close` stays blocked with six streams still active on
-  the driver after the HTTP/3 engine has destroyed cleanly, so the
-  connection is only reclaimed when the drain deadline expires. Requests
-  with a body, large responses, and prompt shutdown are affected (#32).
+- A QUIC connection's close period was the process drain budget, so every
+  finished connection lingered for the whole budget and shutdown waited it
+  out. The connection now drains for the RFC 9000 close period.
+- An HTTP/3 failure no longer stops the transport being driven, so a
+  queued close still reaches the wire and the drain timer still fires.
+- Request data longer than one read buffer is taken one buffer at a time
+  instead of being rejected, since the HTTP/3 engine re-presents what has
+  not been consumed.
+- The secure layer closed sockets with a lifecycle cause where a close mode
+  was expected, which selected a graceful shutdown the TLS close never
+  accepted, so a server that had served one TLS HTTP/1.1 request could not
+  stop. A retiring TLS connection now drives its secure channel to
+  completion, and a graceful signal to an engine that is already ending is
+  no longer counted as a shutdown failure.
 
 ### Removed
 

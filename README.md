@@ -9,11 +9,9 @@ client certificates, qualified against curl, OpenSSL and GnuTLS in
 [`test/interop`](test/interop/README.md). Static files, reverse proxying,
 bounded caches, virtual host dispatch, and ACME over authenticated TLS are
 implemented. A `transport = "quic"` listener becomes ready and serves HTTP/3,
-with ALPN inside QUIC selecting `h3`, verified against curl 8.21.0 over
-ngtcp2. A served QUIC connection is not released afterwards, because its
-transport close waits on stream ownership the HTTP/3 engine has already
-given up, so a request body, a large response, and a prompt shutdown do not
-work yet (#32). The current Let's Encrypt chain uses certificate algorithms
+with ALPN inside QUIC selecting `h3`, qualified against curl 8.21.0 over
+ngtcp2 in the same interoperability matrix: request bodies, large responses,
+and prompt shutdown included. The current Let's Encrypt chain uses certificate algorithms
 mach-tls cannot verify (#38), and a listener's credential generation cannot
 yet be replaced (#37).
 
