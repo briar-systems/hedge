@@ -106,7 +106,7 @@ Gate: configuration rollback, zero-downtime reload, graceful drain, privilege bo
 
 Gate: ACME staging environments, failure recovery, clock skew, account rollover, and certificate rotation suites pass.
 
-## 10. Mach Web
+## 10. Laurel
 
 - implement application composition and typed request context
 - implement routing, middleware, errors, sessions, forms, multipart input, and rendering
@@ -126,4 +126,3 @@ Gate: framework security corpus, handler cancellation, session rotation, upload 
 - publish security response and compatibility policies
 
 Gate: a release candidate operates a real public website through sustained traffic while all defined production evidence remains green.
-

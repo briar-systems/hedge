@@ -1,0 +1,283 @@
+# the shutdown sequence, as a state machine over time rather than a code path
+#
+# ARCHITECTURE.md specifies seven ordered steps: mark readiness false, stop
+# accepting, send protocol-specific graceful signals, allow active exchanges to
+# finish within the drain deadline, cancel what remains, flush bounded telemetry,
+# and close with a reasoned status. Split across a poll loop and a stop function
+# those steps are not orderable and not testable; a drain deadline in particular
+# can otherwise only be reached by holding a real connection open past it.
+#
+# so the ordering lives here as a pure function of the phase, the number of
+# connections still live, and the clock. the serving runtime executes the action
+# it is handed and reports back how many connections it still holds. nothing in
+# this module touches a socket, which is what makes deadline expiry, repeated
+# stop, and an already-idle shutdown all testable without one.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.chrono.time;
+
+pub def Phase: u8;
+# accepting and serving normally
+pub val SERVING: Phase = 1;
+# readiness is false, acceptance has stopped, engines have been signalled, and
+# the exchanges that were already in flight are being allowed to finish
+pub val DRAINING: Phase = 2;
+# the drain deadline passed with work still outstanding
+pub val CANCELLING: Phase = 3;
+pub val FLUSHING: Phase = 4;
+pub val CLOSED: Phase = 5;
+
+pub def Reason: u8;
+pub val RUNNING: Reason = 0;
+# every connection finished within the deadline
+pub val DRAINED: Reason = 1;
+# the deadline passed and the remainder were cancelled
+pub val DEADLINE: Reason = 2;
+# the caller asked to stop without waiting
+pub val IMMEDIATE: Reason = 3;
+# a step of the sequence itself failed
+pub val FAILED: Reason = 4;
+
+pub def Action: u8;
+pub val NOTHING: Action = 0;
+# readiness false, stop accepting, and signal every engine
+pub val SIGNAL: Action = 1;
+# cancel every exchange still outstanding
+pub val CANCEL: Action = 2;
+pub val FLUSH: Action = 3;
+pub val CLOSE: Action = 4;
+
+pub rec State {
+    phase: Phase;
+    reason: Reason;
+    has_deadline: bool;
+    deadline: time.Time;
+    # connections still live when the deadline expired, which is the number the
+    # exit status has to be able to report
+    cancelled: usize;
+    # which step failed, so a reasoned status can name it rather than only
+    # reporting that something went wrong
+    failed_at: Action;
+}
+
+# assigned by name: an empty record literal does not reliably clear its
+# members. see briar-systems/mach#3108.
+pub fun make() State {
+    var value: State;
+    value.phase = SERVING;
+    value.reason = RUNNING;
+    value.has_deadline = false;
+    value.deadline = time.Time{sec: 0, nsec: 0};
+    value.cancelled = 0;
+    value.failed_at = NOTHING;
+    ret value;
+}
+
+pub fun serving(state: *State) bool {
+    ret state != nil && state.phase == SERVING;
+}
+
+pub fun draining(state: *State) bool {
+    ret state != nil && (state.phase == DRAINING || state.phase == CANCELLING);
+}
+
+pub fun closed(state: *State) bool {
+    ret state != nil && state.phase == CLOSED;
+}
+
+# every step but the last has run: the connections are gone and telemetry is
+# flushed, and all that remains is releasing the resources themselves
+pub fun awaiting_close(state: *State) bool {
+    ret state != nil && state.phase == FLUSHING;
+}
+
+fun deadline_from(now: time.Time, timeout_ns: u64) time.Time {
+    var value: time.Time = now;
+    value.sec = now.sec + (timeout_ns / 1000000000)::i64;
+    value.nsec = now.nsec + (timeout_ns % 1000000000)::i64;
+    if (value.nsec >= 1000000000) {
+        value.nsec = value.nsec - 1000000000;
+        value.sec = value.sec + 1;
+    }
+    ret value;
+}
+
+# begin the sequence
+#
+# `timeout_ns` of zero means the caller is not willing to wait, which is a
+# different outcome from draining and is reported as one. beginning twice is not
+# an error: a second stop request while a drain is under way must not restart
+# the deadline, or a peer that keeps asking could hold the process open.
+pub fun begin(state: *State, now: time.Time, timeout_ns: u64) Action {
+    if (state == nil || state.phase != SERVING) { ret NOTHING; }
+    state.phase = DRAINING;
+    state.has_deadline = timeout_ns != 0;
+    if (state.has_deadline) { state.deadline = deadline_from(now, timeout_ns); }
+    if (!state.has_deadline) { state.reason = IMMEDIATE; }
+    ret SIGNAL;
+}
+
+# advance the sequence
+#
+# `live` is what the runtime still holds. the runtime calls this after doing
+# whatever the previous action asked of it, so each phase is entered exactly
+# once and every step is observable.
+pub fun step(state: *State, live: usize, now: time.Time) Action {
+    if (state == nil || state.phase == SERVING || state.phase == CLOSED) {
+        ret NOTHING;
+    }
+    if (state.phase == DRAINING) {
+        if (live == 0) {
+            if (state.reason == RUNNING) { state.reason = DRAINED; }
+            state.phase = FLUSHING;
+            ret FLUSH;
+        }
+        val expired: bool = !state.has_deadline
+            || !time.time_before(now, state.deadline);
+        if (!expired) { ret NOTHING; }
+        state.cancelled = live;
+        if (state.reason == RUNNING) { state.reason = DEADLINE; }
+        state.phase = CANCELLING;
+        ret CANCEL;
+    }
+    if (state.phase == CANCELLING) {
+        if (live != 0) { ret NOTHING; }
+        state.phase = FLUSHING;
+        ret FLUSH;
+    }
+    state.phase = CLOSED;
+    ret CLOSE;
+}
+
+# a step of the sequence failed. the phase still advances, because a failed
+# flush must not prevent the close that follows it. the first failure is the one
+# retained: a later step failing because an earlier one did is not new
+# information.
+pub fun fail(state: *State, action: Action) {
+    if (state == nil || state.reason == FAILED) { ret; }
+    state.reason = FAILED;
+    state.failed_at = action;
+}
+
+# the caller cancelled inside the deadline rather than waiting it out, so the
+# phase has to move on with the outcome recorded honestly
+pub fun cancel_now(state: *State, live: usize) {
+    if (state == nil || state.phase != DRAINING) { ret; }
+    state.cancelled = live;
+    if (state.reason == RUNNING) { state.reason = IMMEDIATE; }
+    state.phase = CANCELLING;
+}
+
+pub fun failed_step(state: *State) Action {
+    if (state == nil) { ret NOTHING; }
+    ret state.failed_at;
+}
+
+pub fun reason(state: *State) Reason {
+    if (state == nil) { ret FAILED; }
+    ret state.reason;
+}
+
+pub fun cancelled(state: *State) usize {
+    if (state == nil) { ret 0; }
+    ret state.cancelled;
+}
+
+fun at(sec: i64) time.Time {
+    ret time.Time{sec: sec, nsec: 0};
+}
+
+test "lifecycle: an idle runtime drains without cancelling anything" {
+    var state: State = make();
+    if (!serving(?state)) { ret 1; }
+    if (begin(?state, at(0), 30000000000) != SIGNAL) { ret 2; }
+    if (!draining(?state) || serving(?state)) { ret 3; }
+    # nothing is live, so the deadline is never consulted
+    if (step(?state, 0, at(1)) != FLUSH) { ret 4; }
+    if (step(?state, 0, at(1)) != CLOSE) { ret 5; }
+    if (!closed(?state)) { ret 6; }
+    if (reason(?state) != DRAINED || cancelled(?state) != 0) { ret 7; }
+    # a closed sequence stays closed and asks for nothing further
+    if (step(?state, 0, at(2)) != NOTHING) { ret 8; }
+    ret 0;
+}
+
+test "lifecycle: work that finishes inside the deadline is never cancelled" {
+    var state: State = make();
+    begin(?state, at(0), 30000000000);
+    # still busy, and there is time left
+    if (step(?state, 3, at(5)) != NOTHING) { ret 1; }
+    if (step(?state, 1, at(29)) != NOTHING) { ret 2; }
+    if (state.phase != DRAINING) { ret 3; }
+    # the last exchange finishes with a second to spare
+    if (step(?state, 0, at(29)) != FLUSH) { ret 4; }
+    if (reason(?state) != DRAINED || cancelled(?state) != 0) { ret 5; }
+    ret 0;
+}
+
+test "lifecycle: the deadline cancels exactly what was still outstanding" {
+    var state: State = make();
+    begin(?state, at(10), 20000000000);
+    if (step(?state, 4, at(29)) != NOTHING) { ret 1; }
+    # the deadline is 30; reaching it is expiry, not a moment more of grace
+    if (step(?state, 4, at(30)) != CANCEL) { ret 2; }
+    if (state.phase != CANCELLING) { ret 3; }
+    if (reason(?state) != DEADLINE) { ret 4; }
+    # the count is what was outstanding at expiry, so the exit status can say so
+    if (cancelled(?state) != 4) { ret 5; }
+    if (step(?state, 4, at(31)) != NOTHING) { ret 6; }
+    if (step(?state, 1, at(32)) != NOTHING) { ret 7; }
+    if (step(?state, 0, at(32)) != FLUSH) { ret 8; }
+    if (step(?state, 0, at(32)) != CLOSE) { ret 9; }
+    # cancelling does not turn into a clean drain afterwards
+    if (reason(?state) != DEADLINE || cancelled(?state) != 4) { ret 10; }
+    ret 0;
+}
+
+test "lifecycle: a caller unwilling to wait cancels at once and says so" {
+    var state: State = make();
+    if (begin(?state, at(0), 0) != SIGNAL) { ret 1; }
+    if (state.has_deadline) { ret 2; }
+    # no deadline means the first step expires, whatever the clock says
+    if (step(?state, 2, at(0)) != CANCEL) { ret 3; }
+    if (cancelled(?state) != 2) { ret 4; }
+    # and the outcome is distinguishable from a deadline that elapsed
+    if (reason(?state) != IMMEDIATE) { ret 5; }
+    ret 0;
+}
+
+test "lifecycle: a repeated stop request cannot extend the deadline" {
+    var state: State = make();
+    begin(?state, at(0), 10000000000);
+    val first: time.Time = state.deadline;
+    # a second request while draining is ignored rather than restarting the clock
+    if (begin(?state, at(5), 10000000000) != NOTHING) { ret 1; }
+    if (!time.time_equal(state.deadline, first)) { ret 2; }
+    if (state.phase != DRAINING) { ret 3; }
+    # so the original deadline still governs
+    if (step(?state, 1, at(9)) != NOTHING) { ret 4; }
+    if (step(?state, 1, at(10)) != CANCEL) { ret 5; }
+    # and once the sequence has moved on, beginning again does nothing at all
+    if (begin(?state, at(11), 10000000000) != NOTHING) { ret 6; }
+    ret 0;
+}
+
+test "lifecycle: a failed step still closes, and says the outcome was a failure" {
+    var state: State = make();
+    begin(?state, at(0), 1000000000);
+    if (step(?state, 0, at(0)) != FLUSH) { ret 1; }
+    # the flush failed, which must not strand the process before the close
+    fail(?state, FLUSH);
+    if (step(?state, 0, at(0)) != CLOSE) { ret 2; }
+    if (!closed(?state)) { ret 3; }
+    if (reason(?state) != FAILED) { ret 4; }
+    # the status names the step that failed, not merely that one did
+    if (failed_step(?state) != FLUSH) { ret 5; }
+    # a later failure does not overwrite the first
+    fail(?state, CLOSE);
+    if (failed_step(?state) != FLUSH) { ret 6; }
+    ret 0;
+}

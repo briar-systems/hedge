@@ -1,0 +1,1802 @@
+# strict toml loading, reference resolution, and graph validation
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.allocator;
+use std.allocator.fixed;
+use std.data.toml;
+use hedge.config.schema;
+use trust: hedge.protocol.trust;
+use session: tls.session;
+pub val MAX_INCLUDE_DEPTH: usize = 16;
+pub val MAX_SOURCE_BYTES: usize = 65536;
+
+pub def ResolveFun: fun(ptr, str, *u8, usize) i64;
+
+pub rec Resolver {
+    context: ptr;
+    include: ResolveFun;
+    environment: ResolveFun;
+}
+
+pub rec Capabilities {
+    quic: bool;
+    local_transport: bool;
+    environment_secrets: bool;
+    file_secrets: bool;
+    os_secrets: bool;
+    application_secrets: bool;
+}
+
+rec Workspace {
+    depth: usize;
+    stack: [MAX_INCLUDE_DEPTH]schema.Text;
+    source: [MAX_SOURCE_BYTES]u8;
+}
+
+fun has_include_resolver(resolver: *Resolver) bool {
+    if (resolver == nil) { ret false; }
+    ret resolver.include::usize != 0;
+}
+
+fun has_environment_resolver(resolver: *Resolver) bool {
+    if (resolver == nil) { ret false; }
+    ret resolver.environment::usize != 0;
+}
+
+fun diagnose(diagnostics: *schema.Diagnostics, code: schema.DiagnosticCode, source: str, path: str, message: str) {
+    schema.add_diagnostic(diagnostics, schema.ERROR, code, source, path, message);
+}
+
+fun key_allowed(key: str, a: str, b: str, c: str, d: str, e: str, f: str, g: str, h: str) bool {
+    ret str_equals(key, a) || str_equals(key, b) || str_equals(key, c) || str_equals(key, d)
+        || str_equals(key, e) || str_equals(key, f) || str_equals(key, g) || str_equals(key, h);
+}
+
+fun validate_fields(table: *toml.Table, diagnostics: *schema.Diagnostics, source: str, allowed: *str, count: usize) {
+    var i: usize = 0;
+    for (i < toml.table_len(table)) {
+        val key: str = toml.table_key(table, i);
+        var found: bool = false;
+        var j: usize = 0;
+        for (j < count) {
+            if (str_equals(key, allowed[j])) { found = true; }
+            j = j + 1;
+        }
+        if (!found) { diagnose(diagnostics, schema.UNKNOWN_FIELD, source, key, "unknown configuration field"); }
+        i = i + 1;
+    }
+}
+
+fun value(table: *toml.Table, key: str) *toml.Value {
+    ret toml.get(table, key);
+}
+
+fun optional_table(table: *toml.Table, key: str, diagnostics: *schema.Diagnostics, source: str) *toml.Table {
+    val item: *toml.Value = value(table, key);
+    if (item == nil) { ret nil; }
+    if (item.tag != toml.TYPE_TABLE) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, key, "field must be a table");
+        ret nil;
+    }
+    ret ?item.data.table;
+}
+
+fun required_string(table: *toml.Table, key: str, diagnostics: *schema.Diagnostics, source: str) str {
+    val item: *toml.Value = value(table, key);
+    if (item == nil) {
+        diagnose(diagnostics, schema.MISSING_FIELD, source, key, "required string field is missing");
+        ret nil;
+    }
+    if (item.tag != toml.TYPE_STRING) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, key, "field must be a string");
+        ret nil;
+    }
+    ret item.data.string;
+}
+
+fun optional_string(table: *toml.Table, key: str, diagnostics: *schema.Diagnostics, source: str) str {
+    val item: *toml.Value = value(table, key);
+    if (item == nil) { ret nil; }
+    if (item.tag != toml.TYPE_STRING) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, key, "field must be a string");
+        ret nil;
+    }
+    ret item.data.string;
+}
+
+fun optional_bool(table: *toml.Table, key: str, fallback: bool, diagnostics: *schema.Diagnostics, source: str) bool {
+    val item: *toml.Value = value(table, key);
+    if (item == nil) { ret fallback; }
+    if (item.tag != toml.TYPE_BOOL) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, key, "field must be a boolean");
+        ret fallback;
+    }
+    ret item.data.boolean;
+}
+
+fun optional_usize(table: *toml.Table, key: str, fallback: usize, allow_zero: bool, diagnostics: *schema.Diagnostics, source: str) usize {
+    val item: *toml.Value = value(table, key);
+    if (item == nil) { ret fallback; }
+    if (item.tag != toml.TYPE_INTEGER) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, key, "field must be an integer");
+        ret fallback;
+    }
+    if (item.data.integer < 0 || (!allow_zero && item.data.integer == 0)) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, key, "integer is outside the accepted range");
+        ret fallback;
+    }
+    ret item.data.integer::usize;
+}
+
+fun optional_u64(table: *toml.Table, key: str, fallback: u64, allow_zero: bool, diagnostics: *schema.Diagnostics, source: str) u64 {
+    val parsed: usize = optional_usize(table, key, fallback::usize, allow_zero, diagnostics, source);
+    ret parsed::u64;
+}
+
+fun resolve_text(
+    output: *schema.Text,
+    raw: str,
+    resolver: *Resolver,
+    diagnostics: *schema.Diagnostics,
+    source: str,
+    path: str,
+) bool {
+    schema.clear_text(output);
+    if (raw == nil) { ret true; }
+    val n: usize = str_len(raw);
+    if (n >= 8 && raw[0] == '$' && raw[1] == '{' && raw[2] == 'E' && raw[3] == 'N' && raw[4] == 'V' && raw[5] == ':' && raw[n - 1] == '}') {
+        if (!has_environment_resolver(resolver)) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, source, path, "environment reference has no resolver");
+            ret false;
+        }
+        var name: [schema.TEXT_CAP]u8;
+        val name_len: usize = n - 7;
+        if (name_len == 0 || name_len >= schema.TEXT_CAP) {
+            diagnose(diagnostics, schema.INVALID_VALUE, source, path, "environment reference name is invalid");
+            ret false;
+        }
+        var i: usize = 0;
+        for (i < name_len) {
+            name[i] = raw[i + 6];
+            i = i + 1;
+        }
+        name[name_len] = 0;
+        val resolved: i64 = resolver.environment(resolver.context, (?name[0])::str, ?output.data[0], schema.TEXT_CAP);
+        if (resolved < 0) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, source, path, "environment reference was not found");
+            ret false;
+        }
+        if (resolved::usize >= schema.TEXT_CAP) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, path, "resolved environment value exceeds the configured bound");
+            ret false;
+        }
+        output.data[resolved::usize] = 0;
+        output.len = resolved::usize;
+        ret true;
+    }
+    if (!schema.set_text(output, raw)) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source, path, "string exceeds the configured bound");
+        ret false;
+    }
+    ret true;
+}
+
+fun parse_server(graph: *schema.Graph, table: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    var allowed: [5]str = [5]str{"name", "limits", "timeouts", "features", "workers"};
+    validate_fields(table, diagnostics, source, ?allowed[0], 5);
+    val workers: *toml.Value = value(table, "workers");
+    if (workers != nil) {
+        schema.add_diagnostic(diagnostics, schema.WARNING, schema.DEPRECATED_FIELD, source, "server.workers", "server.workers is deprecated because execution sizing belongs to budgets");
+    }
+    resolve_text(?graph.server_name, required_string(table, "name", diagnostics, source), resolver, diagnostics, source, "server.name");
+
+    val limits: *toml.Table = optional_table(table, "limits", diagnostics, source);
+    if (limits != nil) {
+        var limit_fields: [6]str = [6]str{"max_connections", "max_connections_per_peer", "max_header_bytes", "max_header_count", "max_body_bytes", "max_pipeline_depth"};
+        validate_fields(limits, diagnostics, source, ?limit_fields[0], 6);
+        graph.limits.max_connections = optional_usize(limits, "max_connections", graph.limits.max_connections, false, diagnostics, source);
+        graph.limits.max_connections_per_peer = optional_usize(limits, "max_connections_per_peer", graph.limits.max_connections_per_peer, false, diagnostics, source);
+        graph.limits.max_header_bytes = optional_usize(limits, "max_header_bytes", graph.limits.max_header_bytes, false, diagnostics, source);
+        graph.limits.max_header_count = optional_usize(limits, "max_header_count", graph.limits.max_header_count, false, diagnostics, source);
+        graph.limits.max_body_bytes = optional_usize(limits, "max_body_bytes", graph.limits.max_body_bytes, true, diagnostics, source);
+        graph.limits.max_pipeline_depth = optional_usize(limits, "max_pipeline_depth", graph.limits.max_pipeline_depth, false, diagnostics, source);
+    }
+
+    val timeouts: *toml.Table = optional_table(table, "timeouts", diagnostics, source);
+    if (timeouts != nil) {
+        var timeout_fields: [6]str = [6]str{"handshake_ms", "header_ms", "request_ms", "write_ms", "keep_alive_ms", "drain_ms"};
+        validate_fields(timeouts, diagnostics, source, ?timeout_fields[0], 6);
+        graph.timeouts.handshake_ms = optional_u64(timeouts, "handshake_ms", graph.timeouts.handshake_ms, false, diagnostics, source);
+        graph.timeouts.header_ms = optional_u64(timeouts, "header_ms", graph.timeouts.header_ms, false, diagnostics, source);
+        graph.timeouts.request_ms = optional_u64(timeouts, "request_ms", graph.timeouts.request_ms, false, diagnostics, source);
+        graph.timeouts.write_ms = optional_u64(timeouts, "write_ms", graph.timeouts.write_ms, false, diagnostics, source);
+        graph.timeouts.keep_alive_ms = optional_u64(timeouts, "keep_alive_ms", graph.timeouts.keep_alive_ms, false, diagnostics, source);
+        graph.timeouts.drain_ms = optional_u64(timeouts, "drain_ms", graph.timeouts.drain_ms, false, diagnostics, source);
+    }
+
+    val features: *toml.Table = optional_table(table, "features", diagnostics, source);
+    if (features != nil) {
+        var feature_fields: [7]str = [7]str{"http1", "http2", "http3", "tls", "acme", "proxy", "cache"};
+        validate_fields(features, diagnostics, source, ?feature_fields[0], 7);
+        graph.features.http1 = optional_bool(features, "http1", graph.features.http1, diagnostics, source);
+        graph.features.http2 = optional_bool(features, "http2", graph.features.http2, diagnostics, source);
+        graph.features.http3 = optional_bool(features, "http3", graph.features.http3, diagnostics, source);
+        graph.features.tls = optional_bool(features, "tls", graph.features.tls, diagnostics, source);
+        graph.features.acme = optional_bool(features, "acme", graph.features.acme, diagnostics, source);
+        graph.features.proxy = optional_bool(features, "proxy", graph.features.proxy, diagnostics, source);
+        graph.features.cache = optional_bool(features, "cache", graph.features.cache, diagnostics, source);
+    }
+}
+
+fun parse_protocols(listener: *schema.Listener, item: *toml.Value, diagnostics: *schema.Diagnostics, source: str) {
+    listener.protocols = 0;
+    if (item == nil) {
+        diagnose(diagnostics, schema.MISSING_FIELD, source, "listener.protocols", "listener protocols must be a non-empty string array");
+        ret;
+    }
+    if (item.tag != toml.TYPE_ARRAY) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "listener.protocols", "listener protocols must be a non-empty string array");
+        ret;
+    }
+    var i: usize = 0;
+    for (i < toml.array_len(?item.data.array)) {
+        val protocol: *toml.Value = toml.array_get(?item.data.array, i);
+        if (protocol == nil || protocol.tag != toml.TYPE_STRING) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "listener.protocols", "protocol entries must be strings");
+        } or (str_equals(protocol.data.string, "http/1.1")) {
+            listener.protocols = listener.protocols | schema.PROTOCOL_HTTP1;
+        } or (str_equals(protocol.data.string, "h2")) {
+            listener.protocols = listener.protocols | schema.PROTOCOL_HTTP2;
+        } or (str_equals(protocol.data.string, "h3")) {
+            listener.protocols = listener.protocols | schema.PROTOCOL_HTTP3;
+        } or {
+            diagnose(diagnostics, schema.INVALID_VALUE, source, "listener.protocols", "unsupported application protocol identifier");
+        }
+        i = i + 1;
+    }
+    if (listener.protocols == 0) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, "listener.protocols", "at least one application protocol is required");
+    }
+}
+
+fun parse_proxy_protocol(listener: *schema.Listener, table: *toml.Table, diagnostics: *schema.Diagnostics, source: str) {
+    listener.proxy_protocol = schema.PROXY_OFF;
+    val mode: str = optional_string(table, "proxy_protocol", diagnostics, source);
+    if (mode == nil || str_equals(mode, "off")) { ret; }
+    if (str_equals(mode, "optional")) { listener.proxy_protocol = schema.PROXY_OPTIONAL; ret; }
+    if (str_equals(mode, "required")) { listener.proxy_protocol = schema.PROXY_REQUIRED; ret; }
+    diagnose(diagnostics, schema.INVALID_VALUE, source, "listener.proxy_protocol", "proxy_protocol must be off, optional, or required");
+}
+
+fun parse_trusted_peers(listener: *schema.Listener, item: *toml.Value, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    listener.trusted_peer_count = 0;
+    if (item == nil) { ret; }
+    if (item.tag != toml.TYPE_ARRAY) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "listener.trusted_peers", "trusted peers must be a string array");
+        ret;
+    }
+    var i: usize = 0;
+    for (i < toml.array_len(?item.data.array)) {
+        val entry: *toml.Value = toml.array_get(?item.data.array, i);
+        if (listener.trusted_peer_count >= schema.MAX_TRUSTED_PEERS) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "listener.trusted_peers", "trusted peer count exceeds the configured bound");
+        } or (entry == nil || entry.tag != toml.TYPE_STRING) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "listener.trusted_peers", "trusted peer entries must be strings");
+        } or {
+            resolve_text(?listener.trusted_peers[listener.trusted_peer_count], entry.data.string, resolver, diagnostics, source, "listener.trusted_peers");
+            # rejected here rather than at the listener, so an unparsable prefix
+            # cannot silently narrow the trust set at accept time
+            var prefix: trust.Prefix;
+            if (!trust.parse(schema.text(?listener.trusted_peers[listener.trusted_peer_count]), ?prefix)) {
+                diagnose(diagnostics, schema.INVALID_VALUE, source, "listener.trusted_peers", "trusted peer must be an IP address or CIDR prefix");
+            } or {
+                listener.trusted_peer_count = listener.trusted_peer_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_listener(graph: *schema.Graph, table: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (graph.listener_count >= schema.MAX_LISTENERS) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "listener", "listener count exceeds the configured bound");
+        ret;
+    }
+    var allowed: [10]str = [10]str{"name", "address", "transport", "protocols", "tls", "budget", "backlog", "accept_depth", "proxy_protocol", "trusted_peers"};
+    validate_fields(table, diagnostics, source, ?allowed[0], 10);
+    val listener: *schema.Listener = ?graph.listeners[graph.listener_count];
+    graph.listener_count = graph.listener_count + 1;
+    resolve_text(?listener.name, required_string(table, "name", diagnostics, source), resolver, diagnostics, source, "listener.name");
+    resolve_text(?listener.address, required_string(table, "address", diagnostics, source), resolver, diagnostics, source, "listener.address");
+    schema.clear_text(?listener.tls_policy);
+    schema.clear_text(?listener.budget);
+    resolve_text(?listener.tls_policy, optional_string(table, "tls", diagnostics, source), resolver, diagnostics, source, "listener.tls");
+    resolve_text(?listener.budget, optional_string(table, "budget", diagnostics, source), resolver, diagnostics, source, "listener.budget");
+    listener.backlog = optional_usize(table, "backlog", 256, false, diagnostics, source);
+    listener.accept_depth = optional_usize(table, "accept_depth", 8, false, diagnostics, source);
+    val transport: str = optional_string(table, "transport", diagnostics, source);
+    listener.transport = schema.TRANSPORT_TCP;
+    if (transport != nil && str_equals(transport, "quic")) { listener.transport = schema.TRANSPORT_QUIC; }
+    or (transport != nil && str_equals(transport, "local")) { listener.transport = schema.TRANSPORT_LOCAL; }
+    or (transport != nil && !str_equals(transport, "tcp")) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, "listener.transport", "transport must be tcp, quic, or local");
+    }
+    parse_protocols(listener, value(table, "protocols"), diagnostics, source);
+    parse_proxy_protocol(listener, table, diagnostics, source);
+    parse_trusted_peers(listener, value(table, "trusted_peers"), resolver, diagnostics, source);
+}
+
+fun parse_listener_section(graph: *schema.Graph, item: *toml.Value, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (item == nil) { ret; }
+    if (item.tag != toml.TYPE_ARRAY) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "listener", "listener must be an array of tables");
+        ret;
+    }
+    var i: usize = 0;
+    for (i < toml.array_len(?item.data.array)) {
+        val entry: *toml.Value = toml.array_get(?item.data.array, i);
+        if (entry == nil || entry.tag != toml.TYPE_TABLE) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "listener", "listener entry must be a table");
+        } or {
+            parse_listener(graph, ?entry.data.table, resolver, diagnostics, source);
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_tls_identity(policy: *schema.TlsPolicy, table: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (policy.identity_count >= schema.MAX_TLS_IDENTITIES) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "tls.identity", "TLS identity count exceeds the configured bound");
+        ret;
+    }
+    var identity_allowed: [3]str = [3]str{"server_name", "certificate", "key"};
+    validate_fields(table, diagnostics, source, ?identity_allowed[0], 3);
+    val identity: *schema.TlsIdentity = ?policy.identities[policy.identity_count];
+    policy.identity_count = policy.identity_count + 1;
+    resolve_text(?identity.server_name, optional_string(table, "server_name", diagnostics, source), resolver, diagnostics, source, "tls.identity.server_name");
+    resolve_text(?identity.certificate, required_string(table, "certificate", diagnostics, source), resolver, diagnostics, source, "tls.identity.certificate");
+    resolve_text(?identity.key, required_string(table, "key", diagnostics, source), resolver, diagnostics, source, "tls.identity.key");
+}
+
+fun tls_resumption_seconds(table: *toml.Table, key: str, fallback: usize,
+    diagnostics: *schema.Diagnostics, source: str) u32 {
+    val parsed: usize = optional_usize(table, key, fallback, false,
+        diagnostics, source);
+    if (parsed > schema.TLS_MAX_TICKET_LIFETIME_SECONDS) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, key,
+            "TLS resumption duration exceeds seven days");
+        ret fallback::u32;
+    }
+    ret parsed::u32;
+}
+
+fun parse_tls_resumption(policy: *schema.TlsPolicy, table: *toml.Table,
+    diagnostics: *schema.Diagnostics, source: str) {
+    policy.resumption.enabled = false;
+    policy.resumption.key_lifetime_seconds = 3600;
+    policy.resumption.retirement_overlap_seconds = 1800;
+    policy.resumption.ticket_lifetime_seconds = 7200;
+    policy.resumption.replay_policy = schema.TLS_REPLAY_PERMISSIVE;
+    policy.resumption.tickets_per_connection = 2;
+    val raw: *toml.Value = value(table, "resumption");
+    if (raw == nil) { ret; }
+    if (raw.tag != toml.TYPE_TABLE) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "tls.resumption",
+            "TLS resumption must be a table");
+        ret;
+    }
+    policy.resumption.enabled = true;
+    val configured: *toml.Table = ?raw.data.table;
+    var allowed: [5]str = [5]str{"key_lifetime_seconds",
+        "retirement_overlap_seconds", "ticket_lifetime_seconds", "replay",
+        "tickets_per_connection"};
+    validate_fields(configured, diagnostics, source, ?allowed[0], 5);
+    policy.resumption.key_lifetime_seconds = tls_resumption_seconds(configured,
+        "key_lifetime_seconds", 3600, diagnostics, source);
+    policy.resumption.retirement_overlap_seconds = tls_resumption_seconds(
+        configured, "retirement_overlap_seconds", 1800, diagnostics, source);
+    policy.resumption.ticket_lifetime_seconds = tls_resumption_seconds(configured,
+        "ticket_lifetime_seconds", 7200, diagnostics, source);
+    val retained_seconds: usize =
+        policy.resumption.key_lifetime_seconds::usize *
+        (session.MAX_TICKET_KEYS - 1);
+    if (policy.resumption.retirement_overlap_seconds::usize > retained_seconds) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source,
+            "tls.resumption.retirement_overlap_seconds",
+            "retirement overlap exceeds the bounded ticket key ring");
+    }
+    val replay: str = optional_string(configured, "replay", diagnostics, source);
+    if (replay != nil && str_equals(replay, "single_use")) {
+        policy.resumption.replay_policy = schema.TLS_REPLAY_SINGLE_USE;
+    } or (replay != nil && !str_equals(replay, "permissive")) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source,
+            "tls.resumption.replay", "replay must be permissive or single_use");
+    }
+    val tickets: usize = optional_usize(configured, "tickets_per_connection", 2,
+        false, diagnostics, source);
+    if (tickets > schema.TLS_MAX_TICKETS_PER_CONNECTION) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source,
+            "tls.resumption.tickets_per_connection",
+            "tickets per connection exceeds the supported bound");
+    } or {
+        policy.resumption.tickets_per_connection = tickets::u8;
+    }
+}
+
+# a policy names its identities either as one certificate and key pair or as a
+# table array. the single-pair form is the same thing with one entry, so both
+# reach the credential generation through one shape.
+fun parse_tls_identities(policy: *schema.TlsPolicy, table: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    policy.identity_count = 0;
+    schema.clear_text(?policy.default_name);
+    policy.has_default = false;
+    val certificate: str = optional_string(table, "certificate", diagnostics, source);
+    val identities: *toml.Value = value(table, "identity");
+    if (certificate != nil && identities != nil) {
+        diagnose(diagnostics, schema.CONFLICT, source, "tls.identity", "certificate and identity cannot both be configured");
+    }
+    if (certificate != nil) {
+        val identity: *schema.TlsIdentity = ?policy.identities[0];
+        policy.identity_count = 1;
+        resolve_text(?identity.server_name, optional_string(table, "server_name", diagnostics, source), resolver, diagnostics, source, "tls.server_name");
+        resolve_text(?identity.certificate, certificate, resolver, diagnostics, source, "tls.certificate");
+        resolve_text(?identity.key, required_string(table, "key", diagnostics, source), resolver, diagnostics, source, "tls.key");
+    } or (identities != nil) {
+        if (identities.tag != toml.TYPE_ARRAY || toml.array_len(?identities.data.array) == 0) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "tls.identity", "TLS identities must be a non-empty table array");
+        } or {
+            var i: usize = 0;
+            for (i < toml.array_len(?identities.data.array)) {
+                val entry: *toml.Value = toml.array_get(?identities.data.array, i);
+                if (entry == nil || entry.tag != toml.TYPE_TABLE) {
+                    diagnose(diagnostics, schema.WRONG_TYPE, source, "tls.identity", "TLS identity entries must be tables");
+                } or {
+                    parse_tls_identity(policy, ?entry.data.table, resolver, diagnostics, source);
+                }
+                i = i + 1;
+            }
+        }
+    } or {
+        diagnose(diagnostics, schema.MISSING_FIELD, source, "tls.certificate", "TLS policy requires a certificate or an identity table array");
+    }
+    val chosen: str = optional_string(table, "default", diagnostics, source);
+    if (chosen != nil) {
+        resolve_text(?policy.default_name, chosen, resolver, diagnostics, source, "tls.default");
+        policy.has_default = true;
+    } or (policy.identity_count == 1 && policy.identities[0].server_name.len == 0) {
+        # a policy with one unnamed identity has said what its default is
+        policy.has_default = true;
+    }
+}
+
+fun parse_tls(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var i: usize = 0;
+    for (i < toml.table_len(section)) {
+        val name: str = toml.table_key(section, i);
+        val item: *toml.Value = toml.table_value(section, i);
+        if (item == nil || item.tag != toml.TYPE_TABLE) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, name, "TLS policy must be a table");
+        } or (graph.tls_policy_count >= schema.MAX_TLS_POLICIES) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "TLS policy count exceeds the configured bound");
+        } or {
+            var allowed: [8]str = [8]str{"certificate", "key", "identity", "default", "client_auth", "client_trust", "server_name", "resumption"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 8);
+            val policy: *schema.TlsPolicy = ?graph.tls_policies[graph.tls_policy_count];
+            graph.tls_policy_count = graph.tls_policy_count + 1;
+            resolve_text(?policy.name, name, resolver, diagnostics, source, "tls.name");
+            policy.client_auth = optional_bool(?item.data.table, "client_auth", false, diagnostics, source);
+            resolve_text(?policy.client_trust, optional_string(?item.data.table, "client_trust", diagnostics, source), resolver, diagnostics, source, "tls.client_trust");
+            parse_tls_resumption(policy, ?item.data.table, diagnostics, source);
+            parse_tls_identities(policy, ?item.data.table, resolver, diagnostics, source);
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_hosts(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var i: usize = 0;
+    for (i < toml.table_len(section)) {
+        val name: str = toml.table_key(section, i);
+        val item: *toml.Value = toml.table_value(section, i);
+        if (item == nil || item.tag != toml.TYPE_TABLE) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, name, "host must be a table");
+        } or (graph.host_count >= schema.MAX_HOSTS) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "host count exceeds the configured bound");
+        } or {
+            var allowed: [4]str = [4]str{"listener", "server_name", "names", "budget"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 4);
+            val host: *schema.Host = ?graph.hosts[graph.host_count];
+            graph.host_count = graph.host_count + 1;
+            resolve_text(?host.name, name, resolver, diagnostics, source, "host.name");
+            resolve_text(?host.listener, required_string(?item.data.table, "listener", diagnostics, source), resolver, diagnostics, source, "host.listener");
+            schema.clear_text(?host.budget);
+            resolve_text(?host.budget, optional_string(?item.data.table, "budget", diagnostics, source), resolver, diagnostics, source, "host.budget");
+            host.server_name_count = 0;
+            val server_name: str = optional_string(?item.data.table, "server_name", diagnostics, source);
+            val names: *toml.Value = value(?item.data.table, "names");
+            if (server_name != nil && names != nil) {
+                diagnose(diagnostics, schema.CONFLICT, source, "host.names", "server_name and names cannot both be configured");
+            }
+            if (server_name != nil) {
+                resolve_text(?host.server_names[0], server_name, resolver, diagnostics, source, "host.server_name");
+                host.server_name_count = 1;
+            } or (names != nil) {
+                if (names.tag != toml.TYPE_ARRAY || toml.array_len(?names.data.array) == 0) {
+                    diagnose(diagnostics, schema.WRONG_TYPE, source, "host.names", "host names must be a non-empty string array");
+                } or {
+                    var j: usize = 0;
+                    for (j < toml.array_len(?names.data.array)) {
+                        val host_name: *toml.Value = toml.array_get(?names.data.array, j);
+                        if (host.server_name_count >= schema.MAX_HOST_NAMES) {
+                            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "host.names", "host name count exceeds the configured bound");
+                        } or (host_name == nil || host_name.tag != toml.TYPE_STRING) {
+                            diagnose(diagnostics, schema.WRONG_TYPE, source, "host.names", "host name entries must be strings");
+                        } or {
+                            resolve_text(?host.server_names[host.server_name_count], host_name.data.string, resolver, diagnostics, source, "host.names");
+                            host.server_name_count = host.server_name_count + 1;
+                        }
+                        j = j + 1;
+                    }
+                }
+            } or {
+                resolve_text(?host.server_names[0], name, resolver, diagnostics, source, "host.name");
+                host.server_name_count = 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_route(graph: *schema.Graph, table: *toml.Table, default_name: str, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (graph.route_count >= schema.MAX_ROUTES) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "route", "route count exceeds the configured bound");
+        ret;
+    }
+    var allowed: [6]str = [6]str{"name", "host", "path", "service", "budget", "priority"};
+    validate_fields(table, diagnostics, source, ?allowed[0], 6);
+    val route: *schema.Route = ?graph.routes[graph.route_count];
+    graph.route_count = graph.route_count + 1;
+    val path: str = required_string(table, "path", diagnostics, source);
+    var name: str = optional_string(table, "name", diagnostics, source);
+    if (name == nil) { name = path; }
+    if (name == nil) { name = default_name; }
+    resolve_text(?route.name, name, resolver, diagnostics, source, "route.name");
+    resolve_text(?route.host, required_string(table, "host", diagnostics, source), resolver, diagnostics, source, "route.host");
+    resolve_text(?route.path, path, resolver, diagnostics, source, "route.path");
+    resolve_text(?route.service, required_string(table, "service", diagnostics, source), resolver, diagnostics, source, "route.service");
+    resolve_text(?route.budget, optional_string(table, "budget", diagnostics, source), resolver, diagnostics, source, "route.budget");
+}
+
+fun parse_routes(graph: *schema.Graph, root: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    val direct: *toml.Value = value(root, "route");
+    if (direct != nil) {
+        if (direct.tag != toml.TYPE_ARRAY) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "route", "route must be an array of tables");
+        } or {
+            var i: usize = 0;
+            for (i < toml.array_len(?direct.data.array)) {
+                val entry: *toml.Value = toml.array_get(?direct.data.array, i);
+                if (entry == nil || entry.tag != toml.TYPE_TABLE) {
+                    diagnose(diagnostics, schema.WRONG_TYPE, source, "route", "route entry must be a table");
+                } or {
+                    parse_route(graph, ?entry.data.table, "route", resolver, diagnostics, source);
+                }
+                i = i + 1;
+            }
+        }
+    }
+    val groups: *toml.Table = optional_table(root, "routes", diagnostics, source);
+    if (groups == nil) { ret; }
+    var i: usize = 0;
+    for (i < toml.table_len(groups)) {
+        val group: str = toml.table_key(groups, i);
+        val item: *toml.Value = toml.table_value(groups, i);
+        if (item == nil || item.tag != toml.TYPE_ARRAY) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, group, "route group must be an array of tables");
+        } or {
+            var j: usize = 0;
+            for (j < toml.array_len(?item.data.array)) {
+                val entry: *toml.Value = toml.array_get(?item.data.array, j);
+                if (entry == nil || entry.tag != toml.TYPE_TABLE) {
+                    diagnose(diagnostics, schema.WRONG_TYPE, source, group, "route group entry must be a table");
+                } or {
+                    parse_route(graph, ?entry.data.table, group, resolver, diagnostics, source);
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun service_kind(kind: str) u8 {
+    if (str_equals(kind, "static")) { ret schema.SERVICE_STATIC; }
+    if (str_equals(kind, "proxy")) { ret schema.SERVICE_PROXY; }
+    if (str_equals(kind, "laurel")) { ret schema.SERVICE_LAUREL; }
+    if (str_equals(kind, "fixed")) { ret schema.SERVICE_FIXED; }
+    if (str_equals(kind, "redirect")) { ret schema.SERVICE_REDIRECT; }
+    if (str_equals(kind, "native")) { ret schema.SERVICE_NATIVE; }
+    ret 0;
+}
+
+fun default_status(kind: u8) usize {
+    if (kind == schema.SERVICE_REDIRECT) { ret 302; }
+    ret 200;
+}
+
+fun parse_services(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var i: usize = 0;
+    for (i < toml.table_len(section)) {
+        val name: str = toml.table_key(section, i);
+        val item: *toml.Value = toml.table_value(section, i);
+        if (item == nil || item.tag != toml.TYPE_TABLE) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, name, "service must be a table");
+        } or (graph.service_count >= schema.MAX_SERVICES) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "service count exceeds the configured bound");
+        } or {
+            var allowed: [12]str = [12]str{"kind", "target", "root", "application", "upstream", "body", "budget", "status", "content_type", "index", "precompressed", "cache"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 12);
+            val service: *schema.Service = ?graph.services[graph.service_count];
+            graph.service_count = graph.service_count + 1;
+            resolve_text(?service.name, name, resolver, diagnostics, source, "service.name");
+            val kind: str = required_string(?item.data.table, "kind", diagnostics, source);
+            service.kind = service_kind(kind);
+            if (service.kind == 0) { diagnose(diagnostics, schema.INVALID_VALUE, source, "service.kind", "unknown service kind"); }
+            var target: str = optional_string(?item.data.table, "target", diagnostics, source);
+            if (target == nil) { target = optional_string(?item.data.table, "root", diagnostics, source); }
+            if (target == nil) { target = optional_string(?item.data.table, "application", diagnostics, source); }
+            if (target == nil) { target = optional_string(?item.data.table, "upstream", diagnostics, source); }
+            if (target == nil) { target = optional_string(?item.data.table, "body", diagnostics, source); }
+            resolve_text(?service.target, target, resolver, diagnostics, source, "service.target");
+            resolve_text(?service.budget, optional_string(?item.data.table, "budget", diagnostics, source), resolver, diagnostics, source, "service.budget");
+            service.status = optional_usize(?item.data.table, "status", default_status(service.kind), false, diagnostics, source)::u16;
+            resolve_text(?service.content_type, optional_string(?item.data.table, "content_type", diagnostics, source), resolver, diagnostics, source, "service.content_type");
+            resolve_text(?service.index, optional_string(?item.data.table, "index", diagnostics, source), resolver, diagnostics, source, "service.index");
+            service.precompressed = optional_bool(?item.data.table, "precompressed", false, diagnostics, source);
+            service.cache = optional_bool(?item.data.table, "cache", false, diagnostics, source);
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_budgets(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var i: usize = 0;
+    for (i < toml.table_len(section)) {
+        val name: str = toml.table_key(section, i);
+        val item: *toml.Value = toml.table_value(section, i);
+        if (item == nil || item.tag != toml.TYPE_TABLE) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, name, "budget must be a table");
+        } or (graph.budget_count >= schema.MAX_BUDGETS) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "budget count exceeds the configured bound");
+        } or {
+            var allowed: [4]str = [4]str{"concurrency", "queue", "timeout_ms", "memory_bytes"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 4);
+            val budget: *schema.Budget = ?graph.budgets[graph.budget_count];
+            graph.budget_count = graph.budget_count + 1;
+            resolve_text(?budget.name, name, resolver, diagnostics, source, "budget.name");
+            budget.concurrency = optional_usize(?item.data.table, "concurrency", 1, false, diagnostics, source);
+            budget.queue = optional_usize(?item.data.table, "queue", 0, true, diagnostics, source);
+            budget.timeout_ms = optional_u64(?item.data.table, "timeout_ms", graph.timeouts.request_ms, false, diagnostics, source);
+            budget.memory_bytes = optional_usize(?item.data.table, "memory_bytes", 1048576, false, diagnostics, source);
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_secrets(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var i: usize = 0;
+    for (i < toml.table_len(section)) {
+        val name: str = toml.table_key(section, i);
+        val item: *toml.Value = toml.table_value(section, i);
+        if (item == nil || item.tag != toml.TYPE_TABLE) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, name, "secret must be a table");
+        } or (graph.secret_count >= schema.MAX_SECRETS) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "secret count exceeds the configured bound");
+        } or {
+            var allowed: [2]str = [2]str{"provider", "key"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 2);
+            val secret: *schema.Secret = ?graph.secrets[graph.secret_count];
+            graph.secret_count = graph.secret_count + 1;
+            resolve_text(?secret.name, name, resolver, diagnostics, source, "secret.name");
+            resolve_text(?secret.provider, required_string(?item.data.table, "provider", diagnostics, source), resolver, diagnostics, source, "secret.provider");
+            resolve_text(?secret.key, required_string(?item.data.table, "key", diagnostics, source), resolver, diagnostics, source, "secret.key");
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_telemetry(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var allowed: [7]str = [7]str{"logs", "metrics", "traces", "log_record_bytes", "log_queue_depth", "metric_series", "trace_state_bytes"};
+    validate_fields(section, diagnostics, source, ?allowed[0], 7);
+    graph.telemetry.logs = optional_bool(section, "logs", graph.telemetry.logs, diagnostics, source);
+    graph.telemetry.metrics = optional_bool(section, "metrics", graph.telemetry.metrics, diagnostics, source);
+    graph.telemetry.traces = optional_bool(section, "traces", graph.telemetry.traces, diagnostics, source);
+    graph.telemetry.log_record_bytes = optional_usize(section, "log_record_bytes", graph.telemetry.log_record_bytes, false, diagnostics, source);
+    graph.telemetry.log_queue_depth = optional_usize(section, "log_queue_depth", graph.telemetry.log_queue_depth, false, diagnostics, source);
+    graph.telemetry.metric_series = optional_usize(section, "metric_series", graph.telemetry.metric_series, false, diagnostics, source);
+    graph.telemetry.trace_state_bytes = optional_usize(section, "trace_state_bytes", graph.telemetry.trace_state_bytes, false, diagnostics, source);
+}
+
+fun parse_cache(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var allowed: [7]str = [7]str{"enabled", "memory_bytes", "disk_bytes", "disk_root", "max_entry_bytes", "entries", "heuristic_percent"};
+    validate_fields(section, diagnostics, source, ?allowed[0], 7);
+    graph.cache.enabled = optional_bool(section, "enabled", false, diagnostics, source);
+    graph.cache.memory_bytes = optional_usize(section, "memory_bytes", graph.cache.memory_bytes, false, diagnostics, source);
+    graph.cache.disk_bytes = optional_usize(section, "disk_bytes", graph.cache.disk_bytes, true, diagnostics, source);
+    resolve_text(?graph.cache.disk_root, optional_string(section, "disk_root", diagnostics, source), resolver, diagnostics, source, "cache.disk_root");
+    graph.cache.max_entry_bytes = optional_usize(section, "max_entry_bytes", graph.cache.max_entry_bytes, false, diagnostics, source);
+    graph.cache.entries = optional_usize(section, "entries", graph.cache.entries, false, diagnostics, source);
+    graph.cache.heuristic_percent = optional_u64(section, "heuristic_percent", graph.cache.heuristic_percent, true, diagnostics, source);
+}
+
+fun parse_challenge(value: str, diagnostics: *schema.Diagnostics, source: str) u8 {
+    if (value == nil) { ret schema.CHALLENGE_HTTP_01; }
+    if (str_equals(value, "http-01")) { ret schema.CHALLENGE_HTTP_01; }
+    if (str_equals(value, "dns-01")) { ret schema.CHALLENGE_DNS_01; }
+    if (str_equals(value, "tls-alpn-01")) { ret schema.CHALLENGE_TLS_ALPN_01; }
+    diagnose(diagnostics, schema.INVALID_VALUE, source, "acme.challenge", "challenge must be http-01, dns-01, or tls-alpn-01");
+    ret 0;
+}
+
+fun parse_acme(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var allowed: [11]str = [11]str{"enabled", "directory", "contact", "storage", "origin", "trust", "listener", "terms_agreed", "challenge", "names", "renew_before"};
+    validate_fields(section, diagnostics, source, ?allowed[0], 11);
+    graph.acme.enabled = optional_bool(section, "enabled", true, diagnostics, source);
+    resolve_text(?graph.acme.directory, optional_string(section, "directory", diagnostics, source), resolver, diagnostics, source, "acme.directory");
+    resolve_text(?graph.acme.contact, optional_string(section, "contact", diagnostics, source), resolver, diagnostics, source, "acme.contact");
+    resolve_text(?graph.acme.storage, optional_string(section, "storage", diagnostics, source), resolver, diagnostics, source, "acme.storage");
+    resolve_text(?graph.acme.origin, optional_string(section, "origin", diagnostics, source), resolver, diagnostics, source, "acme.origin");
+    resolve_text(?graph.acme.trust, optional_string(section, "trust", diagnostics, source), resolver, diagnostics, source, "acme.trust");
+    resolve_text(?graph.acme.listener, optional_string(section, "listener", diagnostics, source), resolver, diagnostics, source, "acme.listener");
+    graph.acme.terms_agreed = optional_bool(section, "terms_agreed", false, diagnostics, source);
+    graph.acme.challenge = parse_challenge(optional_string(section, "challenge", diagnostics, source), diagnostics, source);
+    graph.acme.renew_before_seconds = optional_u64(section, "renew_before", graph.acme.renew_before_seconds, false, diagnostics, source);
+    graph.acme.name_count = 0;
+    val names: *toml.Value = value(section, "names");
+    if (names == nil) { ret; }
+    if (names.tag != toml.TYPE_ARRAY || toml.array_len(?names.data.array) == 0) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "acme.names", "acme names must be a non-empty string array");
+        ret;
+    }
+    var i: usize = 0;
+    for (i < toml.array_len(?names.data.array)) {
+        val entry: *toml.Value = toml.array_get(?names.data.array, i);
+        if (graph.acme.name_count >= schema.MAX_ACME_NAMES) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "acme.names", "acme name count exceeds the configured bound");
+        } or (entry == nil || entry.tag != toml.TYPE_STRING) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "acme.names", "acme name entries must be strings");
+        } or {
+            resolve_text(?graph.acme.names[graph.acme.name_count], entry.data.string, resolver, diagnostics, source, "acme.names");
+            graph.acme.name_count = graph.acme.name_count + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun parse_admin(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    if (section == nil) { ret; }
+    var allowed: [4]str = [4]str{"enabled", "listener", "auth_secret", "max_response_bytes"};
+    validate_fields(section, diagnostics, source, ?allowed[0], 4);
+    graph.admin.enabled = optional_bool(section, "enabled", true, diagnostics, source);
+    resolve_text(?graph.admin.listener, optional_string(section, "listener", diagnostics, source), resolver, diagnostics, source, "admin.listener");
+    resolve_text(?graph.admin.auth_secret, optional_string(section, "auth_secret", diagnostics, source), resolver, diagnostics, source, "admin.auth_secret");
+    graph.admin.max_response_bytes = optional_usize(section, "max_response_bytes", graph.admin.max_response_bytes, false, diagnostics, source);
+}
+
+fun parse_table(graph: *schema.Graph, table: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
+    var i: usize = 0;
+    for (i < toml.table_len(table)) {
+        val key: str = toml.table_key(table, i);
+        if (!key_allowed(key, "include", "server", "listener", "tls", "host", "route", "routes", "service")
+            && !key_allowed(key, "budget", "secret", "telemetry", "admin", "cache", "acme", "", "")) {
+            diagnose(diagnostics, schema.UNKNOWN_FIELD, source, key, "unknown top-level configuration field");
+        }
+        i = i + 1;
+    }
+    val server: *toml.Table = optional_table(table, "server", diagnostics, source);
+    if (server != nil) { parse_server(graph, server, resolver, diagnostics, source); }
+    parse_listener_section(graph, value(table, "listener"), resolver, diagnostics, source);
+    parse_tls(graph, optional_table(table, "tls", diagnostics, source), resolver, diagnostics, source);
+    parse_hosts(graph, optional_table(table, "host", diagnostics, source), resolver, diagnostics, source);
+    parse_routes(graph, table, resolver, diagnostics, source);
+    parse_services(graph, optional_table(table, "service", diagnostics, source), resolver, diagnostics, source);
+    parse_budgets(graph, optional_table(table, "budget", diagnostics, source), resolver, diagnostics, source);
+    parse_secrets(graph, optional_table(table, "secret", diagnostics, source), resolver, diagnostics, source);
+    parse_telemetry(graph, optional_table(table, "telemetry", diagnostics, source), resolver, diagnostics, source);
+    parse_cache(graph, optional_table(table, "cache", diagnostics, source), resolver, diagnostics, source);
+    parse_admin(graph, optional_table(table, "admin", diagnostics, source), resolver, diagnostics, source);
+    parse_acme(graph, optional_table(table, "acme", diagnostics, source), resolver, diagnostics, source);
+}
+
+fun stack_contains(workspace: *Workspace, name: str) bool {
+    var i: usize = 0;
+    for (i < workspace.depth) {
+        if (schema.text_equals(?workspace.stack[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun process_source(
+    graph: *schema.Graph,
+    diagnostics: *schema.Diagnostics,
+    a: *allocator.Allocator,
+    source_name: str,
+    source: str,
+    resolver: *Resolver,
+    workspace: *Workspace,
+) bool {
+    if (workspace.depth >= MAX_INCLUDE_DEPTH) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source_name, "include", "include depth exceeds the configured bound");
+        ret false;
+    }
+    if (stack_contains(workspace, source_name)) {
+        diagnose(diagnostics, schema.INCLUDE_CYCLE, source_name, "include", "configuration include cycle detected");
+        ret false;
+    }
+    if (!schema.set_text(?workspace.stack[workspace.depth], source_name)) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source_name, "include", "source name exceeds the configured bound");
+        ret false;
+    }
+    workspace.depth = workspace.depth + 1;
+    val parsed: Result[toml.Table, str] = toml.parse(a, source);
+    if (is_err[toml.Table, str](parsed)) {
+        diagnose(diagnostics, schema.SOURCE_ERROR, source_name, "", unwrap_err[toml.Table, str](parsed));
+        workspace.depth = workspace.depth - 1;
+        ret false;
+    }
+    var table: toml.Table = unwrap_ok[toml.Table, str](parsed);
+    val includes: *toml.Value = value(?table, "include");
+    if (includes != nil) {
+        if (includes.tag != toml.TYPE_ARRAY) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source_name, "include", "include must be a string array");
+        } or {
+            var i: usize = 0;
+            for (i < toml.array_len(?includes.data.array)) {
+                val include: *toml.Value = toml.array_get(?includes.data.array, i);
+                if (include == nil || include.tag != toml.TYPE_STRING) {
+                    diagnose(diagnostics, schema.WRONG_TYPE, source_name, "include", "include entries must be strings");
+                } or (!has_include_resolver(resolver)) {
+                    diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, source_name, "include", "include has no source resolver");
+                } or {
+                    val bytes: i64 = resolver.include(resolver.context, include.data.string, ?workspace.source[0], MAX_SOURCE_BYTES);
+                    if (bytes < 0) {
+                        diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, source_name, include.data.string, "included source was not found");
+                    } or (bytes::usize >= MAX_SOURCE_BYTES) {
+                        diagnose(diagnostics, schema.RESOURCE_LIMIT, source_name, include.data.string, "included source exceeds the configured bound");
+                    } or {
+                        workspace.source[bytes::usize] = 0;
+                        process_source(graph, diagnostics, a, include.data.string, (?workspace.source[0])::str, resolver, workspace);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    parse_table(graph, ?table, resolver, diagnostics, source_name);
+    toml.dnit(a, ?table);
+    workspace.depth = workspace.depth - 1;
+    ret true;
+}
+
+fun duplicate_names(graph: *schema.Graph, diagnostics: *schema.Diagnostics) {
+    var i: usize = 0;
+    var j: usize = 0;
+    for (i < graph.listener_count) {
+        j = i + 1;
+        for (j < graph.listener_count) {
+            if (schema.text_equals(?graph.listeners[i].name, schema.text(?graph.listeners[j].name))) {
+                diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?graph.listeners[j].name), "duplicate listener name");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.host_count) {
+        j = i + 1;
+        for (j < graph.host_count) {
+            if (schema.text_equals(?graph.hosts[i].name, schema.text(?graph.hosts[j].name))) {
+                diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?graph.hosts[j].name), "duplicate host name");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.service_count) {
+        j = i + 1;
+        for (j < graph.service_count) {
+            if (schema.text_equals(?graph.services[i].name, schema.text(?graph.services[j].name))) {
+                diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?graph.services[j].name), "duplicate service name");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.tls_policy_count) {
+        j = i + 1;
+        for (j < graph.tls_policy_count) {
+            if (schema.text_equals(?graph.tls_policies[i].name, schema.text(?graph.tls_policies[j].name))) {
+                diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?graph.tls_policies[j].name), "duplicate TLS policy name");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.tls_policy_count) {
+        val policy: *schema.TlsPolicy = ?graph.tls_policies[i];
+        if (policy.identity_count == 0) {
+            diagnose(diagnostics, schema.MISSING_FIELD, "validation", schema.text(?policy.name), "TLS policy has no identity");
+        }
+        if (policy.has_default && policy.default_name.len != 0
+            && schema.find_identity(policy, schema.text(?policy.default_name)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?policy.default_name), "TLS policy default names no configured identity");
+        }
+        if (policy.client_auth && policy.client_trust.len == 0) {
+            diagnose(diagnostics, schema.MISSING_FIELD, "validation", schema.text(?policy.name), "client authentication requires a client trust anchor");
+        }
+        j = 0;
+        for (j < policy.identity_count) {
+            var k: usize = j + 1;
+            for (k < policy.identity_count) {
+                if (schema.text_equals(?policy.identities[j].server_name, schema.text(?policy.identities[k].server_name))) {
+                    diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?policy.name), "duplicate TLS identity server name");
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.budget_count) {
+        j = i + 1;
+        for (j < graph.budget_count) {
+            if (schema.text_equals(?graph.budgets[i].name, schema.text(?graph.budgets[j].name))) {
+                diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?graph.budgets[j].name), "duplicate budget name");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.secret_count) {
+        j = i + 1;
+        for (j < graph.secret_count) {
+            if (schema.text_equals(?graph.secrets[i].name, schema.text(?graph.secrets[j].name))) {
+                diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?graph.secrets[j].name), "duplicate secret name");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.route_count) {
+        j = i + 1;
+        for (j < graph.route_count) {
+            if (schema.text_equals(?graph.routes[i].host, schema.text(?graph.routes[j].host))
+                && schema.text_equals(?graph.routes[i].name, schema.text(?graph.routes[j].name))) {
+                diagnose(diagnostics, schema.DUPLICATE_NAME, "validation", schema.text(?graph.routes[j].name), "duplicate route name for host");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the native service kind is a family, and its target names the member. an
+# acme deployment needs the challenge responder specifically, so that is what
+# is checked rather than "some native service exists".
+fun has_challenge_service(graph: *schema.Graph) bool {
+    var i: usize = 0;
+    for (i < graph.service_count) {
+        if (graph.services[i].kind == schema.SERVICE_NATIVE
+         && schema.text_equals(?graph.services[i].target, schema.NATIVE_ACME_CHALLENGE)) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun starts_with(value: *schema.Text, prefix: str) bool {
+    var i: usize = 0;
+    for (prefix[i] != 0) {
+        if (i >= value.len || value.data[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a certificate hedge cannot obtain is a certificate hedge does not have, so
+# every reason it could not is refused here rather than discovered on the
+# first renewal
+fun validate_acme(graph: *schema.Graph, diagnostics: *schema.Diagnostics) {
+    if (!graph.acme.enabled) {
+        if (graph.features.acme) {
+            diagnose(diagnostics, schema.CONFLICT, "validation", "acme", "acme is enabled as a feature but no acme section is configured");
+        }
+        ret;
+    }
+    if (!graph.features.acme) {
+        diagnose(diagnostics, schema.UNSUPPORTED, "validation", "acme", "acme requires server.features.acme");
+    }
+    if (graph.acme.directory.len == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.directory", "acme requires a directory url");
+    } or (!starts_with(?graph.acme.directory, "https://")) {
+        # rfc 8555 section 6.1: every acme url is https. an authority named
+        # any other way is refused rather than reached.
+        diagnose(diagnostics, schema.INVALID_VALUE, "validation", "acme.directory", "acme directory url must be https");
+    }
+    if (graph.acme.storage.len == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.storage", "acme requires a storage directory");
+    }
+    if (graph.acme.origin.len == 0 && graph.acme.trust.len == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.trust", "a tls authority requires a trust anchor bundle");
+    }
+    if (graph.acme.origin.len != 0 && graph.acme.trust.len != 0) {
+        diagnose(diagnostics, schema.CONFLICT, "validation", "acme.origin", "a cleartext origin and tls trust cannot both be configured");
+    }
+    if (graph.acme.name_count == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.names", "acme requires at least one name");
+    }
+    if (graph.acme.listener.len == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "acme.listener", "acme requires the secure listener that owns its certificate");
+    } or {
+        val bound: *schema.Listener = schema.find_listener(graph,
+            schema.text(?graph.acme.listener));
+        if (bound == nil) {
+            diagnose(diagnostics, schema.UNREACHABLE, "validation", "acme.listener", "acme listener does not exist");
+        } or (bound.transport != schema.TRANSPORT_TCP) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", "acme.listener", "acme listener must use TCP TLS termination");
+        } or (bound.tls_policy.len == 0) {
+            diagnose(diagnostics, schema.UNREACHABLE, "validation", "acme.listener", "acme listener must name a TLS policy");
+        }
+    }
+    var i: usize = 0;
+    for (i < graph.acme.name_count) {
+        if (graph.acme.names[i].len == 0) {
+            diagnose(diagnostics, schema.INVALID_VALUE, "validation", "acme.names", "an acme name is empty");
+        }
+        i = i + 1;
+    }
+    # the renewal lead is bounded by the scheduler that consumes it, so a
+    # value it would refuse is refused here instead of at the first renewal
+    if (graph.acme.renew_before_seconds == 0
+     || graph.acme.renew_before_seconds > 31536000) {
+        diagnose(diagnostics, schema.INVALID_VALUE, "validation", "acme.renew_before", "renewal lead must be between one second and one year");
+    }
+    if (graph.acme.challenge == schema.CHALLENGE_HTTP_01 && !has_challenge_service(graph)) {
+        diagnose(diagnostics, schema.UNREACHABLE, "validation", "acme.challenge", "http-01 requires a native acme-challenge service route to answer the challenge");
+    }
+    if (graph.acme.challenge == schema.CHALLENGE_DNS_01) {
+        diagnose(diagnostics, schema.UNSUPPORTED, "validation", "acme.challenge", "dns-01 requires a configured record publisher, which this build does not provide");
+    }
+}
+
+pub fun validate(graph: *schema.Graph, capabilities: Capabilities, diagnostics: *schema.Diagnostics) bool {
+    duplicate_names(graph, diagnostics);
+    validate_acme(graph, diagnostics);
+    if (graph.server_name.len == 0) {
+        diagnose(diagnostics, schema.MISSING_FIELD, "validation", "server.name", "server name is required");
+    }
+    if (graph.limits.max_connections_per_peer > graph.limits.max_connections) {
+        diagnose(diagnostics, schema.CONFLICT, "validation", "server.limits", "per-peer connection limit exceeds the global limit");
+    }
+    if (graph.limits.max_pipeline_depth > schema.MAX_PIPELINE_DEPTH) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation",
+            "server.limits.max_pipeline_depth",
+            "pipeline depth exceeds fixed connection storage");
+    }
+    if (graph.timeouts.header_ms > graph.timeouts.request_ms || graph.timeouts.write_ms > graph.timeouts.request_ms) {
+        diagnose(diagnostics, schema.CONFLICT, "validation", "server.timeouts", "phase timeout exceeds the request timeout");
+    }
+    if (graph.timeouts.handshake_ms > schema.MAX_TIMEOUT_MS
+     || graph.timeouts.header_ms > schema.MAX_TIMEOUT_MS
+     || graph.timeouts.request_ms > schema.MAX_TIMEOUT_MS
+     || graph.timeouts.write_ms > schema.MAX_TIMEOUT_MS
+     || graph.timeouts.keep_alive_ms > schema.MAX_TIMEOUT_MS
+     || graph.timeouts.drain_ms > schema.MAX_TIMEOUT_MS) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation",
+            "server.timeouts", "timeout cannot be represented in nanoseconds");
+    }
+    var i: usize = 0;
+    var j: usize = 0;
+    for (i < graph.listener_count) {
+        val listener: *schema.Listener = ?graph.listeners[i];
+        if (listener.transport == schema.TRANSPORT_QUIC && !capabilities.quic) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?listener.name), "QUIC is unavailable in this build");
+        }
+        if (listener.transport == schema.TRANSPORT_LOCAL && !capabilities.local_transport) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?listener.name), "local transport is unavailable on this target");
+        }
+        if ((listener.protocols & schema.PROTOCOL_HTTP3) != 0 && listener.transport != schema.TRANSPORT_QUIC) {
+            diagnose(diagnostics, schema.CONFLICT, "validation", schema.text(?listener.name), "HTTP/3 requires a QUIC listener");
+        }
+        if (listener.transport == schema.TRANSPORT_QUIC
+         && listener.protocols != schema.PROTOCOL_HTTP3) {
+            diagnose(diagnostics, schema.CONFLICT, "validation",
+                schema.text(?listener.name),
+                "QUIC listeners require exactly HTTP/3");
+        }
+        if (listener.tls_policy.len > 0 && schema.find_tls_policy(graph, schema.text(?listener.tls_policy)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?listener.tls_policy), "listener references an unknown TLS policy");
+        }
+        if (listener.tls_policy.len > 0 && !graph.features.tls) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?listener.name), "the listener selects TLS while the server disables it");
+        }
+        if ((listener.protocols & schema.PROTOCOL_HTTP2) != 0 && !graph.features.http2) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?listener.name), "the listener selects HTTP/2 while the server disables it");
+        }
+        if ((listener.protocols & schema.PROTOCOL_HTTP3) != 0 && !graph.features.http3) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?listener.name), "the listener selects HTTP/3 while the server disables it");
+        }
+        if ((listener.protocols & schema.PROTOCOL_HTTP1) != 0 && !graph.features.http1) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?listener.name), "the listener selects HTTP/1 while the server disables it");
+        }
+        # a listener that decodes PROXY headers but trusts nobody would refuse
+        # every header it decoded, which is a configuration mistake rather than
+        # a policy anyone means to express
+        if (listener.proxy_protocol != schema.PROXY_OFF && listener.trusted_peer_count == 0) {
+            diagnose(diagnostics, schema.MISSING_FIELD, "validation", schema.text(?listener.name), "PROXY protocol decoding requires at least one trusted peer");
+        }
+        if (listener.proxy_protocol != schema.PROXY_OFF && listener.transport == schema.TRANSPORT_QUIC) {
+            diagnose(diagnostics, schema.CONFLICT, "validation", schema.text(?listener.name), "the PROXY protocol has no framing on a datagram listener");
+        }
+        if (listener.transport == schema.TRANSPORT_QUIC && listener.tls_policy.len == 0) {
+            diagnose(diagnostics, schema.MISSING_FIELD, "validation", schema.text(?listener.name), "QUIC listener requires a TLS policy");
+        }
+        if (listener.budget.len > 0 && schema.find_budget(graph, schema.text(?listener.budget)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?listener.budget), "listener references an unknown budget");
+        }
+        if (listener.budget.len > 0) {
+            val named: *schema.Budget = schema.find_budget(graph, schema.text(?listener.budget));
+            # a budget whose queue alone exceeds the process limit could never be
+            # honoured, and silently clamping it would hide the misconfiguration
+            if (named != nil && named.queue >= graph.limits.max_connections) {
+                diagnose(diagnostics, schema.CONFLICT, "validation", schema.text(?listener.budget), "budget queue exceeds the process connection limit");
+            }
+        }
+        if (listener.backlog > 2147483647) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation", schema.text(?listener.name), "listener backlog exceeds the native bound");
+        }
+        if (listener.accept_depth > 64) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation", schema.text(?listener.name), "listener accept depth exceeds the runtime bound");
+        }
+        j = i + 1;
+        for (j < graph.listener_count) {
+            val other: *schema.Listener = ?graph.listeners[j];
+            if (listener.transport == other.transport && schema.text_equals(?listener.address, schema.text(?other.address))) {
+                diagnose(diagnostics, schema.CONFLICT, "validation", schema.text(?other.address), "listener address and transport conflict");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.budget_count) {
+        if (graph.budgets[i].timeout_ms > schema.MAX_TIMEOUT_MS) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation",
+                schema.text(?graph.budgets[i].name),
+                "budget timeout cannot be represented in nanoseconds");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.host_count) {
+        val host: *schema.Host = ?graph.hosts[i];
+        if (schema.find_listener(graph, schema.text(?host.listener)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?host.listener), "host references an unknown listener");
+        }
+        if (host.budget.len > 0 && schema.find_budget(graph, schema.text(?host.budget)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?host.budget), "host references an unknown budget");
+        }
+        var name_index: usize = 0;
+        for (name_index < host.server_name_count) {
+            j = 0;
+            for (j < i) {
+                val prior_host: *schema.Host = ?graph.hosts[j];
+                if (schema.text_equals(?prior_host.listener, schema.text(?host.listener))) {
+                    var prior_name_index: usize = 0;
+                    for (prior_name_index < prior_host.server_name_count) {
+                        if (schema.text_equals(?prior_host.server_names[prior_name_index], schema.text(?host.server_names[name_index]))) {
+                            diagnose(diagnostics, schema.CONFLICT, "validation", schema.text(?host.server_names[name_index]), "server name is assigned twice on one listener");
+                        }
+                        prior_name_index = prior_name_index + 1;
+                    }
+                }
+                j = j + 1;
+            }
+            name_index = name_index + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.route_count) {
+        val route: *schema.Route = ?graph.routes[i];
+        if (schema.find_host(graph, schema.text(?route.host)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?route.host), "route references an unknown host");
+        }
+        if (schema.find_service(graph, schema.text(?route.service)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?route.service), "route references an unknown service");
+        }
+        if (route.budget.len > 0 && schema.find_budget(graph, schema.text(?route.budget)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?route.budget), "route references an unknown budget");
+        }
+        j = 0;
+        for (j < i) {
+            val prior: *schema.Route = ?graph.routes[j];
+            if (schema.text_equals(?prior.host, schema.text(?route.host))
+                && (schema.text_equals(?prior.path, schema.text(?route.path)) || schema.text_equals(?prior.path, "/**"))) {
+                diagnose(diagnostics, schema.UNREACHABLE, "validation", schema.text(?route.path), "route is shadowed by an earlier route");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.service_count) {
+        val service: *schema.Service = ?graph.services[i];
+        if (service.target.len == 0) {
+            diagnose(diagnostics, schema.MISSING_FIELD, "validation", schema.text(?service.name), "service target is required");
+        }
+        if (service.kind == schema.SERVICE_PROXY && !graph.features.proxy) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?service.name), "proxy service requires server.features.proxy");
+        }
+        if (service.budget.len > 0 && schema.find_budget(graph, schema.text(?service.budget)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?service.budget), "service references an unknown budget");
+        }
+        if (service.kind == schema.SERVICE_REDIRECT && (service.status < 300 || service.status > 308)) {
+            diagnose(diagnostics, schema.INVALID_VALUE, "validation", schema.text(?service.name), "redirect status must be between 300 and 308");
+        }
+        if (service.kind == schema.SERVICE_FIXED && (service.status < 200 || service.status > 599)) {
+            diagnose(diagnostics, schema.INVALID_VALUE, "validation", schema.text(?service.name), "fixed status must be a final response status");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < graph.secret_count) {
+        val secret: *schema.Secret = ?graph.secrets[i];
+        val provider: str = schema.text(?secret.provider);
+        if (str_equals(provider, "env") && !capabilities.environment_secrets) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?secret.name), "environment secret provider is unavailable");
+        } or (str_equals(provider, "file") && !capabilities.file_secrets) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?secret.name), "file secret provider is unavailable");
+        } or (str_equals(provider, "os") && !capabilities.os_secrets) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?secret.name), "operating-system secret provider is unavailable");
+        } or (str_equals(provider, "application") && !capabilities.application_secrets) {
+            diagnose(diagnostics, schema.UNSUPPORTED, "validation", schema.text(?secret.name), "application secret provider is unavailable");
+        } or (!str_equals(provider, "env") && !str_equals(provider, "file") && !str_equals(provider, "os") && !str_equals(provider, "application")) {
+            diagnose(diagnostics, schema.INVALID_VALUE, "validation", schema.text(?secret.name), "unknown secret provider");
+        }
+        i = i + 1;
+    }
+    if (graph.telemetry.log_record_bytes > 8192 || graph.telemetry.log_queue_depth > 65536 || graph.telemetry.metric_series > 1048576 || graph.telemetry.trace_state_bytes > 512
+        || (graph.telemetry.logs && (graph.telemetry.log_record_bytes == 0 || graph.telemetry.log_queue_depth == 0))
+        || (graph.telemetry.metrics
+            && graph.telemetry.metric_series < schema.MIN_METRIC_SERIES)
+        || (graph.telemetry.traces && graph.telemetry.trace_state_bytes == 0)) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation", "telemetry", "telemetry storage dimensions exceed production bounds");
+    }
+    if (graph.admin.enabled) {
+        if (graph.admin.listener.len == 0) {
+            diagnose(diagnostics, schema.MISSING_FIELD, "validation", "admin.listener", "administration listener is required");
+        }
+        if (graph.admin.auth_secret.len == 0) {
+            diagnose(diagnostics, schema.MISSING_FIELD, "validation", "admin.auth_secret", "administration authentication secret is required");
+        }
+        val admin_listener: *schema.Listener = schema.find_listener(graph, schema.text(?graph.admin.listener));
+        if (admin_listener == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", "admin.listener", "administration references an unknown listener");
+        }
+        if (schema.find_secret(graph, schema.text(?graph.admin.auth_secret)) == nil) {
+            diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", "admin.auth_secret", "administration references an unknown authentication secret");
+        }
+        if (graph.admin.max_response_bytes == 0 || graph.admin.max_response_bytes > 8192) {
+            diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation", "admin.max_response_bytes", "administration response bound exceeds 8192 bytes");
+        }
+        var admin_host_index: usize = 0;
+        for (admin_host_index < graph.host_count) {
+            if (schema.text_equals(?graph.hosts[admin_host_index].listener, schema.text(?graph.admin.listener))) {
+                diagnose(diagnostics, schema.CONFLICT, "validation", "admin.listener", "administration listener cannot serve public virtual hosts");
+            }
+            admin_host_index = admin_host_index + 1;
+        }
+    }
+    ret diagnostics.error_count == 0;
+}
+
+pub fun build(
+    graph: *schema.Graph,
+    diagnostics: *schema.Diagnostics,
+    a: *allocator.Allocator,
+    source_name: str,
+    source: str,
+    resolver: *Resolver,
+    capabilities: Capabilities,
+) bool {
+    if (graph == nil || diagnostics == nil || a == nil || source == nil) { ret false; }
+    schema.reset_graph(graph);
+    schema.reset_diagnostics(diagnostics);
+    var workspace: Workspace;
+    workspace.depth = 0;
+    process_source(graph, diagnostics, a, source_name, source, resolver, ?workspace);
+    ret validate(graph, capabilities, diagnostics);
+}
+
+fun test_resolve(context: ptr, name: str, output: *u8, capacity: usize) i64 {
+    if (!str_equals(name, "HOST")) { ret -1; }
+    val value: str = "example.com";
+    val n: usize = str_len(value);
+    if (capacity > n) {
+        var i: usize = 0;
+        for (i < n) { output[i] = value[i]; i = i + 1; }
+        output[n] = 0;
+    }
+    ret n::i64;
+}
+
+fun test_include(context: ptr, name: str, output: *u8, capacity: usize) i64 {
+    if (!str_equals(name, "base.toml")) { ret -1; }
+    val content: str = "[server]\nname = \"included\"\n\n[[listener]]\nname = \"local\"\naddress = \":8080\"\nprotocols = [\"http/1.1\"]\n\n[host.local]\nlistener = \"local\"\n\n[service.health]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"health\"\nhost = \"local\"\npath = \"/health\"\nservice = \"health\"\n";
+    val n: usize = str_len(content);
+    if (capacity > n) {
+        var i: usize = 0;
+        for (i < n) { output[i] = content[i]; i = i + 1; }
+        output[n] = 0;
+    }
+    ret n::i64;
+}
+
+test "config loader: complete graph is parsed and resolved" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    var resolver: Resolver = Resolver{context: nil, include: (0::usize)::ResolveFun, environment: test_resolve};
+    val source: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \"[::]:443\"\ntransport = \"tcp\"\nprotocols = [\"http/1.1\", \"h2\"]\ntls = \"public\"\nbacklog = 512\naccept_depth = 16\n\n[tls.public]\ncertificate = \"secret:cert\"\nkey = \"secret:key\"\n\n[host.site]\nlistener = \"public\"\nserver_name = \"${ENV:HOST}\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[service.app]\nkind = \"laurel\"\napplication = \"site\"\n";
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (!build(?graph, ?diagnostics, ?a, "hedge.toml", source, ?resolver, capabilities)) { ret 1; }
+    if (graph.listener_count != 1 || graph.host_count != 1 || graph.route_count != 1 || graph.service_count != 1 || graph.listeners[0].backlog != 512 || graph.listeners[0].accept_depth != 16) { ret 2; }
+    if (graph.hosts[0].server_name_count != 1 || !schema.text_equals(?graph.hosts[0].server_names[0], "example.com")) { ret 3; }
+    # the single-pair form is one unnamed identity, and it is the default
+    if (graph.tls_policy_count != 1 || graph.tls_policies[0].identity_count != 1) { ret 4; }
+    if (!schema.text_equals(?graph.tls_policies[0].identities[0].certificate, "secret:cert")
+     || !schema.text_equals(?graph.tls_policies[0].identities[0].key, "secret:key")
+     || graph.tls_policies[0].identities[0].server_name.len != 0
+     || !graph.tls_policies[0].has_default) { ret 5; }
+    if (graph.listeners[0].proxy_protocol != schema.PROXY_OFF
+     || graph.listeners[0].trusted_peer_count != 0) { ret 6; }
+    ret 0;
+}
+
+test "config loader: quic listeners select exactly h3" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true,
+        local_transport: true, environment_secrets: true,
+        file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"h3\"\n\n[[listener]]\nname = \"quic\"\naddress = \"127.0.0.1:443\"\ntransport = \"quic\"\nprotocols = [\"h3\"]\ntls = \"public\"\n\n[tls.public]\ncertificate = \"server.pem\"\nkey = \"server.key\"\n";
+    if (!build(?graph, ?diagnostics, ?a, "h3.toml", source, nil,
+        capabilities)) { ret 1; }
+    graph.listeners[0].protocols = schema.PROTOCOL_HTTP2
+        | schema.PROTOCOL_HTTP3;
+    schema.reset_diagnostics(?diagnostics);
+    if (validate(?graph, capabilities, ?diagnostics)
+     || !saw_code(?diagnostics, schema.CONFLICT)) { ret 2; }
+    graph.listeners[0].protocols = schema.PROTOCOL_HTTP1;
+    schema.reset_diagnostics(?diagnostics);
+    if (validate(?graph, capabilities, ?diagnostics)
+     || !saw_code(?diagnostics, schema.CONFLICT)) { ret 3; }
+    ret 0;
+}
+
+test "config loader: SNI identities and PROXY trust are named explicitly" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    var resolver: Resolver = Resolver{context: nil, include: (0::usize)::ResolveFun, environment: test_resolve};
+    val source: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \"[::]:443\"\nprotocols = [\"http/1.1\", \"h2\"]\ntls = \"public\"\nproxy_protocol = \"required\"\ntrusted_peers = [\"10.0.0.0/8\", \"::1\"]\n\n[tls.public]\nidentity = [ { server_name = \"api.example.com\", certificate = \"api.pem\", key = \"api.key\" }, { server_name = \"alt.example.com\", certificate = \"alt.pem\", key = \"alt.key\" } ]\ndefault = \"api.example.com\"\n\n[host.site]\nlistener = \"public\"\nserver_name = \"api.example.com\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n";
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (!build(?graph, ?diagnostics, ?a, "hedge.toml", source, ?resolver, capabilities)) { ret 1; }
+    if (graph.tls_policies[0].identity_count != 2) { ret 2; }
+    if (schema.find_identity(?graph.tls_policies[0], "alt.example.com") == nil) { ret 3; }
+    if (schema.find_identity(?graph.tls_policies[0], "nowhere.invalid") != nil) { ret 4; }
+    if (!graph.tls_policies[0].has_default
+     || !schema.text_equals(?graph.tls_policies[0].default_name, "api.example.com")) { ret 5; }
+    if (graph.listeners[0].proxy_protocol != schema.PROXY_REQUIRED
+     || graph.listeners[0].trusted_peer_count != 2) { ret 6; }
+    if (!schema.text_equals(?graph.listeners[0].trusted_peers[0], "10.0.0.0/8")) { ret 7; }
+    ret 0;
+}
+
+test "config loader: unusable protocol policy is refused before listeners bind" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    var resolver: Resolver = Resolver{context: nil, include: (0::usize)::ResolveFun, environment: test_resolve};
+    # decoding PROXY headers while trusting nobody would refuse every header
+    val untrusted: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\nproxy_protocol = \"optional\"\n\n[host.site]\nlistener = \"public\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n";
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (build(?graph, ?diagnostics, ?a, "hedge.toml", untrusted, ?resolver, capabilities)) { ret 1; }
+    # an unparsable prefix is refused at load rather than narrowing trust later
+    val malformed: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\nproxy_protocol = \"optional\"\ntrusted_peers = [\"10.0.0.0/99\"]\n\n[host.site]\nlistener = \"public\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n";
+    if (build(?graph, ?diagnostics, ?a, "hedge.toml", malformed, ?resolver, capabilities)) { ret 2; }
+    # a TLS policy whose default names no identity cannot silently serve another
+    val unknown_default: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":443\"\nprotocols = [\"http/1.1\"]\ntls = \"public\"\n\n[tls.public]\nidentity = [ { server_name = \"api.example.com\", certificate = \"api.pem\", key = \"api.key\" } ]\ndefault = \"nowhere.invalid\"\n\n[host.site]\nlistener = \"public\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n";
+    if (build(?graph, ?diagnostics, ?a, "hedge.toml", unknown_default, ?resolver, capabilities)) { ret 3; }
+    # and a policy with no certificate at all is not a policy
+    val bare: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":443\"\nprotocols = [\"http/1.1\"]\ntls = \"public\"\n\n[tls.public]\nclient_auth = false\n\n[host.site]\nlistener = \"public\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n";
+    if (build(?graph, ?diagnostics, ?a, "hedge.toml", bare, ?resolver, capabilities)) { ret 4; }
+    ret 0;
+}
+
+test "config loader: unknown and unreachable configuration is rejected" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val source: str = "[server]\nname = \"site\"\nlegacy = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"all\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[[route]]\nname = \"shadowed\"\nhost = \"site\"\npath = \"/admin\"\nservice = \"app\"\n";
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", source, nil, capabilities)) { ret 1; }
+    var saw_unknown: bool = false;
+    var saw_unreachable: bool = false;
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.UNKNOWN_FIELD) { saw_unknown = true; }
+        if (diagnostics.items[i].code == schema.UNREACHABLE) { saw_unreachable = true; }
+        i = i + 1;
+    }
+    if (!saw_unknown || !saw_unreachable) { ret 2; }
+    ret 0;
+}
+
+test "config loader: includes resolve before validation" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    var resolver: Resolver = Resolver{context: nil, include: test_include, environment: (0::usize)::ResolveFun};
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (!build(?graph, ?diagnostics, ?a, "root.toml", "include = [\"base.toml\"]\n", ?resolver, capabilities)) { ret 1; }
+    if (!schema.text_equals(?graph.server_name, "included") || graph.route_count != 1) { ret 2; }
+    ret 0;
+}
+
+test "config loader: section type errors are explicit" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (build(?graph, ?diagnostics, ?a, "wrong.toml", "server = \"wrong\"\n", nil, capabilities)) { ret 1; }
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.WRONG_TYPE) { ret 0; }
+        i = i + 1;
+    }
+    ret 2;
+}
+
+test "config loader: listener admission dimensions are bounded" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"bounded\"\n\n[[listener]]\nname = \"public\"\naddress = \"127.0.0.1:80\"\nprotocols = [\"http/1.1\"]\nbacklog = 2147483648\naccept_depth = 65\n";
+    if (build(?graph, ?diagnostics, ?a, "bounded.toml", source, nil, capabilities)) { ret 1; }
+    var resource_errors: usize = 0;
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.RESOURCE_LIMIT) { resource_errors = resource_errors + 1; }
+        i = i + 1;
+    }
+    if (resource_errors != 2) { ret 2; }
+    ret 0;
+}
+
+test "config loader: pipeline depth cannot exceed fixed connection storage" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true,
+        local_transport: true, environment_secrets: true,
+        file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"bounded\"\n\n[server.limits]\nmax_pipeline_depth = 3\n";
+    if (build(?graph, ?diagnostics, ?a, "pipeline.toml", source, nil,
+        capabilities)) { ret 1; }
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.RESOURCE_LIMIT
+         && schema.text_equals(?diagnostics.items[i].path,
+            "server.limits.max_pipeline_depth")) { ret 0; }
+        i = i + 1;
+    }
+    ret 2;
+}
+
+test "config loader: TLS resumption policy is explicit and bounded" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true,
+        local_transport: true, environment_secrets: true,
+        file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"resumption\"\n\n[[listener]]\nname = \"secure\"\naddress = \"127.0.0.1:443\"\nprotocols = [\"http/1.1\"]\ntls = \"public\"\n\n[tls.public]\ncertificate = \"server.pem\"\nkey = \"server.key\"\n\n[tls.public.resumption]\nkey_lifetime_seconds = 60\nretirement_overlap_seconds = 30\nticket_lifetime_seconds = 120\nreplay = \"single_use\"\ntickets_per_connection = 3\n\n[host.site]\nlistener = \"secure\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (!build(?graph, ?diagnostics, ?a, "resumption.toml", source, nil,
+        capabilities)) { ret 1; }
+    val configured: *schema.TlsResumption =
+        ?graph.tls_policies[0].resumption;
+    if (!configured.enabled || configured.key_lifetime_seconds != 60
+     || configured.retirement_overlap_seconds != 30
+     || configured.ticket_lifetime_seconds != 120
+     || configured.replay_policy != schema.TLS_REPLAY_SINGLE_USE
+     || configured.tickets_per_connection != 3) { ret 2; }
+    val invalid: str = "[server]\nname = \"resumption\"\n\n[[listener]]\nname = \"secure\"\naddress = \"127.0.0.1:443\"\nprotocols = [\"http/1.1\"]\ntls = \"public\"\n\n[tls.public]\ncertificate = \"server.pem\"\nkey = \"server.key\"\n\n[tls.public.resumption]\nkey_lifetime_seconds = 0\nretirement_overlap_seconds = 604800\nticket_lifetime_seconds = 0\nreplay = \"sometimes\"\ntickets_per_connection = 5\n\n[host.site]\nlistener = \"secure\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (build(?graph, ?diagnostics, ?a, "resumption-invalid.toml", invalid,
+        nil, capabilities) || diagnostics.error_count != 5) { ret 3; }
+    ret 0;
+}
+
+test "config loader: administration requires an isolated authenticated listener" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    val valid: str = "[server]\nname = \"admin-test\"\n\n[[listener]]\nname = \"public\"\naddress = \"127.0.0.1:8080\"\nprotocols = [\"http/1.1\"]\n\n[[listener]]\nname = \"admin\"\naddress = \"127.0.0.1:8081\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[secret.admin_token]\nprovider = \"env\"\nkey = \"HEDGE_ADMIN_TOKEN\"\n\n[admin]\nlistener = \"admin\"\nauth_secret = \"admin_token\"\nmax_response_bytes = 4096\n\n[telemetry]\nmetrics = true\nmetric_series = 64\n";
+    if (!build(?graph, ?diagnostics, ?a, "admin.toml", valid, nil, capabilities)) { ret 1; }
+    if (!graph.admin.enabled || !schema.text_equals(?graph.admin.listener, "admin") || graph.admin.max_response_bytes != 4096 || graph.telemetry.metric_series != 64) { ret 2; }
+
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    val shared: str = "[server]\nname = \"admin-test\"\n\n[[listener]]\nname = \"shared\"\naddress = \"127.0.0.1:8080\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"shared\"\n\n[secret.admin_token]\nprovider = \"env\"\nkey = \"HEDGE_ADMIN_TOKEN\"\n\n[admin]\nlistener = \"shared\"\nauth_secret = \"admin_token\"\n";
+    if (build(?graph, ?diagnostics, ?a, "shared.toml", shared, nil, capabilities)) { ret 3; }
+    var saw_conflict: bool = false;
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.CONFLICT) { saw_conflict = true; }
+        i = i + 1;
+    }
+    if (!saw_conflict) { ret 4; }
+    ret 0;
+}
+
+test "config loader: telemetry dimensions are finite and nonzero when enabled" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"telemetry-bounds\"\n\n[telemetry]\nlogs = true\nmetrics = true\ntraces = true\nlog_record_bytes = 8193\nlog_queue_depth = 0\nmetric_series = 4\ntrace_state_bytes = 513\n";
+    if (build(?graph, ?diagnostics, ?a, "telemetry-bounds.toml", source, nil, capabilities)) { ret 1; }
+    var saw_resource_limit: bool = false;
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.RESOURCE_LIMIT) { saw_resource_limit = true; }
+        i = i + 1;
+    }
+    if (!saw_resource_limit) { ret 2; }
+    ret 0;
+}
+
+test "config loader: trace propagation needs no unused exporter endpoint" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true,
+        local_transport: true, environment_secrets: true, file_secrets: true,
+        os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"trace-propagation\"\n\n[telemetry]\nlogs = false\ntraces = true\ntrace_state_bytes = 512\n";
+    if (!build(?graph, ?diagnostics, ?a, "trace-propagation.toml", source,
+            nil, capabilities)
+     || !graph.telemetry.traces || diagnostics.error_count != 0) { ret 1; }
+    ret 0;
+}
+
+test "config loader: timeouts must fit the runtime nanosecond clock" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"timeout-bounds\"\n\n[server.timeouts]\ndrain_ms = 9223372036855\n\n[budget.api]\ntimeout_ms = 9223372036855\n";
+    if (build(?graph, ?diagnostics, ?a, "timeouts.toml", source, nil,
+        capabilities)) { ret 1; }
+    var resource_errors: usize = 0;
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.RESOURCE_LIMIT) {
+            resource_errors = resource_errors + 1;
+        }
+        i = i + 1;
+    }
+    if (resource_errors != 2) { ret 2; }
+    ret 0;
+}
+
+fun saw_code(diagnostics: *schema.Diagnostics, code: schema.DiagnosticCode) bool {
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == code) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+val ACME_VALID: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":443\"\nprotocols = [\"http/1.1\"]\ntls = \"public\"\n\n[tls.public]\nidentity = [{ server_name = \"site.example\", certificate = \"site.pem\", key = \"site.key\" }]\ndefault = \"site.example\"\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/.well-known/acme-challenge/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\ntrust = \"/etc/ssl/certs/ca-certificates.crt\"\nstorage = \"/var/lib/hedge/acme\"\nlistener = \"public\"\ncontact = \"mailto:ops@example.com\"\nterms_agreed = true\nchallenge = \"http-01\"\nnames = [\"site.example\", \"www.site.example\"]\n";
+
+test "config loader: an acme section is parsed and bounded" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    if (!build(?graph, ?diagnostics, ?a, "hedge.toml", ACME_VALID, nil, capabilities)) { ret 1; }
+    if (!graph.acme.enabled || !graph.features.acme) { ret 2; }
+    if (!schema.text_equals(?graph.acme.directory, "https://acme.example/dir")) { ret 3; }
+    if (!schema.text_equals(?graph.acme.storage, "/var/lib/hedge/acme")) { ret 4; }
+    if (!schema.text_equals(?graph.acme.trust,
+        "/etc/ssl/certs/ca-certificates.crt")) { ret 5; }
+    if (!schema.text_equals(?graph.acme.listener, "public")) { ret 6; }
+    if (graph.acme.challenge != schema.CHALLENGE_HTTP_01) { ret 7; }
+    if (!graph.acme.terms_agreed) { ret 8; }
+    if (graph.acme.name_count != 2
+     || !schema.text_equals(?graph.acme.names[0], "site.example")
+     || !schema.text_equals(?graph.acme.names[1], "www.site.example")) { ret 9; }
+    if (graph.acme.renew_before_seconds != 2592000) { ret 10; }
+    schema.reset_diagnostics(?diagnostics);
+    graph.acme.challenge = parse_challenge("tls-alpn-01", ?diagnostics,
+        "hedge.toml");
+    if (graph.acme.challenge != schema.CHALLENGE_TLS_ALPN_01
+     || !validate(?graph, capabilities, ?diagnostics)) { ret 11; }
+    schema.set_text(?graph.acme.origin, "127.0.0.1:14001");
+    schema.reset_diagnostics(?diagnostics);
+    if (validate(?graph, capabilities, ?diagnostics)
+     || !saw_code(?diagnostics, schema.CONFLICT)) { ret 12; }
+    ret 0;
+}
+
+test "config loader: acme that cannot obtain a certificate fails to load" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    # a cleartext directory is refused: rfc 8555 urls are https
+    val cleartext: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"http://acme.example/dir\"\nstorage = \"/tmp/acme\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", cleartext, nil, capabilities)) { ret 1; }
+    if (!saw_code(?diagnostics, schema.INVALID_VALUE)) { ret 2; }
+
+    # http-01 with nothing configured to answer it is unreachable
+    val unanswerable: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"all\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/tmp/acme\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", unanswerable, nil, capabilities)) { ret 3; }
+    if (!saw_code(?diagnostics, schema.UNREACHABLE)) { ret 4; }
+    if (!saw_code(?diagnostics, schema.MISSING_FIELD)) { ret 13; }
+
+    # a challenge type this build cannot answer is refused before listeners
+    val unsupported: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/tmp/acme\"\nchallenge = \"dns-01\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", unsupported, nil, capabilities)) { ret 5; }
+    if (!saw_code(?diagnostics, schema.UNSUPPORTED)) { ret 6; }
+
+    # the feature flag and the section must agree in both directions
+    val featureless: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/tmp/acme\"\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", featureless, nil, capabilities)) { ret 7; }
+    if (!saw_code(?diagnostics, schema.UNSUPPORTED)) { ret 8; }
+
+    # an enabled feature with no section is a configuration that silently
+    # renews nothing
+    val sectionless: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"all\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", sectionless, nil, capabilities)) { ret 9; }
+    if (!saw_code(?diagnostics, schema.CONFLICT)) { ret 10; }
+
+    # a renewal lead the scheduler would refuse is refused at load
+    val lead: str = "[server]\nname = \"site\"\n\n[server.features]\nacme = true\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[service.challenge]\nkind = \"native\"\ntarget = \"acme-challenge\"\n\n[[route]]\nname = \"acme\"\nhost = \"site\"\npath = \"/**\"\nservice = \"challenge\"\n\n[acme]\ndirectory = \"https://acme.example/dir\"\nstorage = \"/tmp/acme\"\nrenew_before = 99999999\nnames = [\"site.example\"]\n";
+    if (build(?graph, ?diagnostics, ?a, "bad.toml", lead, nil, capabilities)) { ret 11; }
+    if (!saw_code(?diagnostics, schema.INVALID_VALUE)) { ret 12; }
+    ret 0;
+}
+test "config loader: a host names itself once, several times, or by its own key" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.many]\nlistener = \"public\"\nnames = [\"a.example.com\", \"b.example.com\", \"*.c.example.com\"]\n\n[host.one]\nlistener = \"public\"\nserver_name = \"single.example.com\"\n\n[host.implied]\nlistener = \"public\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"a\"\nhost = \"many\"\npath = \"/**\"\nservice = \"app\"\n\n[[route]]\nname = \"b\"\nhost = \"one\"\npath = \"/**\"\nservice = \"app\"\n\n[[route]]\nname = \"c\"\nhost = \"implied\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (!build(?graph, ?diagnostics, ?a, "hosts.toml", source, nil, capabilities)) { ret 1; }
+    if (graph.host_count != 3) { ret 2; }
+    # the array form keeps every name, in the order written, which is the form
+    # dispatch expands into one routing pattern each
+    if (graph.hosts[0].server_name_count != 3) { ret 3; }
+    if (!schema.text_equals(?graph.hosts[0].server_names[0], "a.example.com")
+     || !schema.text_equals(?graph.hosts[0].server_names[1], "b.example.com")
+     || !schema.text_equals(?graph.hosts[0].server_names[2], "*.c.example.com")) { ret 4; }
+    if (graph.hosts[1].server_name_count != 1
+     || !schema.text_equals(?graph.hosts[1].server_names[0], "single.example.com")) { ret 5; }
+    # a host that names itself neither way answers to its own block key
+    if (graph.hosts[2].server_name_count != 1
+     || !schema.text_equals(?graph.hosts[2].server_names[0], "implied")) { ret 6; }
+    ret 0;
+}
+
+test "config loader: a host cannot name itself both ways at once" {
+    var memory: [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a: allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph: schema.Graph;
+    var diagnostics: schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
+    val source: str = "[server]\nname = \"site\"\n\n[[listener]]\nname = \"public\"\naddress = \":80\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\nserver_name = \"a.example.com\"\nnames = [\"b.example.com\"]\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\n\n[[route]]\nname = \"root\"\nhost = \"site\"\npath = \"/**\"\nservice = \"app\"\n";
+    if (build(?graph, ?diagnostics, ?a, "hosts.toml", source, nil, capabilities)) { ret 1; }
+    var saw_conflict: bool = false;
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        if (diagnostics.items[i].code == schema.CONFLICT) { saw_conflict = true; }
+        i = i + 1;
+    }
+    if (!saw_conflict) { ret 2; }
+    ret 0;
+}

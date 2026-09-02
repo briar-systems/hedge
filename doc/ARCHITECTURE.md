@@ -28,13 +28,28 @@ connection plane
   protocol selection, tls, quic, http engines
 
 service plane
-  static files, proxy pools, mach-web applications
+  static files, proxy pools, Laurel applications
 
 telemetry plane
   logs, metrics, traces, health, readiness
 ```
 
 The control plane publishes immutable runtime generations. A listener and every connection retain the generation under which they were created. Reload activates a new generation atomically. Old generations remain alive until their connections drain.
+
+The executable and runtime tests enter those planes through one production
+composition module. Its runtime record owns every binding array and compiled
+plan for the process lifetime. It also owns the public QUIC backing: the
+connection-ID route, timer, pending-initial, and per-listener admission pools,
+and the public connection and session storage. The welded control records for
+the pump, the connection, its deep-secret assembly storage, and the HTTP/3
+session are owned separately by a typed secret owner the executable holds for
+the process lifetime. No public record retains one; code that needs them
+borrows a stack-local view for the duration of a call. Startup
+constructs cache bindings before the resolver and compiles only after both are
+stable. Teardown cancels and releases QUIC operations before closing their UDP
+sockets, then closes certificate management, TLS credentials, proxy state,
+cache storage, and static storage. Partial startup follows the same ordering for
+every resource it acquired.
 
 ## Runtime generation
 
@@ -102,7 +117,11 @@ QUIC exposes connection and stream operations rather than pretending to be one b
 
 TCP connections pass through optional PROXY protocol decoding, optional TLS, and application protocol selection. Cleartext listeners select HTTP/1.1 or an explicit HTTP/2 prior-knowledge policy. TLS uses ALPN for HTTP/1.1 and HTTP/2.
 
-QUIC listeners select HTTP/3 through TLS ALPN inside QUIC.
+QUIC listeners select HTTP/3 through TLS ALPN inside QUIC. Their receive pumps
+share the listener completion driver with TCP while retaining independent
+connection ownership. The serving loop bounds its wait by the next QUIC timer
+deadline. Reload stages every QUIC admission generation before publishing the
+new request plan, then gracefully retires connections pinned to the old plan.
 
 Each protocol engine translates its connection-specific state into the common HTTP service exchange. The common exchange supports streaming bodies, informational responses, trailers, cancellation, upgrades where the protocol permits them, and peer metadata.
 
@@ -122,17 +141,45 @@ A request exchange owns:
 
 The request allocator is reset only after request-body disposition and response completion are resolved. A handler that leaves a body unread must explicitly drain it, reject it, or make the connection non-reusable.
 
+A service may attach one request finalizer to the common call. The protocol owner
+runs it exactly once after the exchange reaches its terminal state and before the
+request allocator is reset. This is where an application framework receives the
+authoritative response status, transfer counters, and cancellation reason. A
+finalizer failure does not prevent memory or transport cleanup, but it fails the
+owning connection or stream so the lifecycle error remains observable.
+
+A service layer may also attach one pre-commit response interceptor. It runs once
+after the inner service has resolved ownership of the request body and before the
+response becomes visible to a protocol engine. The interceptor may continue with
+the proposed response or replace a proposal whose body is absent or can be
+cancelled to a terminal state synchronously. Replacement resets only the response
+builder. It preserves the inner service's request-body disposition and returns to
+the same outer commit, so neither ownership nor commitment is repeated.
+
 HTTP/1.1 processes ordered exchanges while respecting pipeline bounds. HTTP/2 and HTTP/3 process independent streams subject to connection and stream flow control. The service API does not expose those differences as mutable connection operations.
 
 ## Service dispatch
 
-Virtual-host selection precedes route selection. A route resolves to one of:
+Virtual-host selection precedes route selection.
+
+A host declares a set of names, and every one of them is a name that host answers to. A route on a host is compiled once per name, so the set is the contract rather than the first entry in it. Names within a host block are unordered: position confers no precedence, because every name of a host produces an equally specific pattern for the same route.
+
+Precedence between patterns is by specificity, never by declaration order:
+
+1. an exact name outranks a wildcard suffix, which outranks the any-host pattern
+2. between two wildcard suffixes, the longer suffix wins
+3. a pattern naming a port outranks one that does not
+4. then path specificity, then method specificity, then configuration order
+
+Only the last of those is positional, and it is reached only when two patterns are equally specific in every other respect. Two routes that compile to the same host pattern, path, and method are a configuration conflict and are refused before the generation is published, rather than one silently shadowing the other.
+
+A route resolves to one of:
 
 - static file service
 - reverse proxy service
 - load-balanced upstream service
 - redirect or fixed response
-- `mach-web` application
+- Laurel application
 - native handler implementing the HTTP service contract
 
 Middleware wraps services through explicit before, after, and error paths. The core does not build a heap-allocated chain for every request. A compiled route graph references immutable middleware plans.
@@ -155,9 +202,31 @@ Retries are allowed only when request replay safety is known. Body buffering is 
 
 Caching is an optional service layer with independent memory and disk stores. It implements HTTP cache semantics rather than path-based object reuse. Cache keys include the selected representation dimensions. Revalidation, stale policies, range handling, and authorization behavior are explicit.
 
+A stale stored response with a validator adds a conditional field only for the
+origin attempt and only when the client supplied no precondition. The field is
+removed before response policy or recording observes the request. An origin 304
+is consumed by the pre-commit interceptor. Forwardable fields present on the 304
+replace the corresponding stored fields, absent fields remain, and qualified
+private or no-cache fields are removed. The merged response must still satisfy
+shared-cache storage policy before metadata and selecting dimensions change. The
+unconditional client receives the refreshed stored representation, never the 304.
+
+Transport and origin failures represented by 500, 502, 503, or 504 may be replaced
+with the stale stored response only while its stale-if-error interval covers the
+current age. A missing or expired interval leaves the failure response unchanged.
+
+The cache serves one satisfiable byte range as 206. It deliberately does not build
+multipart/byteranges for a request containing several ranges. Such a request gets
+the complete stored representation as 200, which is the permitted full-response
+choice and keeps multipart boundary generation out of the bounded cache reader.
+
+When caching is disabled, composition does not allocate a layer, entry table, or
+body arena and does not install a wrapper. It opens no cache root and starts no
+worker or timer.
+
 ## Web applications
 
-`mach-web` applications receive only the common HTTP service exchange and framework services declared during composition. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities through typed providers.
+Laurel applications receive only the common HTTP service exchange and framework services declared during composition. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities through typed providers.
 
 Applications cannot reach listener or connection internals. Server reload can replace an application generation without invalidating exchanges already executing in the old generation.
 
@@ -170,7 +239,48 @@ Configuration processing has four stages:
 3. Validate the complete graph and resource budgets.
 4. Construct a sealed runtime generation.
 
-Only the sealed generation is published. A failed reload leaves the current generation untouched. Listener transitions are planned before publication so address conflicts and unsupported socket options fail safely.
+Only the sealed generation is published. A failed reload leaves the current
+generation untouched. Listener identity and socket configuration are
+startup-owned, so a hot reload requires the exact active listener set and a
+listener change requires a process restart.
+
+## Certificate management
+
+ACME is an optional control-plane subsystem. It owns an account, one
+certificate covering the configured names, its durable state, and the schedule
+that renews it. It performs no work when it is not configured.
+
+Every step is a step the serving loop takes: one outbound exchange at a time
+per manager on the subsystem's own completion runtime, one protocol decision
+per round, and every wait expressed as a wake time. Nothing in the path blocks
+an accept or a request.
+
+An HTTPS authority is reached through a bounded table of mach-tls client
+sessions and verified for the URL's host against a configured anchor bundle.
+The typed table keeps secret-welded engine state out of callback contexts and
+allows active and superseded configuration generations to originate
+independently. A configured cleartext origin remains available for a local
+conformance authority and is never selected implicitly.
+
+The subsystem does not own TLS credentials. It produces a verified chain and
+its key material and reports that an installation is ready; the owner of the
+credential generation installs it and rotates. A connection holds its
+credential lease for its whole life, so a rotation publishes a new generation
+for new connections without disturbing an established one, and the retired
+generation stays alive until its last lease is released.
+
+Challenge presentation is a provider contract. HTTP-01 is answered by the
+server being validated, through a native route that serves only tokens a
+presentation put there. DNS-01 is answered by a publisher the deployment
+supplies. TLS-ALPN-01 presents an RFC 8737 certificate on a TLS listener.
+Cleanup is owed exactly when presentation succeeded and runs exactly once
+across success, failure, timeout, and cancellation.
+
+Each TLS-ALPN-enabled listener owns one stable credential store. A presentation
+publishes its one-shot generation into that vacant store. Cleanup withdraws it
+immediately, so no later handshake can acquire it. If a validation connection
+still holds the generation, the serving loop defers key destruction until that
+exact lease is released, then reuses the same store for the next presentation.
 
 ## Graceful shutdown
 
@@ -185,6 +295,19 @@ Shutdown proceeds through explicit states:
 7. Close resources and exit with a reasoned status.
 
 HTTP/2 uses GOAWAY. HTTP/3 closes request acceptance through its control and QUIC state. HTTP/1.1 marks responses for connection close and stops reading new requests.
+
+After the last downstream connection retires, transport-neutral service planes
+quiesce while the listener network driver is still live. Their connect, body,
+and close completions retain their owners until terminal settlement. Only then
+may listener teardown destroy the shared driver and make pool storage reusable.
+
+## Telemetry ownership
+
+One process-owned telemetry runtime owns the log sink contract, fixed metric registry, health checks, trace propagation bound, administration credential, and administration handler. It is attached before listeners become ready and remains stable across route generations. Access and error events are observed at the common dispatch boundary, so HTTP/1, HTTP/2, public routes, and listener-owned services share one completion path. Events are encoded directly into a fixed record buffer. A direct sink completes within the call. A queued sink copies into a caller-bounded queue and reports enqueued, rejected, or dropped without waiting for space.
+
+Metric series are registered against caller-owned storage. Tokens identify stable series, updates are atomic, and histogram samples commit bucket, count, and sum together. Rendering performs a sizing pass before writing so an undersized administration response cannot expose a partial metric document.
+
+The administration handler has no public route access. Its listener identity is selected before virtual-host routing, and its bearer credential is resolved into bounded process-owned storage before the route plan is sealed. Metrics and state renderers retain independent contexts. Shutdown makes readiness false before listener drain, invokes the telemetry flush operation exactly once, and clears the credential after serving stops.
 
 ## Lightweight composition
 
@@ -201,4 +324,3 @@ The product remains lightweight through structural choices:
 - one telemetry event construction per event
 
 Lightweight is measured with idle memory, idle wakeups, binary sections, allocations per request, and latency distributions. It is not inferred from source line count.
-

@@ -1,0 +1,547 @@
+# the acme protocol conversation, as steps a serving loop can drive
+#
+# mach-acme's protocol boundary is a set of decisions, not a loop: it says what
+# request to send and what a response means, and never performs i/o. this
+# module is the loop it deliberately does not contain, expressed as one state
+# per outstanding exchange so the serving loop advances it a step at a time.
+#
+# the whole conversation is one request at a time by construction. acme is
+# sequential anyway, and a single in-flight exchange is what lets one bounded
+# wire buffer, one signing buffer, and one nonce reservation belong to the
+# session rather than to a pool of concurrent attempts.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use std.chrono.time;
+use std.net.ip;
+use std.net.tcp;
+use R: std.types.result;
+use io_error: std.io.error;
+use contracts: crypto.contracts;
+use ct: std.crypto.ct;
+use http.core.field;
+use ac: acme.client;
+use jose: acme.jose;
+use nonce: acme.nonce;
+use problem: acme.problem;
+use keys: hedge.acme.keys;
+use transport: hedge.acme.transport;
+
+pub val NONCE_SLOTS:      usize = 4;
+pub val MAX_NONCE_BYTES:  usize = 128;
+pub val DIRECTORY_BYTES:  usize = 4096;
+pub val CAA_ITEMS:        usize = 8;
+pub val SCRATCH_BYTES:    usize = 32768;
+pub val WORK_BYTES:       usize = 8192;
+pub val WIRE_BYTES:       usize = 16384;
+pub val PROBLEM_BYTES:    usize = 4096;
+pub val SUBPROBLEMS:      usize = 8;
+pub val MAX_URL_BYTES:    usize = 512;
+pub val MAX_NONCE_ATTEMPTS: usize = 4;
+
+# hedge's own ceilings rather than the library defaults. a server does not get
+# to discover at runtime that one certificate renewal wants a megabyte of json
+# scratch, so every bound here is one this process already reserved.
+pub fun limits() ac.Limits {
+    var value: ac.Limits;
+    value.max_request_bytes = WIRE_BYTES;
+    value.max_response_bytes = 65536;
+    value.max_problem_bytes = PROBLEM_BYTES;
+    value.max_nonce_bytes = MAX_NONCE_BYTES;
+    value.max_url_bytes = MAX_URL_BYTES;
+    value.max_json_scratch = SCRATCH_BYTES;
+    value.max_json_depth = 16;
+    value.max_json_values = 2048;
+    value.max_json_key_bytes = 64;
+    value.max_json_key_comparisons = 16384;
+    value.max_caa_identities = CAA_ITEMS;
+    value.max_problem_subproblems = SUBPROBLEMS;
+    value.max_bad_nonce_retries = 3;
+    value.request_timeout_ns = 30000000000;
+    value.response_fields = field.limits(64, 16384, 128, 4096);
+    ret value;
+}
+
+pub def Status: u8;
+pub val OK:      Status = 1;
+pub val PENDING: Status = 2;
+pub val FAILED:  Status = 3;
+pub val INVALID: Status = 4;
+
+pub def State: u8;
+pub val IDLE:           State = 0;
+pub val DISCOVER_SEND:  State = 1;
+pub val DISCOVER_WAIT:  State = 2;
+pub val NONCE_SEND:     State = 3;
+pub val NONCE_WAIT:     State = 4;
+pub val SIGN:           State = 5;
+pub val SEND:           State = 6;
+pub val WAIT:           State = 7;
+pub val READY:          State = 8;
+pub val BROKEN:         State = 9;
+
+pub rec Session {
+    protocol:   ac.Client;
+    memory:     nonce.Memory;
+    slots:      [NONCE_SLOTS]nonce.Slot;
+    nonce_bytes: [512]u8;
+    configured: ac.Limits;
+
+    directory:       ac.Directory;
+    directory_bytes: [DIRECTORY_BYTES]u8;
+    caa:             [CAA_ITEMS]view.View;
+    directory_url:   [MAX_URL_BYTES]u8;
+    directory_url_len: usize;
+    discovered:      bool;
+
+    scratch:      [SCRATCH_BYTES]u8;
+    work:         [WORK_BYTES]u8;
+    wire:         [WIRE_BYTES]u8;
+    problem_bytes: [PROBLEM_BYTES]u8;
+    subproblems:  [SUBPROBLEMS]problem.Subproblem;
+
+    signed:   ac.SignedRequest;
+    nonce_attempts: usize;
+    answer:   ac.Response;
+    failure:  problem.Error;
+    state:    State;
+    live:     bool;
+}
+
+fun storage(session: *Session) ac.DirectoryStorage {
+    ret ac.DirectoryStorage{data: ?session.directory_bytes[0],
+        capacity: DIRECTORY_BYTES, caa_items: ?session.caa[0],
+        caa_capacity: CAA_ITEMS};
+}
+
+fun problem_storage(session: *Session) ac.ProblemStorage {
+    ret ac.ProblemStorage{data: ?session.problem_bytes[0],
+        capacity: PROBLEM_BYTES, subproblems: ?session.subproblems[0],
+        subproblem_capacity: SUBPROBLEMS};
+}
+
+fun fail(session: *Session, cause: problem.Error) Status {
+    session.failure = cause;
+    session.state = BROKEN;
+    ret FAILED;
+}
+
+fun fail_local(session: *Session, detail: str) Status {
+    ret fail(session, problem.local(problem.STATE, detail));
+}
+
+pub fun make(session: *Session, directory_url: view.View) Status {
+    if (session == nil || directory_url.data == nil
+     || directory_url.len == 0 || directory_url.len > MAX_URL_BYTES) {
+        ret INVALID;
+    }
+    session.live = false;
+    session.discovered = false;
+    session.state = IDLE;
+    session.failure = problem.none();
+    session.configured = limits();
+    var i: usize = 0;
+    for (i < directory_url.len) {
+        session.directory_url[i] = directory_url.data[i];
+        i = i + 1;
+    }
+    session.directory_url_len = directory_url.len;
+    session.memory.initialized = false;
+    val prepared: problem.Error = nonce.init_memory(?session.memory,
+        ?session.slots[0], NONCE_SLOTS, ?session.nonce_bytes[0], 512,
+        MAX_NONCE_BYTES);
+    if (problem.failed(prepared)) { ret FAILED; }
+    var pool: nonce.Pool = nonce.pool(?session.memory);
+    val started: problem.Error = ac.init(?session.protocol, ?pool,
+        session.configured);
+    if (problem.failed(started)) { ret FAILED; }
+    session.live = true;
+    ret OK;
+}
+
+pub fun release(session: *Session) bool {
+    if (session == nil || !session.live) { ret false; }
+    ac.release(?session.protocol);
+    nonce.release_memory(?session.memory);
+    session.live = false;
+    ret true;
+}
+
+pub fun directory_view(session: *Session) view.View {
+    ret view.view(?session.directory_url[0], session.directory_url_len);
+}
+
+pub fun discovered(session: *Session) bool {
+    ret session != nil && session.discovered;
+}
+
+pub fun directory(session: *Session) ac.Directory {
+    ret session.directory;
+}
+
+pub fun failure(session: *Session) problem.Error {
+    ret session.failure;
+}
+
+pub fun state(session: *Session) State {
+    if (session == nil) { ret BROKEN; }
+    ret session.state;
+}
+
+# the completed response. its views point into the transport's buffer and stay
+# valid until the next exchange begins.
+pub fun response(session: *Session) ac.Response {
+    ret session.answer;
+}
+
+pub fun begin_discovery(session: *Session) Status {
+    if (session == nil || !session.live) { ret INVALID; }
+    if (session.state != IDLE && session.state != READY) { ret INVALID; }
+    session.failure = problem.none();
+    session.state = DISCOVER_SEND;
+    ret PENDING;
+}
+
+# mach-acme's account, order, challenge, and certificate modules initialize
+# the signed request themselves, because each binds its own payload and
+# endpoint. the caller reaches those through `protocol` and `request`, then
+# hands the prepared request back here to be signed and sent.
+pub fun protocol(session: *Session) *ac.Client {
+    ret ?session.protocol;
+}
+
+pub fun request(session: *Session) *ac.SignedRequest {
+    ret ?session.signed;
+}
+
+pub fun scratch(session: *Session) *u8 {
+    ret ?session.scratch[0];
+}
+
+# sends the request the caller has already initialized. every byte it points
+# at must stay alive and unchanged until the exchange completes, because the
+# protocol binds the exact url, payload, and account identity by digest.
+pub fun begin_prepared(session: *Session) Status {
+    if (session == nil || !session.live || !session.discovered) { ret INVALID; }
+    if (session.state != IDLE && session.state != READY) { ret INVALID; }
+    session.nonce_attempts = 0;
+    session.failure = problem.none();
+    session.state = SIGN;
+    ret PENDING;
+}
+
+fun send(session: *Session, engine: *transport.Transport,
+    request: ac.WireRequest, now: time.Time, next: State) Status {
+    if (problem.failed(request.error)) { ret fail(session, request.error); }
+    transport.finish(engine);
+    val begun: transport.Status = transport.begin(engine, request, now);
+    if (begun == transport.FAILED || begun == transport.INVALID) {
+        ret fail_local(session, "acme request could not be sent");
+    }
+    session.state = next;
+    ret PENDING;
+}
+
+fun await(session: *Session, engine: *transport.Transport,
+    now: time.Time) transport.Status {
+    ret transport.poll(engine, now);
+}
+
+# a signing attempt with no stored nonce is not a failure: the protocol layer
+# marks the request as needing one and the caller fetches it. the attempt
+# budget bounds that exchange so a nonce endpoint that never satisfies the
+# pool cannot spin.
+fun needs_nonce(session: *Session) Status {
+    if (session.nonce_attempts >= MAX_NONCE_ATTEMPTS) {
+        ret fail_local(session, "the authority never supplied a usable nonce");
+    }
+    session.nonce_attempts = session.nonce_attempts + 1;
+    session.state = NONCE_SEND;
+    ret PENDING;
+}
+
+fun sign(session: *Session, key: *keys.Key) Status {
+    if (session.signed.state == ac.REQUEST_NEEDS_NONCE) {
+        ret needs_nonce(session);
+    }
+    var scratch: [keys.SCALAR_BYTES]^u8;
+    val private: jose.PrivateKey = keys.private_key(key, ?scratch[0]);
+    val operation: jose.Operation = ac.prepare_signed(?session.protocol,
+        ?session.signed, keys.signer(key), private, jose.no_entropy(),
+        contracts.Buffer{data: ?session.work[0], capacity: WORK_BYTES},
+        contracts.Buffer{data: ?session.wire[0], capacity: WIRE_BYTES});
+    ct_zeroize(?scratch[0]);
+    if (problem.failed(operation.error)) {
+        if (session.signed.state == ac.REQUEST_NEEDS_NONCE) {
+            ret needs_nonce(session);
+        }
+        ret fail(session, operation.error);
+    }
+    session.state = SEND;
+    ret PENDING;
+}
+
+fun ct_zeroize(scratch: *^u8) {
+    ct.zeroize(scratch, keys.SCALAR_BYTES);
+}
+
+# advances the conversation by one step. `key` is the account key; it is
+# classified into a stack buffer for the exact signing call and zeroized
+# immediately after.
+pub fun poll(session: *Session, engine: *transport.Transport, key: *keys.Key,
+    now: time.Time) Status {
+    if (session == nil || !session.live || engine == nil || key == nil) {
+        ret INVALID;
+    }
+    if (session.state == READY) { ret OK; }
+    if (session.state == BROKEN) { ret FAILED; }
+    if (session.state == IDLE) { ret INVALID; }
+
+    if (session.state == DISCOVER_SEND) {
+        ret send(session, engine, ac.discovery_request(directory_view(session),
+            session.configured), now, DISCOVER_WAIT);
+    }
+    if (session.state == DISCOVER_WAIT) {
+        val progress: transport.Status = await(session, engine, now);
+        if (progress == transport.PENDING) { ret PENDING; }
+        if (progress != transport.OK) {
+            ret fail_local(session, "acme directory could not be fetched");
+        }
+        val parsed: problem.Error = ac.parse_directory(
+            transport.response(engine), session.configured,
+            ?session.scratch[0], SCRATCH_BYTES, storage(session),
+            ?session.directory);
+        transport.finish(engine);
+        if (problem.failed(parsed)) { ret fail(session, parsed); }
+        session.discovered = true;
+        session.state = READY;
+        ret OK;
+    }
+    if (session.state == NONCE_SEND) {
+        ret send(session, engine, ac.nonce_request(?session.protocol,
+            session.directory), now, NONCE_WAIT);
+    }
+    if (session.state == NONCE_WAIT) {
+        val progress: transport.Status = await(session, engine, now);
+        if (progress == transport.PENDING) { ret PENDING; }
+        if (progress != transport.OK) {
+            ret fail_local(session, "acme nonce could not be fetched");
+        }
+        val accepted: problem.Error = ac.accept_nonce_response(
+            ?session.protocol, ?session.signed, transport.response(engine));
+        transport.finish(engine);
+        if (problem.failed(accepted)) { ret fail(session, accepted); }
+        session.state = SIGN;
+        ret PENDING;
+    }
+    if (session.state == SIGN) { ret sign(session, key); }
+    if (session.state == SEND) {
+        ret send(session, engine, ac.signed_wire(?session.protocol,
+            ?session.signed), now, WAIT);
+    }
+    if (session.state == WAIT) {
+        val progress: transport.Status = await(session, engine, now);
+        if (progress == transport.PENDING) { ret PENDING; }
+        if (progress != transport.OK) {
+            ret fail_local(session, "acme request did not complete");
+        }
+        session.answer = transport.response(engine);
+        val decision: ac.Decision = ac.accept_signed_response(
+            ?session.protocol, ?session.signed, session.answer,
+            ?session.scratch[0], SCRATCH_BYTES, problem_storage(session));
+        if (decision.action == ac.ACTION_COMPLETE) {
+            session.state = READY;
+            ret OK;
+        }
+        if (decision.action == ac.ACTION_RETRY_SIGNED) {
+            session.state = SIGN;
+            ret PENDING;
+        }
+        if (decision.action == ac.ACTION_ACQUIRE_NONCE) {
+            session.state = NONCE_SEND;
+            ret PENDING;
+        }
+        ret fail(session, decision.cause);
+    }
+    ret INVALID;
+}
+
+# releases the exchange the completed response points into
+pub fun complete(session: *Session, engine: *transport.Transport) bool {
+    if (session == nil || engine == nil) { ret false; }
+    transport.finish(engine);
+    if (session.state == READY) { session.state = IDLE; }
+    ret true;
+}
+
+val DIRECTORY_BODY: str = "{\"newNonce\":\"https://acme.example/nonce\",\"newAccount\":\"https://acme.example/new-account\",\"newOrder\":\"https://acme.example/new-order\",\"revokeCert\":\"https://acme.example/revoke\",\"keyChange\":\"https://acme.example/key-change\"}";
+
+rec Harness {
+    request:  [4096]u8;
+    response: [8192]u8;
+    items:    [64]field.Field;
+    engine:   transport.Transport;
+    session:  Session;
+    url:      [64]u8;
+    reply:    [512]u8;
+}
+
+fun string_length(value: str) usize {
+    var i: usize = 0;
+    for (value[i] != 0) { i = i + 1; }
+    ret i;
+}
+
+fun put_str(target: *u8, at: usize, value: str) usize {
+    var i: usize = 0;
+    for (value[i] != 0) {
+        target[at + i] = value[i];
+        i = i + 1;
+    }
+    ret at + i;
+}
+
+fun put_number(target: *u8, at: usize, value: usize) usize {
+    var digits: [20]u8;
+    var count: usize = 0;
+    var remaining: usize = value;
+    for (true) {
+        digits[count] = ('0' + (remaining % 10)::u8);
+        count = count + 1;
+        remaining = remaining / 10;
+        if (remaining == 0) { brk; }
+    }
+    var i: usize = 0;
+    for (i < count) {
+        target[at + i] = digits[count - 1 - i];
+        i = i + 1;
+    }
+    ret at + count;
+}
+
+# rfc 8555 urls are https and mach-acme refuses anything else, so a local
+# authority is named as https and reached through a configured cleartext
+# origin, exactly as the reference conformance stack does
+fun harness_url(harness: *Harness) view.View {
+    val at: usize = put_str(?harness.url[0], 0, "https://acme.example/dir");
+    ret view.view(?harness.url[0], at);
+}
+
+fun contains(data: *u8, len: usize, needle: str) bool {
+    val wanted: usize = string_length(needle);
+    if (wanted == 0 || len < wanted) { ret false; }
+    var at: usize = 0;
+    for (at + wanted <= len) {
+        var i: usize = 0;
+        for (i < wanted && data[at + i] == needle[i]) { i = i + 1; }
+        if (i == wanted) { ret true; }
+        at = at + 1;
+    }
+    ret false;
+}
+
+fun harness_reply(harness: *Harness) usize {
+    val body: usize = string_length(DIRECTORY_BODY);
+    var at: usize = put_str(?harness.reply[0], 0,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ");
+    at = put_number(?harness.reply[0], at, body);
+    at = put_str(?harness.reply[0], at, "\r\n\r\n");
+    at = put_str(?harness.reply[0], at, DIRECTORY_BODY);
+    ret at;
+}
+
+test "acme session: discovery reaches a directory over a real socket" {
+    val listening: R.Result[tcp.Listener, io_error.Error] = tcp.listen(
+        ip.endpoint(127, 0, 0, 1, 0), 4);
+    if (R.is_err[tcp.Listener, io_error.Error](listening)) { ret 1; }
+    var server: tcp.Listener = R.unwrap_ok[tcp.Listener, io_error.Error](listening);
+    val bound: R.Result[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?server);
+    if (R.is_err[ip.Endpoint, io_error.Error](bound)) {
+        tcp.listener_close(?server);
+        ret 2;
+    }
+    val endpoint: ip.Endpoint = R.unwrap_ok[ip.Endpoint, io_error.Error](bound);
+    var harness: Harness;
+    if (!transport.make(?harness.engine, ?harness.request[0], 4096,
+        ?harness.response[0], 8192, ?harness.items[0], 64,
+        field.limits(64, 16384, 128, 4096), transport.literal_addresses())) {
+        tcp.listener_close(?server);
+        ret 3;
+    }
+    var account: keys.Key;
+    if (!keys.generate(?account)) {
+        tcp.listener_close(?server);
+        ret 4;
+    }
+    if (!transport.set_origin(?harness.engine,
+        transport.cleartext_origin(endpoint))) {
+        tcp.listener_close(?server);
+        ret 5;
+    }
+    if (make(?harness.session, harness_url(?harness)) != OK) {
+        tcp.listener_close(?server);
+        ret 13;
+    }
+    if (begin_discovery(?harness.session) != PENDING) {
+        tcp.listener_close(?server);
+        ret 6;
+    }
+    var status: Status = PENDING;
+    var accepted: bool = false;
+    var answered: bool = false;
+    var peer: tcp.Stream;
+    var received: [2048]u8;
+    var total: usize = 0;
+    var rounds: usize = 0;
+    for (status == PENDING && rounds < 8192) {
+        status = poll(?harness.session, ?harness.engine, ?account, time.now());
+        if (!accepted && transport.stage(?harness.engine) != transport.IDLE
+         && transport.stage(?harness.engine) != transport.RESOLVING) {
+            val incoming: R.Result[tcp.Stream, io_error.Error] = tcp.accept(?server);
+            if (!R.is_err[tcp.Stream, io_error.Error](incoming)) {
+                peer = R.unwrap_ok[tcp.Stream, io_error.Error](incoming);
+                tcp.stream_set_read_timeout(?peer, 1000);
+                accepted = true;
+            }
+        }
+        if (accepted && !answered) {
+            val read: R.Result[usize, io_error.Error] = tcp.stream_read(?peer,
+                ?received[total], 2048 - total);
+            if (!R.is_err[usize, io_error.Error](read)) {
+                total = total + R.unwrap_ok[usize, io_error.Error](read);
+            }
+            if (total >= 4 && received[total - 1] == 10
+             && received[total - 2] == 13 && received[total - 3] == 10
+             && received[total - 4] == 13) {
+                val length: usize = harness_reply(?harness);
+                tcp.stream_write(?peer, ?harness.reply[0], length);
+                answered = true;
+            }
+        }
+        rounds = rounds + 1;
+    }
+    if (accepted) { tcp.stream_close(?peer); }
+    tcp.listener_close(?server);
+    if (status != OK) { ret 7; }
+    if (!discovered(?harness.session)) { ret 8; }
+    val found: ac.Directory = directory(?harness.session);
+    if (!view.view_eq_str(found.new_nonce_url, "https://acme.example/nonce")) { ret 9; }
+    if (!view.view_eq_str(found.new_order_url, "https://acme.example/new-order")) { ret 10; }
+    if (!view.view_eq_str(found.new_account_url,
+        "https://acme.example/new-account")) { ret 11; }
+    # the request the session sent was a plain GET for the configured path
+    if (total < 8 || received[0] != 'G' || received[4] != '/'
+     || received[5] != 'd') { ret 12; }
+    # the host header carries the url's authority, not the origin it was
+    # actually reached at
+    if (!contains(?received[0], total, "acme.example")) { ret 14; }
+    complete(?harness.session, ?harness.engine);
+    release(?harness.session);
+    transport.destroy(?harness.engine);
+    keys.destroy(?account);
+    ret 0;
+}

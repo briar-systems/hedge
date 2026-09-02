@@ -1,0 +1,613 @@
+# HTTP caching policy
+#
+# RFC 9111. Every decision here is a policy decision about someone else's bytes,
+# so the failure direction is always toward not storing and not reusing. Hedge is
+# a shared cache: `private`, `Authorization`, and `Vary: *` are all disqualifying
+# unless the origin said otherwise in the specific way the specification requires.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use std.chrono.time;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http_date: hedge.http.date;
+use directives: hedge.http.cache_control;
+
+pub def Storable: u8;
+pub val STORE: Storable = 1;
+pub val SKIP_METHOD: Storable = 2;
+pub val SKIP_STATUS: Storable = 3;
+pub val SKIP_NO_STORE: Storable = 4;
+pub val SKIP_PRIVATE: Storable = 5;
+pub val SKIP_AUTHORIZATION: Storable = 6;
+pub val SKIP_VARY_ANY: Storable = 7;
+pub val SKIP_NO_FRESHNESS: Storable = 8;
+pub val SKIP_PARTIAL: Storable = 9;
+pub val SKIP_SET_COOKIE: Storable = 10;
+
+pub def Reuse: u8;
+pub val FRESH: Reuse = 1;
+pub val STALE_SERVABLE: Reuse = 2;
+pub val REVALIDATE: Reuse = 3;
+pub val UNUSABLE: Reuse = 4;
+
+pub rec Limits {
+    # a shared cache may guess a lifetime from Last-Modified; guessing is
+    # permitted, not required, and defaults off because a wrong guess serves a
+    # stale representation nobody asked it to keep
+    heuristic_percent: u64;
+    max_heuristic_ns: u64;
+    max_lifetime_ns: u64;
+}
+
+pub fun default_limits() Limits {
+    ret Limits{heuristic_percent: 0, max_heuristic_ns: 86400000000000, max_lifetime_ns: 0};
+}
+
+# what a stored response must remember about when it arrived
+#
+# `describe` fills every field. `blank` exists for callers that need a Metadata
+# before they have a response to describe: naming every field is the only way to
+# be sure none of them carries whatever the stack held.
+pub rec Metadata {
+    status: status.Status;
+    has_date: bool;
+    date: time.Time;
+    requested_at: time.Time;
+    received_at: time.Time;
+    age_value: u64;
+    lifetime_ns: u64;
+    has_lifetime: bool;
+    must_revalidate: bool;
+    no_cache: bool;
+    stale_while_revalidate: u64;
+    stale_if_error: u64;
+    has_last_modified: bool;
+    last_modified: time.Time;
+}
+
+pub fun blank() Metadata {
+    ret Metadata{
+        status: 0,
+        has_date: false,
+        date: time.unix(0, 0),
+        requested_at: time.unix(0, 0),
+        received_at: time.unix(0, 0),
+        age_value: 0,
+        lifetime_ns: 0,
+        has_lifetime: false,
+        must_revalidate: false,
+        no_cache: false,
+        stale_while_revalidate: directives.NO_DELTA,
+        stale_if_error: directives.NO_DELTA,
+        has_last_modified: false,
+        last_modified: time.unix(0, 0),
+    };
+}
+
+fun header(fields: *field.Fields, name: str, length: usize) view.View {
+    if (fields == nil) { ret view.view(nil, 0); }
+    val found: *field.Field = field.find_first(fields, view.view(name, length));
+    if (found == nil) { ret view.view(nil, 0); }
+    ret found.value;
+}
+
+fun present(value: view.View) bool {
+    ret value.data != nil && value.len != 0;
+}
+
+fun seconds(value: view.View, output: *u64) bool {
+    if (!present(value)) { ret false; }
+    var total: u64 = 0;
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (c < '0' || c > '9') { ret false; }
+        total = total * 10 + (c - '0')::u64;
+        if (total > 0xffffffff) { total = 0xffffffff; }
+        i = i + 1;
+    }
+    @output = total;
+    ret true;
+}
+
+# RFC 9111 section 6.1: statuses a cache may store without explicit freshness
+fun cacheable_by_default(code: status.Status) bool {
+    ret code == status.OK || code == status.NON_AUTHORITATIVE_INFORMATION
+     || code == status.NO_CONTENT || code == status.PARTIAL_CONTENT
+     || code == status.MULTIPLE_CHOICES || code == status.MOVED_PERMANENTLY
+     || code == status.NOT_FOUND || code == status.METHOD_NOT_ALLOWED
+     || code == status.GONE || code == status.URI_TOO_LONG
+     || code == status.NOT_IMPLEMENTED || code == status.PERMANENT_REDIRECT;
+}
+
+# is a field the origin singled out as belonging to one user rather than to the
+# representation, through a qualified `private=` or `no-cache=`
+pub fun excluded_field(response_directives: directives.Directives, name: view.View) bool {
+    if (response_directives.private_qualified
+     && directives.lists_field(response_directives.private_fields, name)) { ret true; }
+    ret response_directives.no_cache_qualified
+     && directives.lists_field(response_directives.no_cache_fields, name);
+}
+
+# a shared cache that stored a `Set-Cookie` would hand one client's session to
+# every client that followed. The origin may say it thought about that, by naming
+# the field in a qualified `private=` or `no-cache=`, and then the rest of the
+# response is storable without it. Silence is not that statement, so a response
+# carrying an unqualified `Set-Cookie` is not stored at all.
+pub fun set_cookie_unsafe(fields: *field.Fields,
+    response_directives: directives.Directives) bool {
+    if (fields == nil || fields.items == nil) { ret false; }
+    val name: view.View = view.view(field.SET_COOKIE, 10);
+    var i: usize = 0;
+    for (i < fields.len) {
+        val item: *field.Field = ?fields.items[i];
+        if (item.name.len == 10) {
+            var matched: bool = true;
+            var j: usize = 0;
+            for (j < 10) {
+                var c: u8 = item.name.data[j];
+                if (c >= 'A' && c <= 'Z') { c = c + 32; }
+                if (c != field.SET_COOKIE[j]) { matched = false; }
+                j = j + 1;
+            }
+            if (matched && !excluded_field(response_directives, name)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun vary_is_any(fields: *field.Fields) bool {
+    if (fields == nil || fields.items == nil) { ret false; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        val item: *field.Field = ?fields.items[i];
+        if (item.name.len == 4) {
+            val name: str = "vary";
+            var matched: bool = true;
+            var j: usize = 0;
+            for (j < 4) {
+                var c: u8 = item.name.data[j];
+                if (c >= 'A' && c <= 'Z') { c = c + 32; }
+                if (c != name[j]) { matched = false; }
+                j = j + 1;
+            }
+            if (matched) {
+                var k: usize = 0;
+                for (k < item.value.len) {
+                    if (item.value.data[k] == '*') { ret true; }
+                    k = k + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun difference_ns(later: time.Time, earlier: time.Time) u64 {
+    if (later.sec < earlier.sec
+     || (later.sec == earlier.sec && later.nsec <= earlier.nsec)) { ret 0; }
+    val gap: i64 = later.sec - earlier.sec;
+    if (gap > 9223372035) { ret 0xffffffffffffffff; }
+    ret (gap * 1000000000 + (later.nsec - earlier.nsec))::u64;
+}
+
+fun scale_ns(seconds_value: u64) u64 {
+    if (seconds_value > 9223372035) { ret 0xffffffffffffffff; }
+    ret seconds_value * 1000000000;
+}
+
+# an absent delta is zero, not an enormous one: a directive nobody sent must not
+# license serving a stale representation
+fun delta_ns(seconds_value: u64) u64 {
+    if (seconds_value == directives.NO_DELTA) { ret 0; }
+    ret scale_ns(seconds_value);
+}
+
+# is this response worth storing at all, and if not, exactly why
+pub fun storable(request: *message.Request, response_fields: *field.Fields,
+    code: status.Status, request_directives: directives.Directives,
+    response_directives: directives.Directives, configured: Limits) Storable {
+    if (request == nil) { ret SKIP_METHOD; }
+    if (request.method.kind != method.GET && request.method.kind != method.HEAD) {
+        ret SKIP_METHOD;
+    }
+    # a 304 updates a selected stored response. it is not a representation that
+    # can stand alone when no stored response was selected.
+    if (code == status.NOT_MODIFIED) { ret SKIP_STATUS; }
+    if (request_directives.no_store || response_directives.no_store) { ret SKIP_NO_STORE; }
+    # a shared cache must not keep a response marked for one user
+    if (response_directives.private_response && !response_directives.private_qualified) {
+        ret SKIP_PRIVATE;
+    }
+    if (vary_is_any(response_fields)) { ret SKIP_VARY_ANY; }
+    if (set_cookie_unsafe(response_fields, response_directives)) { ret SKIP_SET_COOKIE; }
+    # a partial representation is not stored here: reassembling ranges would let a
+    # client choose which bytes of a representation the next client sees
+    if (code == status.PARTIAL_CONTENT) { ret SKIP_PARTIAL; }
+    if (!status.is_final(code)) { ret SKIP_STATUS; }
+    val explicit: bool = response_directives.s_maxage != directives.NO_DELTA
+        || response_directives.max_age != directives.NO_DELTA
+        || response_directives.public_response
+        || present(header(response_fields, "expires", 7));
+    # RFC 9111 section 3.5: an authorized request needs an explicit invitation
+    if (present(header(?request.fields, field.AUTHORIZATION, 13))) {
+        if (!response_directives.public_response && !response_directives.must_revalidate
+         && response_directives.s_maxage == directives.NO_DELTA) {
+            ret SKIP_AUTHORIZATION;
+        }
+    }
+    if (!cacheable_by_default(code) && !explicit) { ret SKIP_STATUS; }
+    if (!explicit && configured.heuristic_percent == 0
+     && !present(header(response_fields, field.LAST_MODIFIED, 13))) {
+        ret SKIP_NO_FRESHNESS;
+    }
+    ret STORE;
+}
+
+# record what this response says about its own freshness, at the moment it arrived
+pub fun describe(response_fields: *field.Fields, code: status.Status,
+    response_directives: directives.Directives, requested_at: time.Time,
+    received_at: time.Time, configured: Limits) Metadata {
+    var result: Metadata;
+    result.status = code;
+    result.requested_at = requested_at;
+    result.received_at = received_at;
+    result.has_date = http_date.parse(header(response_fields, field.DATE, 4), ?result.date);
+    result.age_value = 0;
+    seconds(header(response_fields, "age", 3), ?result.age_value);
+    result.must_revalidate = response_directives.must_revalidate
+        || response_directives.proxy_revalidate;
+    result.no_cache = response_directives.no_cache && !response_directives.no_cache_qualified;
+    result.stale_while_revalidate = response_directives.stale_while_revalidate;
+    result.stale_if_error = response_directives.stale_if_error;
+    result.has_last_modified = http_date.parse(
+        header(response_fields, field.LAST_MODIFIED, 13), ?result.last_modified);
+    result.has_lifetime = false;
+    result.lifetime_ns = 0;
+    if (response_directives.s_maxage != directives.NO_DELTA) {
+        result.has_lifetime = true;
+        result.lifetime_ns = scale_ns(response_directives.s_maxage);
+    } or (response_directives.max_age != directives.NO_DELTA) {
+        result.has_lifetime = true;
+        result.lifetime_ns = scale_ns(response_directives.max_age);
+    } or {
+        var expires: time.Time;
+        if (http_date.parse(header(response_fields, "expires", 7), ?expires) && result.has_date) {
+            result.has_lifetime = true;
+            result.lifetime_ns = difference_ns(expires, result.date);
+        } or (configured.heuristic_percent != 0 && result.has_last_modified && result.has_date) {
+            val since: u64 = difference_ns(result.date, result.last_modified);
+            var guess: u64 = since / 100 * configured.heuristic_percent;
+            if (guess > configured.max_heuristic_ns) { guess = configured.max_heuristic_ns; }
+            result.has_lifetime = true;
+            result.lifetime_ns = guess;
+        }
+    }
+    if (configured.max_lifetime_ns != 0 && result.lifetime_ns > configured.max_lifetime_ns) {
+        result.lifetime_ns = configured.max_lifetime_ns;
+    }
+    ret result;
+}
+
+# RFC 9111 section 4.2.3
+pub fun current_age(stored: Metadata, now: time.Time) u64 {
+    var apparent: u64 = 0;
+    if (stored.has_date) { apparent = difference_ns(stored.received_at, stored.date); }
+    var corrected: u64 = scale_ns(stored.age_value);
+    val response_delay: u64 = difference_ns(stored.received_at,
+        stored.requested_at);
+    if (corrected > 0xffffffffffffffff - response_delay) {
+        corrected = 0xffffffffffffffff;
+    } or { corrected = corrected + response_delay; }
+    if (apparent > corrected) { corrected = apparent; }
+    val resident: u64 = difference_ns(now, stored.received_at);
+    if (corrected > 0xffffffffffffffff - resident) { ret 0xffffffffffffffff; }
+    ret corrected + resident;
+}
+
+pub fun fresh_for(stored: Metadata) u64 {
+    if (!stored.has_lifetime) { ret 0; }
+    ret stored.lifetime_ns;
+}
+
+# may this stored response answer this request, and on what terms
+pub fun reuse(stored: Metadata, request_directives: directives.Directives,
+    now: time.Time) Reuse {
+    if (request_directives.no_store) { ret UNUSABLE; }
+    # a request's own `no-cache` demands validation whatever the stored age says
+    if (request_directives.no_cache) { ret REVALIDATE; }
+    if (stored.no_cache) { ret REVALIDATE; }
+    val age: u64 = current_age(stored, now);
+    val lifetime: u64 = fresh_for(stored);
+    var required: u64 = 0;
+    if (request_directives.min_fresh != directives.NO_DELTA) {
+        required = scale_ns(request_directives.min_fresh);
+    }
+    if (required > 0xffffffffffffffff - age) { ret REVALIDATE; }
+    if (age + required < lifetime) {
+        if (request_directives.max_age != directives.NO_DELTA
+         && age >= scale_ns(request_directives.max_age)) { ret REVALIDATE; }
+        ret FRESH;
+    }
+    # the response is stale from here on
+    if (stored.must_revalidate) { ret REVALIDATE; }
+    val staleness: u64 = age - lifetime;
+    if (request_directives.max_stale_present) {
+        if (request_directives.max_stale == directives.NO_DELTA) { ret STALE_SERVABLE; }
+        if (staleness <= delta_ns(request_directives.max_stale)) { ret STALE_SERVABLE; }
+    }
+    if (stored.stale_while_revalidate != directives.NO_DELTA
+     && staleness <= delta_ns(stored.stale_while_revalidate)) { ret STALE_SERVABLE; }
+    ret REVALIDATE;
+}
+
+# a stale response may answer a failed revalidation within `stale-if-error`
+pub fun servable_on_error(stored: Metadata, now: time.Time) bool {
+    if (stored.must_revalidate || stored.no_cache) { ret false; }
+    val age: u64 = current_age(stored, now);
+    val lifetime: u64 = fresh_for(stored);
+    if (age < lifetime) { ret true; }
+    if (stored.stale_if_error == directives.NO_DELTA) { ret false; }
+    ret age - lifetime <= delta_ns(stored.stale_if_error);
+}
+
+pub fun revalidation_failure(code: status.Status) bool {
+    ret code == status.INTERNAL_SERVER_ERROR || code == status.BAD_GATEWAY
+        || code == status.SERVICE_UNAVAILABLE || code == status.GATEWAY_TIMEOUT;
+}
+
+# RFC 9111 section 4.4: an unsafe method invalidates what the cache holds
+pub fun invalidates(request_method: method.Kind, code: status.Status) bool {
+    if (request_method == method.GET || request_method == method.HEAD
+     || request_method == method.OPTIONS || request_method == method.TRACE) { ret false; }
+    ret code < 400;
+}
+
+fun test_fields(items: *field.Field, capacity: usize) field.Fields {
+    ret field.init(items, capacity, field.limits(capacity, 1024, 64, 256));
+}
+
+fun add(fields: *field.Fields, name: str, name_length: usize, value: str, value_length: usize) {
+    field.append(fields, field.Field{
+        name: view.view(name, name_length),
+        value: view.view(value, value_length),
+        sensitive: false,
+    });
+}
+
+test "cache policy: an explicitly fresh response is storable and fresh" {
+    var items: [2]field.Field;
+    var fields: field.Fields = test_fields(?items[0], 2);
+    add(?fields, "cache-control", 13, "max-age=60", 10);
+    add(?fields, "date", 4, "Sun, 06 Nov 1994 08:49:37 GMT", 29);
+    val response: directives.Directives = directives.parse(?fields);
+    val received: time.Time = time.unix(784111777, 0);
+    val stored: Metadata = describe(?fields, status.OK, response, received, received,
+        default_limits());
+    if (!stored.has_lifetime || stored.lifetime_ns != 60000000000) { ret 1; }
+    if (current_age(stored, received) != 0) { ret 2; }
+    if (reuse(stored, directives.none(), received) != FRESH) { ret 3; }
+    if (reuse(stored, directives.none(), time.unix(784111777 + 30, 0)) != FRESH) { ret 4; }
+    if (reuse(stored, directives.none(), time.unix(784111777 + 61, 0)) != REVALIDATE) { ret 5; }
+    ret 0;
+}
+
+test "cache policy: an Age header ages a response before it was ever stored" {
+    var items: [3]field.Field;
+    var fields: field.Fields = test_fields(?items[0], 3);
+    add(?fields, "cache-control", 13, "max-age=60", 10);
+    add(?fields, "date", 4, "Sun, 06 Nov 1994 08:49:37 GMT", 29);
+    add(?fields, "age", 3, "50", 2);
+    val response: directives.Directives = directives.parse(?fields);
+    val received: time.Time = time.unix(784111777, 0);
+    val stored: Metadata = describe(?fields, status.OK, response, received, received,
+        default_limits());
+    if (current_age(stored, received) != 50000000000) { ret 1; }
+    if (reuse(stored, directives.none(), received) != FRESH) { ret 2; }
+    if (reuse(stored, directives.none(), time.unix(784111777 + 11, 0)) != REVALIDATE) { ret 3; }
+    ret 0;
+}
+
+test "cache policy: refreshed age includes the validation response delay" {
+    var items: [3]field.Field;
+    var fields: field.Fields = test_fields(?items[0], 3);
+    add(?fields, "cache-control", 13, "max-age=60", 10);
+    add(?fields, "date", 4, "Sun, 06 Nov 1994 08:49:42 GMT", 29);
+    add(?fields, "age", 3, "2", 1);
+    val response: directives.Directives = directives.parse(?fields);
+    val requested: time.Time = time.unix(784111777, 0);
+    val received: time.Time = time.unix(784111782, 0);
+    val stored: Metadata = describe(?fields, status.OK, response, requested,
+        received, default_limits());
+    # corrected age is Age(2) + response delay(5), then resident time(5)
+    if (current_age(stored, time.unix(784111787, 0)) != 12000000000) {
+        ret 1;
+    }
+    ret 0;
+}
+
+test "cache policy: no-store, private, and Vary any are never stored" {
+    var items: [2]field.Field;
+    var fields: field.Fields = test_fields(?items[0], 2);
+    add(?fields, "cache-control", 13, "no-store", 8);
+    var request_items: [1]field.Field;
+    var request_fields: field.Fields = test_fields(?request_items[0], 1);
+    var request: message.Request;
+    request.method = method.from_kind(method.GET);
+    request.fields = request_fields;
+    if (storable(?request, ?fields, status.OK, directives.none(),
+        directives.parse(?fields), default_limits()) != SKIP_NO_STORE) { ret 1; }
+    var private_items: [1]field.Field;
+    var private_fields: field.Fields = test_fields(?private_items[0], 1);
+    add(?private_fields, "cache-control", 13, "private, max-age=60", 19);
+    if (storable(?request, ?private_fields, status.OK, directives.none(),
+        directives.parse(?private_fields), default_limits()) != SKIP_PRIVATE) { ret 2; }
+    var vary_items: [2]field.Field;
+    var vary_fields: field.Fields = test_fields(?vary_items[0], 2);
+    add(?vary_fields, "cache-control", 13, "max-age=60", 10);
+    add(?vary_fields, "vary", 4, "*", 1);
+    if (storable(?request, ?vary_fields, status.OK, directives.none(),
+        directives.parse(?vary_fields), default_limits()) != SKIP_VARY_ANY) { ret 3; }
+    ret 0;
+}
+
+test "cache policy: an authorized request needs an explicit invitation to be shared" {
+    var response_items: [1]field.Field;
+    var response_fields: field.Fields = test_fields(?response_items[0], 1);
+    add(?response_fields, "cache-control", 13, "max-age=60", 10);
+    var request_items: [1]field.Field;
+    var request_fields: field.Fields = test_fields(?request_items[0], 1);
+    add(?request_fields, "authorization", 13, "Bearer x", 8);
+    var request: message.Request;
+    request.method = method.from_kind(method.GET);
+    request.fields = request_fields;
+    if (storable(?request, ?response_fields, status.OK, directives.none(),
+        directives.parse(?response_fields), default_limits()) != SKIP_AUTHORIZATION) { ret 1; }
+    var invited_items: [1]field.Field;
+    var invited: field.Fields = test_fields(?invited_items[0], 1);
+    add(?invited, "cache-control", 13, "public, max-age=60", 18);
+    if (storable(?request, ?invited, status.OK, directives.none(),
+        directives.parse(?invited), default_limits()) != STORE) { ret 2; }
+    var shared_items: [1]field.Field;
+    var shared: field.Fields = test_fields(?shared_items[0], 1);
+    add(?shared, "cache-control", 13, "s-maxage=60", 11);
+    if (storable(?request, ?shared, status.OK, directives.none(),
+        directives.parse(?shared), default_limits()) != STORE) { ret 3; }
+    ret 0;
+}
+
+test "cache policy: only understood methods and whole representations are stored" {
+    var response_items: [1]field.Field;
+    var response_fields: field.Fields = test_fields(?response_items[0], 1);
+    add(?response_fields, "cache-control", 13, "max-age=60", 10);
+    var request_items: [1]field.Field;
+    var request_fields: field.Fields = test_fields(?request_items[0], 1);
+    var request: message.Request;
+    request.fields = request_fields;
+    request.method = method.from_kind(method.POST);
+    if (storable(?request, ?response_fields, status.OK, directives.none(),
+        directives.parse(?response_fields), default_limits()) != SKIP_METHOD) { ret 1; }
+    request.method = method.from_kind(method.GET);
+    if (storable(?request, ?response_fields, status.PARTIAL_CONTENT, directives.none(),
+        directives.parse(?response_fields), default_limits()) != SKIP_PARTIAL) { ret 2; }
+    # a status with no default cacheability and no explicit freshness is not stored
+    var bare_items: [1]field.Field;
+    var bare: field.Fields = test_fields(?bare_items[0], 1);
+    if (storable(?request, ?bare, status.CREATED, directives.none(),
+        directives.parse(?bare), default_limits()) != SKIP_STATUS) { ret 3; }
+    if (storable(?request, ?bare, status.OK, directives.none(),
+        directives.parse(?bare), default_limits()) != SKIP_NO_FRESHNESS) { ret 4; }
+    ret 0;
+}
+
+test "cache policy: must-revalidate refuses to serve stale, stale-while-revalidate allows it" {
+    var strict_items: [2]field.Field;
+    var strict: field.Fields = test_fields(?strict_items[0], 2);
+    add(?strict, "cache-control", 13, "max-age=10, must-revalidate", 27);
+    add(?strict, "date", 4, "Sun, 06 Nov 1994 08:49:37 GMT", 29);
+    val received: time.Time = time.unix(784111777, 0);
+    val strict_stored: Metadata = describe(?strict, status.OK, directives.parse(?strict),
+        received, received, default_limits());
+    if (reuse(strict_stored, directives.none(), time.unix(784111777 + 20, 0)) != REVALIDATE) { ret 1; }
+    var lenient_items: [2]field.Field;
+    var lenient: field.Fields = test_fields(?lenient_items[0], 2);
+    add(?lenient, "cache-control", 13, "max-age=10, stale-while-revalidate=60", 37);
+    add(?lenient, "date", 4, "Sun, 06 Nov 1994 08:49:37 GMT", 29);
+    val lenient_stored: Metadata = describe(?lenient, status.OK, directives.parse(?lenient),
+        received, received, default_limits());
+    if (reuse(lenient_stored, directives.none(), time.unix(784111777 + 20, 0)) != STALE_SERVABLE) { ret 2; }
+    if (reuse(lenient_stored, directives.none(), time.unix(784111777 + 200, 0)) != REVALIDATE) { ret 3; }
+    ret 0;
+}
+
+test "cache policy: a request may demand validation or accept staleness" {
+    var items: [2]field.Field;
+    var fields: field.Fields = test_fields(?items[0], 2);
+    add(?fields, "cache-control", 13, "max-age=10", 10);
+    add(?fields, "date", 4, "Sun, 06 Nov 1994 08:49:37 GMT", 29);
+    val received: time.Time = time.unix(784111777, 0);
+    val stored: Metadata = describe(?fields, status.OK, directives.parse(?fields),
+        received, received, default_limits());
+    var demand_items: [1]field.Field;
+    var demand: field.Fields = test_fields(?demand_items[0], 1);
+    add(?demand, "cache-control", 13, "no-cache", 8);
+    if (reuse(stored, directives.parse(?demand), received) != REVALIDATE) { ret 1; }
+    var tolerant_items: [1]field.Field;
+    var tolerant: field.Fields = test_fields(?tolerant_items[0], 1);
+    add(?tolerant, "cache-control", 13, "max-stale=100", 13);
+    if (reuse(stored, directives.parse(?tolerant), time.unix(784111777 + 50, 0)) != STALE_SERVABLE) { ret 2; }
+    var strict_items: [1]field.Field;
+    var strict: field.Fields = test_fields(?strict_items[0], 1);
+    add(?strict, "cache-control", 13, "min-fresh=20", 12);
+    if (reuse(stored, directives.parse(?strict), received) != REVALIDATE) { ret 3; }
+    ret 0;
+}
+
+test "cache policy: an unsafe method invalidates and a safe one does not" {
+    if (invalidates(method.GET, status.OK)) { ret 1; }
+    if (invalidates(method.HEAD, status.OK)) { ret 2; }
+    if (!invalidates(method.POST, status.CREATED)) { ret 3; }
+    if (!invalidates(method.DELETE, status.NO_CONTENT)) { ret 4; }
+    # a failed unsafe request changed nothing, so it invalidates nothing
+    if (invalidates(method.POST, status.INTERNAL_SERVER_ERROR)) { ret 5; }
+    ret 0;
+}
+
+test "cache policy: a shared cache refuses a response that sets a cookie" {
+    var request_items: [1]field.Field;
+    var request_fields: field.Fields = test_fields(?request_items[0], 1);
+    var request: message.Request;
+    request.method = method.from_kind(method.GET);
+    request.fields = request_fields;
+    var careless_items: [2]field.Field;
+    var careless: field.Fields = test_fields(?careless_items[0], 2);
+    add(?careless, "cache-control", 13, "max-age=60", 10);
+    add(?careless, "set-cookie", 10, "session=abc", 11);
+    # storing this would hand one client's session to the next one
+    if (storable(?request, ?careless, status.OK, directives.none(),
+        directives.parse(?careless), default_limits()) != SKIP_SET_COOKIE) { ret 1; }
+    # an origin that named the field said it thought about caches, so the rest
+    # of the representation is storable without it
+    var named_items: [2]field.Field;
+    var named: field.Fields = test_fields(?named_items[0], 2);
+    add(?named, "cache-control", 13, "private=\"set-cookie\", max-age=60", 31);
+    add(?named, "set-cookie", 10, "session=abc", 11);
+    val named_directives: directives.Directives = directives.parse(?named);
+    if (storable(?request, ?named, status.OK, directives.none(), named_directives,
+        default_limits()) != STORE) { ret 2; }
+    if (!excluded_field(named_directives, view.view("Set-Cookie", 10))) { ret 3; }
+    if (excluded_field(named_directives, view.view("etag", 4))) { ret 4; }
+    # and no-cache="set-cookie" is the same statement about reuse
+    var withheld_items: [2]field.Field;
+    var withheld: field.Fields = test_fields(?withheld_items[0], 2);
+    add(?withheld, "cache-control", 13, "no-cache=\"set-cookie\", max-age=60", 32);
+    add(?withheld, "set-cookie", 10, "session=abc", 11);
+    if (storable(?request, ?withheld, status.OK, directives.none(),
+        directives.parse(?withheld), default_limits()) != STORE) { ret 5; }
+    ret 0;
+}
+
+test "cache policy: a min-fresh beyond the representable range demands validation" {
+    var items: [2]field.Field;
+    var fields: field.Fields = test_fields(?items[0], 2);
+    add(?fields, "cache-control", 13, "max-age=600", 11);
+    add(?fields, "date", 4, "Sun, 06 Nov 1994 08:49:37 GMT", 29);
+    val received: time.Time = time.unix(784111777, 0);
+    val stored: Metadata = describe(?fields, status.OK, directives.parse(?fields),
+        received, received, default_limits());
+    var demand_items: [1]field.Field;
+    var demand: field.Fields = test_fields(?demand_items[0], 1);
+    add(?demand, "cache-control", 13, "min-fresh=99999999999999999999", 29);
+    # the demand must not wrap around into an apparently satisfied one
+    if (reuse(stored, directives.parse(?demand), received) != REVALIDATE) { ret 1; }
+    ret 0;
+}

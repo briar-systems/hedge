@@ -1,0 +1,267 @@
+# bounded quic timer scheduling with one heap node per connection slot
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use quic.transport;
+
+pub def Status: u8;
+pub val TIMER_OK: Status = 1;
+pub val TIMER_INVALID: Status = 2;
+pub val TIMER_STALE: Status = 3;
+pub val TIMER_FULL: Status = 4;
+pub val TIMER_EMPTY: Status = 5;
+pub val TIMER_NOT_DUE: Status = 6;
+
+pub rec Node {
+    timer: transport.Timer;
+    connection_slot: usize;
+    connection_generation: u64;
+}
+
+pub rec Position {
+    index: usize;
+    connection_generation: u64;
+    live: bool;
+}
+
+pub rec Queue {
+    nodes: *Node;
+    positions: *Position;
+    capacity: usize;
+    len: usize;
+    initialized: bool;
+}
+
+pub rec Result {
+    status: Status;
+    node: Node;
+}
+
+pub fun make(queue: *Queue, nodes: *Node, positions: *Position,
+    capacity: usize) bool {
+    if (queue == nil || nodes == nil || positions == nil || capacity == 0) {
+        ret false;
+    }
+    queue.nodes = nodes;
+    queue.positions = positions;
+    queue.capacity = capacity;
+    queue.len = 0;
+    queue.initialized = true;
+    var i: usize = 0;
+    for (i < capacity) {
+        positions[i].index = capacity;
+        positions[i].connection_generation = 0;
+        positions[i].live = false;
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun before(left: Node, right: Node) bool {
+    if (left.timer.deadline_ns != right.timer.deadline_ns) {
+        ret left.timer.deadline_ns < right.timer.deadline_ns;
+    }
+    ret left.connection_slot < right.connection_slot;
+}
+
+fun exchange(queue: *Queue, left: usize, right: usize) {
+    if (left == right) { ret; }
+    val saved: Node = queue.nodes[left];
+    queue.nodes[left] = queue.nodes[right];
+    queue.nodes[right] = saved;
+    queue.positions[queue.nodes[left].connection_slot].index = left;
+    queue.positions[queue.nodes[right].connection_slot].index = right;
+}
+
+fun sift_up(queue: *Queue, start: usize) usize {
+    var index: usize = start;
+    for (index > 0) {
+        val parent: usize = (index - 1) / 2;
+        if (!before(queue.nodes[index], queue.nodes[parent])) { ret index; }
+        exchange(queue, index, parent);
+        index = parent;
+    }
+    ret index;
+}
+
+fun sift_down(queue: *Queue, start: usize) usize {
+    var index: usize = start;
+    for (true) {
+        val left: usize = index * 2 + 1;
+        if (left >= queue.len) { ret index; }
+        var smallest: usize = left;
+        val right: usize = left + 1;
+        if (right < queue.len && before(queue.nodes[right], queue.nodes[left])) {
+            smallest = right;
+        }
+        if (!before(queue.nodes[smallest], queue.nodes[index])) { ret index; }
+        exchange(queue, index, smallest);
+        index = smallest;
+    }
+    ret index;
+}
+
+fun remove_at(queue: *Queue, index: usize) Node {
+    val removed: Node = queue.nodes[index];
+    queue.positions[removed.connection_slot].index = queue.capacity;
+    queue.positions[removed.connection_slot].connection_generation = 0;
+    queue.positions[removed.connection_slot].live = false;
+    queue.len = queue.len - 1;
+    if (index < queue.len) {
+        queue.nodes[index] = queue.nodes[queue.len];
+        queue.positions[queue.nodes[index].connection_slot].index = index;
+        val settled: usize = sift_up(queue, index);
+        sift_down(queue, settled);
+    }
+    ret removed;
+}
+
+pub fun disarm(queue: *Queue, connection_slot: usize,
+    connection_generation: u64) Status {
+    if (queue == nil || !queue.initialized || queue.nodes == nil
+     || queue.positions == nil || connection_slot >= queue.capacity
+     || connection_generation == 0) { ret TIMER_INVALID; }
+    val position: *Position = ?queue.positions[connection_slot];
+    if (!position.live) { ret TIMER_OK; }
+    if (position.connection_generation != connection_generation) {
+        ret TIMER_STALE;
+    }
+    remove_at(queue, position.index);
+    ret TIMER_OK;
+}
+
+pub fun refresh(queue: *Queue, connection_slot: usize,
+    connection_generation: u64, timer: transport.Timer) Status {
+    if (queue == nil || !queue.initialized || queue.nodes == nil
+     || queue.positions == nil || connection_slot >= queue.capacity
+     || connection_generation == 0) { ret TIMER_INVALID; }
+    if (!timer.armed) {
+        ret disarm(queue, connection_slot, connection_generation);
+    }
+    if (timer.source == 0 || timer.generation == 0) { ret TIMER_INVALID; }
+    val position: *Position = ?queue.positions[connection_slot];
+    if (position.live) {
+        if (position.connection_generation != connection_generation) {
+            ret TIMER_STALE;
+        }
+        val index: usize = position.index;
+        queue.nodes[index].timer = timer;
+        val settled: usize = sift_up(queue, index);
+        sift_down(queue, settled);
+        ret TIMER_OK;
+    }
+    if (queue.len >= queue.capacity) { ret TIMER_FULL; }
+    val index: usize = queue.len;
+    queue.len = queue.len + 1;
+    queue.nodes[index] = Node{timer: timer, connection_slot: connection_slot,
+        connection_generation: connection_generation};
+    position.index = index;
+    position.connection_generation = connection_generation;
+    position.live = true;
+    sift_up(queue, index);
+    ret TIMER_OK;
+}
+
+pub fun next_deadline(queue: *Queue, output: *u64) Status {
+    if (queue == nil || !queue.initialized || output == nil) {
+        ret TIMER_INVALID;
+    }
+    if (queue.len == 0) { ret TIMER_EMPTY; }
+    @output = queue.nodes[0].timer.deadline_ns;
+    ret TIMER_OK;
+}
+
+pub fun take_due(queue: *Queue, now_ns: u64) Result {
+    var result: Result;
+    if (queue == nil || !queue.initialized) {
+        result.status = TIMER_INVALID;
+        ret result;
+    }
+    if (queue.len == 0) {
+        result.status = TIMER_EMPTY;
+        ret result;
+    }
+    if (queue.nodes[0].timer.deadline_ns > now_ns) {
+        result.status = TIMER_NOT_DUE;
+        ret result;
+    }
+    result.node = remove_at(queue, 0);
+    result.status = TIMER_OK;
+    ret result;
+}
+
+fun test_timer(source: u64, deadline: u64, generation: u64)
+    transport.Timer {
+    ret transport.Timer{source: source, deadline_ns: deadline,
+        generation: generation, armed: true};
+}
+
+test "hedge.protocol.quic.timers: deadlines are ordered and refreshed in place" {
+    var nodes: [3]Node;
+    var positions: [3]Position;
+    var queue: Queue;
+    if (!make(?queue, ?nodes[0], ?positions[0], 3)) { ret 1; }
+    if (refresh(?queue, 0, 1, test_timer(10, 30, 1)) != TIMER_OK
+     || refresh(?queue, 1, 1, test_timer(11, 10, 1)) != TIMER_OK
+     || refresh(?queue, 2, 1, test_timer(12, 20, 1)) != TIMER_OK) { ret 2; }
+    if (refresh(?queue, 0, 1, test_timer(10, 5, 2)) != TIMER_OK
+     || queue.len != 3) { ret 3; }
+    var deadline: u64 = 0;
+    if (next_deadline(?queue, ?deadline) != TIMER_OK || deadline != 5) {
+        ret 4;
+    }
+    val first: Result = take_due(?queue, 5);
+    val second: Result = take_due(?queue, 10);
+    val third: Result = take_due(?queue, 20);
+    if (first.status != TIMER_OK || first.node.connection_slot != 0
+     || second.status != TIMER_OK || second.node.connection_slot != 1
+     || third.status != TIMER_OK || third.node.connection_slot != 2
+     || queue.len != 0) { ret 5; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.timers: early deadlines remain scheduled" {
+    var nodes: [1]Node;
+    var positions: [1]Position;
+    var queue: Queue;
+    if (!make(?queue, ?nodes[0], ?positions[0], 1)) { ret 1; }
+    if (refresh(?queue, 0, 4, test_timer(10, 100, 1)) != TIMER_OK) {
+        ret 2;
+    }
+    if (take_due(?queue, 99).status != TIMER_NOT_DUE || queue.len != 1) {
+        ret 3;
+    }
+    if (take_due(?queue, 100).status != TIMER_OK || queue.len != 0) {
+        ret 4;
+    }
+    ret 0;
+}
+
+test "hedge.protocol.quic.timers: stale generations cannot alter recycled slots" {
+    var nodes: [1]Node;
+    var positions: [1]Position;
+    var queue: Queue;
+    if (!make(?queue, ?nodes[0], ?positions[0], 1)) { ret 1; }
+    if (refresh(?queue, 0, 7, test_timer(10, 100, 1)) != TIMER_OK
+     || refresh(?queue, 0, 6, test_timer(10, 50, 2)) != TIMER_STALE
+     || disarm(?queue, 0, 6) != TIMER_STALE || queue.len != 1) { ret 2; }
+    if (disarm(?queue, 0, 7) != TIMER_OK || queue.len != 0) { ret 3; }
+    if (refresh(?queue, 0, 8, test_timer(10, 40, 3)) != TIMER_OK
+     || take_due(?queue, 40).node.connection_generation != 8) { ret 4; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.timers: disarmed timers consume no heap capacity" {
+    var nodes: [1]Node;
+    var positions: [1]Position;
+    var queue: Queue;
+    if (!make(?queue, ?nodes[0], ?positions[0], 1)) { ret 1; }
+    var timer: transport.Timer = test_timer(10, 100, 1);
+    if (refresh(?queue, 0, 1, timer) != TIMER_OK) { ret 2; }
+    timer.armed = false;
+    if (refresh(?queue, 0, 1, timer) != TIMER_OK || queue.len != 0
+     || next_deadline(?queue, ?timer.deadline_ns) != TIMER_EMPTY) { ret 3; }
+    ret 0;
+}

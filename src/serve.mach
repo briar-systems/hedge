@@ -1,0 +1,1077 @@
+# the serving runtime: listeners, a bounded connection pool, and one sealed plan
+#
+# this module owns the loop that turns accepted connections into served requests.
+# it is the only place that knows both the listener plane and the connection
+# plane, and it hands each connection the same immutable plan for its lifetime.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.chrono.time;
+use std.net.ip;
+use http.core.message;
+use hedge.config.schema;
+use hedge.listener;
+use hedge.connection;
+use hedge.telemetry;
+use lifecycle: hedge.lifecycle;
+use budget: hedge.budget;
+use hedge_tls: hedge.protocol.tls;
+use h3_session: hedge.protocol.h3.session;
+use quic_runtime: hedge.protocol.quic.runtime;
+use plan: hedge.dispatch.plan;
+use telemetry_health: hedge.telemetry.health;
+
+pub val DEFAULT_POLL_MS: i32 = 50;
+val QUIC_RETRY_MAX_AGE_NS: u64 = 10000000000;
+val QUIC_ADDRESS_MAX_AGE_NS: u64 = 600000000000;
+
+pub def State: u8;
+pub val NEW: State = 1;
+pub val READY: State = 2;
+pub val DRAINING: State = 3;
+pub val STOPPED: State = 4;
+
+pub rec Slot {
+    live: bool;
+    retiring: bool;
+    # accepted and holding a place in its budget's queue, not yet being served
+    waiting: bool;
+    token: listener.ConnectionToken;
+    handle: *connection.Connection;
+    budgets: *budget.Set;
+    charge: budget.Charge;
+}
+
+rec BudgetGeneration {
+    set: budget.Set;
+    storage: [schema.MAX_BUDGETS]budget.Budget;
+}
+
+fun timeout_nanoseconds(milliseconds: u64, output: *u64) bool {
+    if (output == nil || milliseconds > schema.MAX_TIMEOUT_MS) { ret false; }
+    @output = milliseconds * 1000000;
+    ret true;
+}
+
+# a service plane the serving loop must drive alongside connections
+pub def PlaneFun: fun(ptr, time.Time) bool;
+
+pub def PlaneQuiesceStatus: u8;
+pub val PLANE_QUIESCED: PlaneQuiesceStatus = 1;
+pub val PLANE_PENDING: PlaneQuiesceStatus = 2;
+pub val PLANE_FAILED: PlaneQuiesceStatus = 3;
+pub def PlaneQuiesceFun: fun(ptr, time.Time) PlaneQuiesceStatus;
+
+pub rec Runtime {
+    state: State;
+    plane_ctx: ptr;
+    plane: PlaneFun;
+    plane_quiesce: PlaneQuiesceFun;
+    generation: u64;
+    owner: listener.Owner;
+    slots: *Slot;
+    connections: *connection.Connection;
+    capacity: usize;
+    live: usize;
+    next_id: u64;
+    plan: *plan.Plan;
+    graph: *schema.Graph;
+    configured: connection.Config;
+    limits: message.Limits;
+    observability: *telemetry.Runtime;
+    served: u64;
+    accepted: u64;
+    rejected: u64;
+    shutdown: lifecycle.State;
+    drain_timeout_ns: u64;
+    # a fallible teardown call that failed. a return nobody reads is a check
+    # that does not exist, which is how a total teardown failure stayed
+    # invisible until the shutdown sequence started reporting its outcome.
+    teardown_failures: u64;
+    budget_generations: [2]BudgetGeneration;
+    active_budgets: *budget.Set;
+    queued: u64;
+    expired: u64;
+    quic: *quic_runtime.Runtime;
+    quic_storages: *quic_runtime.PumpStorage;
+    quic_handles: [schema.MAX_LISTENERS]quic_runtime.PumpHandle;
+    quic_handle_live: [schema.MAX_LISTENERS]bool;
+    quic_count: usize;
+    quic_released: bool;
+}
+
+fun monotonic_ns() u64 {
+    val value: i64 = time.time_unix_nsec(time.monotonic());
+    if (value <= 0) { ret 1; }
+    ret value::u64;
+}
+
+fun earlier_deadline(found: bool, candidate: time.Time,
+    output: *time.Time) bool {
+    if (!found || time.time_before(candidate, @output)) {
+        @output = candidate;
+    }
+    ret true;
+}
+
+fun next_budget_deadline(runtime: *Runtime,
+    output: *time.Time) bool {
+    if (runtime == nil || output == nil) { ret false; }
+    var found: bool = false;
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        val slot: *Slot = ?runtime.slots[i];
+        var deadline: time.Time;
+        if (slot.live && slot.waiting
+         && budget.deadline(?slot.charge, ?deadline)) {
+            found = earlier_deadline(found, deadline, output);
+        }
+        i = i + 1;
+    }
+    if (runtime.quic != nil && !runtime.quic_released) {
+        var deadline: time.Time;
+        if (quic_runtime.next_budget_deadline(runtime.quic, ?deadline)
+            == quic_runtime.OK) {
+            found = earlier_deadline(found, deadline, output);
+        }
+    }
+    ret found;
+}
+
+fun deadline_timeout_ms(now: time.Time, deadline: time.Time) i32 {
+    if (!time.time_before(now, deadline)) { ret 0; }
+    val remaining_ns: i64 = time.time_sub(deadline, now);
+    if (remaining_ns <= 0) { ret 0; }
+    var wait_ms: i64 = remaining_ns / 1000000;
+    if (remaining_ns % 1000000 != 0) { wait_ms = wait_ms + 1; }
+    if (wait_ms > 2147483647) { ret 2147483647; }
+    ret wait_ms::i32;
+}
+
+fun live_count(runtime: *Runtime) usize {
+    if (runtime == nil) { ret 0; }
+    var count: usize = runtime.live;
+    if (runtime.quic != nil && !runtime.quic_released) {
+        val quic_live: usize = quic_runtime.live(runtime.quic);
+        if (count > (-1)::usize - quic_live) { ret (-1)::usize; }
+        count = count + quic_live;
+    }
+    ret count;
+}
+
+fun configure_budgets(target: *BudgetGeneration, graph: *schema.Graph) bool {
+    if (target == nil || graph == nil || !budget.make(?target.set,
+        ?target.storage[0], schema.MAX_BUDGETS)) { ret false; }
+    var i: usize = 0;
+    for (i < graph.budget_count) {
+        val configured: *schema.Budget = ?graph.budgets[i];
+        var timeout_ns: u64 = 0;
+        if (!timeout_nanoseconds(configured.timeout_ms, ?timeout_ns)) { ret false; }
+        if (budget.define(?target.set, schema.text(?configured.name),
+            configured.concurrency, configured.queue,
+            timeout_ns,
+            configured.memory_bytes) == budget.NO_BUDGET) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun make(
+    runtime: *Runtime,
+    slots: *Slot,
+    connections: *connection.Connection,
+    capacity: usize,
+    active_plan: *plan.Plan,
+    graph: *schema.Graph,
+) bool {
+    if (runtime == nil || slots == nil || connections == nil || capacity == 0
+     || active_plan == nil || !plan.sealed(active_plan) || graph == nil) { ret false; }
+    runtime.state = NEW;
+    runtime.generation = 0;
+    runtime.slots = slots;
+    runtime.connections = connections;
+    runtime.capacity = capacity;
+    runtime.live = 0;
+    runtime.next_id = 1;
+    runtime.plan = active_plan;
+    runtime.graph = graph;
+    runtime.configured = connection.config_from(graph);
+    runtime.limits = connection.message_limits(graph, runtime.configured);
+    runtime.observability = nil;
+    runtime.plane_ctx = nil;
+    runtime.plane = (0::usize)::PlaneFun;
+    runtime.plane_quiesce = (0::usize)::PlaneQuiesceFun;
+    runtime.served = 0;
+    runtime.accepted = 0;
+    runtime.rejected = 0;
+    runtime.shutdown = lifecycle.make();
+    if (!timeout_nanoseconds(graph.timeouts.drain_ms,
+        ?runtime.drain_timeout_ns)) { ret false; }
+    runtime.queued = 0;
+    runtime.expired = 0;
+    runtime.teardown_failures = 0;
+    runtime.quic = nil;
+    runtime.quic_storages = nil;
+    runtime.quic_count = 0;
+    runtime.quic_released = false;
+    if (!configure_budgets(?runtime.budget_generations[0], graph)) { ret false; }
+    runtime.active_budgets = ?runtime.budget_generations[0].set;
+    var i: usize = 0;
+    for (i < capacity) {
+        slots[i].live = false;
+        slots[i].retiring = false;
+        slots[i].waiting = false;
+        slots[i].budgets = nil;
+        slots[i].charge = budget.no_charge();
+        slots[i].handle = ?connections[i];
+        i = i + 1;
+    }
+    i = 0;
+    for (i < schema.MAX_LISTENERS) {
+        runtime.quic_handle_live[i] = false;
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun attach_quic(runtime: *Runtime, quic: *quic_runtime.Runtime,
+    storages: *quic_runtime.PumpStorage) bool {
+    if (runtime == nil || quic == nil || storages == nil
+     || runtime.state != NEW || runtime.quic != nil) { ret false; }
+    runtime.quic = quic;
+    runtime.quic_storages = storages;
+    runtime.quic_released = false;
+    ret true;
+}
+
+pub fun attach_plane(runtime: *Runtime, context: ptr, plane: PlaneFun) bool {
+    if (runtime == nil || plane::usize == 0) { ret false; }
+    runtime.plane_ctx = context;
+    runtime.plane = plane;
+    runtime.plane_quiesce = (0::usize)::PlaneQuiesceFun;
+    ret true;
+}
+
+pub fun attach_plane_lifecycle(runtime: *Runtime, context: ptr, plane: PlaneFun,
+    quiesce: PlaneQuiesceFun) bool {
+    if (runtime == nil || plane::usize == 0 || quiesce::usize == 0) { ret false; }
+    runtime.plane_ctx = context;
+    runtime.plane = plane;
+    runtime.plane_quiesce = quiesce;
+    ret true;
+}
+
+pub fun attach_telemetry(runtime: *Runtime, observability: *telemetry.Runtime) bool {
+    if (runtime == nil || observability == nil || runtime.state != NEW) { ret false; }
+    runtime.observability = observability;
+    ret true;
+}
+
+fun pattern(name: str) bool {
+    var i: usize = 0;
+    for (name[i] != 0) {
+        if (name[i] == '*') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun hosts_servable(runtime: *Runtime, graph: *schema.Graph,
+    owned: *listener.OwnedListener, policy: usize,
+    diagnostics: *schema.Diagnostics) bool {
+    var i: usize = 0;
+    for (i < graph.host_count) {
+        val host: *schema.Host = ?graph.hosts[i];
+        if (!schema.text_equals(?host.listener, schema.text(?owned.name))) {
+            i = i + 1;
+            cnt;
+        }
+        var j: usize = 0;
+        for (j < host.server_name_count) {
+            val name: str = schema.text(?host.server_names[j]);
+            # a wildcard host is a pattern, not a name a client can send, so
+            # whether a certificate covers it cannot be decided by asking for it
+            if (host.server_names[j].len != 0 && !pattern(name)
+             && !hedge_tls.servable(policy, name)) {
+                schema.add_diagnostic(diagnostics, schema.ERROR,
+                    schema.UNRESOLVED_REFERENCE, "runtime", name,
+                    "no configured certificate serves this virtual host");
+                ret false;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun quic_config(runtime: *Runtime, graph: *schema.Graph, index: usize,
+    generation: u64, active_plan: *plan.Plan, budgets: *budget.Set,
+    output: *quic_runtime.PumpConfig) bool {
+    if (runtime == nil || graph == nil || index >= graph.listener_count
+     || generation == 0 || active_plan == nil || budgets == nil
+     || output == nil) { ret false; }
+    val configured: *schema.Listener = ?graph.listeners[index];
+    if (configured.transport != schema.TRANSPORT_QUIC
+     || configured.protocols != schema.PROTOCOL_HTTP3
+     || configured.tls_policy.len == 0) { ret false; }
+    val policy_index: usize = hedge_tls.find(schema.text(?configured.name));
+    val policy: *hedge_tls.Policy = hedge_tls.policy_at(policy_index);
+    if (policy == nil) { ret false; }
+    var per_peer: usize = graph.limits.max_connections_per_peer;
+    if (per_peer > runtime.capacity) { per_peer = runtime.capacity; }
+    var named_budget: usize = budget.NO_BUDGET;
+    if (configured.budget.len != 0) {
+        named_budget = budget.find(budgets,
+            schema.text(?configured.budget));
+    }
+    val connection_config: connection.Config = connection.config_from(graph);
+    var max_requests: usize = connection_config.max_streams;
+    if (max_requests > h3_session.MAX_STREAMS) {
+        max_requests = h3_session.MAX_STREAMS;
+    }
+    @output = quic_runtime.PumpConfig{
+        admission_generation: generation,
+        connection_limit: runtime.capacity,
+        max_connections_per_peer: per_peer,
+        require_retry: true,
+        retry_max_age_ns: QUIC_RETRY_MAX_AGE_NS,
+        address_max_age_ns: QUIC_ADDRESS_MAX_AGE_NS,
+        tls_policy: policy,
+        tls_policy_index: policy_index,
+        plan: active_plan,
+        budgets: budgets,
+        listener_budget: named_budget,
+        limits: connection.message_limits(graph, connection_config),
+        max_requests: max_requests,
+        listener_name: schema.text(?configured.name),
+        handshake_timeout_ns: graph.timeouts.handshake_ms * 1000000,
+        request_timeout_ns: graph.timeouts.request_ms * 1000000,
+        idle_timeout_ms: graph.timeouts.keep_alive_ms,
+        drain_timeout_ns: quic_runtime.CONNECTION_DRAIN_NS,
+    };
+    ret true;
+}
+
+fun release_quic(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
+    if (runtime.quic == nil || runtime.quic_released) { ret true; }
+    var success: bool = quic_runtime.cancel_all(controls, runtime.quic) == quic_runtime.OK;
+    var released: quic_runtime.Status = quic_runtime.release(controls, runtime.quic);
+    for (released == quic_runtime.BLOCKED) {
+        if (!listener.poll(?runtime.owner, 1)) { ret false; }
+        if (quic_runtime.advance(controls, runtime.quic, time.now(), monotonic_ns())
+            == quic_runtime.FAILED) { ret false; }
+        released = quic_runtime.release(controls, runtime.quic);
+    }
+    if (released != quic_runtime.OK) { ret false; }
+    runtime.quic_released = true;
+    runtime.quic_count = 0;
+    var i: usize = 0;
+    for (i < schema.MAX_LISTENERS) {
+        runtime.quic_handle_live[i] = false;
+        i = i + 1;
+    }
+    ret success;
+}
+
+fun fail_start(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
+    val released: bool = release_quic(controls, runtime);
+    if (!runtime.quic_released) {
+        runtime.state = DRAINING;
+        listener.begin_drain(?runtime.owner);
+        ret false;
+    }
+    runtime.state = DRAINING;
+    val stopped: bool = listener.stop(?runtime.owner);
+    if (stopped) { runtime.state = STOPPED; }
+    ret released && stopped;
+}
+
+fun start_quic(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64,
+    graph: *schema.Graph) bool {
+    var required: usize = 0;
+    var i: usize = 0;
+    for (i < graph.listener_count) {
+        if (graph.listeners[i].transport == schema.TRANSPORT_QUIC) {
+            required = required + 1;
+        }
+        i = i + 1;
+    }
+    if (required == 0) { ret true; }
+    if (runtime.quic == nil || runtime.quic_storages == nil) { ret false; }
+    i = 0;
+    for (i < graph.listener_count) {
+        val configured: *schema.Listener = ?graph.listeners[i];
+        if (configured.transport != schema.TRANSPORT_QUIC) {
+            i = i + 1;
+            cnt;
+        }
+        val owned: *listener.OwnedListener = listener.active_listener(
+            ?runtime.owner, i);
+        var config: quic_runtime.PumpConfig;
+        if (owned == nil || !owned.has_udp_socket || !owned.has_bound_endpoint
+         || !quic_config(runtime, graph, i, generation, runtime.plan,
+            runtime.active_budgets, ?config)) {
+            fail_start(controls, runtime);
+            ret false;
+        }
+        val attached: quic_runtime.Status = quic_runtime.attach(controls, runtime.quic,
+            ?runtime.owner.network, ?owned.udp_socket, ?runtime.owner.root_scope,
+            owned.bound_endpoint, config, ?runtime.quic_storages[i],
+            ?runtime.quic_handles[i]);
+        if (attached != quic_runtime.OK) {
+            fail_start(controls, runtime);
+            ret false;
+        }
+        runtime.quic_handle_live[i] = true;
+        runtime.quic_count = runtime.quic_count + 1;
+        if (quic_runtime.start(controls, runtime.quic, runtime.quic_handles[i])
+            != quic_runtime.OK) {
+            fail_start(controls, runtime);
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret runtime.quic_count == required;
+}
+
+pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64, graph: *schema.Graph,
+    diagnostics: *schema.Diagnostics) bool {
+    if (runtime == nil || runtime.state != NEW) { ret false; }
+    if (!listener.start(?runtime.owner, generation, graph, diagnostics)) { ret false; }
+    if (runtime.quic != nil && !quic_runtime.bind_admission(runtime.quic,
+        listener.admission_manager(?runtime.owner))) {
+        fail_start(controls, runtime);
+        ret false;
+    }
+    if (!listener.attach_connections(?runtime.owner, nil, connection.complete)) {
+        fail_start(controls, runtime);
+        ret false;
+    }
+    # a TLS listener whose policy did not load, or whose virtual hosts have no
+    # certificate, must not become ready and then refuse the clients it accepts
+    var i: usize = 0;
+    for (i < schema.MAX_LISTENERS) {
+        val owned: *listener.OwnedListener = listener.active_listener(?runtime.owner, i);
+        if (owned == nil || !owned.policy.secure) { i = i + 1; cnt; }
+        val policy: usize = hedge_tls.find(schema.text(?owned.name));
+        if (policy == hedge_tls.NO_POLICY) {
+            schema.add_diagnostic(diagnostics, schema.ERROR, schema.UNRESOLVED_REFERENCE,
+                "runtime", schema.text(?owned.name), "listener TLS policy was not published");
+            fail_start(controls, runtime);
+            ret false;
+        }
+        if (!hosts_servable(runtime, graph, owned, policy, diagnostics)) {
+            fail_start(controls, runtime);
+            ret false;
+        }
+        i = i + 1;
+    }
+    if (!start_quic(controls, runtime, generation, graph)) {
+        schema.add_diagnostic(diagnostics, schema.ERROR, schema.SOURCE_ERROR,
+            "runtime", "quic", "QUIC listener pumps did not become ready");
+        if (runtime.state != STOPPED) { fail_start(controls, runtime); }
+        ret false;
+    }
+    runtime.generation = generation;
+    runtime.state = READY;
+    if (runtime.observability != nil && !telemetry.begin_ready(runtime.observability)) {
+        fail_start(controls, runtime);
+        ret false;
+    }
+    ret true;
+}
+
+fun free_slot(runtime: *Runtime) usize {
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (!runtime.slots[i].live) { ret i; }
+        i = i + 1;
+    }
+    ret runtime.capacity;
+}
+
+
+# admit every queued connection the pool can hold and refuse the rest at once
+fun admit(runtime: *Runtime, now: time.Time) usize {
+    var admitted: usize = 0;
+    for (true) {
+        var token: listener.ConnectionToken;
+        if (!listener.take_connection(?runtime.owner, ?token)) { brk; }
+        val source: *listener.Connection = listener.inspect_connection(?runtime.owner, token);
+        val index: usize = free_slot(runtime);
+        if (source == nil || index >= runtime.capacity) {
+            runtime.rejected = runtime.rejected + 1;
+            if (!listener.close_connection(?runtime.owner, token)) {
+                runtime.teardown_failures = runtime.teardown_failures + 1;
+            }
+            cnt;
+        }
+        val slot: *Slot = ?runtime.slots[index];
+        val owned: *listener.OwnedListener = listener.active_listener(?runtime.owner,
+            source.listener_index);
+        var policy: usize = hedge_tls.NO_POLICY;
+        if (owned != nil && owned.policy.secure) {
+            policy = hedge_tls.find(schema.text(?owned.name));
+        }
+        if (owned == nil || !connection.make(slot.handle, runtime.next_id, runtime.generation,
+            token, source, ?runtime.owner.network, runtime.plan, runtime.active_budgets,
+            runtime.configured, runtime.limits, owned, policy, now)) {
+            runtime.rejected = runtime.rejected + 1;
+            if (!listener.close_connection(?runtime.owner, token)) {
+                runtime.teardown_failures = runtime.teardown_failures + 1;
+            }
+            cnt;
+        }
+        slot.live = true;
+        slot.retiring = false;
+        slot.waiting = false;
+        slot.budgets = runtime.active_budgets;
+        slot.token = token;
+        runtime.next_id = runtime.next_id + 1;
+        runtime.live = runtime.live + 1;
+        runtime.accepted = runtime.accepted + 1;
+        admitted = admitted + 1;
+        # the budget is charged after the connection exists but before it is
+        # driven, which is the last point at which refusing it costs nothing
+        val allowance: usize = listener_budget(runtime, source.listener_index);
+        val outcome: budget.Outcome = budget.charge(slot.budgets, allowance,
+            $size_of(connection.Connection), now, ?slot.charge);
+        if (outcome == budget.QUEUED) {
+            slot.waiting = true;
+            runtime.queued = runtime.queued + 1;
+        } or (outcome != budget.ADMITTED) {
+            runtime.rejected = runtime.rejected + 1;
+            retire(runtime, index);
+        }
+    }
+    ret admitted;
+}
+
+fun listener_budget(runtime: *Runtime, index: usize) usize {
+    if (runtime.graph == nil || index >= runtime.graph.listener_count) {
+        ret budget.NO_BUDGET;
+    }
+    val configured: *schema.Listener = ?runtime.graph.listeners[index];
+    if (configured.budget.len == 0) { ret budget.NO_BUDGET; }
+    ret budget.find(runtime.active_budgets, schema.text(?configured.budget));
+}
+
+# a connection holding a place in its budget's queue tries again, and is closed
+# when it has waited longer than the budget allows
+fun admit_waiting(runtime: *Runtime, now: time.Time) usize {
+    var admitted: usize = 0;
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        val slot: *Slot = ?runtime.slots[i];
+        if (!slot.live || !slot.waiting) { i = i + 1; cnt; }
+        val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge,
+            now);
+        if (outcome == budget.ADMITTED) {
+            slot.waiting = false;
+            admitted = admitted + 1;
+        }
+        or (outcome != budget.QUEUED) {
+            runtime.expired = runtime.expired + 1;
+            retire(runtime, i);
+        }
+        i = i + 1;
+    }
+    ret admitted;
+}
+
+fun retire(runtime: *Runtime, index: usize) {
+    if (index >= runtime.capacity) { ret; }
+    val slot: *Slot = ?runtime.slots[index];
+    if (!slot.live) { ret; }
+    if (!slot.retiring) {
+        slot.retiring = true;
+        slot.waiting = false;
+    }
+    # an H2 body or transport cancellation may need a later completion. the
+    # listener token and pool slot stay owned until that close phase settles.
+    if (!connection.close(slot.handle)) {
+        if (connection.close_waiting(slot.handle)) { ret; }
+        runtime.teardown_failures = runtime.teardown_failures + 1;
+    }
+    if (slot.charge.live) { budget.release(slot.budgets, ?slot.charge); }
+    slot.budgets = nil;
+    runtime.served = runtime.served + slot.handle.requests;
+    if (!listener.release_connection(?runtime.owner, slot.token)) {
+        runtime.teardown_failures = runtime.teardown_failures + 1;
+    }
+    slot.live = false;
+    slot.retiring = false;
+    if (runtime.live > 0) { runtime.live = runtime.live - 1; }
+}
+
+# drive one connection until it blocks on I/O or finishes
+fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
+    val slot: *Slot = ?runtime.slots[index];
+    val progress: connection.Step = connection.advance(slot.handle, now);
+    if (progress == connection.STEP_DONE || progress == connection.STEP_ERROR) {
+        retire(runtime, index);
+        ret true;
+    }
+    ret false;
+}
+
+pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms: i32) bool {
+    if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) { ret false; }
+    var bounded_timeout: i32 = timeout_ms;
+    val poll_started_at: time.Time = time.now();
+    if (runtime.quic != nil && !runtime.quic_released) {
+        var deadline: u64 = 0;
+        if (quic_runtime.next_deadline(runtime.quic, ?deadline)
+            == quic_runtime.OK) {
+            val current: u64 = monotonic_ns();
+            var wait_ms: u64 = 0;
+            if (deadline > current) {
+                val remaining: u64 = deadline - current;
+                wait_ms = remaining / 1000000;
+                if (remaining % 1000000 != 0) { wait_ms = wait_ms + 1; }
+            }
+            if (wait_ms > 2147483647) { wait_ms = 2147483647; }
+            if (bounded_timeout < 0 || wait_ms < bounded_timeout::u64) {
+                bounded_timeout = wait_ms::i32;
+            }
+        }
+    }
+    var budget_deadline: time.Time;
+    if (next_budget_deadline(runtime, ?budget_deadline)) {
+        val wait_ms: i32 = deadline_timeout_ms(poll_started_at,
+            budget_deadline);
+        if (bounded_timeout < 0 || wait_ms < bounded_timeout) {
+            bounded_timeout = wait_ms;
+        }
+    }
+    val polled: bool = listener.poll(?runtime.owner, bounded_timeout);
+    val now: time.Time = time.now();
+    var quic_ok: bool = true;
+    if (runtime.quic != nil && !runtime.quic_released
+     && quic_runtime.advance(controls, runtime.quic, now, monotonic_ns())
+        == quic_runtime.FAILED) {
+        quic_ok = false;
+    }
+    if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
+    admit_waiting(runtime, now);
+    if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        # a connection still waiting for its budget is not driven, which is what
+        # makes the queue a queue rather than a label
+        if (runtime.slots[i].live && !runtime.slots[i].waiting) {
+            if (runtime.slots[i].retiring) { retire(runtime, i); }
+            or { drive(runtime, i, now); }
+        }
+        i = i + 1;
+    }
+    # plane and tcp progress can release shared budget capacity for quic
+    val settled: time.Time = time.now();
+    if (runtime.quic != nil && !runtime.quic_released
+     && quic_runtime.advance(controls, runtime.quic, settled, monotonic_ns())
+        == quic_runtime.FAILED) {
+        quic_ok = false;
+    }
+    val promoted: usize = admit_waiting(runtime, settled);
+    if (promoted != 0) {
+        i = 0;
+        for (i < runtime.capacity) {
+            if (runtime.slots[i].live && !runtime.slots[i].waiting) {
+                if (runtime.slots[i].retiring) { retire(runtime, i); }
+                or { drive(runtime, i, settled); }
+            }
+            i = i + 1;
+        }
+    }
+    if (lifecycle.serving(?runtime.shutdown)) {
+        listener.resume_admission(?runtime.owner);
+    }
+    # a stop the operating system asked for enters the same sequence a
+    # programmatic one does, so there is one ordering rather than two
+    if (runtime.owner.state == listener.OWNER_DRAINING
+     && lifecycle.serving(?runtime.shutdown)) {
+        begin_shutdown(controls, runtime, now);
+    }
+    advance_shutdown(controls, runtime, now, false);
+    if (!quic_ok && lifecycle.serving(?runtime.shutdown)) {
+        begin_shutdown(controls, runtime, now);
+    }
+    ret polled && quic_ok;
+}
+
+# --- the shutdown sequence ---
+#
+# ARCHITECTURE.md's seven steps, in order, executed once each. `lifecycle` owns
+# the ordering and the clock; this owns what each step means to a serving
+# runtime.
+
+# step 1 readiness false, step 2 stop accepting, step 3 protocol-specific signals
+fun run_signal(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
+    var ok: bool = true;
+    if (runtime.observability != nil
+     && !telemetry.begin_drain(runtime.observability)) { ok = false; }
+    if (!listener.begin_drain(?runtime.owner)) { ok = false; }
+    if (runtime.quic != nil && !runtime.quic_released
+     && quic_runtime.graceful_all(controls, runtime.quic, monotonic_ns())
+        != quic_runtime.OK) { ok = false; }
+    runtime.state = DRAINING;
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        # HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
+        # reading. the engine decides which; the runtime only asks.
+        if (runtime.slots[i].live
+         && !connection.begin_graceful(runtime.slots[i].handle)) { ok = false; }
+        i = i + 1;
+    }
+    ret ok;
+}
+
+# step 5 cancel whatever the deadline did not let finish
+fun run_cancel(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
+    val failures: u64 = runtime.teardown_failures;
+    var quic_ok: bool = true;
+    if (runtime.quic != nil && !runtime.quic_released
+     && quic_runtime.cancel_all(controls, runtime.quic) != quic_runtime.OK) {
+        quic_ok = false;
+    }
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (runtime.slots[i].live) { retire(runtime, i); }
+        i = i + 1;
+    }
+    ret quic_ok && runtime.teardown_failures == failures;
+}
+
+fun run_action(controls: *quic_runtime.ControlView, runtime: *Runtime, action: lifecycle.Action) {
+    if (action == lifecycle.NOTHING) { ret; }
+    var ok: bool = true;
+    if (action == lifecycle.SIGNAL) { ok = run_signal(controls, runtime); }
+    or (action == lifecycle.CANCEL) { ok = run_cancel(controls, runtime); }
+    or (action == lifecycle.FLUSH) {
+        if (runtime.observability != nil) {
+            ok = telemetry.shutdown(runtime.observability);
+        }
+    }
+    or {
+        ok = release_quic(controls, runtime);
+        if (runtime.quic == nil || runtime.quic_released) {
+            if (listener.stop(?runtime.owner)) {
+                runtime.state = STOPPED;
+            } or {
+                runtime.state = DRAINING;
+                ok = false;
+            }
+        }
+    }
+    if (!ok) { lifecycle.fail(?runtime.shutdown, action); }
+}
+
+# step 4: let the sequence advance as far as the clock and the live count allow
+#
+# `close` is false while polling. the final step tears down the io runtime, the
+# network driver and the listener sockets, and doing that from inside a poll of
+# that same runtime is a use of what it is destroying. releasing resources is
+# the process's last act, so the sequence parks at FLUSHING and the owner
+# performs the close.
+fun advance_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Time, close: bool) {
+    var guard: usize = 0;
+    for (guard < 8) {
+        if (!close && lifecycle.awaiting_close(?runtime.shutdown)) { ret; }
+        val action: lifecycle.Action = lifecycle.step(?runtime.shutdown,
+            live_count(runtime), now);
+        if (action == lifecycle.NOTHING) { ret; }
+        run_action(controls, runtime, action);
+        guard = guard + 1;
+    }
+}
+
+# begin the sequence and let active exchanges finish within the drain deadline
+pub fun begin_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Time) bool {
+    if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) {
+        ret false;
+    }
+    run_action(controls, runtime, lifecycle.begin(?runtime.shutdown, now,
+        runtime.drain_timeout_ns));
+    advance_shutdown(controls, runtime, now, false);
+    ret true;
+}
+
+# --- reload ---
+#
+# a connection captures its plan and its generation when it is accepted and
+# keeps both for its whole life, so a reload does not reach into work already in
+# flight. what reload does is publish new listeners and a new plan for the
+# connections that come next, and ask the ones that came before to finish.
+#
+# the superseded generation stays alive until its last connection is gone, which
+# is what `superseded` reports. releasing its plan before that would pull the
+# route graph out from under a request that is still being served.
+pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64, active_plan: *plan.Plan,
+    graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
+    if (runtime == nil || active_plan == nil || graph == nil || diagnostics == nil
+     || runtime.state != READY || !plan.sealed(active_plan)
+     || active_plan.generation != generation
+     || generation <= runtime.generation) { ret false; }
+    # a reload during shutdown would publish listeners the sequence has already
+    # decided to stop accepting on
+    if (!lifecycle.serving(?runtime.shutdown)) { ret false; }
+    if (listeners_changed(runtime, graph)) {
+        schema.add_diagnostic(diagnostics, schema.ERROR, schema.CONFLICT,
+            "runtime", "reload",
+            "listener changes require a process restart");
+        ret false;
+    }
+    var drain_timeout_ns: u64 = 0;
+    if (!timeout_nanoseconds(graph.timeouts.drain_ms, ?drain_timeout_ns)) {
+        ret false;
+    }
+    var next: *BudgetGeneration = ?runtime.budget_generations[0];
+    if (runtime.active_budgets == ?runtime.budget_generations[0].set) {
+        next = ?runtime.budget_generations[1];
+    }
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (runtime.slots[i].live
+         && runtime.slots[i].budgets == ?next.set) { ret false; }
+        i = i + 1;
+    }
+    if (runtime.quic_count != 0
+     && quic_runtime.budgets_in_use(controls, runtime.quic, ?next.set)) { ret false; }
+    if (!configure_budgets(next, graph)) { ret false; }
+    var quic_result: quic_runtime.UpdateResult = quic_runtime.UpdateResult{
+        status: quic_runtime.OK, committed: false, rollback_failed: false};
+    if (runtime.quic_count != 0) {
+        var updates: [schema.MAX_LISTENERS]quic_runtime.PumpUpdate;
+        var update_count: usize = 0;
+        i = 0;
+        for (i < graph.listener_count) {
+            if (runtime.quic_handle_live[i]) {
+                var config: quic_runtime.PumpConfig;
+                if (!quic_config(runtime, graph, i, generation, active_plan,
+                    ?next.set, ?config)) { ret false; }
+                updates[update_count] = quic_runtime.PumpUpdate{
+                    handle: runtime.quic_handles[i], config: config};
+                update_count = update_count + 1;
+            }
+            i = i + 1;
+        }
+        quic_result = quic_runtime.update_all(controls, runtime.quic,
+            ?updates[0], update_count);
+        if (!quic_result.committed) {
+            if (quic_result.rollback_failed) {
+                begin_shutdown(controls, runtime, time.now());
+            }
+            ret false;
+        }
+    }
+    runtime.plan = active_plan;
+    runtime.graph = graph;
+    runtime.generation = generation;
+    runtime.active_budgets = ?next.set;
+    runtime.configured = connection.config_from(graph);
+    runtime.limits = connection.message_limits(graph, runtime.configured);
+    runtime.drain_timeout_ns = drain_timeout_ns;
+    var signalled: bool = true;
+    i = 0;
+    for (i < runtime.capacity) {
+        # every connection from an older generation finishes what it is doing
+        # and then closes, independently of the ones accepted since
+        if (runtime.slots[i].live
+         && runtime.slots[i].handle.generation != generation) {
+            if (!connection.begin_graceful(runtime.slots[i].handle)) {
+                signalled = false;
+            }
+        }
+        i = i + 1;
+    }
+    # publication already happened, so a signalling failure cannot be reported
+    # as a rejected reload. enter the ordered shutdown path and surface it there.
+    if (!signalled || (quic_result.committed
+        && quic_result.status != quic_runtime.OK)) {
+        begin_shutdown(controls, runtime, time.now());
+    }
+    ret true;
+}
+
+# whether the candidate names a different set of listeners than the active one
+fun listeners_changed(runtime: *Runtime, graph: *schema.Graph) bool {
+    if (runtime.graph == nil
+     || runtime.graph.listener_count != graph.listener_count) { ret true; }
+    var i: usize = 0;
+    for (i < graph.listener_count) {
+        val configured: *schema.Listener = ?graph.listeners[i];
+        val active: *schema.Listener = ?runtime.graph.listeners[i];
+        if (!schema.text_equals(?active.name, schema.text(?configured.name))
+         || !schema.text_equals(?active.address,
+            schema.text(?configured.address))
+         || active.transport != configured.transport
+         || active.protocols != configured.protocols
+         || !schema.text_equals(?active.tls_policy,
+            schema.text(?configured.tls_policy))
+         || active.backlog != configured.backlog
+         || active.accept_depth != configured.accept_depth
+         || active.proxy_protocol != configured.proxy_protocol
+         || active.trusted_peer_count != configured.trusted_peer_count) {
+            ret true;
+        }
+        var peer: usize = 0;
+        for (peer < active.trusted_peer_count) {
+            if (!schema.text_equals(?active.trusted_peers[peer],
+                schema.text(?configured.trusted_peers[peer]))) { ret true; }
+            peer = peer + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# live connections still belonging to a superseded generation
+pub fun superseded(controls: *quic_runtime.ControlView, runtime: *Runtime) usize {
+    if (runtime == nil) { ret 0; }
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i < runtime.capacity) {
+        if (runtime.slots[i].live
+         && runtime.slots[i].handle.generation != runtime.generation) {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if (runtime.quic != nil && !runtime.quic_released) {
+        val quic_count: usize = quic_runtime.superseded(controls, runtime.quic);
+        if (count > (-1)::usize - quic_count) { ret (-1)::usize; }
+        count = count + quic_count;
+    }
+    ret count;
+}
+
+pub fun draining(runtime: *Runtime) bool {
+    ret runtime != nil && lifecycle.draining(?runtime.shutdown);
+}
+
+pub fun idle(runtime: *Runtime) bool {
+    ret runtime != nil && live_count(runtime) == 0;
+}
+
+# the sequence has run to its end, resources included
+pub fun finished(runtime: *Runtime) bool {
+    ret runtime != nil && lifecycle.closed(?runtime.shutdown);
+}
+
+# every step but the resource close has run, which is the point at which a
+# serving loop has nothing left to poll for
+pub fun drained(runtime: *Runtime) bool {
+    ret runtime != nil && (lifecycle.awaiting_close(?runtime.shutdown)
+        || lifecycle.closed(?runtime.shutdown));
+}
+
+pub fun shutdown_reason(runtime: *Runtime) lifecycle.Reason {
+    if (runtime == nil) { ret lifecycle.FAILED; }
+    ret lifecycle.reason(?runtime.shutdown);
+}
+
+pub fun shutdown_cancelled(runtime: *Runtime) usize {
+    if (runtime == nil) { ret 0; }
+    ret lifecycle.cancelled(?runtime.shutdown);
+}
+
+# fallible teardown calls that failed, which would otherwise be invisible
+pub fun teardown_failures(runtime: *Runtime) u64 {
+    if (runtime == nil) { ret 0; }
+    ret runtime.teardown_failures;
+}
+
+pub fun shutdown_failed_step(runtime: *Runtime) lifecycle.Action {
+    if (runtime == nil) { ret lifecycle.NOTHING; }
+    ret lifecycle.failed_step(?runtime.shutdown);
+}
+
+# stop without waiting
+#
+# every caller of this wants the process or the test to end now, so it enters
+# the sequence with no deadline: signal, cancel, flush, close. the outcome is
+# reported as IMMEDIATE rather than as a clean drain, because it is not one.
+# calling it after a graceful drain has already begun finishes that sequence
+# instead of restarting it, so a stop is idempotent.
+pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
+    if (runtime == nil || runtime.state == NEW) { ret false; }
+    if (lifecycle.closed(?runtime.shutdown)) {
+        if (runtime.state != STOPPED) {
+            val quic_ok: bool = release_quic(controls, runtime);
+            if (runtime.quic == nil || runtime.quic_released) {
+                if (!listener.stop(?runtime.owner)) {
+                    runtime.teardown_failures = runtime.teardown_failures + 1;
+                } or {
+                    runtime.state = STOPPED;
+                }
+            }
+            if (!quic_ok) {
+                runtime.teardown_failures = runtime.teardown_failures + 1;
+            }
+        }
+        ret runtime.state == STOPPED
+            && runtime.teardown_failures == 0
+            && lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED;
+    }
+    val now: time.Time = time.now();
+    if (lifecycle.serving(?runtime.shutdown)) {
+        run_action(controls, runtime, lifecycle.begin(?runtime.shutdown, now, 0));
+    }
+    # a synchronous stop owns cancellation until every retained transport and
+    # body completion has crossed the ordinary listener completion path.
+    lifecycle.cancel_now(?runtime.shutdown, live_count(runtime));
+    run_action(controls, runtime, lifecycle.CANCEL);
+    for (live_count(runtime) != 0) {
+        if (!poll(controls, runtime, -1)) {
+            lifecycle.fail(?runtime.shutdown, lifecycle.CANCEL);
+            ret false;
+        }
+    }
+    if (runtime.plane_quiesce::usize != 0) {
+        var status: PlaneQuiesceStatus = runtime.plane_quiesce(
+            runtime.plane_ctx, time.now());
+        for (status == PLANE_PENDING) {
+            if (!listener.poll(?runtime.owner, -1)) {
+                lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
+                ret false;
+            }
+            val settled: time.Time = time.now();
+            if (runtime.plane::usize != 0) {
+                runtime.plane(runtime.plane_ctx, settled);
+            }
+            status = runtime.plane_quiesce(runtime.plane_ctx, settled);
+        }
+        if (status != PLANE_QUIESCED) {
+            lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
+            ret false;
+        }
+    }
+    advance_shutdown(controls, runtime, time.now(), true);
+    ret lifecycle.closed(?runtime.shutdown)
+        && lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED
+        && runtime.teardown_failures == 0;
+}
+
+pub fun bound_endpoint_text(runtime: *Runtime, index: usize, output: *u8, capacity: usize) usize {
+    val owned: *listener.OwnedListener = listener.active_listener(?runtime.owner, index);
+    if (owned == nil || !owned.has_bound_endpoint) { ret 0; }
+    ret endpoint_text(owned, output, capacity);
+}
+
+fun endpoint_text(owned: *listener.OwnedListener, output: *u8, capacity: usize) usize {
+    ret ip.endpoint_format(owned.bound_endpoint, output, capacity);
+}
+
+test "serve: poll timeout rounds budget deadlines without oversleeping" {
+    if (deadline_timeout_ms(time.Time{sec: 10, nsec: 0},
+            time.Time{sec: 10, nsec: 1}) != 1
+     || deadline_timeout_ms(time.Time{sec: 10, nsec: 0},
+            time.Time{sec: 10, nsec: 1000000}) != 1
+     || deadline_timeout_ms(time.Time{sec: 10, nsec: 1},
+            time.Time{sec: 10, nsec: 0}) != 0) { ret 1; }
+    ret 0;
+}

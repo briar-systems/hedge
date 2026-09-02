@@ -1,12 +1,451 @@
-# configured service identity
+# configured service identity and the handler contract every service kind satisfies
 
-pub val KIND_STATIC:      u8 = 1;
-pub val KIND_PROXY:       u8 = 2;
-pub val KIND_APPLICATION: u8 = 3;
-pub val KIND_REDIRECT:    u8 = 4;
-pub val KIND_FIXED:       u8 = 5;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.view;
+use std.allocator;
+use std.sync.cancel;
+use std.chrono.time;
+use http_date: hedge.http.date;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.status;
+use http.core.body;
+use hedge.config.schema;
+use call: hedge.dispatch.call;
 
-pub rec Service {
-    id:   u64;
+pub val KIND_STATIC: u8 = schema.SERVICE_STATIC;
+pub val KIND_PROXY: u8 = schema.SERVICE_PROXY;
+pub val KIND_APPLICATION: u8 = schema.SERVICE_LAUREL;
+pub val KIND_FIXED: u8 = schema.SERVICE_FIXED;
+pub val KIND_REDIRECT: u8 = schema.SERVICE_REDIRECT;
+pub val KIND_NATIVE: u8 = schema.SERVICE_NATIVE;
+
+pub val MAX_APPLICATIONS: usize = 32;
+
+# every service kind reduces to one handler over one bound call
+pub def ServeFun: fun(ptr, *call.Call) exchange.ServiceStatus;
+
+pub rec Handler {
+    ctx: ptr;
+    serve: ServeFun;
+}
+
+# a listener-owned service is selected before public virtual-host routing. it is
+# how an isolated control plane can share the protocol engines without gaining
+# a public route.
+pub rec ListenerService {
+    listener: str;
+    name: str;
+    handler: Handler;
+}
+
+pub fun no_handler() Handler {
+    ret Handler{ctx: nil, serve: (0::usize)::ServeFun};
+}
+
+pub fun has_handler(handler: Handler) bool {
+    ret handler.serve::usize != 0;
+}
+
+# an immutable per-generation description of one configured service
+pub rec Descriptor {
     kind: u8;
+    name: str;
+    target: str;
+    content_type: str;
+    status: status.Status;
+    handler: Handler;
+}
+
+# a registered application is reached only through this handler contract, so
+# hedge links no framework code and a framework needs no hedge symbol
+pub rec Application {
+    name: str;
+    handler: Handler;
+    live: bool;
+}
+
+pub rec Applications {
+    items: *Application;
+    capacity: usize;
+    len: usize;
+}
+
+pub fun make_applications(registry: *Applications, items: *Application, capacity: usize) bool {
+    if (registry == nil || (capacity != 0 && items == nil) || capacity > MAX_APPLICATIONS) { ret false; }
+    registry.items = items;
+    registry.capacity = capacity;
+    registry.len = 0;
+    ret true;
+}
+
+pub fun find_application(registry: *Applications, name: str) *Application {
+    if (registry == nil || name == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < registry.len) {
+        if (registry.items[i].live && str_equals(registry.items[i].name, name)) { ret ?registry.items[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun register_application(registry: *Applications, name: str, handler: Handler) bool {
+    if (registry == nil || name == nil || name[0] == 0 || !has_handler(handler)
+     || registry.len >= registry.capacity || find_application(registry, name) != nil) { ret false; }
+    val slot: *Application = ?registry.items[registry.len];
+    registry.len = registry.len + 1;
+    slot.name = name;
+    slot.handler = handler;
+    slot.live = true;
+    ret true;
+}
+
+# a factory turns one configured service into a handler bound to generation-owned state
+pub def FactoryFun: fun(ptr, *schema.Service, *Handler) bool;
+
+# one factory and the generation-owned state it draws from
+pub rec Factory {
+    ctx: ptr;
+    build: FactoryFun;
+}
+
+pub fun no_factory() Factory {
+    ret Factory{ctx: nil, build: (0::usize)::FactoryFun};
+}
+
+pub fun has_factory(entry: Factory) bool {
+    ret entry.build::usize != 0;
+}
+
+# an optional layer wrapped around a constructed handler, such as a cache
+pub def WrapFun: fun(ptr, *schema.Service, Handler, *Handler) bool;
+
+pub rec Wrapper {
+    ctx: ptr;
+    wrap: WrapFun;
+}
+
+pub fun no_wrapper() Wrapper {
+    ret Wrapper{ctx: nil, wrap: (0::usize)::WrapFun};
+}
+
+pub fun has_wrapper(entry: Wrapper) bool {
+    ret entry.wrap::usize != 0;
+}
+
+# service kinds hedge does not implement in its core are supplied here, so a
+# deployment that enables none of them links none of their code. each factory
+# carries its own state, because no two kinds share a runtime.
+pub rec Resolver {
+    static_files: Factory;
+    proxy: Factory;
+    native: Factory;
+    caching: Wrapper;
+    applications: *Applications;
+    observer: call.Observer;
+    listener_services: *ListenerService;
+    listener_service_count: usize;
+}
+
+pub fun no_resolver() Resolver {
+    ret Resolver{
+        static_files: no_factory(),
+        proxy: no_factory(),
+        native: no_factory(),
+        caching: no_wrapper(),
+        applications: nil,
+        observer: call.no_observer(),
+        listener_services: nil,
+        listener_service_count: 0,
+    };
+}
+
+pub fun text_view(value: str) view.View {
+    if (value == nil) { ret view.view(nil, 0); }
+    ret view.view(value, str_len(value));
+}
+
+pub fun add_field(active: *call.Call, name: str, value: str) bool {
+    val response: *message.Response = call.response(active);
+    if (response == nil) { ret false; }
+    ret message.add_field(response, field.Field{
+        name: text_view(name),
+        value: text_view(value),
+        sensitive: false,
+    }) == field.ADD_OK;
+}
+
+# stamp the fields every hedge response carries, then commit
+#
+# RFC 9110 requires an origin server with a clock to send `Date`, and a cache
+# cannot compute an age without it. Every commit path goes through here so no
+# response can be emitted without one.
+fun stamp_date(active: *call.Call) bool {
+    val response: *message.Response = call.response(active);
+    if (response == nil) { ret false; }
+    if (field.find_first(?response.fields, text_view(field.DATE)) == nil) {
+        val storage: *u8 = arena_bytes(active, http_date.IMF_LENGTH + 1);
+        if (storage == nil) { ret false; }
+        val length: usize = http_date.format(time.now(), storage, http_date.IMF_LENGTH + 1);
+        if (length != 0 && message.add_field(response, field.Field{
+            name: text_view(field.DATE),
+            value: view.view(storage, length),
+            sensitive: false,
+        }) != field.ADD_OK) { ret false; }
+    }
+    ret true;
+}
+
+pub fun commit(active: *call.Call) message.ResponseStatus {
+    val response: *message.Response = call.response(active);
+    if (response == nil || response.body_kind == message.BODY_WRITER) {
+        ret message.RESPONSE_INVALID;
+    }
+    if (!stamp_date(active)) { ret message.RESPONSE_INVALID; }
+    val intercepted: call.Interception = call.intercept_response(active);
+    if (intercepted == call.INTERCEPT_FAILED) { ret message.RESPONSE_INVALID; }
+    if (intercepted == call.INTERCEPT_REPLACED && !stamp_date(active)) {
+        ret message.RESPONSE_INVALID;
+    }
+    val committed: message.ResponseStatus = exchange.commit(active.exchange,
+        call.limits(active));
+    if (committed == message.RESPONSE_OK) { call.record_head(active); }
+    ret committed;
+}
+
+pub fun arena_bytes(active: *call.Call, count: usize) *u8 {
+    val a: *allocator.Allocator = call.allocator_of(active);
+    if (a == nil) { ret nil; }
+    val allocated: Result[*u8, *u8] = allocator.allocate[u8](a, count);
+    if (is_err[*u8, *u8](allocated)) { ret nil; }
+    ret unwrap_ok[*u8, *u8](allocated);
+}
+
+# commit a bodyless response after the caller has set status and fields
+#
+# a response that permits content but carries none is still length-delimited: it
+# declares zero. without that the message would only end when the connection
+# closes, which costs the client a round trip and the server a reusable socket.
+pub fun commit_bodyless(active: *call.Call, chosen: call.Disposition) exchange.ServiceStatus {
+    val response: *message.Response = call.response(active);
+    val request: *message.Request = call.request(active);
+    if (response == nil || request == nil) { ret exchange.SERVICE_FAILED; }
+    if (status.permits_content(request.method.kind, response.status)
+     && field.find_first(?response.fields, text_view(field.CONTENT_LENGTH)) == nil
+     && !add_field(active, field.CONTENT_LENGTH, "0")) { ret exchange.SERVICE_FAILED; }
+    if (!call.resolve_body(active, chosen)) { ret exchange.SERVICE_FAILED; }
+    if (commit(active) != message.RESPONSE_OK) { ret exchange.SERVICE_FAILED; }
+    ret exchange.SERVICE_COMPLETE;
+}
+
+pub fun respond(active: *call.Call, code: status.Status) exchange.ServiceStatus {
+    val response: *message.Response = call.response(active);
+    if (response == nil || message.set_status(response, code) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret commit_bodyless(active, call.BODY_DRAIN);
+}
+
+# a bounded body reader over immutable bytes the caller keeps alive for the exchange
+pub rec TextBody {
+    data: *u8;
+    length: usize;
+    offset: usize;
+    reader: body.Reader;
+}
+
+fun text_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
+    val state: *TextBody = context::*TextBody;
+    if (state == nil) { ret body.failed("text body has no state", body.REUSE_FORBIDDEN); }
+    var remaining: usize = state.length - state.offset;
+    if (remaining == 0) { ret body.complete(body.REUSE_ALLOWED); }
+    if (remaining > capacity) { remaining = capacity; }
+    if (remaining == 0) { ret body.failed("text body read admitted no capacity", body.REUSE_FORBIDDEN); }
+    var i: usize = 0;
+    for (i < remaining) {
+        output[i] = state.data[state.offset + i];
+        i = i + 1;
+    }
+    state.offset = state.offset + remaining;
+    ret body.data(remaining);
+}
+
+fun text_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
+    val state: *TextBody = context::*TextBody;
+    if (state == nil) { ret body.failed("text body has no state", body.REUSE_FORBIDDEN); }
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
+    state.offset = state.length;
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+fun text_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+fun text_release(context: ptr) {
+}
+
+# storage lives in the request arena, so the reader borrows for exactly one exchange
+pub fun make_text_body(
+    state: *TextBody,
+    data: *u8,
+    length: usize,
+    generation: u64,
+    configured: body.Limits,
+    scope: *cancel.Scope,
+) bool {
+    if (state == nil || (length != 0 && data == nil) || scope == nil) { ret false; }
+    state.data = data;
+    state.length = length;
+    state.offset = 0;
+    state.reader = body.init_reader(
+        (state)::ptr,
+        text_read,
+        text_finish,
+        text_complete,
+        text_release,
+        body.OWNER_APPLICATION,
+        generation,
+        true,
+        length::u64,
+        configured,
+        nil,
+        scope,
+    );
+    ret state.reader.valid;
+}
+
+# decimal text for a length, written into the request arena so the field view
+# stays valid for exactly the exchange that produced it
+pub fun arena_number(active: *call.Call, value: u64) str {
+    val a: *allocator.Allocator = call.allocator_of(active);
+    if (a == nil) { ret nil; }
+    val allocated: Result[*u8, *u8] = allocator.allocate[u8](a, 21);
+    if (is_err[*u8, *u8](allocated)) { ret nil; }
+    val output: *u8 = unwrap_ok[*u8, *u8](allocated);
+    var digits: usize = 1;
+    var scale: u64 = value;
+    for (scale >= 10) { scale = scale / 10; digits = digits + 1; }
+    output[digits] = 0;
+    var remaining: u64 = value;
+    var i: usize = digits;
+    for (i > 0) {
+        i = i - 1;
+        output[i] = ('0' + (remaining % 10)::u8);
+        remaining = remaining / 10;
+    }
+    ret output::str;
+}
+
+# allocate the reader state in the call arena and commit the response around it
+pub fun respond_with_bytes(active: *call.Call, data: *u8, length: usize) exchange.ServiceStatus {
+    val response: *message.Response = call.response(active);
+    val a: *allocator.Allocator = call.allocator_of(active);
+    val configured: message.Limits = call.limits(active);
+    if (response == nil || a == nil) { ret exchange.SERVICE_FAILED; }
+    val allocated: Result[*TextBody, *u8] = allocator.allocate[TextBody](a, 1);
+    if (is_err[*TextBody, *u8](allocated)) { ret exchange.SERVICE_FAILED; }
+    val state: *TextBody = unwrap_ok[*TextBody, *u8](allocated);
+    if (!make_text_body(state, data, length, response.generation, configured.response_body, call.scope(active))) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (field.find_first(?response.fields, text_view(field.CONTENT_LENGTH)) == nil) {
+        val measured: str = arena_number(active, length::u64);
+        if (measured == nil || !add_field(active, field.CONTENT_LENGTH, measured)) {
+            ret exchange.SERVICE_FAILED;
+        }
+    }
+    if (message.set_body_reader(response, ?state.reader, configured) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!call.resolve_body(active, call.BODY_DRAIN)) { ret exchange.SERVICE_FAILED; }
+    if (commit(active) != message.RESPONSE_OK) { ret exchange.SERVICE_FAILED; }
+    ret exchange.SERVICE_COMPLETE;
+}
+
+pub fun respond_with_text(active: *call.Call, text: str) exchange.ServiceStatus {
+    if (text == nil) { ret respond_with_bytes(active, nil, 0); }
+    ret respond_with_bytes(active, text::*u8, str_len(text));
+}
+
+# a fixed response service owns nothing beyond its immutable descriptor
+pub fun serve_fixed(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    val descriptor: *Descriptor = context::*Descriptor;
+    if (descriptor == nil) { ret exchange.SERVICE_FAILED; }
+    val response: *message.Response = call.response(active);
+    if (response == nil || message.set_status(response, descriptor.status) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    var media: str = descriptor.content_type;
+    if (media == nil || media[0] == 0) { media = "text/plain; charset=utf-8"; }
+    if (!add_field(active, field.CONTENT_TYPE, media)) { ret exchange.SERVICE_FAILED; }
+    # a HEAD response carries the length the matching GET would have sent
+    if (!status.permits_content(call.request(active).method.kind, descriptor.status)) {
+        var length: usize = 0;
+        if (descriptor.target != nil) { length = str_len(descriptor.target); }
+        val measured: str = arena_number(active, length::u64);
+        if (measured == nil || !add_field(active, field.CONTENT_LENGTH, measured)) {
+            ret exchange.SERVICE_FAILED;
+        }
+        ret commit_bodyless(active, call.BODY_DRAIN);
+    }
+    ret respond_with_text(active, descriptor.target);
+}
+
+# a redirect service names its own location and status and never reads a body
+pub fun serve_redirect(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    val descriptor: *Descriptor = context::*Descriptor;
+    if (descriptor == nil) { ret exchange.SERVICE_FAILED; }
+    val response: *message.Response = call.response(active);
+    if (response == nil || message.set_status(response, descriptor.status) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    if (!add_field(active, field.LOCATION, descriptor.target)) { ret exchange.SERVICE_FAILED; }
+    ret commit_bodyless(active, call.BODY_DRAIN);
+}
+
+test "service: an application registry rejects duplicates and unknown names" {
+    var slots: [4]Application;
+    var registry: Applications;
+    if (!make_applications(?registry, ?slots[0], 4)) { ret 1; }
+    val handler: Handler = Handler{ctx: nil, serve: (1::usize)::ServeFun};
+    if (!register_application(?registry, "site", handler)) { ret 2; }
+    if (register_application(?registry, "site", handler)) { ret 3; }
+    if (find_application(?registry, "site") == nil) { ret 4; }
+    if (find_application(?registry, "other") != nil) { ret 5; }
+    ret 0;
+}
+
+test "service: an unresolved kind produces no handler" {
+    val empty: Resolver = no_resolver();
+    if (has_factory(empty.static_files) || has_factory(empty.proxy) || empty.applications != nil) { ret 1; }
+    if (has_handler(no_handler())) { ret 2; }
+    ret 0;
+}
+
+test "service: response writers are rejected before commitment" {
+    var writer: body.Writer = body.empty_writer(1);
+    var response: message.Response;
+    response.body_kind = message.BODY_WRITER;
+    response.body_writer = ?writer;
+    response.committed = false;
+    var exchange: exchange.Exchange;
+    exchange.response = ?response;
+    var active: call.Call;
+    active.exchange = ?exchange;
+    if (commit(?active) != message.RESPONSE_INVALID) { ret 1; }
+    if (response.committed) { ret 2; }
+    ret 0;
 }

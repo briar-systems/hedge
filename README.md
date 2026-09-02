@@ -4,7 +4,16 @@ Hedge is a lightweight production web server written in Mach.
 
 Hedge is the deployable product in the Mach web stack. It will serve static files, Mach web applications, and upstream services over HTTP/1.1, HTTP/2, and HTTP/3 with native Mach TLS and QUIC.
 
-The repository currently contains the product contract and implementation scaffold. The executable fails closed until the serving runtime exists. Nothing in this repository claims to serve traffic yet.
+Hedge serves HTTP/1.1 and HTTP/2 over TLS 1.2 and TLS 1.3, with SNI, ALPN and
+client certificates, qualified against curl, OpenSSL and GnuTLS in
+[`test/interop`](test/interop/README.md). Static files, reverse proxying,
+bounded caches, virtual host dispatch, and ACME over authenticated TLS are
+implemented. A `transport = "quic"` listener becomes ready and serves HTTP/3,
+with ALPN inside QUIC selecting `h3`, qualified against curl 8.21.0 over
+ngtcp2 in the same interoperability matrix: request bodies, large responses,
+and prompt shutdown included. The current Let's Encrypt chain uses certificate algorithms
+mach-tls cannot verify (#38), and a listener's credential generation cannot
+yet be replaced (#37).
 
 ## Product goals
 
@@ -30,7 +39,7 @@ Lightweight does not mean omitting production duties. It means that protocol eng
 - `mach-http` provides HTTP semantics and connection engines.
 - `mach-quic` provides QUIC transport and recovery.
 - `mach-acme` provides certificate issuance and renewal.
-- `mach-web` provides the production web application framework.
+- Laurel provides the production web application framework.
 - `hedge` assembles those libraries into an operated server.
 
 See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md) for the dependency contracts.
@@ -55,5 +64,19 @@ mach dep pull
 mach test .
 mach build .
 ```
+
+The runtime harness in `test/runtime` composes the whole server into one test
+binary and is run separately:
+
+```sh
+mach dep pull test/runtime
+mach test test/runtime
+```
+
+Its debug profile carries no debug info because the compilation peaks near
+18 GiB; on a 32 GiB machine the harness passes in the debug profile and is
+killed in the release profile, so the release run needs more memory than
+that.
+
 
 Build output uses Mach's default `out/` directory.

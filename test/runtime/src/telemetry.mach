@@ -1,0 +1,287 @@
+# production telemetry through composition and real listener sockets
+
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.option;
+use std.allocator;
+use page: std.allocator.page;
+use std.net.ip;
+use std.net.tcp;
+use std.log.record;
+use std.log.sink;
+use hedge.config.schema;
+use hedge.listener;
+use hedge.serve;
+use quic_runtime: hedge.protocol.quic.runtime;
+use hedge.secret;
+use composition: hedge.composition;
+use telemetry_production: hedge.telemetry.production;
+use wire: hedgetest.wire;
+
+val CAPTURE_BYTES: usize = 32768;
+val RESPONSE_BYTES: usize = 16384;
+
+rec Capture {
+    data: [CAPTURE_BYTES]u8;
+    len: usize;
+    writes: usize;
+}
+
+fun capture_publish(context: ptr, data: *u8, length: usize) sink.WriteReport {
+    val capture: *Capture = context::*Capture;
+    if (capture == nil || data == nil || capture.len + length + 1 > CAPTURE_BYTES) {
+        ret sink.failed(length, 0, "telemetry capture is full");
+    }
+    var i: usize = 0;
+    for (i < length) {
+        capture.data[capture.len + i] = data[i];
+        i = i + 1;
+    }
+    capture.len = capture.len + length;
+    capture.data[capture.len] = 0;
+    capture.writes = capture.writes + 1;
+    ret sink.persisted(length);
+}
+
+fun application_secret(context: ptr, provider: str, key: str, output: *u8,
+    capacity: usize) i64 {
+    if (!str_equals(provider, "application") || !str_equals(key, "admin")
+     || output == nil || capacity < 6) { ret -1; }
+    output[0] = 'v'; output[1] = 'a'; output[2] = 'l'; output[3] = 'i';
+    output[4] = 'd'; output[5] = 0;
+    ret 5;
+}
+
+fun configure_listener(target: *schema.Listener, name: str) {
+    schema.set_text(?target.name, name);
+    schema.set_text(?target.address, "127.0.0.1:0");
+    schema.clear_text(?target.tls_policy);
+    schema.clear_text(?target.budget);
+    target.transport = schema.TRANSPORT_TCP;
+    target.protocols = schema.PROTOCOL_HTTP1;
+    target.backlog = 16;
+    target.accept_depth = 2;
+    target.proxy_protocol = schema.PROXY_OFF;
+    target.trusted_peer_count = 0;
+}
+
+fun configure(graph: *schema.Graph) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "telemetry-composition-test");
+    graph.limits.max_connections = 4;
+    graph.limits.max_connections_per_peer = 4;
+    graph.listener_count = 2;
+    configure_listener(?graph.listeners[0], "public");
+    configure_listener(?graph.listeners[1], "admin");
+
+    graph.host_count = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    schema.set_text(?graph.hosts[0].listener, "public");
+    graph.hosts[0].server_name_count = 1;
+    schema.set_text(?graph.hosts[0].server_names[0], "localhost");
+
+    graph.service_count = 1;
+    val fixed: *schema.Service = ?graph.services[0];
+    schema.set_text(?fixed.name, "public-service");
+    fixed.kind = schema.SERVICE_FIXED;
+    schema.set_text(?fixed.target, "public\n");
+    schema.clear_text(?fixed.budget);
+    schema.set_text(?fixed.content_type, "text/plain");
+    schema.clear_text(?fixed.index);
+    fixed.precompressed = false;
+    fixed.status = 200;
+    fixed.cache = false;
+
+    graph.route_count = 1;
+    schema.set_text(?graph.routes[0].name, "public-route");
+    schema.set_text(?graph.routes[0].host, "site");
+    schema.set_text(?graph.routes[0].path, "/**");
+    schema.set_text(?graph.routes[0].service, "public-service");
+    schema.clear_text(?graph.routes[0].budget);
+
+    graph.telemetry.logs = true;
+    graph.telemetry.metrics = true;
+    graph.telemetry.traces = true;
+    graph.telemetry.log_record_bytes = 1024;
+    graph.telemetry.log_queue_depth = 8;
+    graph.telemetry.metric_series = schema.MIN_METRIC_SERIES;
+    graph.telemetry.trace_state_bytes = 512;
+
+    graph.secret_count = 1;
+    schema.set_text(?graph.secrets[0].name, "admin-token");
+    schema.set_text(?graph.secrets[0].provider, "application");
+    schema.set_text(?graph.secrets[0].key, "admin");
+    graph.admin.enabled = true;
+    schema.set_text(?graph.admin.listener, "admin");
+    schema.set_text(?graph.admin.auth_secret, "admin-token");
+    graph.admin.max_response_bytes = 8192;
+}
+
+fun endpoint(runtime: *composition.Runtime, name: str, output: *ip.Endpoint) bool {
+    var i: usize = 0;
+    for (i < schema.MAX_LISTENERS) {
+        val owned: *listener.OwnedListener =
+            listener.active_listener(?runtime.serving.owner, i);
+        if (owned != nil && owned.has_bound_endpoint
+         && str_equals(schema.text(?owned.name), name)) {
+            @output = owned.bound_endpoint;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun request(runtime: *composition.Runtime, target: ip.Endpoint, head: str,
+    marker: str, output: *u8, capacity: usize) usize {
+    var client: tcp.Stream;
+    if (!wire.connect(target, ?client) || !wire.send(?client, head)) {
+        tcp.stream_close(?client);
+        ret 0;
+    }
+    val length: usize = wire.collect(?runtime.serving, ?client, output,
+        capacity, marker);
+    tcp.stream_close(?client);
+    ret length;
+}
+
+fun settle(runtime: *composition.Runtime) bool {
+    var quic_controls: quic_runtime.ControlView;
+    var rounds: usize = 0;
+    for (rounds < 200 && !serve.idle(?runtime.serving)) {
+        serve.poll(?quic_controls, ?runtime.serving, 1);
+        rounds = rounds + 1;
+    }
+    ret serve.idle(?runtime.serving);
+}
+
+test "telemetry composition: public and authenticated admin planes share process ownership" {
+    var controls: composition.Controls;
+    var heap: allocator.Allocator;
+    if (option.is_some[*u8](page.make(?heap))) { ret 1; }
+    val runtime_memory: Result[*composition.Runtime, *u8] =
+        allocator.allocate[composition.Runtime](?heap, 1);
+    val storage_memory: Result[*composition.PlanStorage, *u8] =
+        allocator.allocate[composition.PlanStorage](?heap, 2);
+    if (is_err[*composition.Runtime, *u8](runtime_memory)
+     || is_err[*composition.PlanStorage, *u8](storage_memory)) { ret 2; }
+    val runtime: *composition.Runtime =
+        unwrap_ok[*composition.Runtime, *u8](runtime_memory);
+    val storages: *composition.PlanStorage =
+        unwrap_ok[*composition.PlanStorage, *u8](storage_memory);
+
+    var graph: schema.Graph;
+    configure(?graph);
+    var capture: Capture;
+    capture.len = 0;
+    capture.writes = 0;
+    capture.data[0] = 0;
+    val contract: sink.Contract = sink.Contract{
+        delivery: sink.DELIVERY_DIRECT,
+        max_record: 1024,
+        oversize: record.OVERSIZE_REJECT,
+        adapter: sink.ADAPTER_CUSTOM,
+        target_atomic_limit: 0,
+        queue_capacity: 0,
+        overload: sink.OVERLOAD_REJECT_NEW,
+    };
+    var downstream: sink.Sink = sink.Sink{ctx: (?capture)::ptr,
+        f_publish: capture_publish, contract: contract};
+    var options: composition.Options = composition.default_options();
+    options.telemetry = telemetry_production.Options{
+        secrets: secret.Resolver{context: nil, resolve: application_secret},
+        downstream: ?downstream,
+    };
+    var diagnostics: schema.Diagnostics;
+    schema.reset_diagnostics(?diagnostics);
+    val started: composition.StartReport = composition.start(runtime, ?controls, ?heap,
+        ?graph, 1, ?storages[0], ?diagnostics, options);
+    if (started.status != composition.START_OK) { ret 3; }
+
+    var public_endpoint: ip.Endpoint;
+    var admin_endpoint: ip.Endpoint;
+    if (!endpoint(runtime, "public", ?public_endpoint)
+     || !endpoint(runtime, "admin", ?admin_endpoint)
+     || runtime.serving.observability != ?runtime.observability.runtime
+     || runtime.plans[0].observer.ctx != (?runtime.observability.runtime)::ptr
+     || runtime.plans[0].listener_service_count != 1
+     || runtime.observability.secret_value[0] != 'v') {
+        composition.stop(runtime, ?controls);
+        ret 4;
+    }
+
+    var response: [RESPONSE_BYTES]u8;
+    var length: usize = request(runtime, public_endpoint,
+        "GET /ready HTTP/1.1\r\nHost: localhost\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nConnection: close\r\n\r\n",
+        "public\n", ?response[0], RESPONSE_BYTES);
+    if (length == 0
+     || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")
+     || !wire.contains(?response[0], length, "public\n")) {
+        composition.stop(runtime, ?controls);
+        ret 5;
+    }
+
+    length = request(runtime, admin_endpoint,
+        "GET /ready HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\nConnection: close\r\n\r\n",
+        "Bearer", ?response[0], RESPONSE_BYTES);
+    if (length == 0
+     || !wire.starts_with(?response[0], length,
+        "HTTP/1.1 401 Unauthorized\r\n")
+     || !wire.contains(?response[0], length, "Bearer")) {
+        composition.stop(runtime, ?controls);
+        ret 6;
+    }
+
+    length = request(runtime, admin_endpoint,
+        "GET /ready HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer valid\r\nConnection: close\r\n\r\n",
+        "\"ready\":true", ?response[0], RESPONSE_BYTES);
+    if (length == 0
+     || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")
+     || !wire.contains(?response[0], length, "\"ready\":true")) {
+        composition.stop(runtime, ?controls);
+        ret 7;
+    }
+
+    length = request(runtime, admin_endpoint,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer valid\r\nConnection: close\r\n\r\n",
+        "hedge_requests_total", ?response[0], RESPONSE_BYTES);
+    if (length == 0
+     || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")
+     || !wire.contains(?response[0], length, "hedge_requests_total")) {
+        composition.stop(runtime, ?controls);
+        ret 8;
+    }
+    if (!settle(runtime)) { composition.stop(runtime, ?controls); ret 9; }
+
+    val stopped: composition.StopReport = composition.stop(runtime, ?controls);
+    if (!stopped.stopped || stopped.serve_failures != 0
+     || stopped.cleanup_failures != 0) { ret 10; }
+    if (runtime.observability.runtime.initialized
+     || runtime.observability.queue_storage != nil
+     || runtime.observability.metric_storage != nil
+     || runtime.observability.listener_service_count != 0) { ret 11; }
+    var i: usize = 0;
+    for (i < secret.MAX_VALUE_BYTES + 1) {
+        if (runtime.observability.secret_value[i] != 0) { ret 12; }
+        i = i + 1;
+    }
+    if (capture.writes < 4) { ret 13; }
+    if (!wire.contains(?capture.data[0], capture.len, "kind=\"access\"")) {
+        ret 14;
+    }
+    if (!wire.contains(?capture.data[0], capture.len,
+        "trace_id=\"4bf92f3577b34da6a3ce929d0e0e4736\"")) { ret 15; }
+    if (!wire.contains(?capture.data[0], capture.len,
+        "listener=\"public\"")) { ret 16; }
+    if (!wire.contains(?capture.data[0], capture.len,
+        "listener=\"admin\"")) { ret 17; }
+    ret 0;
+}

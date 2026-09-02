@@ -1,0 +1,338 @@
+# request and response transformation across the proxy hop
+#
+# A hop-by-hop field belongs to one connection and must never cross to the next
+# one. Forwarding a `Connection` field, or any field it names, is how a proxy
+# turns two disagreeing parsers into request smuggling, so the filter here is a
+# deny list applied to every field rather than a fix applied to known names.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+
+pub val MAX_FORWARDED_BYTES: usize = 256;
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+pub fun name_is(name: view.View, expected: str) bool {
+    val length: usize = str_len(expected);
+    if (name.len != length || name.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (lower(name.data[i]) != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the fixed hop-by-hop set from RFC 9110, plus the framing fields the next hop
+# recomputes for itself
+fun always_hop_by_hop(name: view.View) bool {
+    ret name_is(name, "connection")
+     || name_is(name, "keep-alive")
+     || name_is(name, "proxy-connection")
+     || name_is(name, "proxy-authenticate")
+     || name_is(name, "proxy-authorization")
+     || name_is(name, "te")
+     || name_is(name, "trailer")
+     || name_is(name, "transfer-encoding")
+     || name_is(name, "upgrade")
+     || name_is(name, "content-length")
+     || name_is(name, "host");
+}
+
+fun member_is(list: view.View, start: usize, end: usize, name: view.View) bool {
+    var from: usize = start;
+    var to: usize = end;
+    for (from < to && (list.data[from] == ' ' || list.data[from] == '\t')) { from = from + 1; }
+    for (to > from && (list.data[to - 1] == ' ' || list.data[to - 1] == '\t')) { to = to - 1; }
+    if (to - from != name.len) { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        if (lower(list.data[from + i]) != lower(name.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a field named by any `Connection` header is hop-by-hop for this connection
+pub fun named_by_connection(fields: *field.Fields, name: view.View) bool {
+    if (fields == nil || fields.items == nil) { ret false; }
+    var f: usize = 0;
+    for (f < fields.len) {
+        val item: *field.Field = ?fields.items[f];
+        if (name_is(item.name, "connection") || name_is(item.name, "proxy-connection")) {
+            val list: view.View = item.value;
+            var start: usize = 0;
+            var i: usize = 0;
+            for (i <= list.len) {
+                if (i == list.len || list.data[i] == ',') {
+                    if (i > start && member_is(list, start, i, name)) { ret true; }
+                    start = i + 1;
+                }
+                i = i + 1;
+            }
+        }
+        f = f + 1;
+    }
+    ret false;
+}
+
+pub fun forwardable(fields: *field.Fields, name: view.View) bool {
+    if (always_hop_by_hop(name)) { ret false; }
+    ret !named_by_connection(fields, name);
+}
+
+# copy the end-to-end fields of one message into another collection
+pub fun copy_fields(source: *field.Fields, destination: *field.Fields) bool {
+    if (source == nil || destination == nil) { ret false; }
+    var i: usize = 0;
+    for (i < source.len) {
+        val item: *field.Field = ?source.items[i];
+        if (forwardable(source, item.name)) {
+            if (field.append(destination, @item) != field.ADD_OK) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun copy_request_fields(source: *field.Fields,
+    destination: *field.Fields) bool {
+    if (source == nil || destination == nil) { ret false; }
+    var i: usize = 0;
+    for (i < source.len) {
+        val item: *field.Field = ?source.items[i];
+        if (forwardable(source, item.name)
+         && !name_is(item.name, "traceparent")
+         && !name_is(item.name, "tracestate")) {
+            if (field.append(destination, @item) != field.ADD_OK) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub rec Peer {
+    address: view.View;
+    secure: bool;
+    host: view.View;
+}
+
+fun write_text(output: *u8, offset: usize, capacity: usize, text: str, ok: *bool) usize {
+    var at: usize = offset;
+    var i: usize = 0;
+    for (text[i] != 0) {
+        if (at + 1 >= capacity) { @ok = false; ret at; }
+        output[at] = text[i];
+        at = at + 1;
+        i = i + 1;
+    }
+    ret at;
+}
+
+fun write_view(output: *u8, offset: usize, capacity: usize, value: view.View, ok: *bool) usize {
+    var at: usize = offset;
+    var i: usize = 0;
+    for (i < value.len) {
+        if (at + 1 >= capacity) { @ok = false; ret at; }
+        output[at] = value.data[i];
+        at = at + 1;
+        i = i + 1;
+    }
+    ret at;
+}
+
+fun quotable(value: view.View) bool {
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (c == '"' || c == '\\' || c < ' ' || c == 127) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# `Forwarded: for="<peer>";proto=<scheme>;host="<host>"`
+#
+# the peer identity this proxy states is its own observation. an inbound
+# Forwarded or X-Forwarded-For is not extended, because a value from an
+# untrusted peer would let a client choose the identity the upstream sees.
+pub fun format_forwarded(peer: Peer, output: *u8, capacity: usize) usize {
+    if (output == nil || capacity == 0 || peer.address.len == 0
+     || !quotable(peer.address) || !quotable(peer.host)) { ret 0; }
+    var ok: bool = true;
+    var at: usize = write_text(output, 0, capacity, "for=\"", ?ok);
+    at = write_view(output, at, capacity, peer.address, ?ok);
+    at = write_text(output, at, capacity, "\";proto=", ?ok);
+    if (peer.secure) { at = write_text(output, at, capacity, "https", ?ok); }
+    or { at = write_text(output, at, capacity, "http", ?ok); }
+    if (peer.host.len != 0) {
+        at = write_text(output, at, capacity, ";host=\"", ?ok);
+        at = write_view(output, at, capacity, peer.host, ?ok);
+        at = write_text(output, at, capacity, "\"", ?ok);
+    }
+    if (!ok) { ret 0; }
+    output[at] = 0;
+    ret at;
+}
+
+# `Via: <version> <pseudonym>`
+pub fun format_via(version: message.Version, pseudonym: str, output: *u8,
+    capacity: usize) usize {
+    if (output == nil || capacity == 0 || pseudonym == nil || pseudonym[0] == 0) { ret 0; }
+    var ok: bool = true;
+    var at: usize = 0;
+    if (version.wire == message.WIRE_H1) {
+        at = write_text(output, at, capacity, "1.", ?ok);
+        if (version.minor == 0) { at = write_text(output, at, capacity, "0", ?ok); }
+        or { at = write_text(output, at, capacity, "1", ?ok); }
+    } or (version.wire == message.WIRE_H2) {
+        at = write_text(output, at, capacity, "2", ?ok);
+    } or {
+        at = write_text(output, at, capacity, "3", ?ok);
+    }
+    at = write_text(output, at, capacity, " ", ?ok);
+    at = write_text(output, at, capacity, pseudonym, ?ok);
+    if (!ok) { ret 0; }
+    output[at] = 0;
+    ret at;
+}
+
+# replay safety is a property of the request, not a hope about the upstream
+#
+# a method must be idempotent and the body must be absent, because this proxy
+# never buffers a request body in order to replay it.
+pub def Replay: u8;
+pub val REPLAY_FORBIDDEN: Replay = 1;
+pub val REPLAY_SAFE: Replay = 2;
+
+pub fun classify_replay(request: *message.Request) Replay {
+    if (request == nil || request.body == nil) { ret REPLAY_FORBIDDEN; }
+    if (!method.is_idempotent(request.method.kind)) { ret REPLAY_FORBIDDEN; }
+    # this proxy never buffers a request body in order to replay it, so a request
+    # that carries one, or whose length is unknown, is not replayable at all
+    if (!request.body.has_length || request.body.declared_length != 0) { ret REPLAY_FORBIDDEN; }
+    ret REPLAY_SAFE;
+}
+
+test "forward: the fixed hop-by-hop set never crosses the hop" {
+    if (forwardable(nil, view.view("connection", 10))) { ret 1; }
+    if (forwardable(nil, view.view("Transfer-Encoding", 17))) { ret 2; }
+    if (forwardable(nil, view.view("keep-alive", 10))) { ret 3; }
+    if (forwardable(nil, view.view("upgrade", 7))) { ret 4; }
+    if (forwardable(nil, view.view("content-length", 14))) { ret 5; }
+    if (forwardable(nil, view.view("host", 4))) { ret 6; }
+    if (forwardable(nil, view.view("proxy-authorization", 19))) { ret 7; }
+    if (!forwardable(nil, view.view("accept", 6))) { ret 8; }
+    if (!forwardable(nil, view.view("authorization", 13))) { ret 9; }
+    ret 0;
+}
+
+test "forward: a field named by Connection is hop-by-hop for this connection" {
+    var items: [2]field.Field;
+    var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 256, 64, 128));
+    field.append(?fields, field.Field{
+        name: view.view("connection", 10),
+        value: view.view("keep-alive, X-Private", 21),
+        sensitive: false,
+    });
+    field.append(?fields, field.Field{
+        name: view.view("x-private", 9),
+        value: view.view("secret", 6),
+        sensitive: false,
+    });
+    if (!named_by_connection(?fields, view.view("x-private", 9))) { ret 1; }
+    if (!named_by_connection(?fields, view.view("X-Private", 9))) { ret 2; }
+    if (named_by_connection(?fields, view.view("x-public", 8))) { ret 3; }
+    if (forwardable(?fields, view.view("x-private", 9))) { ret 4; }
+    ret 0;
+}
+
+test "forward: copying keeps end-to-end fields and drops the rest" {
+    var items: [4]field.Field;
+    var fields: field.Fields = field.init(?items[0], 4, field.limits(4, 512, 64, 128));
+    field.append(?fields, field.Field{name: view.view("connection", 10),
+        value: view.view("x-hop", 5), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("x-hop", 5),
+        value: view.view("1", 1), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("accept", 6),
+        value: view.view("*/*", 3), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("transfer-encoding", 17),
+        value: view.view("chunked", 7), sensitive: false});
+    var out_items: [4]field.Field;
+    var outbound: field.Fields = field.init(?out_items[0], 4, field.limits(4, 512, 64, 128));
+    if (!copy_fields(?fields, ?outbound)) { ret 1; }
+    if (outbound.len != 1) { ret 2; }
+    if (!name_is(out_items[0].name, "accept")) { ret 3; }
+    ret 0;
+}
+
+test "forward: proxy-managed trace fields are replaced, never duplicated" {
+    var items: [3]field.Field;
+    var fields: field.Fields = field.init(?items[0], 3,
+        field.limits(3, 512, 64, 128));
+    field.append(?fields, field.Field{name: view.view("traceparent", 11),
+        value: view.view("untrusted", 9), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("tracestate", 10),
+        value: view.view("vendor=value", 12), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("accept", 6),
+        value: view.view("*/*", 3), sensitive: false});
+    var out_items: [3]field.Field;
+    var outbound: field.Fields = field.init(?out_items[0], 3,
+        field.limits(3, 512, 64, 128));
+    if (!copy_request_fields(?fields, ?outbound) || outbound.len != 1
+     || !name_is(out_items[0].name, "accept")) { ret 1; }
+    ret 0;
+}
+
+test "forward: forwarded metadata states this proxy's own observation" {
+    var output: [MAX_FORWARDED_BYTES]u8;
+    val peer: Peer = Peer{
+        address: view.view("192.0.2.7:51000", 15),
+        secure: false,
+        host: view.view("example.test", 12),
+    };
+    val length: usize = format_forwarded(peer, ?output[0], MAX_FORWARDED_BYTES);
+    if (length == 0) { ret 1; }
+    if (!view.view_eq_str(view.view(?output[0], length),
+        "for=\"192.0.2.7:51000\";proto=http;host=\"example.test\"")) { ret 2; }
+    val secured: Peer = Peer{address: view.view("198.51.100.9", 12), secure: true,
+        host: view.view(nil, 0)};
+    val secure_length: usize = format_forwarded(secured, ?output[0], MAX_FORWARDED_BYTES);
+    if (!view.view_eq_str(view.view(?output[0], secure_length),
+        "for=\"198.51.100.9\";proto=https")) { ret 3; }
+    ret 0;
+}
+
+test "forward: a peer identity that could break out of the quoting is refused" {
+    var output: [MAX_FORWARDED_BYTES]u8;
+    val hostile: Peer = Peer{
+        address: view.view("1.2.3.4\";proto=https;for=\"9.9.9.9", 33),
+        secure: false,
+        host: view.view(nil, 0),
+    };
+    if (format_forwarded(hostile, ?output[0], MAX_FORWARDED_BYTES) != 0) { ret 1; }
+    val small: Peer = Peer{address: view.view("192.0.2.7", 9), secure: false,
+        host: view.view(nil, 0)};
+    if (format_forwarded(small, ?output[0], 8) != 0) { ret 2; }
+    ret 0;
+}
+
+test "forward: via names the protocol this hop received" {
+    var output: [64]u8;
+    val length: usize = format_via(message.version_h1(1, 1), "hedge", ?output[0], 64);
+    if (length == 0 || !view.view_eq_str(view.view(?output[0], length), "1.1 hedge")) { ret 1; }
+    val h2: usize = format_via(message.version_h2(), "hedge", ?output[0], 64);
+    if (!view.view_eq_str(view.view(?output[0], h2), "2 hedge")) { ret 2; }
+    ret 0;
+}
