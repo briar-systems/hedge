@@ -65,4 +65,18 @@ mach test .
 mach build .
 ```
 
+The runtime harness in `test/runtime` composes the whole server into one test
+binary and is run separately:
+
+```sh
+mach dep pull test/runtime
+mach test test/runtime
+```
+
+Its debug profile carries no debug info because the compilation peaks near
+18 GiB; on a 32 GiB machine the harness passes in the debug profile and is
+killed in the release profile, so the release run needs more memory than
+that.
+
+
 Build output uses Mach's default `out/` directory.
