@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A request body the service never reads no longer logs `body ended at a
+  different declared length` once the protocol layer has drained it. The
+  reader in mach-http compared the bytes the service read with the declared
+  length even when the drain owned the remainder (mach-http v0.7.6). A body
+  that really ends short of its declared length still fails the exchange on
+  every protocol.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added
