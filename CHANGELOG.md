@@ -2,14 +2,10 @@
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- A request body the service never reads no longer logs `body ended at a
-  different declared length` once the protocol layer has drained it. The
-  reader in mach-http compared the bytes the service read with the declared
-  length even when the drain owned the remainder (mach-http v0.7.6). A body
-  that really ends short of its declared length still fails the exchange on
-  every protocol.
+- Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.4, mach-quic
+  v0.5.8, mach-acme v0.1.9, mach-crypto v0.8.2.
 
 ### Removed
 
@@ -18,10 +14,27 @@
   the literal sweep was a workaround for briar-systems/mach#3108, which is
   being fixed in the compiler.
 
-### Changed
+### Fixed
 
-- Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.4, mach-quic
-  v0.5.8, mach-acme v0.1.9, mach-crypto v0.8.2.
+- Every TCP stream hedge owns now disables Nagle's algorithm, on accepted
+  connections and on upstream ones alike. Nagle holds a sub-maximum segment
+  back until the peer acknowledges the segment before it, and every protocol
+  hedge speaks writes a message as more than one segment and then waits for
+  the peer to answer, so each exchange paid the peer's delayed
+  acknowledgement: 40 ms on Linux. A keep-alive HTTP/2 connection served
+  about 22 requests a second at 18 percent processor use and collapsed under
+  concurrency; it now serves the same work at the rate the server can
+  actually do it. HTTP/1.1 was affected too, at one stalled segment per
+  connection rather than one per exchange. The interoperability matrix gains
+  a leg that times 100 requests over one HTTP/2 connection, because every
+  other leg runs a single client against an idle server and passes at either
+  rate.
+- A request body the service never reads no longer logs `body ended at a
+  different declared length` once the protocol layer has drained it. The
+  reader in mach-http compared the bytes the service read with the declared
+  length even when the drain owned the remainder (mach-http v0.7.6). A body
+  that really ends short of its declared length still fails the exchange on
+  every protocol.
 
 ## [0.2.0] - 2026-09-02
 
