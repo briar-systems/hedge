@@ -119,6 +119,32 @@ check "cleartext HTTP/2 prior knowledge, request body" 200 \
     "$(curl_code --http2-prior-knowledge -H 'Host: localhost' \
         --data-binary @"$work/upload.bin" http://127.0.0.1:9080/echo)"
 
+# every leg above runs one client against an idle server, where an exchange that
+# waits 40 ms on a timer instead of 1 ms on readiness still passes. a keep-alive
+# HTTP/2 connection that pays the peer's delayed acknowledgement once per
+# exchange serves about 22 requests a second, so the rate is the assertion.
+h2_keepalive_elapsed_ms() {
+    local args=()
+    local _
+    for _ in $(seq 100); do args+=(http://127.0.0.1:9080/hello -o /dev/null); done
+    local started finished codes expected
+    started="$(date +%s%N)"
+    codes="$(timeout 60 curl -sS --http2-prior-knowledge -H 'Host: localhost' \
+        -w '%{http_code}' "${args[@]}" 2>/dev/null)"
+    finished="$(date +%s%N)"
+    expected="$(printf '200%.0s' $(seq 100))"
+    if [ "$codes" != "$expected" ]; then echo "not-served"; return; fi
+    echo $(( (finished - started) / 1000000 ))
+}
+
+h2_elapsed="$(h2_keepalive_elapsed_ms)"
+if [ "$h2_elapsed" != "not-served" ] && [ "$h2_elapsed" -lt 2000 ]; then
+    check "one HTTP/2 connection serves 100 requests without waiting on a timer" ok ok
+else
+    check "one HTTP/2 connection serves 100 requests without waiting on a timer" \
+        "under 2000 ms" "$h2_elapsed ms"
+fi
+
 check "TLS ALPN selects http/1.1" 200 \
     "$(curl_code --http1.1 --cacert $fixtures/root.pem \
         --resolve api.example.com:9443:127.0.0.1 https://api.example.com:9443/hello)"
