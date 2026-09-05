@@ -69,10 +69,9 @@ application = "site"
 The implemented schema accepts these top-level sections:
 
 - `server` with bounded `limits`, `timeouts`, and feature selection
-- `listener` arrays with `tcp` or `local` transport and explicit protocol sets.
-  `quic` parses, and is refused before listeners become ready because this build
-  composes no QUIC connection driver: a datagram listener would bind and then
-  answer nothing
+- `listener` arrays with `tcp`, `local` or `quic` transport and explicit
+  protocol sets. A `quic` listener binds a UDP endpoint, becomes ready, and
+  serves HTTP/3 to clients that select `h3` through ALPN inside QUIC
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
