@@ -11,6 +11,18 @@
   that really ends short of its declared length still fails the exchange on
   every protocol.
 
+### Changed
+
+- A TLS client that offers no ALPN extension now selects the listener's
+  HTTP/1.1, where the listener serves it, instead of selecting nothing.
+  RFC 7301 section 3.2 reserves the `no_application_protocol` alert for a
+  client that offered protocols and matched none; a client that offered no
+  extension is served without ALPN. HTTP/2 over TLS is reachable only by
+  negotiating `h2`, so HTTP/1.1 is the only fallback, and a listener that
+  does not serve it still selects nothing. This is inert until mach-tls
+  stops failing the handshake for a client that sent no extension, which is
+  where the alert is actually raised.
+
 ### Removed
 
 - `tools/check-version.sh` and `tools/partial_literal_sweep.py`. The version
