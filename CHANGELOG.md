@@ -18,6 +18,11 @@
   the literal sweep was a workaround for briar-systems/mach#3108, which is
   being fixed in the compiler.
 
+### Changed
+
+- Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.4, mach-quic
+  v0.5.8, mach-acme v0.1.9, mach-crypto v0.8.2.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added
