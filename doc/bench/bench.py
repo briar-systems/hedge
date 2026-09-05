@@ -262,39 +262,64 @@ def read_oha(payload: dict) -> tuple[float, float, float, float, str]:
     return (rps, size_per_sec / (1024 * 1024), p50, p99, "; ".join(notes))
 
 
-def run_curl_h3(curl: str, url: str, path: str, connections: int,
+# a cell may overrun its duration by at most this, to let the batch in flight
+# when the clock runs out finish. a server that cannot finish it inside the
+# grace fails the cell rather than stalling the matrix: one stalled HTTP/3 cell
+# held the run for over ten minutes before this bound existed.
+H3_GRACE = 30.0
+
+# how many bytes one batch asks for. large enough that process startup is noise,
+# small enough that a slow server still completes a batch inside the grace.
+H3_BATCH_BYTES = 32 * 1024 * 1024
+
+
+def run_curl_h3(curl: str, url: str, path: str, body_bytes: int, connections: int,
                 duration: int, work: Path) -> tuple[float, float, float, float, str]:
     """An HTTP/3 cell.
 
     curl is the only HTTP/3 client on this machine, and it is a transfer tool
     rather than a load generator: it has no run-for-a-duration mode, so the cell
-    is a sequence of parallel batches repeated until the duration is spent. Each
-    batch asks for four requests per requested concurrency so that batch setup
-    is a small fraction of the batch. curl multiplexes onto one QUIC connection,
-    so `connections` here bounds concurrent streams and not sockets.
+    is a sequence of parallel batches repeated until the duration is spent. curl
+    multiplexes onto one QUIC connection, so `connections` here bounds concurrent
+    streams and not sockets.
+
+    Every batch is bounded by a wall clock as well as by curl's per-transfer
+    `--max-time`, because `--max-time` bounds one transfer and says nothing
+    about how long a batch of several hundred takes against a server that has
+    stopped making progress. A batch that runs out of clock is killed and
+    whatever it printed before then is still counted, since curl writes its
+    per-transfer line as each transfer completes.
     """
-    per_batch = connections * 4
+    per_batch = max(connections,
+                    min(connections * 4, max(1, H3_BATCH_BYTES // max(body_bytes, 1))))
     config = work / "h3-urls.conf"
     config.write_text(
         "".join(f'url = "{url}{path}"\noutput = "/dev/null"\n' for _ in range(per_batch))
     )
+    argv = [curl, "--http3-only", "--insecure", "-4", "-s",
+            "--parallel", "--parallel-max", str(connections),
+            "--max-time", "30",
+            "-w", "%{http_code} %{size_download} %{time_total}\n",
+            "--config", str(config)]
 
     requests = 0
     total_bytes = 0
     failures = 0
+    truncated = False
     times: list[float] = []
     started = time.monotonic()
     deadline = started + duration
     while time.monotonic() < deadline:
-        done = subprocess.run(
-            [curl, "--http3-only", "--insecure", "-4", "-s",
-             "--parallel", "--parallel-max", str(connections),
-             "--max-time", "60",
-             "-w", "%{http_code} %{size_download} %{time_total}\n",
-             "--config", str(config)],
-            capture_output=True, text=True,
-        )
-        for line in done.stdout.splitlines():
+        budget = deadline - time.monotonic() + H3_GRACE
+        try:
+            output = subprocess.run(argv, capture_output=True, text=True,
+                                    timeout=budget).stdout
+        except subprocess.TimeoutExpired as expired:
+            truncated = True
+            output = expired.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
+        for line in output.splitlines():
             parts = line.split()
             if len(parts) != 3:
                 continue
@@ -305,15 +330,25 @@ def run_curl_h3(curl: str, url: str, path: str, connections: int,
             requests += 1
             total_bytes += int(size)
             times.append(float(seconds))
+        if truncated:
+            break
     elapsed = time.monotonic() - started
 
+    notes = []
+    if truncated:
+        notes.append(f"a batch of {per_batch} requests did not finish within "
+                     f"{duration}s + {H3_GRACE:.0f}s of grace")
+    if failures:
+        notes.append(f"{failures} failed requests")
     if not times:
-        return (0.0, 0.0, 0.0, 0.0, "no HTTP/3 request completed")
+        notes.append("no HTTP/3 request completed")
+        return (0.0, 0.0, 0.0, 0.0, "; ".join(notes))
+
     times.sort()
     p50 = times[int(len(times) * 0.50)] * 1000.0
     p99 = times[min(int(len(times) * 0.99), len(times) - 1)] * 1000.0
-    note = f"{failures} failed requests" if failures else ""
-    return (requests / elapsed, total_bytes / (1024 * 1024) / elapsed, p50, p99, note)
+    return (requests / elapsed, total_bytes / (1024 * 1024) / elapsed, p50, p99,
+            "; ".join(notes))
 
 
 def build_servers(args: argparse.Namespace) -> dict[str, Server]:
@@ -335,7 +370,7 @@ def build_servers(args: argparse.Namespace) -> dict[str, Server]:
 
 
 def measure(args: argparse.Namespace, protocol: Protocol, size_name: str,
-            connections: int, server_name: str, duration: int,
+            body_bytes: int, connections: int, server_name: str, duration: int,
             work: Path) -> Result:
     result = Result(protocol.key, size_name, connections, server_name)
     endpoint = protocol.endpoint(server_name)
@@ -380,8 +415,8 @@ def measure(args: argparse.Namespace, protocol: Protocol, size_name: str,
                 result.ok = rps > 0 and not note
         else:
             rps, mib, p50, p99, note = run_curl_h3(
-                args.curl, endpoint.url, f"/{size_name}", connections, duration,
-                work)
+                args.curl, endpoint.url, f"/{size_name}", body_bytes, connections,
+                duration, work)
             result.requests_per_sec, result.mib_per_sec = rps, mib
             result.p50_ms, result.p99_ms, result.note = p50, p99, note
             result.ok = rps > 0 and not note
@@ -429,9 +464,10 @@ def machine_description(args: argparse.Namespace) -> list[tuple[str, str]]:
     except OSError:
         pass
 
-    hedge_version = command_output([args.hedge_binary, "--version"])
-    if hedge_version == "unavailable":
-        hedge_version = read_manifest_version(Path(args.root) / "mach.toml")
+    # the binary carries no version flag: it reads argv[1] as a configuration
+    # path and fails on anything else. tools/check-version.sh holds mach.toml
+    # and src/hedge.mach to one version, so the manifest is the authority.
+    hedge_version = read_manifest_version(Path(args.root) / "mach.toml")
 
     return [
         ("CPU", f"{model}, {cores} cores / {threads} threads"),
@@ -573,15 +609,15 @@ def main() -> int:
     failures = 0
 
     for protocol in PROTOCOLS:
-        for size_name, _ in sizes:
+        for size_name, body_bytes in sizes:
             for count in connections:
                 for server in ("hedge", "caddy"):
                     index += 1
                     label = (f"[{index}/{total}] {protocol.key} {size_name} "
                              f"c={count} {server}")
                     print(label, flush=True)
-                    found = measure(args, protocol, size_name, count, server,
-                                    duration, work)
+                    found = measure(args, protocol, size_name, body_bytes,
+                                    count, server, duration, work)
                     results[(protocol.key, size_name, count, server)] = found
                     if found.ok:
                         print(f"    {found.requests_per_sec:,.0f} req/s  "

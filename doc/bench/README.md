@@ -8,9 +8,16 @@ machine you can reproduce the numbers on.
 ```
 
 That provisions everything, runs the matrix, and writes a results file into
-[`results/`](results/). The published runs are in there. Read one of those
-before running your own: it names the machine it came off, and a number from a
-different machine is a different number.
+[`results/`](results/). Read a published run before starting your own: it names
+the machine it came off, and a number from a different machine is a different
+number.
+
+No run is published yet. hedge fails three of the four protocol rows for reasons
+filed as [#69](https://github.com/briar-systems/hedge/issues/69),
+[#70](https://github.com/briar-systems/hedge/issues/70) and
+[#71](https://github.com/briar-systems/hedge/issues/71), and the first table
+lands once those close. [`COMPARISON.md`](COMPARISON.md) carries what has been
+measured so far.
 
 ## What is measured
 
@@ -90,6 +97,10 @@ HTTP/2 row above it.
   where responses are compared byte for byte.
 - **Long runs.** Ten seconds per cell finds a throughput plateau. It does not
   find a leak, a fragmentation problem, or anything that needs an hour.
+- **A quiet machine.** The load generator and the server share the same cores,
+  which is why the CPU column is worth more than the request rate when the two
+  disagree. The published run was taken on a desktop with a browser open;
+  nothing else was benchmarking, but nothing was shut down either.
 
 ## Reproducing
 

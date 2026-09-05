@@ -2,24 +2,38 @@
 
 Caddy is the obvious thing to hold hedge against. It serves the same job from
 one static binary, it is widely deployed, and it has spent years on exactly the
-paths hedge is building. This is where hedge stands against it today, on the
-numbers in [`results/`](results/) and on what it takes to operate each one.
+paths hedge is building. This is where hedge stands against it today, on
+measurement and on what it takes to operate each one.
 
 hedge loses most of this comparison. That is the useful part: each place it
 loses has a reason, and the reasons are different from each other.
 
+**No full results table is published yet.** hedge fails three of the four
+protocol rows outright, for reasons filed as
+[#69](https://github.com/briar-systems/hedge/issues/69),
+[#70](https://github.com/briar-systems/hedge/issues/70) and
+[#71](https://github.com/briar-systems/hedge/issues/71). A table that is mostly
+the word `failed` would document those issues worse than the issues do. The
+first run lands in [`results/`](results/) once they close, and everything below
+comes from measurements taken while finding them: each one is reproducible with
+`doc/bench/run.sh` today.
+
 ## Throughput
 
-Caddy is faster everywhere, and by a lot. On the published run the gaps are
-roughly:
+Caddy is faster everywhere, and by a lot. The gaps measured so far are roughly:
 
 | protocol | hedge relative to Caddy |
 | --- | --- |
-| HTTP/1.1 cleartext, small bodies | about 8x slower |
-| HTTP/1.1 cleartext, large bodies | about 60x slower |
-| HTTP/1.1 over TLS | not measured; see below |
-| HTTP/2 over TLS | unusable, see below |
-| HTTP/3 | both measured by the curl harness; hedge is slower |
+| HTTP/1.1 cleartext, 1 KiB bodies | about 10x slower |
+| HTTP/1.1 cleartext, 1 MiB bodies | about 170x slower |
+| HTTP/1.1 over TLS | no measurement: hedge refuses the client |
+| HTTP/2 over TLS | no measurement: every request times out |
+| HTTP/3 | no measurement: a batch does not finish |
+
+hedge's cleartext ceiling is a transfer rate rather than a request rate. It
+serves about 9,500 requests a second at 1 KiB and about 175 at 1 MiB, which is
+roughly 175 MiB/s either way. Caddy reaches 30 GiB/s on the 1 MiB bodies, where
+it is handing pages to the loopback rather than copying them.
 
 Three separate causes account for essentially all of it, and only one of them
 is about hedge being young.
@@ -51,7 +65,7 @@ as [#71](https://github.com/briar-systems/hedge/issues/71). Every hedge row in
 the results file pays this, because the benchmark serves all four protocols
 from one process.
 
-## Two rows hedge does not have
+## Three rows hedge does not have
 
 **HTTP/1.1 over TLS is missing** because hedge refuses any TLS client that
 sends no ALPN extension, answering `no_application_protocol` instead of simply
@@ -67,8 +81,17 @@ continuously, which is what a loop advancing on an expiring timer looks like.
 Tracked as [#70](https://github.com/briar-systems/hedge/issues/70), and it is
 the most serious of the four.
 
-Both are recorded here rather than left out of the tables. A benchmark that
-omits the rows a server fails is not a benchmark.
+**HTTP/3 does not finish a batch.** A batch of 256 requests for a 1 KiB file ran
+for over ten minutes without completing, with curl at 0.1% CPU waiting and
+hedge at 14%, and the QUIC listener's receive queue holding 181,440 undrained
+bytes. Caddy finishes the same batch in seconds. The signature matches HTTP/2
+closely enough that it is recorded on
+[#70](https://github.com/briar-systems/hedge/issues/70) rather than filed
+separately.
+
+All three are recorded here rather than left out. A benchmark that omits the
+rows a server fails is not a benchmark, and these three are the whole reason
+the results file is being held rather than published.
 
 ## Memory
 
@@ -76,8 +99,8 @@ This is the one column where the comparison is not one-sided, and it splits in
 two.
 
 Serving HTTP/1.1 and HTTP/2 with no QUIC listener, hedge idles at about 5 MiB
-resident and peaks near 30 MiB under 64 connections. Caddy idles around 40 MiB
-and peaks near 70 MiB. hedge's footprint is genuinely small, and its bounds are
+resident and peaks near 30 MiB under 64 connections. Caddy's peak in the same
+cells is around 70 MiB. hedge's footprint is genuinely small, and its bounds are
 declared rather than emergent: every collection in a configuration has a
 compile-time maximum, admission reserves an entry's whole length before writing
 a byte, and a disabled subsystem allocates nothing at all. `test/interop`
@@ -187,9 +210,11 @@ document should not pretend otherwise.
 
 Use Caddy if you want a fast, finished web server today.
 
-hedge is not that yet. Its HTTP/2 path does not work under load, its TLS path is
-an order of magnitude off because the whole toolchain is scalar, and enabling
-HTTP/3 costs 600 MiB. What it has is a bounded, C-free implementation of the
-whole stack with the defects above written down, filed, and measurable by
-rerunning `doc/bench/run.sh` after each one closes. That is the state, and these
-numbers exist so the next run can be compared to them.
+hedge is not that yet. Its HTTP/2 and HTTP/3 paths do not work under load, its
+TLS listener refuses clients that offer no ALPN, its TLS throughput is an order
+of magnitude off because the whole toolchain is scalar, and enabling HTTP/3
+costs 600 MiB. What it has is a bounded, C-free implementation of the whole
+stack, with every one of those written down, filed, and measurable by rerunning
+`doc/bench/run.sh` after each one closes. That is the state. The harness exists
+so that the first published run is a fact rather than a claim, and so that the
+run after it can be compared to the one before.
