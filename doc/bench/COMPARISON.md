@@ -147,6 +147,23 @@ makes you name them, and tells you at load time when the set you named is
 inconsistent. Whether that is worth forty extra lines depends entirely on
 whether you would rather find a mistake at startup or in production.
 
+One default is worth knowing before you deploy: hedge admits at most 100
+connections from any single peer address, where Caddy ships no per-peer bound at
+all. On a public listener facing the internet directly, that is hedge's default
+doing its job. Behind a load balancer, a reverse proxy or a NAT it is a trap.
+Every connection then arrives from one address, the whole site shares those 100
+slots, and the bound stops being anti-abuse and becomes a capacity ceiling that
+shows up as refused connections under load rather than as an error.
+
+Enabling `proxy_protocol` does not rescue it. The bound is charged in
+`admission.acquire` against the address the kernel reported at accept, and the
+PROXY header is not decoded until the connection prologue runs, which is after
+admission has already decided. A decoded peer reaches logging, routing and
+forwarded headers; it does not reach the connection bound. Raising
+`server.limits.max_connections_per_peer` to suit the topology is the only lever.
+This benchmark raises it to 1024, because on loopback every connection is one
+peer and the default would measure itself rather than the server.
+
 Where hedge is clearly worse rather than merely more explicit is the
 duplication: serving one name over TCP and QUIC needs two host blocks declaring
 the same name, one of which exists only to attach a TLS policy and carries no
