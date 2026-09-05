@@ -191,6 +191,8 @@ pub rec PendingConfig {
 }
 
 pub rec PendingInitial {
+    next_live: usize;
+    prev_live: usize;
     data: [assembly.MAX_UDP_PAYLOAD]u8;
     accepted: quic_listener.Accepted;
     config: PendingConfig;
@@ -330,6 +332,8 @@ pub rec Connection {
     generation: u64;
     source: u64;
     next_free: usize;
+    next_live: usize;
+    prev_live: usize;
     pump: usize;
     pump_generation: u64;
     admission_bank: usize;
@@ -402,12 +406,18 @@ pub rec Runtime {
     timer_queue: timers.Queue;
     sessions: h3_session.Pool;
     free_head: usize;
+    # the live connections, so every sweep costs what is live rather than what
+    # was configured. an idle QUIC listener sweeps nothing.
+    live_head: usize;
     connection_capacity: usize;
     max_connections: usize;
     admission: *process_admission.Manager;
     live_connections: usize;
     live_total: usize;
     pending_free_head: usize;
+    # the queued initials, so a sweep costs what is queued rather than what
+    # the configured connection limit reserved
+    pending_live_head: usize;
     pending_initial_count: usize;
     pump_count: usize;
     next_source: u64;
@@ -529,12 +539,19 @@ pub fun make_storage(storage: *Storage,
     ret true;
 }
 
+# a free slot owns no connection state, so making one free must not write into
+# the connection storage it is not using. that storage is half a megabyte per
+# slot and the pool is sized by `limits.max_connections`: touching all of it at
+# startup is what made an idle HTTP/3 listener resident in hundreds of
+# megabytes. `arm_connection_storage` does that work when a slot is taken.
 fun reset_connection(value: *Connection, index: usize,
     capacity: usize) {
     value.live = false;
     value.state = CONNECTION_FREE;
     value.next_free = index + 1;
     if (index + 1 == capacity) { value.next_free = NO_CONNECTION; }
+    value.next_live = NO_CONNECTION;
+    value.prev_live = NO_CONNECTION;
     value.h3_session = h3_session.NO_SESSION;
     value.scope_live = false;
     value.charge_live = false;
@@ -545,7 +562,6 @@ fun reset_connection(value: *Connection, index: usize,
     value.plan = nil;
     value.budgets = nil;
     value.budget_charge = budget.no_charge();
-    value.storage.listener_name[0] = 0;
     value.listener_name_length = 0;
     value.h3_started = false;
     value.h3_abandoning = false;
@@ -558,6 +574,11 @@ fun reset_connection(value: *Connection, index: usize,
     value.tls_live = false;
     value.assembly_attempted = false;
     value.assembly_released = false;
+}
+
+# put the storage a taken slot is about to use into its empty state
+fun arm_connection_storage(value: *Connection) {
+    value.storage.listener_name[0] = 0;
     var i: usize = 0;
     for (i < assembly.SEND_CAPACITY) {
         value.storage.sends[i].pending = false;
@@ -568,6 +589,70 @@ fun reset_connection(value: *Connection, index: usize,
         value.storage.published[i].live = false;
         i = i + 1;
     }
+}
+
+# the live list is intrusive and doubly linked, so a connection leaves it in
+# constant time from wherever a sweep happens to be standing
+fun link_live(controls: *ControlView, runtime: *Runtime, index: usize) {
+    val value: *Connection = ?controls.connections[index];
+    value.prev_live = NO_CONNECTION;
+    value.next_live = runtime.live_head;
+    if (runtime.live_head != NO_CONNECTION) {
+        controls.connections[runtime.live_head].prev_live = index;
+    }
+    runtime.live_head = index;
+}
+
+# the length of the live list, which is what a sweep costs
+fun live_walk_length(controls: *ControlView, runtime: *Runtime) usize {
+    var count: usize = 0;
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
+        count = count + 1;
+        i = controls.connections[i].next_live;
+    }
+    ret count;
+}
+
+fun link_pending_live(runtime: *Runtime, index: usize) {
+    val pending: *PendingInitial = ?runtime.storage.pending_initials[index];
+    pending.prev_live = NO_CONNECTION;
+    pending.next_live = runtime.pending_live_head;
+    if (runtime.pending_live_head != NO_CONNECTION) {
+        runtime.storage.pending_initials[runtime.pending_live_head].prev_live =
+            index;
+    }
+    runtime.pending_live_head = index;
+}
+
+fun unlink_pending_live(runtime: *Runtime, index: usize) {
+    val pending: *PendingInitial = ?runtime.storage.pending_initials[index];
+    if (pending.prev_live != NO_CONNECTION) {
+        runtime.storage.pending_initials[pending.prev_live].next_live =
+            pending.next_live;
+    } or (runtime.pending_live_head == index) {
+        runtime.pending_live_head = pending.next_live;
+    }
+    if (pending.next_live != NO_CONNECTION) {
+        runtime.storage.pending_initials[pending.next_live].prev_live =
+            pending.prev_live;
+    }
+    pending.next_live = NO_CONNECTION;
+    pending.prev_live = NO_CONNECTION;
+}
+
+fun unlink_live(controls: *ControlView, runtime: *Runtime, index: usize) {
+    val value: *Connection = ?controls.connections[index];
+    if (value.prev_live != NO_CONNECTION) {
+        controls.connections[value.prev_live].next_live = value.next_live;
+    } or (runtime.live_head == index) {
+        runtime.live_head = value.next_live;
+    }
+    if (value.next_live != NO_CONNECTION) {
+        controls.connections[value.next_live].prev_live = value.prev_live;
+    }
+    value.next_live = NO_CONNECTION;
+    value.prev_live = NO_CONNECTION;
 }
 
 pub fun make(controls: *ControlView, runtime: *Runtime, storage: Storage,
@@ -597,9 +682,11 @@ pub fun make(controls: *ControlView, runtime: *Runtime, storage: Storage,
     runtime.max_connections = config.max_connections;
     runtime.admission = nil;
     runtime.free_head = 0;
+    runtime.live_head = NO_CONNECTION;
     runtime.live_connections = 0;
     runtime.live_total = 0;
     runtime.pending_free_head = 0;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.pending_initial_count = 0;
     runtime.pump_count = 0;
     runtime.next_source = 1;
@@ -618,6 +705,8 @@ pub fun make(controls: *ControlView, runtime: *Runtime, storage: Storage,
     for (i < storage.pending_initial_capacity) {
         storage.pending_initials[i].live = false;
         storage.pending_initials[i].next_free = i + 1;
+        storage.pending_initials[i].next_live = NO_CONNECTION;
+        storage.pending_initials[i].prev_live = NO_CONNECTION;
         if (i + 1 == storage.pending_initial_capacity) {
             storage.pending_initials[i].next_free = NO_CONNECTION;
         }
@@ -1053,11 +1142,11 @@ fun mark_connection_superseded(controls: *ControlView, runtime: *Runtime,
 }
 
 fun mark_superseded_graceful(controls: *ControlView, runtime: *Runtime) {
-    var i: usize = 0;
-    for (i < runtime.connection_capacity) {
-        val value: *Connection = ?controls.connections[i];
-        mark_connection_superseded(controls, runtime, value);
-        i = i + 1;
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
+        val next: usize = controls.connections[i].next_live;
+        mark_connection_superseded(controls, runtime, ?controls.connections[i]);
+        i = next;
     }
 }
 
@@ -1222,7 +1311,9 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
     value.tls_live = false;
     value.assembly_attempted = false;
     value.assembly_released = false;
+    arm_connection_storage(value);
     value.live = true;
+    link_live(controls, runtime, index);
     runtime.live_connections = runtime.live_connections + 1;
     runtime.live_total = runtime.live_total + 1;
     controls.pumps[pump_index].active_connections =
@@ -1274,6 +1365,7 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     value.peer = ip.endpoint(0, 0, 0, 0, 0);
     value.local = ip.endpoint(0, 0, 0, 0, 0);
     value.live = false;
+    unlink_live(controls, runtime, index);
     value.state = CONNECTION_FREE;
     value.next_free = runtime.free_head;
     runtime.free_head = index;
@@ -1734,6 +1826,7 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
     pending.lease_live = true;
     pending.cleanup_only = false;
     pending.live = true;
+    link_pending_live(runtime, index);
     runtime.pending_initial_count = runtime.pending_initial_count + 1;
     runtime.live_total = runtime.live_total + 1;
     controls.pumps[pump_index].queued_initials =
@@ -1770,6 +1863,7 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
     pending.lease_live = lease_live;
     pending.cleanup_only = true;
     pending.live = true;
+    link_pending_live(runtime, index);
     runtime.pending_initial_count = runtime.pending_initial_count + 1;
     runtime.live_total = runtime.live_total + 1;
     controls.pumps[pump_index].queued_initials =
@@ -1812,6 +1906,7 @@ fun take_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize
     pending.cleanup_only = false;
     pending.length = 0;
     pending.live = false;
+    unlink_pending_live(runtime, index);
     pending.next_free = runtime.pending_free_head;
     runtime.pending_free_head = index;
 }
@@ -2416,14 +2511,15 @@ fun drain_completions(controls: *ControlView, runtime: *Runtime, now: time.Time,
         }
         pump_index = pump_index + 1;
     }
-    var index: usize = 0;
-    for (index < runtime.connection_capacity) {
+    var index: usize = runtime.live_head;
+    for (index != NO_CONNECTION) {
         val value: *Connection = ?controls.connections[index];
+        val next_index: usize = value.next_live;
         var send: usize = 0;
         for (send < assembly.SEND_CAPACITY) {
             val context: *CompletionContext =
                 ?value.storage.sends[send].context;
-            if (value.live && context.completion_pending) {
+            if (context.completion_pending) {
                 val completion: io_runtime.Completion = context.completion;
                 context.completion_pending = false;
                 if (complete_at(controls, runtime, context, completion,
@@ -2431,7 +2527,7 @@ fun drain_completions(controls: *ControlView, runtime: *Runtime, now: time.Time,
             }
             send = send + 1;
         }
-        index = index + 1;
+        index = next_index;
     }
     ret status;
 }
@@ -2540,14 +2636,14 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
 fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, wall: time.Time,
     now_ns: u64) Status {
     var status: Status = OK;
-    var i: usize = 0;
-    for (i < runtime.storage.pending_initial_capacity) {
+    var i: usize = runtime.pending_live_head;
+    for (i != NO_CONNECTION) {
         val pending: *PendingInitial = ?runtime.storage.pending_initials[i];
-        if (!pending.live) { i = i + 1; cnt; }
+        val next: usize = pending.next_live;
         if (pending.pump >= MAX_PUMPS
          || pending.admission_bank >= ADMISSION_BANKS) {
             if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
-            i = i + 1;
+            i = next;
             cnt;
         }
         val pump: *Pump = ?controls.pumps[pending.pump];
@@ -2555,24 +2651,24 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, wall: ti
             ?pump.admissions[pending.admission_bank];
         if (pending.cleanup_only) {
             if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
-            i = i + 1;
+            i = next;
             cnt;
         }
         if (!pump.live || pump.generation != pending.pump_generation
          || pump.draining || pump.cancelling || !bank.live) {
             if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
-            i = i + 1;
+            i = next;
             cnt;
         }
         val outcome: budget.Outcome = budget.retry(
             pending.config.budgets, ?pending.budget_charge, wall);
-        if (outcome == budget.QUEUED) { i = i + 1; cnt; }
+        if (outcome == budget.QUEUED) { i = next; cnt; }
         if (outcome != budget.ADMITTED) {
             if (!pending.budget_charge.live) {
                 pending.budget_charge_live = false;
             }
             if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
-            i = i + 1;
+            i = next;
             cnt;
         }
         val packet_value: net_types.Packet = pending_packet(pending);
@@ -2581,7 +2677,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, wall: ti
         if (!materialize_pending_config(?pending.config,
             ?config_snapshot)) {
             if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
-            i = i + 1;
+            i = next;
             cnt;
         }
         val lease: process_admission.Lease = pending.lease;
@@ -2591,7 +2687,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, wall: ti
             pump_index, bank_index, lease);
         if (connection_index == NO_CONNECTION) {
             if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
-            i = i + 1;
+            i = next;
             cnt;
         }
         val value: *Connection =
@@ -2603,7 +2699,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, wall: ti
             value.state = CONNECTION_CLEANUP;
             cleanup_accepting(controls, runtime, connection_index);
             if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
-            i = i + 1;
+            i = next;
             cnt;
         }
         val initialized: bool = initialize_connection(controls, runtime,
@@ -2621,7 +2717,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, wall: ti
         }
         take_pending_initial(controls, runtime, i);
         if (!initialized || !delivered) { status = FAILED; }
-        i = i + 1;
+        i = next;
     }
     ret status;
 }
@@ -2629,13 +2725,14 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, wall: ti
 fun cancel_pending_bank(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize) bool {
     var success: bool = true;
-    var i: usize = 0;
-    for (i < runtime.storage.pending_initial_capacity) {
+    var i: usize = runtime.pending_live_head;
+    for (i != NO_CONNECTION) {
         val pending: *PendingInitial = ?runtime.storage.pending_initials[i];
-        if (pending.live && pending.pump == pump_index
+        val next: usize = pending.next_live;
+        if (pending.pump == pump_index
          && pending.admission_bank == bank_index
          && !release_pending_initial(controls, runtime, i)) { success = false; }
-        i = i + 1;
+        i = next;
     }
     ret success;
 }
@@ -2673,21 +2770,22 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now: time.Time,
         }
         due = timers.take_due(?runtime.timer_queue, now_ns);
     }
-    var i: usize = 0;
-    for (i < runtime.connection_capacity) {
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
         val value: *Connection = ?controls.connections[i];
-        if (value.live && value.state == CONNECTION_CLEANUP) {
+        val next: usize = value.next_live;
+        if (value.state == CONNECTION_CLEANUP) {
             if (!cleanup_accepting(controls, runtime, i)) { status = FAILED; }
-        } or (value.live && value.state == CONNECTION_FINALIZING) {
+        } or (value.state == CONNECTION_FINALIZING) {
             if (finalize_connection(controls, runtime, i) == FAILED) { status = FAILED; }
-        } or (value.live && value.state != CONNECTION_BROKEN) {
+        } or (value.state != CONNECTION_BROKEN) {
             if (!progress_connection(controls, runtime, i, now, now_ns)) {
                 status = FAILED;
             }
             val released: Status = release_connection(controls, runtime, i, now, now_ns);
             if (released == FAILED) { status = FAILED; }
         }
-        i = i + 1;
+        i = next;
     }
     if (advance_pending_initials(controls, runtime, now, now_ns) == FAILED) {
         status = FAILED;
@@ -2708,17 +2806,17 @@ pub fun next_budget_deadline(runtime: *Runtime,
     output: *time.Time) Status {
     if (runtime == nil || !runtime.initialized || output == nil) { ret INVALID; }
     var found: bool = false;
-    var i: usize = 0;
-    for (i < runtime.storage.pending_initial_capacity) {
+    var i: usize = runtime.pending_live_head;
+    for (i != NO_CONNECTION) {
         val pending: *PendingInitial = ?runtime.storage.pending_initials[i];
         var deadline: time.Time;
-        if (pending.live && pending.budget_charge_live
+        if (pending.budget_charge_live
          && budget.deadline(?pending.budget_charge, ?deadline)
          && (!found || time.time_before(deadline, @output))) {
             @output = deadline;
             found = true;
         }
-        i = i + 1;
+        i = pending.next_live;
     }
     if (found) { ret OK; }
     ret BLOCKED;
@@ -2733,10 +2831,11 @@ pub fun graceful_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHan
     if (pump.admissions[active].live
      && (!begin_retire(?pump.admissions[active])
         || !cancel_pending_bank(controls, runtime, handle.index, active))) { ret FAILED; }
-    var i: usize = 0;
-    for (i < runtime.connection_capacity) {
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
         val value: *Connection = ?controls.connections[i];
-        if (value.live && value.pump == handle.index
+        val next: usize = value.next_live;
+        if (value.pump == handle.index
          && value.pump_generation == handle.generation
          && value.state == CONNECTION_LIVE) {
             value.state = CONNECTION_GRACEFUL;
@@ -2745,7 +2844,7 @@ pub fun graceful_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHan
                 ret FAILED;
             }
         }
-        i = i + 1;
+        i = next;
     }
     ret OK;
 }
@@ -2769,14 +2868,15 @@ pub fun graceful_all(controls: *ControlView, runtime: *Runtime, now_ns: u64) Sta
 pub fun cancel_all(controls: *ControlView, runtime: *Runtime) Status {
     if (runtime == nil || !runtime.initialized) { ret INVALID; }
     var status: Status = OK;
-    var i: usize = 0;
-    for (i < runtime.connection_capacity) {
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
         val value: *Connection = ?controls.connections[i];
-        if (value.live && value.state == CONNECTION_CLEANUP) {
+        val next: usize = value.next_live;
+        if (value.state == CONNECTION_CLEANUP) {
             if (!cleanup_accepting(controls, runtime, i)) { status = FAILED; }
-        } or (value.live && value.state == CONNECTION_FINALIZING) {
+        } or (value.state == CONNECTION_FINALIZING) {
             if (finalize_connection(controls, runtime, i) == FAILED) { status = FAILED; }
-        } or (value.live && value.state != CONNECTION_BROKEN) {
+        } or (value.state != CONNECTION_BROKEN) {
             if (value.h3_session != h3_session.NO_SESSION
              && !value.h3_abandoning
              && !value.h3_cancelled) {
@@ -2791,7 +2891,7 @@ pub fun cancel_all(controls: *ControlView, runtime: *Runtime) Status {
             value.close_started = true;
             value.state = CONNECTION_CANCELLING;
         }
-        i = i + 1;
+        i = next;
     }
     i = 0;
     for (i < MAX_PUMPS) {
@@ -2897,16 +2997,17 @@ pub fun live(runtime: *Runtime) usize {
 pub fun superseded(controls: *ControlView, runtime: *Runtime) usize {
     if (runtime == nil || !runtime.initialized) { ret 0; }
     var count: usize = 0;
-    var i: usize = 0;
-    for (i < runtime.connection_capacity) {
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
         val value: *Connection = ?controls.connections[i];
+        val next: usize = value.next_live;
         if (connection_superseded(controls, runtime, value)) { count = count + 1; }
-        i = i + 1;
+        i = next;
     }
-    i = 0;
-    for (i < runtime.storage.pending_initial_capacity) {
+    i = runtime.pending_live_head;
+    for (i != NO_CONNECTION) {
         val pending: *PendingInitial = ?runtime.storage.pending_initials[i];
-        if (pending.live && pending.pump < MAX_PUMPS) {
+        if (pending.pump < MAX_PUMPS) {
             val pump: *Pump = ?controls.pumps[pending.pump];
             if (!pump.live || pending.pump_generation != pump.generation
              || pending.admission_bank != pump.active_admission
@@ -2915,24 +3016,24 @@ pub fun superseded(controls: *ControlView, runtime: *Runtime) usize {
                 count = count + 1;
             }
         }
-        i = i + 1;
+        i = pending.next_live;
     }
     ret count;
 }
 
 pub fun budgets_in_use(controls: *ControlView, runtime: *Runtime, target: *budget.Set) bool {
     if (runtime == nil || !runtime.initialized || target == nil) { ret false; }
-    var i: usize = 0;
-    for (i < runtime.connection_capacity) {
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
         val value: *Connection = ?controls.connections[i];
-        if (value.live && value.budgets == target) { ret true; }
-        i = i + 1;
+        if (value.budgets == target) { ret true; }
+        i = value.next_live;
     }
-    i = 0;
-    for (i < runtime.storage.pending_initial_capacity) {
+    i = runtime.pending_live_head;
+    for (i != NO_CONNECTION) {
         val pending: *PendingInitial = ?runtime.storage.pending_initials[i];
-        if (pending.live && pending.config.budgets == target) { ret true; }
-        i = i + 1;
+        if (pending.config.budgets == target) { ret true; }
+        i = pending.next_live;
     }
     ret false;
 }
@@ -2947,13 +3048,12 @@ pub fun snapshot(controls: *ControlView, runtime: *Runtime) Snapshot {
     value.timers = runtime.timer_queue.len;
     value.stopping = runtime.stopping;
     value.initialized = true;
-    var i: usize = 0;
-    for (i < runtime.connection_capacity) {
-        if (controls.connections[i].live
-         && controls.connections[i].state == CONNECTION_BROKEN) {
+    var i: usize = runtime.live_head;
+    for (i != NO_CONNECTION) {
+        if (controls.connections[i].state == CONNECTION_BROKEN) {
             value.broken = value.broken + 1;
         }
-        i = i + 1;
+        i = controls.connections[i].next_live;
     }
     ret value;
 }
@@ -3137,6 +3237,8 @@ test "hedge.protocol.quic.runtime: multi-pump update rolls back staging" {
     control_storage.pump_capacity = MAX_PUMPS;
     var runtime: Runtime;
     var storages: [2]PumpStorage;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.pump_count = 2;
     var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
@@ -3205,6 +3307,8 @@ test "hedge.protocol.quic.runtime: failed rollback is fatal before commit" {
     control_storage.pump_capacity = MAX_PUMPS;
     var runtime: Runtime;
     var storage: PumpStorage;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
     var protocols: [1]tls_config.ProtocolName;
@@ -3258,6 +3362,8 @@ test "hedge.protocol.quic.runtime: update reports committed retirement failure" 
     control_storage.pump_capacity = MAX_PUMPS;
     var runtime: Runtime;
     var storage: PumpStorage;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.pump_count = 1;
     var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
@@ -3314,6 +3420,8 @@ test "hedge.protocol.quic.runtime: update gracefully retires superseded" {
     var connection: Connection;
     var connection_storage: ConnectionStorage;
     var pump_storage: PumpStorage;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.pump_count = 1;
     runtime.connection_capacity = 1;
@@ -3518,6 +3626,8 @@ test "hedge.protocol.quic.runtime: stale completion generations are inert" {
     control_storage.pumps = ?control_pumps[0];
     control_storage.pump_capacity = MAX_PUMPS;
     var runtime: Runtime;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     var context: CompletionContext;
     context.pump = 0;
@@ -3542,6 +3652,8 @@ test "hedge.protocol.quic.runtime: budget generation remains pinned by quic work
     var pending: PendingInitial;
     var first: budget.Set;
     var second: budget.Set;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.connection_capacity = 1;
     controls.connections = ?connection;
@@ -3549,14 +3661,18 @@ test "hedge.protocol.quic.runtime: budget generation remains pinned by quic work
     runtime.storage.pending_initial_capacity = 1;
     connection.live = true;
     connection.budgets = ?first;
+    link_live(controls, ?runtime, 0);
     if (!budgets_in_use(controls, ?runtime, ?first)
      || budgets_in_use(controls, ?runtime, ?second)) { ret 1; }
     connection.live = false;
+    unlink_live(controls, ?runtime, 0);
     pending.live = true;
+    link_pending_live(?runtime, 0);
     pending.config.budgets = ?second;
     if (budgets_in_use(controls, ?runtime, ?first)
      || !budgets_in_use(controls, ?runtime, ?second)) { ret 2; }
     pending.live = false;
+    unlink_pending_live(?runtime, 0);
     if (budgets_in_use(controls, ?runtime, ?second)) { ret 3; }
     ret 0;
 }
@@ -3596,6 +3712,8 @@ test "hedge.protocol.quic.runtime: pending transfer preserves old generation" {
     var old_budgets: budget.Set;
     old_plan.generation = 1;
     new_plan.generation = 2;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.connection_capacity = 1;
     controls.connections = ?connection;
@@ -3614,6 +3732,7 @@ test "hedge.protocol.quic.runtime: pending transfer preserves old generation" {
         process_admission.Lease{index: 0, generation: 1};
     val index: usize = acquire_connection(controls, ?runtime, 0, 0, lease);
     pending.live = true;
+    link_pending_live(?runtime, 0);
     pending.pump = 0;
     pending.admission_bank = 0;
     pending.accepted.charge.source = 20;
@@ -3665,6 +3784,8 @@ test "hedge.protocol.quic.runtime: queued initial deadline expires exactly" {
             time.Time{sec: 0, nsec: 0}, ?running) != budget.ADMITTED
      || budget.charge(?budgets, allowance, 0,
             time.Time{sec: 0, nsec: 0}, ?waiting) != budget.QUEUED) { ret 2; }
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.storage.pending_initials = ?pending;
     runtime.storage.pending_initial_capacity = 1;
@@ -3677,6 +3798,7 @@ test "hedge.protocol.quic.runtime: queued initial deadline expires exactly" {
     controls.pumps[0].admissions[0].live = true;
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live = true;
+    link_pending_live(?runtime, 0);
     pending.pump = 0;
     pending.pump_generation = 2;
     pending.admission_bank = 0;
@@ -3714,6 +3836,8 @@ test "hedge.protocol.quic.runtime: accepting cleanup retries shared lease" {
     var lease: process_admission.Lease;
     if (!process_admission.reserve(?manager, nil, ?lease)
      || !process_admission.commit(?manager, lease)) { ret 2; }
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.connection_capacity = 1;
     controls.connections = ?connection;
@@ -3763,6 +3887,8 @@ test "hedge.protocol.quic.runtime: pending cleanup retries each lease once" {
         time.Time{sec: 0, nsec: 0}, ?running);
     budget.charge(?budgets, allowance, 0,
         time.Time{sec: 0, nsec: 0}, ?waiting);
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.storage.pending_initials = ?pending;
     runtime.storage.pending_initial_capacity = 1;
@@ -3774,6 +3900,7 @@ test "hedge.protocol.quic.runtime: pending cleanup retries each lease once" {
     controls.pumps[0].admissions[0].live = true;
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live = true;
+    link_pending_live(?runtime, 0);
     pending.pump = 0;
     pending.admission_bank = 0;
     pending.config.budgets = ?budgets;
@@ -3840,6 +3967,8 @@ test "hedge.protocol.quic.runtime: shutdown cancels queued ownership" {
         ?peers[0][0], ?charges[0][0], ?replay[0][0]);
     val second: AdmissionStorage = test_admission_storage(?q_pending[1][0],
         ?peers[1][0], ?charges[1][0], ?replay[1][0]);
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.admission = ?manager;
     runtime.storage.pending_initials = ?pending;
@@ -3853,6 +3982,7 @@ test "hedge.protocol.quic.runtime: shutdown cancels queued ownership" {
     controls.pumps[0].queued_initials = 1;
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live = true;
+    link_pending_live(?runtime, 0);
     pending.pump = 0;
     pending.pump_generation = 1;
     pending.admission_bank = 0;
@@ -3883,6 +4013,8 @@ test "hedge.protocol.quic.runtime: queued old generation pins retirement" {
     var new_plan: plan.Plan;
     old_plan.generation = 1;
     new_plan.generation = 2;
+    runtime.live_head = NO_CONNECTION;
+    runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized = true;
     runtime.storage.pending_initials = ?pending;
     runtime.storage.pending_initial_capacity = 1;
@@ -3894,6 +4026,7 @@ test "hedge.protocol.quic.runtime: queued old generation pins retirement" {
     controls.pumps[0].admissions[0].retiring = true;
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live = true;
+    link_pending_live(?runtime, 0);
     pending.pump = 0;
     pending.pump_generation = 1;
     pending.admission_bank = 0;
@@ -3960,5 +4093,106 @@ test "hedge.protocol.quic.runtime: a connection drains faster than the process" 
     if (CONNECTION_DRAIN_NS == 0) { ret 1; }
     if (graph.timeouts.drain_ms == 0) { ret 2; }
     if (CONNECTION_DRAIN_NS >= graph.timeouts.drain_ms * 1000000) { ret 3; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a free pool is prepared without touching connection storage" {
+    var control_pumps: [MAX_PUMPS]Pump;
+    var control_storage: ControlView;
+    val controls: *ControlView = ?control_storage;
+    control_storage.pumps = ?control_pumps[0];
+    control_storage.pump_capacity = MAX_PUMPS;
+    var connections: [2]Connection;
+    var secret_storages: [2]assembly.SecretStorage;
+    var connection_storages: [2]ConnectionStorage;
+    var sessions: [2]h3_session.Session;
+    var session_storages: [2]h3_session.SessionStorage;
+    var entries: [16]routing.Entry;
+    var nodes: [2]timers.Node;
+    var positions: [2]timers.Position;
+    var initials: [2]PendingInitial;
+    var storage: Storage;
+    var runtime: Runtime;
+    control_storage.connections = ?connections[0];
+    control_storage.sessions = ?sessions[0];
+    control_storage.secret_storages = ?secret_storages[0];
+    control_storage.connection_capacity = 2;
+    control_storage.session_capacity = 2;
+    # a mark this pool has no reason to clear. the storage is half a megabyte a
+    # slot and the pool is sized by the configured connection limit, so writing
+    # to every slot at startup is what makes an idle HTTP/3 listener resident.
+    var slot: usize = 0;
+    for (slot < 2) {
+        connection_storages[slot].sends[0].pending = true;
+        connection_storages[slot].published[0].live = true;
+        slot = slot + 1;
+    }
+    if (!make_storage(?storage, ?connection_storages[0], 2,
+            ?session_storages[0], 2,
+            ?entries[0], 16, ?nodes[0], ?positions[0], 2,
+            ?initials[0], 2)
+     || !make(controls, ?runtime, storage,
+        RuntimeConfig{max_connections: 2})) { ret 1; }
+    if (!connection_storages[0].sends[0].pending
+     || !connection_storages[0].published[0].live
+     || !connection_storages[1].sends[0].pending
+     || !connection_storages[1].published[0].live) { ret 2; }
+    val taken: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (taken != 0) { ret 3; }
+    # the slot that was taken is armed, and only that one
+    if (connection_storages[0].sends[0].pending
+     || connection_storages[0].published[0].live) { ret 4; }
+    if (!connection_storages[1].sends[0].pending
+     || !connection_storages[1].published[0].live) { ret 5; }
+    return_connection(controls, ?runtime, taken);
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: the live list holds exactly the live connections" {
+    var control_pumps: [MAX_PUMPS]Pump;
+    var control_storage: ControlView;
+    val controls: *ControlView = ?control_storage;
+    control_storage.pumps = ?control_pumps[0];
+    control_storage.pump_capacity = MAX_PUMPS;
+    var connections: [2]Connection;
+    var secret_storages: [2]assembly.SecretStorage;
+    var connection_storages: [2]ConnectionStorage;
+    var sessions: [2]h3_session.Session;
+    var session_storages: [2]h3_session.SessionStorage;
+    var entries: [16]routing.Entry;
+    var nodes: [2]timers.Node;
+    var positions: [2]timers.Position;
+    var initials: [2]PendingInitial;
+    var storage: Storage;
+    var runtime: Runtime;
+    control_storage.connections = ?connections[0];
+    control_storage.sessions = ?sessions[0];
+    control_storage.secret_storages = ?secret_storages[0];
+    control_storage.connection_capacity = 2;
+    control_storage.session_capacity = 2;
+    if (!make_storage(?storage, ?connection_storages[0], 2,
+            ?session_storages[0], 2,
+            ?entries[0], 16, ?nodes[0], ?positions[0], 2,
+            ?initials[0], 2)
+     || !make(controls, ?runtime, storage,
+        RuntimeConfig{max_connections: 2})) { ret 1; }
+    # a pool with nothing live is a pool a sweep walks in no steps at all,
+    # whatever the configured capacity is
+    if (runtime.live_head != NO_CONNECTION || live_walk_length(controls,
+        ?runtime) != 0) { ret 2; }
+    val first: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    val second: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (first == NO_CONNECTION || second == NO_CONNECTION || first == second
+     || live_walk_length(controls, ?runtime) != 2) { ret 3; }
+    # a connection released from the middle of a sweep leaves the list whole
+    return_connection(controls, ?runtime, first);
+    if (live_walk_length(controls, ?runtime) != 1
+     || runtime.live_head != second) { ret 4; }
+    return_connection(controls, ?runtime, second);
+    if (live_walk_length(controls, ?runtime) != 0
+     || runtime.live_head != NO_CONNECTION) { ret 5; }
     ret 0;
 }

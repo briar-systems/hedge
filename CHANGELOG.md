@@ -16,6 +16,22 @@
 
 ### Fixed
 
+- The QUIC runtime sweeps the connections and queued initials that are live
+  rather than the whole pool the configured connection limit reserved. Every
+  poll walked all `limits.max_connections` connection slots twice and every
+  queued-initial slot three times, whether or not a datagram had arrived, so
+  an idle HTTP/3 listener taxed the unrelated TCP path. Both pools now carry
+  an intrusive live list beside their existing free list and every sweep
+  walks it. At the default limit of 10000, cleartext HTTP/1.1 served
+  alongside an idle QUIC listener went from 339 to 511 requests a second.
+- A free QUIC connection slot and a free HTTP/3 session no longer have their
+  storage written when the pool is prepared. A connection storage is 588 KiB
+  and a session 33 KiB, both allocated for the configured connection limit,
+  so arming every slot at startup made an idle server resident in that whole
+  product. Both are armed when the slot is taken. Peak resident memory for a
+  server with an idle QUIC listener fell from 672 MiB to 557 MiB. What
+  remains is the secret-welded connection and session arrays, which
+  mach-crypto wipes at allocation.
 - Every TCP stream hedge owns now disables Nagle's algorithm, on accepted
   connections and on upstream ones alike. Nagle holds a sub-maximum segment
   back until the peer acknowledges the segment before it, and every protocol
