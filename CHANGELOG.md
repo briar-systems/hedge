@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.4, mach-quic
+  v0.5.8, mach-acme v0.1.9, mach-crypto v0.8.2.
+
+### Removed
+
+- `tools/check-version.sh` and `tools/partial_literal_sweep.py`. The version
+  check belongs to the release process rather than a script in the tree, and
+  the literal sweep was a workaround for briar-systems/mach#3108, which is
+  being fixed in the compiler.
+
 ### Fixed
 
 - Every TCP stream hedge owns now disables Nagle's algorithm, on accepted
@@ -17,6 +29,12 @@
   a leg that times 100 requests over one HTTP/2 connection, because every
   other leg runs a single client against an idle server and passes at either
   rate.
+- A request body the service never reads no longer logs `body ended at a
+  different declared length` once the protocol layer has drained it. The
+  reader in mach-http compared the bytes the service read with the declared
+  length even when the drain owned the remainder (mach-http v0.7.6). A body
+  that really ends short of its declared length still fails the exchange on
+  every protocol.
 
 ## [0.2.0] - 2026-09-02
 
