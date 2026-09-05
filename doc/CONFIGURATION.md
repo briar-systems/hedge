@@ -69,10 +69,9 @@ application = "site"
 The implemented schema accepts these top-level sections:
 
 - `server` with bounded `limits`, `timeouts`, and feature selection
-- `listener` arrays with `tcp` or `local` transport and explicit protocol sets.
-  `quic` parses, and is refused before listeners become ready because this build
-  composes no QUIC connection driver: a datagram listener would bind and then
-  answer nothing
+- `listener` arrays with `tcp`, `local` or `quic` transport and explicit
+  protocol sets. A `quic` listener binds a UDP endpoint, becomes ready, and
+  serves HTTP/3 to clients that select `h3` through ALPN inside QUIC
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
@@ -142,6 +141,14 @@ binary forms are accepted, and a malformed header closes the connection rather
 than being read as the start of a request.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+
+`server.limits.max_connections_per_peer` defaults to 100 and is charged against
+the address the transport reported when the connection was accepted, which is
+before any PROXY header has been read. On a listener that decodes the PROXY
+protocol that address is the hop rather than the client, so every connection
+arriving through one load balancer, reverse proxy or NAT shares a single peer's
+allowance. Size this bound for the topology in front of the listener, not for
+the clients behind it. Charging it against the decoded source instead is #78.
 
 `server.limits.max_pipeline_depth` bounds HTTP/1 requests admitted into one
 connection before earlier responses release their slots. The default and fixed

@@ -44,6 +44,14 @@ Lightweight does not mean omitting production duties. It means that protocol eng
 
 See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md) for the dependency contracts.
 
+## Try it
+
+- [Demos](demo/README.md) are three configurations that run as they are: a
+  static site, the same site over TLS with HTTP/2 and HTTP/3, and a reverse
+  proxy. Each takes about a minute.
+- [Benchmarks](doc/bench/README.md) measure hedge under load beside Caddy, with
+  published results and a script that reproduces them.
+
 ## Documentation
 
 - [Architecture](doc/ARCHITECTURE.md)
