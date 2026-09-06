@@ -4,8 +4,20 @@
 
 ### Changed
 
-- Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.4, mach-quic
-  v0.5.8, mach-acme v0.1.9, mach-crypto v0.8.2.
+- Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.5, mach-quic
+  v0.5.9, mach-acme v0.1.9, mach-crypto v0.8.2.
+
+### Changed
+
+- A TLS client that offers no ALPN extension now selects the listener's
+  HTTP/1.1, where the listener serves it, instead of selecting nothing.
+  RFC 7301 section 3.2 reserves the `no_application_protocol` alert for a
+  client that offered protocols and matched none; a client that offered no
+  extension is served without ALPN. HTTP/2 over TLS is reachable only by
+  negotiating `h2`, so HTTP/1.1 is the only fallback, and a listener that
+  does not serve it still selects nothing. mach-tls v0.2.5 stops failing the
+  handshake for a client that sent no extension, which is where the alert was
+  raised, and the interoperability matrix gains a no-ALPN OpenSSL leg.
 
 ### Removed
 
