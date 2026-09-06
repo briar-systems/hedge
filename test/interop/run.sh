@@ -262,6 +262,16 @@ third_kind="$(printf '%s' "$third_session" | sed -n 's/^\(New\|Reused\), TLSv1.3
 check "single-use replay falls back to a full TLS 1.3 handshake" New \
     "$third_kind"
 
+# RFC 7301 section 3.2: a client that sends no ALPN extension is served without
+# one, and the listener's HTTP/1.1 is the only protocol reachable that way
+no_alpn="$(printf '%s' "$request" | timeout 15 openssl s_client \
+    -connect 127.0.0.1:9443 -servername api.example.com \
+    -CAfile "$fixtures/root.pem" -tls1_3 -ign_eof 2>&1)"
+no_alpn_code="$(printf '%s' "$no_alpn" | sed -n 's#^HTTP/1.1 \([0-9]*\).*#\1#p' | head -1)"
+no_alpn_alert="$(printf '%s' "$no_alpn" | sed -n 's/.*SSL alert number \([0-9]*\).*/\1/p' | head -1)"
+check "a TLS client offering no ALPN is served HTTP/1.1" "200/none" \
+    "${no_alpn_code:-none}/${no_alpn_alert:-none}"
+
 # --- protocol-correct refusals ----------------------------------------------
 
 check "a TLS 1.2 client is refused with protocol_version" 70 \
