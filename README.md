@@ -11,7 +11,10 @@ bounded caches, virtual host dispatch, and ACME over authenticated TLS are
 implemented. A `transport = "quic"` listener becomes ready and serves HTTP/3,
 with ALPN inside QUIC selecting `h3`, qualified against curl 8.21.0 over
 ngtcp2 in the same interoperability matrix: request bodies, large responses,
-and prompt shutdown included. The current Let's Encrypt chain uses certificate algorithms
+and prompt shutdown included. HTTP/3 is qualified for that single-client
+matrix only: under concurrent load a QUIC send failure escalates into a
+process-wide shutdown that never completes (#89), so a `quic` listener is not
+yet fit for public traffic. The current Let's Encrypt chain uses certificate algorithms
 mach-tls cannot verify (#38), and a listener's credential generation cannot
 yet be replaced (#37).
 
