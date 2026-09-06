@@ -1,19 +1,23 @@
 # Results
 
 One file per run, named `<date>-<hostname>.md`. Each names the machine, the tool
-versions and the hedge revision it came from, because a number from a different
+versions and the hedge version it came from, because a number from a different
 machine is a different number.
 
-Nothing is published here yet. hedge currently fails three of the four protocol
-rows, for reasons filed as
-[#69](https://github.com/briar-systems/hedge/issues/69),
-[#70](https://github.com/briar-systems/hedge/issues/70) and
-[#71](https://github.com/briar-systems/hedge/issues/71). The first run lands
-once those close.
+| run | hedge | notes |
+| --- | --- | --- |
+| [2026-09-05-D00](2026-09-05-D00.md) | 0.2.0 plus the fixes for #69, #70 and #71 | first published run |
 
-The harness is finished and reproducible in the meantime:
+Cells are marked one of three ways. An unmarked cell served every request it was
+offered. A cell marked † served some and lost the rest, and keeps its numbers,
+because a rate over what completed still says how far the server got. A cell
+reading "served nothing" completed no request at all, and has no numbers because
+a rate computed from zero completions is not a measurement. Every marked cell is
+counted and explained at the bottom of the file.
+
+To produce another:
 
 ```sh
-./doc/bench/run.sh --smoke   # one short cell per protocol
-./doc/bench/run.sh           # the full matrix
+./doc/bench/run.sh --smoke   # one short cell per protocol, writes nothing
+./doc/bench/run.sh           # the full matrix, about 16 minutes
 ```

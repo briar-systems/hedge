@@ -12,12 +12,8 @@ That provisions everything, runs the matrix, and writes a results file into
 the machine it came off, and a number from a different machine is a different
 number.
 
-No run is published yet. hedge fails three of the four protocol rows for reasons
-filed as [#69](https://github.com/briar-systems/hedge/issues/69),
-[#70](https://github.com/briar-systems/hedge/issues/70) and
-[#71](https://github.com/briar-systems/hedge/issues/71), and the first table
-lands once those close. [`COMPARISON.md`](COMPARISON.md) carries what has been
-measured so far.
+[`COMPARISON.md`](COMPARISON.md) reads the published run against Caddy on both
+the numbers and the ergonomics.
 
 ## What is measured
 
@@ -123,8 +119,19 @@ uses the release build in `out/`, and builds one if there is none.
 
 ## Reading a failure
 
-A cell that fails is printed as `failed` in its table and named at the bottom of
-the results file with what went wrong. Failures are never filled in with a
-plausible number and never quietly dropped. If a cell fails, the harness or the
-configuration is wrong, or the server is: all three have happened, and
-[`COMPARISON.md`](COMPARISON.md) says which.
+A cell reports one of three outcomes, and none of them is ever filled in with a
+plausible number or quietly dropped.
+
+- **Unmarked.** Every request offered was served.
+- **Marked †.** Some were served and the rest were lost. The cell keeps its
+  numbers, because a rate over what completed still says how far the server got,
+  and the counts served and lost are listed at the bottom of the file. Replacing
+  these with the word "failed" would hide the difference between a server that
+  is behind and one that is dead.
+- **"served nothing".** No request completed, so there is no rate to report.
+
+Every marked cell is named at the bottom of the results file with what happened,
+and a protocol with a defect known before the run cites its issue there.
+
+If a cell fails, the harness or the configuration is wrong, or the server is:
+all three have happened, and [`COMPARISON.md`](COMPARISON.md) says which.

@@ -49,6 +49,10 @@ class Protocol:
     oha_version: str | None
     hedge: Endpoint
     caddy: Endpoint
+    # a defect known to break this protocol before the run starts. a cell that
+    # fails then cites it, so a reader does not have to match a symptom against
+    # the issue tracker by hand. `None` means a failure here is news.
+    tracking: str | None = None
 
     def endpoint(self, server: str) -> Endpoint:
         return self.hedge if server == "hedge" else self.caddy
@@ -86,6 +90,8 @@ PROTOCOLS = [
         oha_version=None,
         hedge=Endpoint("https://localhost:18443", True),
         caddy=Endpoint("https://localhost:18444", True),
+        tracking="[#89](https://github.com/briar-systems/hedge/issues/89), "
+                 "HTTP/3 under concurrency",
     ),
 ]
 
@@ -102,8 +108,18 @@ class Result:
     p99_ms: float = 0.0
     peak_rss_kib: int = 0
     cpu_seconds: float = 0.0
+    responses: int = 0
+    failures: int = 0
+    # ok means the cell produced a usable measurement. a cell that served most
+    # of its requests and lost some is degraded, not failed, and its numbers are
+    # worth more than the word "failed": suppressing them would hide how far a
+    # server got. only a cell that completed nothing is failed.
     ok: bool = True
     note: str = ""
+
+    @property
+    def clean(self) -> bool:
+        return self.ok and self.failures == 0
 
 
 @dataclass
@@ -240,7 +256,7 @@ def seconds(value) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
-def read_oha(payload: dict) -> tuple[float, float, float, float, str]:
+def read_oha(payload: dict) -> tuple[float, float, float, float, str, int, int]:
     summary = payload.get("summary") or {}
     percentiles = payload.get("latencyPercentiles") or {}
     codes = payload.get("statusCodeDistribution") or {}
@@ -251,15 +267,21 @@ def read_oha(payload: dict) -> tuple[float, float, float, float, str]:
     p50 = seconds(percentiles.get("p50")) * 1000.0
     p99 = seconds(percentiles.get("p99")) * 1000.0
 
-    notes = []
+    served = sum(n for code, n in codes.items() if str(code) == "200")
     non_200 = {code: n for code, n in codes.items() if str(code) != "200"}
+    lost = sum(errors.values()) + sum(non_200.values())
+
+    notes = []
     if non_200:
         notes.append(f"non-200 responses: {non_200}")
     if errors:
         notes.append(f"errors: {dict(list(errors.items())[:3])}")
     if not codes and not errors:
         notes.append("oha reported neither a response nor an error")
-    return (rps, size_per_sec / (1024 * 1024), p50, p99, "; ".join(notes))
+    if served and lost:
+        notes.insert(0, f"{served:,} served, {lost:,} lost")
+    return (rps, size_per_sec / (1024 * 1024), p50, p99, "; ".join(notes),
+            served, lost)
 
 
 # a cell may overrun its duration by at most this, to let the batch in flight
@@ -274,7 +296,8 @@ H3_BATCH_BYTES = 32 * 1024 * 1024
 
 
 def run_curl_h3(curl: str, url: str, path: str, body_bytes: int, connections: int,
-                duration: int, work: Path) -> tuple[float, float, float, float, str]:
+                duration: int, work: Path
+                ) -> tuple[float, float, float, float, str, int, int]:
     """An HTTP/3 cell.
 
     curl is the only HTTP/3 client on this machine, and it is a transfer tool
@@ -342,13 +365,13 @@ def run_curl_h3(curl: str, url: str, path: str, body_bytes: int, connections: in
         notes.append(f"{failures} failed requests")
     if not times:
         notes.append("no HTTP/3 request completed")
-        return (0.0, 0.0, 0.0, 0.0, "; ".join(notes))
+        return (0.0, 0.0, 0.0, 0.0, "; ".join(notes), 0, failures)
 
     times.sort()
     p50 = times[int(len(times) * 0.50)] * 1000.0
     p99 = times[min(int(len(times) * 0.99), len(times) - 1)] * 1000.0
     return (requests / elapsed, total_bytes / (1024 * 1024) / elapsed, p50, p99,
-            "; ".join(notes))
+            "; ".join(notes), requests, failures)
 
 
 def build_servers(args: argparse.Namespace) -> dict[str, Server]:
@@ -409,17 +432,19 @@ def measure(args: argparse.Namespace, protocol: Protocol, size_name: str,
                 result.ok = False
                 result.note = error
             else:
-                rps, mib, p50, p99, note = read_oha(payload)
+                rps, mib, p50, p99, note, served, lost = read_oha(payload)
                 result.requests_per_sec, result.mib_per_sec = rps, mib
                 result.p50_ms, result.p99_ms, result.note = p50, p99, note
-                result.ok = rps > 0 and not note
+                result.responses, result.failures = served, lost
+                result.ok = rps > 0 and served > 0
         else:
-            rps, mib, p50, p99, note = run_curl_h3(
+            rps, mib, p50, p99, note, served, lost = run_curl_h3(
                 args.curl, endpoint.url, f"/{size_name}", body_bytes, connections,
                 duration, work)
             result.requests_per_sec, result.mib_per_sec = rps, mib
             result.p50_ms, result.p99_ms, result.note = p50, p99, note
-            result.ok = rps > 0 and not note
+            result.responses, result.failures = served, lost
+            result.ok = rps > 0 and served > 0
 
         if not server.alive():
             result.ok = False
@@ -540,6 +565,12 @@ def render(results: dict, args: argparse.Namespace, duration: int,
             add("Driven by the curl batch harness, not by `oha`. These numbers are")
             add("comparable with each other and with nothing else in this file.")
             add("")
+        failed_here = [r for r in results.values()
+                       if r.protocol == protocol.key and not r.ok]
+        if failed_here and protocol.tracking:
+            add(f"Cells below that failed did so for a defect known before this "
+                f"run: {protocol.tracking}. They were not retried.")
+            add("")
         add("| body | conns | server | req/s | MiB/s | p50 ms | p99 ms | peak RSS | CPU s |")
         add("| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for size_name, _ in SIZES:
@@ -550,24 +581,39 @@ def render(results: dict, args: argparse.Namespace, duration: int,
                         continue
                     if not found.ok:
                         add(f"| {size_name} | {connections} | {server} | "
-                            f"failed | | | | | |")
+                            f"served nothing | | | | | |")
                         continue
                     rss = f"{found.peak_rss_kib / 1024:,.0f} MiB"
-                    add(f"| {size_name} | {connections} | {server} | "
+                    # a degraded cell keeps its numbers and carries a mark, so a
+                    # reader sees both how far the server got and that it did
+                    # not get all the way. the marks are listed under the table.
+                    mark = "" if found.clean else " †"
+                    add(f"| {size_name} | {connections} | {server}{mark} | "
                         f"{number(found.requests_per_sec)} | "
                         f"{number(found.mib_per_sec, 1)} | "
                         f"{number(found.p50_ms, 2)} | "
                         f"{number(found.p99_ms, 2)} | "
                         f"{rss} | {number(found.cpu_seconds, 1)} |")
+        degraded = [r for r in results.values()
+                    if r.protocol == protocol.key and not r.clean and r.ok]
+        if degraded:
+            add("")
+            add("† lost requests as well as serving them. The rate is over what "
+                "completed, so it describes the part that worked and not the "
+                "whole load offered. Counts are below.")
         add("")
 
     notes = [r for r in results.values() if r.note]
     if notes:
         add("## Cells that reported something")
         add("")
+        tracked = {p.key: p.tracking for p in PROTOCOLS}
         for found in sorted(notes, key=lambda r: (r.protocol, r.size, r.connections)):
+            cite = ""
+            if not found.clean and tracked.get(found.protocol):
+                cite = f" Tracked as {tracked[found.protocol]}."
             add(f"- `{found.protocol}` {found.size} at {found.connections} "
-                f"on {found.server}: {found.note}")
+                f"on {found.server}: {found.note}.{cite}")
         add("")
 
     return "\n".join(lines) + "\n"
@@ -607,6 +653,7 @@ def main() -> int:
     index = 0
     started = time.monotonic()
     failures = 0
+    degraded = 0
 
     for protocol in PROTOCOLS:
         for size_name, body_bytes in sizes:
@@ -620,19 +667,23 @@ def main() -> int:
                                     count, server, duration, work)
                     results[(protocol.key, size_name, count, server)] = found
                     if found.ok:
+                        if not found.clean:
+                            degraded += 1
                         print(f"    {found.requests_per_sec:,.0f} req/s  "
                               f"{found.mib_per_sec:,.1f} MiB/s  "
                               f"p50 {found.p50_ms:.2f}ms  p99 {found.p99_ms:.2f}ms  "
-                              f"rss {found.peak_rss_kib / 1024:,.0f}MiB",
+                              f"rss {found.peak_rss_kib / 1024:,.0f}MiB"
+                              + (f"  [{found.note}]" if found.note else ""),
                               flush=True)
                     else:
                         failures += 1
-                        print(f"    FAILED {found.note}", flush=True)
+                        print(f"    SERVED NOTHING {found.note}", flush=True)
 
     elapsed = time.monotonic() - started
 
     if args.smoke:
-        print(f"\nsmoke: {total - failures}/{total} cells produced numbers")
+        print(f"\nsmoke: {total - failures}/{total} cells produced numbers, "
+              f"{degraded} of those lost requests")
         return 1 if failures else 0
 
     document = render(results, args, duration, elapsed)
@@ -645,9 +696,10 @@ def main() -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(document)
     print(f"\nwrote {destination}")
-    if failures:
-        print(f"{failures} of {total} cells failed; the results file names them")
-        return 1
+    if failures or degraded:
+        print(f"{failures} of {total} cells served nothing and {degraded} lost "
+              f"requests while serving; the results file names them")
+        return 1 if failures else 0
     return 0
 
 
