@@ -16,7 +16,11 @@ matrix only: under concurrent load a QUIC send failure escalates into a
 process-wide shutdown that never completes (#89), so a `quic` listener is not
 yet fit for public traffic. The current Let's Encrypt chain uses certificate algorithms
 mach-tls cannot verify (#38), and a listener's credential generation cannot
-yet be replaced (#37).
+yet be replaced (#37). Under load, hedge is not yet competitive: a TLS
+handshake costs about half a second of CPU and every TLS record tens of
+milliseconds (#91), which on a single serving thread serialises concurrent TLS
+and HTTP/2 clients into timeouts. The measured state, against Caddy, is in
+[`doc/bench`](doc/bench/COMPARISON.md).
 
 ## Product goals
 

@@ -1,14 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.1] - 2026-09-05
+
+Validated with the root suite in both profiles, the interoperability matrix
+(46 legs) and IR verification on all six targets. The runtime harness
+(`test/runtime`) was not run for this release: it peaks near 18 GiB and the
+release machine could not provide it.
+
+### Added
+
+- `demo/`: three runnable deployments (a static site, the same over TLS with HTTP/2 and HTTP/3, and a reverse proxy), and `doc/bench/`: a benchmark project against Caddy with a published first run and a comparison of throughput, memory and operation.
 
 ### Changed
 
 - Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.5, mach-quic
   v0.5.9, mach-acme v0.1.9, mach-crypto v0.8.2.
-
-### Changed
-
 - A TLS client that offers no ALPN extension now selects the listener's
   HTTP/1.1, where the listener serves it, instead of selecting nothing.
   RFC 7301 section 3.2 reserves the `no_application_protocol` alert for a
