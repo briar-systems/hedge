@@ -11,9 +11,16 @@ bounded caches, virtual host dispatch, and ACME over authenticated TLS are
 implemented. A `transport = "quic"` listener becomes ready and serves HTTP/3,
 with ALPN inside QUIC selecting `h3`, qualified against curl 8.21.0 over
 ngtcp2 in the same interoperability matrix: request bodies, large responses,
-and prompt shutdown included. The current Let's Encrypt chain uses certificate algorithms
+and prompt shutdown included. HTTP/3 is qualified for that single-client
+matrix only: under concurrent load a QUIC send failure escalates into a
+process-wide shutdown that never completes (#89), so a `quic` listener is not
+yet fit for public traffic. The current Let's Encrypt chain uses certificate algorithms
 mach-tls cannot verify (#38), and a listener's credential generation cannot
-yet be replaced (#37).
+yet be replaced (#37). Under load, hedge is not yet competitive: a TLS
+handshake costs about half a second of CPU and every TLS record tens of
+milliseconds (#91), which on a single serving thread serialises concurrent TLS
+and HTTP/2 clients into timeouts. The measured state, against Caddy, is in
+[`doc/bench`](doc/bench/COMPARISON.md).
 
 ## Product goals
 
@@ -43,6 +50,14 @@ Lightweight does not mean omitting production duties. It means that protocol eng
 - `hedge` assembles those libraries into an operated server.
 
 See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md) for the dependency contracts.
+
+## Try it
+
+- [Demos](demo/README.md) are three configurations that run as they are: a
+  static site, the same site over TLS with HTTP/2 and HTTP/3, and a reverse
+  proxy. Each takes about a minute.
+- [Benchmarks](doc/bench/README.md) measure hedge under load beside Caddy, with
+  published results and a script that reproduces them.
 
 ## Documentation
 

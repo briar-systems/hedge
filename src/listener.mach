@@ -20,6 +20,7 @@ use io_runtime: std.io.runtime;
 use std.net.ip;
 use std.net.tcp;
 use std.net.udp;
+use socket: std.net.socket;
 use net_async: std.net.async;
 use local_endpoint: std.net.local.endpoint;
 use local_types: std.net.local.types;
@@ -454,6 +455,23 @@ fun close_unowned_tcp(resource: usize) bool {
     ret !is_err[bool, io_error.Error](tcp.stream_close(?stream));
 }
 
+# the transport policy every TCP stream this process owns is held to, applied
+# before the stream is handed to anything that will write on it
+#
+# Nagle's algorithm holds a sub-MSS segment back until the peer acknowledges the
+# segment before it. every protocol hedge speaks writes a message as more than
+# one segment and then waits for the peer to answer: HTTP/2 frames its headers
+# and its data separately, and a proxied request writes its head before its
+# body. the peer has nothing to say until the whole message arrives, so it
+# delays its acknowledgement, and every exchange pays that delay: 40 ms on
+# Linux, which bounds a keep-alive HTTP/2 connection at about 22 requests a
+# second no matter how fast the server is.
+pub fun apply_stream_policy(resource: usize) bool {
+    if (!socket.bool_option_supported(socket.NO_DELAY)) { ret true; }
+    ret !is_err[bool, io_error.Error](socket.set_bool(
+        io_handle.SocketHandle{value: resource}, socket.NO_DELAY, true));
+}
+
 fun dispatch_accept(owner: *Owner, context: *CompletionContext, completion: io_runtime.Completion) {
     if (context.set_index >= 2) {
         if (!completion.has_error && context.kind == CONTEXT_ACCEPT_TCP) { close_unowned_tcp(completion.resource); }
@@ -476,11 +494,17 @@ fun dispatch_accept(owner: *Owner, context: *CompletionContext, completion: io_r
 
     if (!completion.has_error && set.state == SET_ACTIVE && owner.state == OWNER_READY) {
         if (context.kind == CONTEXT_ACCEPT_TCP) {
-            val connection: *Connection = queue_connection(owner, set, context.listener_index, schema.TRANSPORT_TCP, ?slot.peer);
-            if (connection == nil) {
+            # policy first: a socket that cannot carry it is refused rather than
+            # served slowly, and nothing is queued that has to be unqueued
+            if (!apply_stream_policy(completion.resource)) {
                 close_unowned_tcp(completion.resource);
             } or {
-                connection.tcp_stream = tcp.Stream{handle: io_handle.SocketHandle{value: completion.resource}};
+                val connection: *Connection = queue_connection(owner, set, context.listener_index, schema.TRANSPORT_TCP, ?slot.peer);
+                if (connection == nil) {
+                    close_unowned_tcp(completion.resource);
+                } or {
+                    connection.tcp_stream = tcp.Stream{handle: io_handle.SocketHandle{value: completion.resource}};
+                }
             }
         } or {
             val accepted: Result[local_async.Stream, io_error.Error] = local_async.accepted(?owner.local, completion);
@@ -1261,4 +1285,47 @@ pub fun stop(owner: *Owner) bool {
     owner.queued_connection_count = 0;
     owner.state = OWNER_STOPPED;
     ret success;
+}
+
+# a real socket pair, because the defect this asserts against is a kernel
+# setting: nothing short of asking the kernel back can tell whether Nagle is off
+test "listener: an accepted stream is adopted with Nagle disabled" {
+    if (!socket.bool_option_supported(socket.NO_DELAY)) { ret 0; }
+    val listening: Result[tcp.Listener, io_error.Error] = tcp.listen(
+        ip.endpoint(127, 0, 0, 1, 0), 4);
+    if (is_err[tcp.Listener, io_error.Error](listening)) { ret 1; }
+    var server: tcp.Listener = unwrap_ok[tcp.Listener, io_error.Error](listening);
+    val bound: Result[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?server);
+    if (is_err[ip.Endpoint, io_error.Error](bound)) {
+        tcp.listener_close(?server);
+        ret 1;
+    }
+    val dialed: Result[tcp.Stream, io_error.Error] = tcp.connect(
+        unwrap_ok[ip.Endpoint, io_error.Error](bound));
+    if (is_err[tcp.Stream, io_error.Error](dialed)) {
+        tcp.listener_close(?server);
+        ret 1;
+    }
+    var client: tcp.Stream = unwrap_ok[tcp.Stream, io_error.Error](dialed);
+    val taken: Result[tcp.Stream, io_error.Error] = tcp.accept(?server);
+    if (is_err[tcp.Stream, io_error.Error](taken)) {
+        tcp.stream_close(?client);
+        tcp.listener_close(?server);
+        ret 1;
+    }
+    var accepted: tcp.Stream = unwrap_ok[tcp.Stream, io_error.Error](taken);
+    var failures: i32 = 0;
+    val before: Result[bool, io_error.Error] = socket.get_bool(accepted.handle,
+        socket.NO_DELAY);
+    if (is_err[bool, io_error.Error](before)
+     || unwrap_ok[bool, io_error.Error](before)) { failures = failures + 1; }
+    if (!apply_stream_policy(accepted.handle.value)) { failures = failures + 1; }
+    val after: Result[bool, io_error.Error] = socket.get_bool(accepted.handle,
+        socket.NO_DELAY);
+    if (is_err[bool, io_error.Error](after)
+     || !unwrap_ok[bool, io_error.Error](after)) { failures = failures + 1; }
+    tcp.stream_close(?accepted);
+    tcp.stream_close(?client);
+    tcp.listener_close(?server);
+    ret failures;
 }

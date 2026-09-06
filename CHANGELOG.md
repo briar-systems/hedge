@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.2.1] - 2026-09-05
+
+Validated with the root suite in both profiles, the interoperability matrix
+(46 legs) and IR verification on all six targets. The runtime harness
+(`test/runtime`) was not run for this release: it peaks near 18 GiB and the
+release machine could not provide it.
+
+### Added
+
+- `demo/`: three runnable deployments (a static site, the same over TLS with HTTP/2 and HTTP/3, and a reverse proxy), and `doc/bench/`: a benchmark project against Caddy with a published first run and a comparison of throughput, memory and operation.
+
+### Changed
+
+- Dependencies: mach-http v0.7.6, laurel v0.8.9, mach-tls v0.2.5, mach-quic
+  v0.5.9, mach-acme v0.1.9, mach-crypto v0.8.2.
+- A TLS client that offers no ALPN extension now selects the listener's
+  HTTP/1.1, where the listener serves it, instead of selecting nothing.
+  RFC 7301 section 3.2 reserves the `no_application_protocol` alert for a
+  client that offered protocols and matched none; a client that offered no
+  extension is served without ALPN. HTTP/2 over TLS is reachable only by
+  negotiating `h2`, so HTTP/1.1 is the only fallback, and a listener that
+  does not serve it still selects nothing. mach-tls v0.2.5 stops failing the
+  handshake for a client that sent no extension, which is where the alert was
+  raised, and the interoperability matrix gains a no-ALPN OpenSSL leg.
+
+### Removed
+
+- `tools/check-version.sh` and `tools/partial_literal_sweep.py`. The version
+  check belongs to the release process rather than a script in the tree, and
+  the literal sweep was a workaround for briar-systems/mach#3108, which is
+  being fixed in the compiler.
+
+### Fixed
+
+- The QUIC runtime sweeps the connections and queued initials that are live
+  rather than the whole pool the configured connection limit reserved. Every
+  poll walked all `limits.max_connections` connection slots twice and every
+  queued-initial slot three times, whether or not a datagram had arrived, so
+  an idle HTTP/3 listener taxed the unrelated TCP path. Both pools now carry
+  an intrusive live list beside their existing free list and every sweep
+  walks it. At the default limit of 10000, cleartext HTTP/1.1 served
+  alongside an idle QUIC listener went from 339 to 511 requests a second.
+- A free QUIC connection slot and a free HTTP/3 session no longer have their
+  storage written when the pool is prepared. A connection storage is 588 KiB
+  and a session 33 KiB, both allocated for the configured connection limit,
+  so arming every slot at startup made an idle server resident in that whole
+  product. Both are armed when the slot is taken. Peak resident memory for a
+  server with an idle QUIC listener fell from 672 MiB to 557 MiB. What
+  remains is the secret-welded connection and session arrays, which
+  mach-crypto wipes at allocation.
+- Every TCP stream hedge owns now disables Nagle's algorithm, on accepted
+  connections and on upstream ones alike. Nagle holds a sub-maximum segment
+  back until the peer acknowledges the segment before it, and every protocol
+  hedge speaks writes a message as more than one segment and then waits for
+  the peer to answer, so each exchange paid the peer's delayed
+  acknowledgement: 40 ms on Linux. A keep-alive HTTP/2 connection served
+  about 22 requests a second at 18 percent processor use and collapsed under
+  concurrency; it now serves the same work at the rate the server can
+  actually do it. HTTP/1.1 was affected too, at one stalled segment per
+  connection rather than one per exchange. The interoperability matrix gains
+  a leg that times 100 requests over one HTTP/2 connection, because every
+  other leg runs a single client against an idle server and passes at either
+  rate.
+- A request body the service never reads no longer logs `body ended at a
+  different declared length` once the protocol layer has drained it. The
+  reader in mach-http compared the bytes the service read with the declared
+  length even when the drain owned the remainder (mach-http v0.7.6). A body
+  that really ends short of its declared length still fails the exchange on
+  every protocol.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added
