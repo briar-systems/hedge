@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-13
+
+### Fixed
+- Log method and target as text rather than hex (#77).
+
+### Changed
+- Dependencies: mach-std v2.1.0.
+
 ## [0.3.0] - 2026-09-13
 
 ### Changed
