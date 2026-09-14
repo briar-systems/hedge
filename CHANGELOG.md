@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.3.0] - 2026-09-13
+
+### Changed
+- Migrated to mach 5.0 and mach-std 2.0.0.
+- Dependencies: mach-crypto v0.9.0, mach-tls v0.3.0, mach-quic v0.6.0, mach-http v0.8.0, mach-acme v0.2.0, laurel v0.9.0.
+
 ## [0.2.1] - 2026-09-05
 
 Validated with the root suite in both profiles, the interoperability matrix
