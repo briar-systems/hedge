@@ -80,20 +80,7 @@ mach test .
 mach build .
 ```
 
-The runtime harness in `test/runtime` composes the whole server into one test
-binary and is run separately:
-
-```sh
-mach dep pull test/runtime
-mach test test/runtime
-```
-
-Its debug profile carries no debug info because the compilation peaks near
-18 GiB; on a 32 GiB machine the harness passes in the debug profile and is
-killed in the release profile, so the release run needs more memory than
-that.
-
-GitHub Actions CI runs the root test suite in both profiles, the runtime harness in both profiles, and the live ACME conformance suite on every pull request.
+GitHub Actions CI runs the root test suite in both profiles and the live ACME conformance suite on every pull request.
 
 
 Build output uses Mach's default `out/` directory.
