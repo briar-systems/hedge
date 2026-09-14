@@ -93,5 +93,7 @@ Its debug profile carries no debug info because the compilation peaks near
 killed in the release profile, so the release run needs more memory than
 that.
 
+GitHub Actions CI runs the root test suite in both profiles, the runtime harness in both profiles, and the live ACME conformance suite on every pull request.
+
 
 Build output uses Mach's default `out/` directory.
