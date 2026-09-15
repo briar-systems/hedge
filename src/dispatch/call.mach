@@ -5,8 +5,13 @@ use http.core.body;
 use http.core.exchange;
 use http.core.field;
 use http.core.message;
+use hedge.storage;
 use std.allocator;
-use std.allocator.fixed;
+use mem: std.memory;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.error.err;
+use std.allocator.page;
 use std.chrono.time;
 use std.sync.cancel;
 use std.types.bool.bool;
@@ -45,26 +50,139 @@ pub fun no_route() Route {
     ret Route{index: 0, name: nil, host: nil, service: nil};
 }
 
-# the request arena is caller-owned and reset only after the exchange settles
+# the request arena: a bump allocator over chunks claimed as the request needs
+# them, bounded by the bytes of chunk it may hold. the bound is the server's
+# until a route is selected and the route's after, and every chunk returns to
+# the shared classes when the exchange settles.
 pub rec Memory {
     allocator:   allocator.Allocator;
-    state:       fixed.FixedState;
-    capacity:    usize;
+    chunks:      *storage.Chunks;
+    head:        *u8;
+    head_size:   usize;
+    offset:      usize;
+    last_offset: usize;
+    last_size:   usize;
+    held:        usize;
+    limit:       usize;
+    refused:     bool;
     initialized: bool;
 }
 
-pub fun make_memory(memory: *Memory, storage: *u8, capacity: usize) bool {
-    if (memory == nil || storage == nil || capacity == 0) { ret false; }
-    fixed.make(?memory.allocator, ?memory.state, storage, capacity);
-    memory.capacity    = capacity;
+# each chunk starts with the chunk before it, so release walks back from the head
+rec ChunkLink {
+    previous:      *u8;
+    previous_size: usize;
+}
+
+val LINK_BYTES: usize = $size_of(ChunkLink);
+
+fun align_up(value: usize, align: usize) usize {
+    val mask: usize = align - 1;
+    ret (value + mask) & ~mask;
+}
+
+fun memory_allocate(context: ptr, size: usize, align: usize) opt[ptr] {
+    val memory: *Memory = context::*Memory;
+    if (size == 0) { ret opt[ptr].some{nil}; }
+    if (memory.head != nil) {
+        val start: usize = align_up(memory.offset, align);
+        if (start <= memory.head_size && size <= memory.head_size - start) {
+            memory.last_offset = start;
+            memory.last_size   = size;
+            memory.offset      = start + size;
+            ret opt[ptr].some{(memory.head::usize + start)::ptr};
+        }
+    }
+    var wanted: usize = storage.MIN_CHUNK;
+    if (size + align + LINK_BYTES > wanted) { wanted = size + align + LINK_BYTES; }
+    val chunk_size: usize = storage.chunk_class_size(wanted);
+    if (chunk_size == 0 || memory.held + chunk_size > memory.limit) {
+        memory.refused = true;
+        ret opt[ptr].none{};
+    }
+    val chunk: *u8 = storage.claim_chunk(memory.chunks, chunk_size);
+    if (chunk == nil) {
+        memory.refused = true;
+        ret opt[ptr].none{};
+    }
+    val link: *ChunkLink = chunk::*ChunkLink;
+    link.previous      = memory.head;
+    link.previous_size = memory.head_size;
+    memory.head        = chunk;
+    memory.head_size   = chunk_size;
+    memory.held        = memory.held + chunk_size;
+    val start: usize = align_up(LINK_BYTES, align);
+    memory.last_offset = start;
+    memory.last_size   = size;
+    memory.offset      = start + size;
+    ret opt[ptr].some{(chunk::usize + start)::ptr};
+}
+
+fun memory_reallocate(context: ptr, p: ptr, old_size: usize, new_size: usize,
+    align: usize) opt[ptr] {
+    val memory: *Memory = context::*Memory;
+    if (p == nil)      { ret memory_allocate(context, new_size, align); }
+    if (new_size == 0) { ret opt[ptr].some{nil}; }
+    if (memory.head != nil && p::usize == memory.head::usize + memory.last_offset
+        && old_size == memory.last_size && new_size <= memory.head_size - memory.last_offset) {
+        memory.last_size = new_size;
+        memory.offset    = memory.last_offset + new_size;
+        ret opt[ptr].some{p};
+    }
+    val fresh: opt[ptr] = memory_allocate(context, new_size, align);
+    if (!(sel fresh.some)) { ret fresh; }
+    var count: usize = old_size;
+    if (new_size < count) { count = new_size; }
+    mem.raw_copy(fresh.some, p, count);
+    ret fresh;
+}
+
+fun memory_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
+    val memory: *Memory = context::*Memory;
+    if (p != nil && memory.head != nil
+        && p::usize == memory.head::usize + memory.last_offset && size == memory.last_size) {
+        memory.offset    = memory.last_offset;
+        memory.last_size = 0;
+    }
+    ret 0;
+}
+
+pub fun make_memory(memory: *Memory, chunks: *storage.Chunks, limit: usize) bool {
+    if (memory == nil || chunks == nil || limit == 0) { ret false; }
+    memory.allocator = allocator.Allocator{ctx: memory::ptr, fn_allocate: memory_allocate,
+        fn_reallocate: memory_reallocate, fn_deallocate: memory_deallocate};
+    memory.chunks      = chunks;
+    memory.head        = nil;
+    memory.head_size   = 0;
+    memory.offset      = 0;
+    memory.last_offset = 0;
+    memory.last_size   = 0;
+    memory.held        = 0;
+    memory.limit       = limit;
+    memory.refused     = false;
     memory.initialized = true;
     ret true;
 }
 
-pub fun reset_memory(memory: *Memory) bool {
+# returns every chunk. the next exchange starts from the bound it is given
+pub fun reset_memory(memory: *Memory, limit: usize) bool {
     if (memory == nil || !memory.initialized) { ret false; }
-    fixed.reset(?memory.state);
-    ret true;
+    var ok: bool = true;
+    for (memory.head != nil) {
+        val link:     *ChunkLink = memory.head::*ChunkLink;
+        val previous: *u8        = link.previous;
+        val size:     usize      = link.previous_size;
+        if (!storage.release_chunk(memory.chunks, memory.head, memory.head_size)) { ok = false; }
+        memory.head      = previous;
+        memory.head_size = size;
+    }
+    memory.offset      = 0;
+    memory.last_offset = 0;
+    memory.last_size   = 0;
+    memory.held        = 0;
+    if (limit != 0) { memory.limit = limit; }
+    memory.refused     = false;
+    ret ok;
 }
 
 # a response recorder observes the committed head and every body byte on its way
@@ -362,9 +480,24 @@ pub fun allocator_of(call: *Call) *allocator.Allocator {
     ret ?call.memory.allocator;
 }
 
+# the bytes of chunk this call may hold, which is what a budget charges
 pub fun memory_capacity(call: *Call) usize {
     if (call == nil || call.memory == nil || !call.memory.initialized) { ret 0; }
-    ret call.memory.capacity;
+    ret call.memory.limit;
+}
+
+# the selected route's bound replaces the server's before the handler runs
+pub fun bound_memory(call: *Call, limit: usize) bool {
+    if (call == nil || call.memory == nil || !call.memory.initialized || limit == 0) {
+        ret false;
+    }
+    call.memory.limit = limit;
+    ret true;
+}
+
+# an allocation was refused because the bound or the chunk classes ran out
+pub fun memory_refused(call: *Call) bool {
+    ret call != nil && call.memory != nil && call.memory.refused;
 }
 
 pub fun scope(call: *Call) *cancel.Scope {
@@ -426,7 +559,7 @@ fun finish_call(call: *Call, complete: bool) bool {
         call.finalizer = no_finalizer();
         finalized      = finalizer.finish(finalizer.ctx, call);
     }
-    val reset: bool = reset_memory(call.memory);
+    val reset: bool = reset_memory(call.memory, 0);
     ret finalized && reset;
 }
 
@@ -535,5 +668,56 @@ test "call: an asynchronously cancelling intercepted body remains noncommittable
         ret 5;
     }
     if (!operation_ok(cancel.destroy(?scope))) { ret 6; }
+    ret 0;
+}
+
+test "call: request memory grows by chunks up to its bound and reports a refusal" {
+    var heap: allocator.Allocator;
+    page.make(?heap);
+    var chunks: storage.Chunks;
+    if (!storage.make_chunks(?chunks, ?heap)) { ret 1; }
+    var memory: Memory;
+    if (!make_memory(?memory, ?chunks, storage.MIN_CHUNK * 2)) { ret 2; }
+    val a: *allocator.Allocator = ?memory.allocator;
+    # two small allocations share the first chunk
+    val first:  res[*u8, allocator.Error] = allocator.allocate[u8](a, 1024);
+    val second: res[*u8, allocator.Error] = allocator.allocate[u8](a, 1024);
+    if (sel first.err || sel second.err || memory.held != storage.MIN_CHUNK) { ret 3; }
+    # the rest of the bound is one more chunk, and everything past it is refused
+    val third: res[*u8, allocator.Error] = allocator.allocate[u8](a, storage.MIN_CHUNK - 256);
+    if (sel third.err || memory.held != storage.MIN_CHUNK * 2 || memory.refused) { ret 4; }
+    val fourth: res[*u8, allocator.Error] = allocator.allocate[u8](a, storage.MIN_CHUNK);
+    if (!(sel fourth.err) || !memory.refused) { ret 5; }
+    # a larger bound admits a dedicated chunk for a large allocation
+    memory.limit = storage.MIN_CHUNK * 8;
+    val large: res[*u8, allocator.Error] = allocator.allocate[u8](a, storage.MIN_CHUNK * 3);
+    if (sel large.err) { ret 6; }
+    if (memory.held != storage.MIN_CHUNK * 6) { ret 6; }
+    large.ok[storage.MIN_CHUNK * 3 - 1] = 7;
+    if (!reset_memory(?memory, storage.MIN_CHUNK) || memory.held != 0 || memory.refused
+        || memory.limit != storage.MIN_CHUNK) { ret 7; }
+    if (!storage.destroy_chunks(?chunks)) { ret 8; }
+    ret 0;
+}
+
+test "call: the most recent request allocation resizes and rolls back in place" {
+    var heap: allocator.Allocator;
+    page.make(?heap);
+    var chunks: storage.Chunks;
+    if (!storage.make_chunks(?chunks, ?heap)) { ret 1; }
+    var memory: Memory;
+    if (!make_memory(?memory, ?chunks, storage.MIN_CHUNK)) { ret 2; }
+    val a: *allocator.Allocator = ?memory.allocator;
+    val grown: res[*u8, allocator.Error] = allocator.allocate[u8](a, 16);
+    if (sel grown.err) { ret 3; }
+    grown.ok[0] = 42;
+    val resized: res[*u8, allocator.Error] = allocator.reallocate[u8](a, grown.ok, 16, 64);
+    if (sel resized.err) { ret 4; }
+    if (resized.ok != grown.ok || resized.ok[0] != 42) { ret 4; }
+    val before:   usize                = memory.offset;
+    val released: err[allocator.Error] = allocator.deallocate[u8](a, resized.ok, 64);
+    if (sel released.err) { ret 5; }
+    if (memory.offset >= before) { ret 5; }
+    if (!reset_memory(?memory, 0) || !storage.destroy_chunks(?chunks)) { ret 6; }
     ret 0;
 }

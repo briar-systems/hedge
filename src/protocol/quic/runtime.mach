@@ -49,6 +49,9 @@ use process_admission: hedge.admission;
 use hedge.budget;
 use hedge.config.schema;
 use hedge_connection: hedge.connection;
+use hedge_storage: hedge.storage;
+use A: std.allocator;
+use std.allocator.page;
 use hedge.dispatch.plan;
 use hedge.listener;
 use h3_session:    hedge.protocol.h3.session;
@@ -126,6 +129,8 @@ val COMPLETION_STATELESS: CompletionKind = 3;
 
 pub rec RuntimeConfig {
     max_connections: usize;
+    # request memory for every h3 exchange is claimed from here
+    chunks:          *hedge_storage.Chunks;
 }
 
 pub rec PumpConfig {
@@ -142,6 +147,7 @@ pub rec PumpConfig {
     listener_budget:          usize;
     limits:                   message.Limits;
     max_requests:             usize;
+    call_memory_bytes:        usize;
     listener_name:            str;
     handshake_timeout_ns:     u64;
     request_timeout_ns:       u64;
@@ -155,6 +161,7 @@ rec ConnectionConfig {
     budgets:              *budget.Set;
     limits:               message.Limits;
     max_requests:         usize;
+    call_memory_bytes:    usize;
     listener_name:        str;
     handshake_timeout_ns: u64;
     request_timeout_ns:   u64;
@@ -209,6 +216,7 @@ pub rec PendingConfig {
     listener_budget:      usize;
     limits:               message.Limits;
     max_requests:         usize;
+    call_memory_bytes:    usize;
     listener_name:        [schema.TEXT_CAP]u8;
     handshake_timeout_ns: u64;
     request_timeout_ns:   u64;
@@ -353,6 +361,7 @@ pub rec Connection {
     h3_session:           usize;
     listener_name_length: usize;
     max_requests:         usize;
+    call_memory_bytes:    usize;
     request_timeout_ns:   u64;
     timer_pass:           u64;
     generation:           u64;
@@ -432,6 +441,7 @@ pub rec Runtime {
     routes:      routing.Table;
     timer_queue: timers.Queue;
     sessions:    h3_session.Pool;
+    chunks:      *hedge_storage.Chunks;
     free_head:   usize;
     # the live connections, so every sweep costs what is live rather than what
     # was configured. an idle QUIC listener sweeps nothing.
@@ -690,6 +700,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, storage: Storage,
     val required_routes: usize =
         route_capacity_required(storage.connection_capacity);
     if (runtime == nil || runtime.initialized || config.max_connections == 0
+        || config.chunks == nil
         || !view_valid(controls, storage.connection_capacity)
         || storage.connection_storages == nil
         || storage.connection_capacity == 0
@@ -710,6 +721,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, storage: Storage,
     runtime.storage               = storage;
     runtime.connection_capacity   = storage.connection_capacity;
     runtime.max_connections       = config.max_connections;
+    runtime.chunks                = config.chunks;
     runtime.admission             = nil;
     runtime.free_head             = 0;
     runtime.live_head             = NO_CONNECTION;
@@ -1650,6 +1662,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     value.peer               = accepted.peer;
     value.local              = connection_local(pump, received);
     value.max_requests       = config_snapshot.max_requests;
+    value.call_memory_bytes  = config_snapshot.call_memory_bytes;
     value.request_timeout_ns = config_snapshot.request_timeout_ns;
     if (!copy_listener_name(value, config_snapshot.listener_name)
         || !adopt_local_cid(value, accepted)
@@ -1788,6 +1801,7 @@ fun snapshot_pending_config(source: *PumpConfig,
     output.listener_budget      = source.listener_budget;
     output.limits               = source.limits;
     output.max_requests         = source.max_requests;
+    output.call_memory_bytes    = source.call_memory_bytes;
     output.handshake_timeout_ns = source.handshake_timeout_ns;
     output.request_timeout_ns   = source.request_timeout_ns;
     output.idle_timeout_ms      = source.idle_timeout_ms;
@@ -1809,6 +1823,7 @@ fun materialize_pending_config(source: *PendingConfig,
     output.budgets              = source.budgets;
     output.limits               = source.limits;
     output.max_requests         = source.max_requests;
+    output.call_memory_bytes    = source.call_memory_bytes;
     output.listener_name        = ?source.listener_name[0];
     output.handshake_timeout_ns = source.handshake_timeout_ns;
     output.request_timeout_ns   = source.request_timeout_ns;
@@ -1825,6 +1840,7 @@ fun active_connection_config(source: *PumpConfig,
     output.budgets              = source.budgets;
     output.limits               = source.limits;
     output.max_requests         = source.max_requests;
+    output.call_memory_bytes    = source.call_memory_bytes;
     output.listener_name        = source.listener_name;
     output.handshake_timeout_ns = source.handshake_timeout_ns;
     output.request_timeout_ns   = source.request_timeout_ns;
@@ -2282,7 +2298,7 @@ fun start_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
         || !h3_session.begin(session, ?value.assembly.driver, ?value.storage.scope,
         value.plan, value.budgets, value.limits, value.max_requests,
         (?value.storage.listener_name[0])::str, peer, local,
-        value.request_timeout_ns, now_ns)) {
+        value.request_timeout_ns, now_ns, runtime.chunks, value.call_memory_bytes)) {
         if (!h3_session.abandon(?runtime.sessions,
             controls.sessions, index)) {
             value.h3_session    = index;
@@ -3265,6 +3281,10 @@ fun test_update_all(controls: *ControlView, runtime: *Runtime, updates: *PumpUpd
 }
 
 test "hedge.protocol.quic.runtime: caller storage is bounded and reusable" {
+    var test_heap:   A.Allocator;
+    page.make(?test_heap);
+    var test_chunks: hedge_storage.Chunks;
+    if (!hedge_storage.make_chunks(?test_chunks, ?test_heap)) { ret 90; }
     var control_pumps:   [MAX_PUMPS]Pump;
     var control_storage: ControlView;
     val controls:        *ControlView = ?control_storage;
@@ -3294,7 +3314,7 @@ test "hedge.protocol.quic.runtime: caller storage is bounded and reusable" {
         ?session_storages[0], 2,
         ?entries[0], 16, ?nodes[0], ?positions[0], 2,
         ?initials[0], 2)
-        || !make(controls, ?runtime, storage, RuntimeConfig{max_connections: 2})
+        || !make(controls, ?runtime, storage, RuntimeConfig{max_connections: 2, chunks: ?test_chunks})
         || runtime.free_head != 0 || runtime.routes.capacity != 16
         || runtime.timer_queue.capacity != 2 || runtime.sessions.capacity != 2) {
         ret 1;
@@ -3612,6 +3632,10 @@ test "hedge.protocol.quic.runtime: update gracefully retires superseded" {
 }
 
 test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
+    var test_heap:   A.Allocator;
+    page.make(?test_heap);
+    var test_chunks: hedge_storage.Chunks;
+    if (!hedge_storage.make_chunks(?test_chunks, ?test_heap)) { ret 90; }
     var control_pumps:   [MAX_PUMPS]Pump;
     var control_storage: ControlView;
     val controls:        *ControlView = ?control_storage;
@@ -3638,7 +3662,7 @@ test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
         ?entries[0], 8, ?nodes[0], ?positions[0], 1,
         ?initials[0], 1)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 1})) { ret 1; }
+        RuntimeConfig{max_connections: 1, chunks: ?test_chunks})) { ret 1; }
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (index != 0) { ret 2; }
@@ -4237,6 +4261,10 @@ test "hedge.protocol.quic.runtime: a connection drains faster than the process" 
 }
 
 test "hedge.protocol.quic.runtime: a free pool is prepared without touching connection storage" {
+    var test_heap:   A.Allocator;
+    page.make(?test_heap);
+    var test_chunks: hedge_storage.Chunks;
+    if (!hedge_storage.make_chunks(?test_chunks, ?test_heap)) { ret 90; }
     var control_pumps:   [MAX_PUMPS]Pump;
     var control_storage: ControlView;
     val controls:        *ControlView = ?control_storage;
@@ -4272,7 +4300,7 @@ test "hedge.protocol.quic.runtime: a free pool is prepared without touching conn
         ?entries[0], 16, ?nodes[0], ?positions[0], 2,
         ?initials[0], 2)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 2})) { ret 1; }
+        RuntimeConfig{max_connections: 2, chunks: ?test_chunks})) { ret 1; }
     if (!connection_storages[0].sends[0].pending
         || !connection_storages[0].published[0].live
         || !connection_storages[1].sends[0].pending
@@ -4290,6 +4318,10 @@ test "hedge.protocol.quic.runtime: a free pool is prepared without touching conn
 }
 
 test "hedge.protocol.quic.runtime: the live list holds exactly the live connections" {
+    var test_heap:   A.Allocator;
+    page.make(?test_heap);
+    var test_chunks: hedge_storage.Chunks;
+    if (!hedge_storage.make_chunks(?test_chunks, ?test_heap)) { ret 90; }
     var control_pumps:   [MAX_PUMPS]Pump;
     var control_storage: ControlView;
     val controls:        *ControlView = ?control_storage;
@@ -4316,7 +4348,7 @@ test "hedge.protocol.quic.runtime: the live list holds exactly the live connecti
         ?entries[0], 16, ?nodes[0], ?positions[0], 2,
         ?initials[0], 2)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 2})) { ret 1; }
+        RuntimeConfig{max_connections: 2, chunks: ?test_chunks})) { ret 1; }
     # a pool with nothing live is a pool a sweep walks in no steps at all,
     # whatever the configured capacity is
     if (runtime.live_head != NO_CONNECTION || live_walk_length(controls,
@@ -4338,6 +4370,10 @@ test "hedge.protocol.quic.runtime: the live list holds exactly the live connecti
 }
 
 test "hedge.protocol.quic.runtime: failing a connection leaves the runtime advanceable" {
+    var test_heap:   A.Allocator;
+    page.make(?test_heap);
+    var test_chunks: hedge_storage.Chunks;
+    if (!hedge_storage.make_chunks(?test_chunks, ?test_heap)) { ret 90; }
     var control_pumps:   [MAX_PUMPS]Pump;
     var control_storage: ControlView;
     val controls:        *ControlView = ?control_storage;
@@ -4364,7 +4400,7 @@ test "hedge.protocol.quic.runtime: failing a connection leaves the runtime advan
         ?entries[0], 16, ?nodes[0], ?positions[0], 2,
         ?initials[0], 2)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 2})) { ret 1; }
+        RuntimeConfig{max_connections: 2, chunks: ?test_chunks})) { ret 1; }
     val first: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (first == NO_CONNECTION) { ret 2; }

@@ -66,7 +66,7 @@ kind = "laurel"
 application = "site"
 ```
 
-A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application, binds it with `hedge.service.laurel.make`, registers `bound_handler` under that name in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `composition.stop` returns. The program also owns the application's lifecycle, so it starts the application before `composition.start` and drains and stops it after `composition.stop`. A configuration that names an unregistered application fails with `no application is registered under this name`.
+A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application, binds it with `hedge.service.laurel.make`, registers `bound_handler` under that name in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `composition.stop` returns. The program also owns the application's lifecycle, so it starts the application before `composition.start` and drains and stops it after `composition.stop`. A configuration that names an unregistered application fails with `no application is registered under this name`. Register an application with the request memory it needs (see [Request memory](#request-memory)). A laurel application's per-request state alone is several kilobytes before its sessions, forms and response bodies.
 
 The implemented schema accepts these top-level sections:
 
@@ -158,6 +158,33 @@ storage maximum are both 2. A value above 2 is rejected during validation rather
 than accepted and silently clamped. When both slots are occupied, the HTTP/1
 engine reports saturation and leaves later bytes in its bounded read buffer
 until a slot is released.
+
+## Request memory
+
+Each request gets its own memory, which the services that handle it allocate from.
+That memory is not reserved in advance. It is claimed in chunks of at least 16 KiB
+as the request asks for it, and every chunk is returned for reuse when the request
+settles, so an idle connection holds none and a request holds only what it used.
+
+What bounds a request is how many bytes of chunk it may hold:
+
+- `server.limits.call_memory_bytes` is the bound for every request until a route
+  is selected, and for any service that does not say otherwise. It defaults to
+  32768 (32 KiB).
+- A registered application declares what it needs when it is registered, as the
+  last argument to `service.register_application`. A `laurel` service uses that
+  declaration instead of the server bound.
+- `service.<name>.memory_bytes` overrides both, for a service whose needs depend
+  on how it is configured.
+
+Every bound must be between 16384 (16 KiB) and 268435456 (256 MiB). A request
+budget's `memory_bytes` is charged this bound, not what the request goes on to use,
+because the charge is taken before the handler runs.
+
+A request that runs out is not silent. The allocation that failed is refused, and
+the service answers however it answers a failed allocation. The request is then
+logged as an error with `code = "memory_exhausted"`, naming the route and the
+bound it hit, and `hedge_request_memory_refusals_total` counts it.
 
 ## Budgets
 
@@ -344,7 +371,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the six built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
