@@ -199,11 +199,13 @@ pub fun message_limits(graph: *schema.Graph, configured: Config) message.Limits 
 # pending when the connection has not read them yet, so backpressure reaches the
 # service instead of being buffered behind its back
 rec RequestBody {
-    owner:         *Connection;
-    slot:          usize;
-    reader:        body.Reader;
-    pending_token: u64;
-    next_token:    u64;
+    owner:            *Connection;
+    slot:             usize;
+    reader:           body.Reader;
+    pending_token:    u64;
+    next_token:       u64;
+    pending_output:   *u8;
+    pending_capacity: usize;
 }
 
 pub rec Connection {
@@ -949,19 +951,27 @@ fun body_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Field
         if (!connection.consume_body(engine, state.slot, count)) {
             ret body.failed("request body consumption was refused", body.REUSE_FORBIDDEN);
         }
+        state.pending_output   = nil;
+        state.pending_capacity = 0;
         ret body.data(count);
     }
     if (state.owner.engine_slots[state.slot].inbound_complete) {
+        state.pending_output   = nil;
+        state.pending_capacity = 0;
         ret body.complete(body.REUSE_ALLOWED);
     }
-    state.next_token    = state.next_token + 1;
-    state.pending_token = state.next_token;
+    state.pending_output   = output;
+    state.pending_capacity = capacity;
+    state.next_token       = state.next_token + 1;
+    state.pending_token    = state.next_token;
     ret body.pending(state.pending_token);
 }
 
 fun body_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
     val state: *RequestBody = context::*RequestBody;
     if (state == nil || state.owner == nil) { ret body.failed("request body has no owner", body.REUSE_FORBIDDEN); }
+    state.pending_output   = nil;
+    state.pending_capacity = 0;
     if (mode == body.CANCEL)                { ret body.cancelled(body.REUSE_FORBIDDEN); }
     if (mode == body.TIMEOUT)               { ret body.timed_out(body.REUSE_FORBIDDEN); }
     if (mode == body.REJECT) {
@@ -982,11 +992,18 @@ fun body_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progre
     if (state == nil || state.owner == nil || token != state.pending_token) {
         ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
     }
-    state.pending_token = 0;
+    val output:   *u8   = state.pending_output;
+    val capacity: usize = state.pending_capacity;
+    state.pending_token    = 0;
+    state.pending_output   = nil;
+    state.pending_capacity = 0;
     if (state.owner.engine_slots[state.slot].inbound_complete) {
-        ret body.complete(body.REUSE_ALLOWED);
+        val engine: *connection.Engine = ?state.owner.engine;
+        if (engine.held_slot != state.slot || engine.held_length == 0) {
+            ret body.complete(body.REUSE_ALLOWED);
+        }
     }
-    ret body_read(context, nil, 0, trailers);
+    ret body_read(context, output, capacity, trailers);
 }
 
 fun body_release(context: ptr) {}
@@ -1012,10 +1029,12 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
     owner.request_scope_live = false;
     if (!operation_ok(cancel.make_child(?owner.request_scope, ?owner.engine_scope, has_deadline, deadline))) { ret SETUP_SCOPE; }
     owner.request_scope_live         = true;
-    owner.request_body.owner         = owner;
-    owner.request_body.slot          = slot;
-    owner.request_body.pending_token = 0;
-    owner.request_body.next_token    = 0;
+    owner.request_body.owner            = owner;
+    owner.request_body.slot             = slot;
+    owner.request_body.pending_token    = 0;
+    owner.request_body.next_token       = 0;
+    owner.request_body.pending_output   = nil;
+    owner.request_body.pending_capacity = 0;
     # the parser already resolved framing; it stays the single authority for length
     val length_known: bool = parsed.plan.mode == framing.FRAME_NONE
         || parsed.plan.mode == framing.FRAME_LENGTH;
@@ -1781,6 +1800,75 @@ test "connection: a pending response read completes into the retained stage" {
         != body.COMPLETE) {
         operation_ok(cancel.destroy(?scope));
         ret 4;
+    }
+    cancel.destroy(?scope);
+    ret 0;
+}
+
+test "connection: a pending request body read completes into the retained buffer" {
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    var owner: Connection;
+    owner.engine.initialized               = true;
+    owner.engine.capacity                  = PIPELINE_DEPTH;
+    owner.engine.role                      = connection.SERVER;
+    owner.engine.slots                     = ?owner.engine_slots[0];
+    owner.engine.held_slot                 = connection.NO_SLOT;
+    owner.engine.held_length               = 0;
+    owner.engine_slots[0].state            = connection.SLOT_LIVE;
+    owner.engine_slots[0].inbound_complete = false;
+    owner.request_body.owner               = ?owner;
+    owner.request_body.slot                = 0;
+    owner.request_body.pending_token       = 0;
+    owner.request_body.next_token          = 0;
+    owner.request_body.pending_output      = nil;
+    owner.request_body.pending_capacity    = 0;
+    var reader: body.Reader = body.init_reader(
+        (?owner.request_body)::ptr,
+        body_read,
+        body_finish,
+        body_complete,
+        body_release,
+        body.OWNER_APPLICATION,
+        1,
+        true,
+        4,
+        body.limits(4, 4, 2),
+        nil,
+        ?scope,
+    );
+    if (!reader.valid) {
+        cancel.destroy(?scope);
+        ret 2;
+    }
+    var buffer: [4]u8;
+    val initial: body.Progress = body.read(?reader, ?buffer[0], 4);
+    if (initial.status != body.PENDING || reader.pending_kind != body.OP_READ
+        || owner.request_body.pending_output != ?buffer[0]
+        || owner.request_body.pending_capacity != 4) {
+        cancel.destroy(?scope);
+        ret 3;
+    }
+    var chunk: [4]u8;
+    chunk[0] = 'h';
+    chunk[1] = 'e';
+    chunk[2] = 'l';
+    chunk[3] = 'p';
+    owner.engine.held_slot   = 0;
+    owner.engine.held_length = 4;
+    owner.engine.held_body   = ?chunk[0];
+    val completed: body.Progress = body.complete_reader(?reader, initial.token);
+    if (completed.status != body.DATA || completed.count != 4
+        || buffer[0] != 'h' || buffer[1] != 'e' || buffer[2] != 'l' || buffer[3] != 'p'
+        || owner.request_body.pending_output != nil || owner.request_body.pending_capacity != 0) {
+        cancel.destroy(?scope);
+        ret 4;
+    }
+    owner.engine_slots[0].inbound_complete = true;
+    val terminal: body.Progress = body.read(?reader, ?buffer[0], 4);
+    if (terminal.status != body.COMPLETE) {
+        cancel.destroy(?scope);
+        ret 5;
     }
     cancel.destroy(?scope);
     ret 0;
