@@ -66,6 +66,8 @@ kind = "laurel"
 application = "site"
 ```
 
+A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application, binds it with `hedge.service.laurel.make`, registers `bound_handler` under that name in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `composition.stop` returns. The program also owns the application's lifecycle, so it starts the application before `composition.start` and drains and stops it after `composition.stop`. A configuration that names an unregistered application fails with `no application is registered under this name`.
+
 The implemented schema accepts these top-level sections:
 
 - `server` with bounded `limits`, `timeouts`, and feature selection
@@ -404,7 +406,7 @@ Diagnostics retain severity, stable code, source, field path, and message. The l
 
 ## Reload
 
-Reload parses and validates a complete candidate configuration. It then constructs candidate certificates, route graphs, upstream pools, application instances, caches, and listeners.
+Reload parses and validates a complete candidate configuration. It then constructs candidate certificates, route graphs, upstream pools, caches, and listeners, and resolves application services against the registry supplied at startup.
 
 Activation is atomic. If any required component cannot be constructed, the current generation remains active. Diagnostics identify the candidate source and never mutate current state.
 
