@@ -14,6 +14,8 @@ use hedge.dispatch.call;
 use hedge.dispatch.plan;
 use hedge.listener;
 use hedge.protocol.h2;
+use hedge.storage;
+use A: std.allocator;
 use hedge.protocol.prologue;
 use hedge.protocol.proxy_protocol;
 use hedge.protocol.secure;
@@ -140,6 +142,23 @@ pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Comp
     val operation: *Operation = owner_context::*Operation;
     if (operation == nil || operation.settle::usize == 0) { ret; }
     operation.settle(operation.owner, operation.token_context, completion);
+}
+
+# storage a connection claims only once it selects a protocol that needs it,
+# owned by the runtime and shared by every connection it drives
+pub rec Storage {
+    h2_sessions: storage.Recycler[h2.Session];
+}
+
+pub fun make_storage(shared: *Storage, a: *A.Allocator) bool {
+    if (shared == nil) { ret false; }
+    ret storage.make[h2.Session](?shared.h2_sessions, a, 1);
+}
+
+# every connection must have released what it claimed
+pub fun destroy_storage(shared: *Storage) bool {
+    if (shared == nil) { ret false; }
+    ret storage.destroy[h2.Session](?shared.h2_sessions);
 }
 
 pub rec Config {
@@ -297,7 +316,8 @@ pub rec Connection {
     prologue_scope_live:    bool;
     tls_policy:             usize;
     session:                usize;
-    h2_session:             usize;
+    h2_session:             *h2.Session;
+    shared:                 *Storage;
     handshaking:            bool;
     close_started:          bool;
     close_pending:          bool;
@@ -444,7 +464,7 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
     var settled: transport.Completion;
     if (!translate(?settled, completion, token_context)) { ret; }
     val now: time.Time = wall_now();
-    if (owner.h2_session != h2.NO_SESSION) {
+    if (owner.h2_session != nil) {
         val stepped: Step = from_h2(h2.complete_io(owner.h2_session, ?settled, now));
         if (stepped == STEP_DONE || stepped == STEP_ERROR) {
             owner.state = CLOSING;
@@ -603,16 +623,18 @@ pub fun make(
     limits: message.Limits,
     owned: *listener.OwnedListener,
     policy: usize,
+    shared: *Storage,
     now: time.Time,
 ) bool {
     if (owner == nil || source == nil || net_driver == nil || active_plan == nil
-        || owned == nil || id == 0 || generation == 0) { ret false; }
+        || owned == nil || shared == nil || id == 0 || generation == 0) { ret false; }
     # a TLS listener whose policy did not resolve must not fall back to
     # cleartext, so the connection is refused before it is admitted
     if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
     owner.tls_policy           = policy;
     owner.session              = secure.NO_SESSION;
-    owner.h2_session           = h2.NO_SESSION;
+    owner.h2_session           = nil;
+    owner.shared               = shared;
     owner.handshaking          = false;
     owner.close_started        = false;
     owner.close_pending        = false;
@@ -751,8 +773,8 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
         ret STEP_PROGRESS;
     }
     if (owner.protocol == selection.HTTP2) {
-        owner.h2_session = h2.acquire();
-        if (owner.h2_session == h2.NO_SESSION) {
+        owner.h2_session = h2.acquire(?owner.shared.h2_sessions);
+        if (owner.h2_session == nil) {
             ret refuse(owner, prologue.REFUSED_EXHAUSTED);
         }
         if (!h2.begin(owner.h2_session, ?owner.channel, ?owner.engine_scope,
@@ -1301,7 +1323,7 @@ fun pump_response(owner: *Connection, now: time.Time) Step {
 fun runnable(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || !owner.engine_live
         || owner.state != ACTIVE) { ret false; }
-    if (owner.h2_session != h2.NO_SESSION) { ret true; }
+    if (owner.h2_session != nil) { ret true; }
     ret owner.engine.state != connection.CLOSED && owner.engine.state != connection.FAILED;
 }
 
@@ -1421,7 +1443,7 @@ pub fun step(owner: *Connection, now: time.Time) Step {
     if (owner.session != secure.NO_SESSION && owner.engine_live) {
         var settled: transport.Completion;
         if (secure.take(owner.session, ?settled)) {
-            if (owner.h2_session != h2.NO_SESSION) {
+            if (owner.h2_session != nil) {
                 val stepped: Step = from_h2(h2.complete_io(owner.h2_session,
                     ?settled, now));
                 if (stepped == STEP_DONE || stepped == STEP_ERROR) {
@@ -1439,7 +1461,7 @@ pub fun step(owner: *Connection, now: time.Time) Step {
         }
     }
     if (owner.state != ACTIVE) { ret STEP_DONE; }
-    if (owner.h2_session != h2.NO_SESSION) {
+    if (owner.h2_session != nil) {
         val stepped: Step = from_h2(h2.step(owner.h2_session, now));
         # whatever the engine queued in this step has to start now. leaving it
         # for the next completion strands the last frame of a response behind a
@@ -1519,7 +1541,7 @@ pub fun begin_graceful(owner: *Connection) bool {
         owner.state = CLOSING;
         ret true;
     }
-    if (owner.h2_session != h2.NO_SESSION) { ret h2.begin_graceful(owner.h2_session); }
+    if (owner.h2_session != nil) { ret h2.begin_graceful(owner.h2_session); }
     # an engine that is already draining or ending needs no signal; only an
     # open engine has something to be asked
     if (owner.engine.state != connection.OPEN) { ret true; }
@@ -1633,15 +1655,15 @@ pub fun close(owner: *Connection) bool {
             abandon_exchange_close(owner);
         }
     }
-    if (owner.h2_session != h2.NO_SESSION) {
+    if (owner.h2_session != nil) {
         owner.requests = h2.requests(owner.h2_session);
-        val released: h2.ReleaseStatus = h2.release_status(owner.h2_session);
+        val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions, owner.h2_session);
         if (released == h2.RELEASE_PENDING) {
             owner.close_pending = true;
             ret false;
         }
         if (released == h2.RELEASE_FAILED) { owner.close_failed = true; }
-        owner.h2_session  = h2.NO_SESSION;
+        owner.h2_session  = nil;
         owner.engine_live = false;
     }
     or (owner.engine_live) {

@@ -8,16 +8,16 @@
 # backpressure, and different close handshakes, and one shared abstraction over
 # them would have to lie about at least one.
 #
-# sessions live in one bounded table addressed by index, for the same reason the
-# TLS sessions do: an HTTP/2 connection needs a quarter of a megabyte of stream
-# and compression storage, and a listener that never negotiates it must not pay
-# for that on every connection slot.
+# a session is claimed when a connection negotiates HTTP/2 and released with it:
+# it holds several hundred kilobytes of stream and compression storage, and a
+# connection that never negotiates HTTP/2 must not pay for that.
 
 use hedge.budget;
 use hedge.dispatch;
 use hedge.dispatch.call;
 use hedge.dispatch.plan;
 use hedge.service;
+use hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
 use http.core.body;
 use http.core.exchange;
@@ -38,8 +38,8 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-
-# this build's concurrent HTTP/2 connection bound
+use A: std.allocator;
+use std.allocator.page;
 
 fun wall_now() time.Time {
     val sampled: time.Clock = time.now();
@@ -56,8 +56,6 @@ fun scope_active(scope: *cancel.Scope) bool {
     ret sel reason.active;
 }
 
-pub val MAX_SESSIONS: usize = 16;
-pub val NO_SESSION:   usize = MAX_SESSIONS;
 # concurrent request streams on one connection. the engine's own table is one
 # wider, because it validates its stream limit as strictly below its capacity.
 pub val MAX_STREAMS:     usize = 8;
@@ -109,7 +107,7 @@ pub val RELEASE_FAILED:  ReleaseStatus = 3;
 # and reports pending when none have arrived, so flow control reaches the
 # service instead of being buffered behind its back
 rec Body {
-    session:          usize;
+    session:          *Session;
     slot:             usize;
     reader:           body.Reader;
     pending_output:   *u8;
@@ -159,7 +157,7 @@ rec Slot {
     charge:            budget.Charge;
 }
 
-rec Session {
+pub rec Session {
     live:               bool;
     state:              State;
     engine:             engine_h2.Engine;
@@ -200,10 +198,6 @@ rec Session {
     release_failed:     bool;
 }
 
-var sessions:   [MAX_SESSIONS]Session;
-var prepared:   bool;
-var live_count: usize;
-
 fun reset_slot(slot: *Slot) {
     slot.live              = false;
     slot.id                = 0;
@@ -226,61 +220,26 @@ fun reset_slot(slot: *Slot) {
     slot.charge            = budget.no_charge();
 }
 
-fun prepare() {
-    if (prepared) { ret; }
-    var i: usize = 0;
-    for (i < MAX_SESSIONS) {
-        sessions[i].live           = false;
-        sessions[i].state          = IDLE;
-        sessions[i].engine_started = false;
-        sessions[i].release_failed = false;
-        var j: usize = 0;
-        for (j < MAX_STREAMS) {
-            reset_slot(?sessions[i].slots[j]);
-            j = j + 1;
-        }
-        i = i + 1;
+pub fun acquire(sessions: *storage.Recycler[Session]) *Session {
+    val session: *Session = storage.claim[Session](sessions);
+    if (session == nil) { ret nil; }
+    session.live              = true;
+    session.state             = IDLE;
+    session.engine_started    = false;
+    session.held_stream       = engine_h2.NO_STREAM;
+    session.held_data         = nil;
+    session.held_length       = 0;
+    session.requests          = 0;
+    session.last_event        = engine_h2.EVENT_NONE;
+    session.last_step         = STEP_IDLE;
+    session.final_goaway_sent = false;
+    session.release_failed    = false;
+    var j: usize = 0;
+    for (j < MAX_STREAMS) {
+        reset_slot(?session.slots[j]);
+        j = j + 1;
     }
-    live_count = 0;
-    prepared   = true;
-}
-
-pub fun capacity() usize {
-    ret MAX_SESSIONS;
-}
-
-pub fun live() usize {
-    prepare();
-    ret live_count;
-}
-
-pub fun acquire() usize {
-    prepare();
-    var i: usize = 0;
-    for (i < MAX_SESSIONS) {
-        if (!sessions[i].live) {
-            sessions[i].live              = true;
-            sessions[i].state             = IDLE;
-            sessions[i].engine_started    = false;
-            sessions[i].held_stream       = engine_h2.NO_STREAM;
-            sessions[i].held_data         = nil;
-            sessions[i].held_length       = 0;
-            sessions[i].requests          = 0;
-            sessions[i].last_event        = engine_h2.EVENT_NONE;
-            sessions[i].last_step         = STEP_IDLE;
-            sessions[i].final_goaway_sent = false;
-            sessions[i].release_failed    = false;
-            var j: usize = 0;
-            for (j < MAX_STREAMS) {
-                reset_slot(?sessions[i].slots[j]);
-                j = j + 1;
-            }
-            live_count = live_count + 1;
-            ret i;
-        }
-        i = i + 1;
-    }
-    ret NO_SESSION;
+    ret session;
 }
 
 fun settle_slot_cancellation(slot: *Slot) exchange.FinishStatus {
@@ -402,10 +361,10 @@ fun retire_closed_stream(session: *Session, slot: *Slot) Step {
     ret STEP_PROGRESS;
 }
 
-pub fun release_status(index: usize) ReleaseStatus {
-    prepare();
-    if (index >= MAX_SESSIONS || !sessions[index].live) { ret RELEASE_FAILED; }
-    val session: *Session = ?sessions[index];
+# storage returns to the recycler once the session has settled, whether or not
+# a one-shot release failed along the way
+pub fun release_status(sessions: *storage.Recycler[Session], session: *Session) ReleaseStatus {
+    if (session == nil || !session.live) { ret RELEASE_FAILED; }
     var pending: bool     = false;
     var j:       usize    = 0;
     for (j < MAX_STREAMS) {
@@ -419,13 +378,9 @@ pub fun release_status(index: usize) ReleaseStatus {
     session.engine_started = false;
     session.state          = CLOSED;
     session.live           = false;
-    if (live_count > 0)         { live_count = live_count - 1; }
-    if (session.release_failed) { ret RELEASE_FAILED; }
+    val failed: bool = session.release_failed;
+    if (!storage.release[Session](sessions, session) || failed) { ret RELEASE_FAILED; }
     ret RELEASE_OK;
-}
-
-pub fun release(index: usize) bool {
-    ret release_status(index) == RELEASE_OK;
 }
 
 # --- configuration ---
@@ -451,16 +406,14 @@ pub fun config_from(limits: message.Limits, max_streams: usize) engine_h2.Config
     ret configured;
 }
 
-pub fun begin(index: usize, channel: *transport.Transport, scope: *cancel.Scope,
+pub fun begin(session: *Session, channel: *transport.Transport, scope: *cancel.Scope,
     active_plan: *plan.Plan, budgets: *budget.Set, limits: message.Limits,
     max_streams: usize,
     listener_name: str,
     secure: bool, peer: message.Endpoint, local: message.Endpoint,
     request_timeout_ns: u64) bool {
-    prepare();
-    if (index >= MAX_SESSIONS || !sessions[index].live || channel == nil
+    if (session == nil || !session.live || channel == nil
         || scope == nil || active_plan == nil) { ret false; }
-    val session: *Session = ?sessions[index];
     session.plan               = active_plan;
     session.budgets            = budgets;
     session.limits             = limits;
@@ -532,10 +485,10 @@ fun free_slot(session: *Session) *Slot {
 fun body_read(context: ptr, output: *u8, capacity: usize,
     trailers: *field.Fields) body.Progress {
     val state: *Body = context::*Body;
-    if (state == nil || state.session >= MAX_SESSIONS) {
+    if (state == nil || state.session == nil) {
         ret body.failed("request body has no owner", body.REUSE_FORBIDDEN);
     }
-    val session: *Session = ?sessions[state.session];
+    val session: *Session = state.session;
     val slot:    *Slot    = ?session.slots[state.slot];
     if (session.held_stream == slot.id && session.held_length != 0) {
         var count: usize = session.held_length;
@@ -575,12 +528,12 @@ fun body_read(context: ptr, output: *u8, capacity: usize,
 fun body_finish(context: ptr, mode: body.Mode,
     trailers: *field.Fields) body.Progress {
     val state: *Body = context::*Body;
-    if (state == nil || state.session >= MAX_SESSIONS) {
+    if (state == nil || state.session == nil) {
         ret body.failed("request body has no owner", body.REUSE_FORBIDDEN);
     }
     if (mode == body.CANCEL)  { ret body.cancelled(body.REUSE_FORBIDDEN); }
     if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
-    val session: *Session = ?sessions[state.session];
+    val session: *Session = state.session;
     val slot:    *Slot    = ?session.slots[state.slot];
     # an unread request body still owes the peer its flow-control window, so it
     # is consumed rather than abandoned
@@ -602,14 +555,14 @@ fun body_finish(context: ptr, mode: body.Mode,
 fun body_complete(context: ptr, token: u64,
     trailers: *field.Fields) body.Progress {
     val state: *Body = context::*Body;
-    if (state == nil || state.session >= MAX_SESSIONS
+    if (state == nil || state.session == nil
         || token != state.pending_token) {
         ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
     }
     val kind: body.Operation = state.reader.pending_kind;
     val mode: body.Mode      = state.reader.pending_mode;
     state.pending_token = 0;
-    val session: *Session = ?sessions[state.session];
+    val session: *Session = state.session;
     val slot:    *Slot    = ?session.slots[state.slot];
     if (kind == body.OP_FINISH) {
         if (session.held_stream == slot.id && session.held_length != 0) {
@@ -733,9 +686,8 @@ fun deadline_from(now: time.Time, timeout_ns: u64) time.Time {
     ret deadline;
 }
 
-fun make_exchange(index: usize, slot: *Slot, event: engine_h2.Event,
+fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     now: time.Time) bool {
-    val session: *Session = ?sessions[index];
     session.requests = session.requests + 1;
     val has_deadline: bool      = session.request_timeout_ns != 0;
     var deadline:     time.Time = now;
@@ -747,7 +699,7 @@ fun make_exchange(index: usize, slot: *Slot, event: engine_h2.Event,
     if (!operation_ok(cancel.make_child(?slot.scope, session.engine_scope, has_deadline,
         deadline))) { ret false; }
     slot.scope_live            = true;
-    slot.body.session          = index;
+    slot.body.session          = session;
     slot.body.slot             = (slot)::usize - (?session.slots[0])::usize;
     slot.body.slot             = slot.body.slot / $size_of(Slot);
     slot.body.pending_output   = nil;
@@ -843,8 +795,7 @@ fun has_body(slot: *Slot) bool {
     ret slot.response.body_kind == message.BODY_READER;
 }
 
-fun begin_response(index: usize, slot: *Slot) Step {
-    val session: *Session = ?sessions[index];
+fun begin_response(session: *Session, slot: *Slot) Step {
     if (slot.headers_sent)        { ret STEP_IDLE; }
     if (!slot.response.committed) { ret STEP_IDLE; }
     val count:   usize           = response_headers(slot);
@@ -859,8 +810,7 @@ fun begin_response(index: usize, slot: *Slot) Step {
     ret STEP_PROGRESS;
 }
 
-fun send_trailers(index: usize, slot: *Slot) Step {
-    val session: *Session = ?sessions[index];
+fun send_trailers(session: *Session, slot: *Slot) Step {
     if (slot.trailers_sent || slot.response.trailers.len == 0) { ret STEP_IDLE; }
     val offered: engine_h2.Offer = engine_h2.send_headers(?session.engine, slot.id,
         slot.response.trailers.items, slot.response.trailers.len, true, true);
@@ -886,8 +836,7 @@ fun response_body_progress(reader: *body.Reader, output: *u8,
 # pull from the response body into the staging buffer and offer it to the
 # engine. the engine consumes only what its windows admit, so the unconsumed
 # remainder is offered again before the body is read further.
-fun advance_response(index: usize, slot: *Slot) Step {
-    val session: *Session = ?sessions[index];
+fun advance_response(session: *Session, slot: *Slot) Step {
     if (!slot.headers_sent || slot.response_complete) { ret STEP_IDLE; }
     # the engine clears a stream's writable flag once it has taken everything
     # offered, so a response with more to send has to say so again. without this
@@ -927,7 +876,7 @@ fun advance_response(index: usize, slot: *Slot) Step {
         && slot.response.trailers.len == 0;
     if (length == 0 && !final) {
         # nothing left to frame, and trailers close the stream instead
-        if (slot.body_done) { ret send_trailers(index, slot); }
+        if (slot.body_done) { ret send_trailers(session, slot); }
         ret STEP_BLOCKED;
     }
     val offered: engine_h2.Offer = engine_h2.offer_data(?session.engine, slot.id,
@@ -945,8 +894,7 @@ fun advance_response(index: usize, slot: *Slot) Step {
     ret STEP_PROGRESS;
 }
 
-fun begin_close_disposition(index: usize, slot: *Slot) bool {
-    val session: *Session = ?sessions[index];
+fun begin_close_disposition(session: *Session, slot: *Slot) bool {
     if (slot.close_disposition) { ret true; }
     slot.close_disposition = true;
     if (session.state == ACTIVE) {
@@ -957,7 +905,7 @@ fun begin_close_disposition(index: usize, slot: *Slot) bool {
     ret session.state == CLOSING;
 }
 
-fun settle_request_body(index: usize, slot: *Slot) body.Progress {
+fun settle_request_body(session: *Session, slot: *Slot) body.Progress {
     val reader: *body.Reader = slot.request.body;
     if (body.reader_terminal_state(reader)) { ret body.reader_result(reader); }
     val chosen: call.Disposition = call.disposition(?slot.active_call);
@@ -981,7 +929,7 @@ fun settle_request_body(index: usize, slot: *Slot) body.Progress {
         ret body.reject(reader);
     }
     if (chosen == call.BODY_CLOSE) {
-        if (!begin_close_disposition(index, slot)) {
+        if (!begin_close_disposition(session, slot)) {
             ret body.failed("request close disposition could not start",
                 body.REUSE_FORBIDDEN);
         }
@@ -991,11 +939,10 @@ fun settle_request_body(index: usize, slot: *Slot) body.Progress {
         body.REUSE_FORBIDDEN);
 }
 
-fun settle_exchange(index: usize, slot: *Slot) Step {
-    val session: *Session = ?sessions[index];
+fun settle_exchange(session: *Session, slot: *Slot) Step {
     if (!slot.exchange_live) { ret STEP_IDLE; }
     if (slot.cancelling)     { ret retire_closed_stream(session, slot); }
-    val request: body.Progress = settle_request_body(index, slot);
+    val request: body.Progress = settle_request_body(session, slot);
     if (request.status == body.PENDING)                 { ret STEP_BLOCKED; }
     if (!body.reader_terminal_state(slot.request.body)) { ret STEP_ERROR; }
     if (slot.exchange.state == exchange.RESPONDING) {
@@ -1018,7 +965,7 @@ fun settle_exchange(index: usize, slot: *Slot) Step {
     ret STEP_PROGRESS;
 }
 
-fun fail_exchange(index: usize, slot: *Slot, code: status.Status) Step {
+fun fail_exchange(session: *Session, slot: *Slot, code: status.Status) Step {
     if (slot.response.committed)                             { ret STEP_ERROR; }
     if (!call.reset_response_for_failure(?slot.active_call)) { ret STEP_ERROR; }
     if (message.set_status(?slot.response, code) != message.RESPONSE_OK) {
@@ -1029,40 +976,37 @@ fun fail_exchange(index: usize, slot: *Slot, code: status.Status) Step {
     if (service.commit(?slot.active_call) != message.RESPONSE_OK) {
         ret STEP_ERROR;
     }
-    ret begin_response(index, slot);
+    ret begin_response(session, slot);
 }
 
-fun start_exchange(index: usize, slot: *Slot) Step {
-    val session: *Session        = ?sessions[index];
+fun start_exchange(session: *Session, slot: *Slot) Step {
     val served:  dispatch.Result = dispatch.serve(session.plan, ?slot.active_call,
         ?slot.captures[0], CAPTURE_SLOTS, session.budgets, ?slot.charge,
         wall_now());
     if (served.outcome == dispatch.FAILED) {
-        ret fail_exchange(index, slot, status.INTERNAL_SERVER_ERROR);
+        ret fail_exchange(session, slot, status.INTERNAL_SERVER_ERROR);
     }
     if (served.outcome == dispatch.PENDING) {
         slot.service_pending = true;
         ret STEP_PROGRESS;
     }
-    ret begin_response(index, slot);
+    ret begin_response(session, slot);
 }
 
-fun resume_exchange(index: usize, slot: *Slot) Step {
-    val session: *Session        = ?sessions[index];
+fun resume_exchange(session: *Session, slot: *Slot) Step {
     val served:  dispatch.Result = dispatch.resume(session.plan, ?slot.active_call,
         session.budgets, ?slot.charge, wall_now());
     if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
     slot.service_pending = false;
     if (served.outcome == dispatch.FAILED) {
-        ret fail_exchange(index, slot, status.BAD_GATEWAY);
+        ret fail_exchange(session, slot, status.BAD_GATEWAY);
     }
-    ret begin_response(index, slot);
+    ret begin_response(session, slot);
 }
 
 # --- events ---
 
-fun open_stream(index: usize, event: engine_h2.Event, now: time.Time) Step {
-    val session: *Session = ?sessions[index];
+fun open_stream(session: *Session, event: engine_h2.Event, now: time.Time) Step {
     if (session.state != ACTIVE) {
         if (!engine_h2.cancel_stream(?session.engine, event.stream_id,
             engine_h2.H2_REFUSED_STREAM)
@@ -1086,7 +1030,7 @@ fun open_stream(index: usize, event: engine_h2.Event, now: time.Time) Step {
     slot.id               = event.stream_id;
     slot.generation       = event.generation;
     slot.inbound_complete = event.end_stream;
-    if (!make_exchange(index, slot, event, now)) {
+    if (!make_exchange(session, slot, event, now)) {
         if (!engine_h2.release_event(?session.engine, event.stream_id,
             event.generation)
             || !engine_h2.cancel_stream(?session.engine, event.stream_id,
@@ -1096,11 +1040,10 @@ fun open_stream(index: usize, event: engine_h2.Event, now: time.Time) Step {
         ret STEP_PROGRESS;
     }
     engine_h2.release_event(?session.engine, event.stream_id, event.generation);
-    ret start_exchange(index, slot);
+    ret start_exchange(session, slot);
 }
 
-fun apply(index: usize, event: engine_h2.Event, now: time.Time) Step {
-    val session: *Session = ?sessions[index];
+fun apply(session: *Session, event: engine_h2.Event, now: time.Time) Step {
     session.last_event = event.kind;
     if (event.kind == engine_h2.EVENT_NEED_READ) {
         engine_h2.submit_read(?session.engine);
@@ -1115,7 +1058,7 @@ fun apply(index: usize, event: engine_h2.Event, now: time.Time) Step {
         ret STEP_DONE;
     }
     if (event.kind == engine_h2.EVENT_REQUEST_HEADERS) {
-        ret open_stream(index, event, now);
+        ret open_stream(session, event, now);
     }
     if (event.kind == engine_h2.EVENT_DATA) {
         session.held_stream = event.stream_id;
@@ -1145,7 +1088,7 @@ fun apply(index: usize, event: engine_h2.Event, now: time.Time) Step {
             slot.inbound_complete = true;
             if (slot.exchange_live) { complete_outstanding_body(slot); }
         }
-        return_event(index, event);
+        return_event(session, event);
         ret STEP_PROGRESS;
     }
     if (event.kind == engine_h2.EVENT_STREAM_RESET
@@ -1172,37 +1115,36 @@ fun complete_outstanding_body(slot: *Slot) {
     body.complete_reader(slot.request.body, slot.body.pending_token);
 }
 
-fun return_event(index: usize, event: engine_h2.Event) {
+fun return_event(session: *Session, event: engine_h2.Event) {
     if (event.stream_id == engine_h2.NO_STREAM) { ret; }
-    engine_h2.release_event(?sessions[index].engine, event.stream_id,
+    engine_h2.release_event(?session.engine, event.stream_id,
         event.generation);
 }
 
-fun pump_slot(index: usize, slot: *Slot, now: time.Time) Step {
+fun pump_slot(session: *Session, slot: *Slot, now: time.Time) Step {
     if (!slot.live || !slot.exchange_live) { ret STEP_IDLE; }
     if (slot.cancelling) {
-        ret retire_closed_stream(?sessions[index], slot);
+        ret retire_closed_stream(session, slot);
     }
     if (slot.service_pending) {
-        val resumed: Step = resume_exchange(index, slot);
+        val resumed: Step = resume_exchange(session, slot);
         if (resumed != STEP_BLOCKED) { ret resumed; }
         ret STEP_BLOCKED;
     }
     if (!slot.headers_sent) {
-        val started: Step = begin_response(index, slot);
+        val started: Step = begin_response(session, slot);
         if (started != STEP_IDLE) { ret started; }
         ret STEP_BLOCKED;
     }
-    if (!slot.response_complete) { ret advance_response(index, slot); }
-    ret settle_exchange(index, slot);
+    if (!slot.response_complete) { ret advance_response(session, slot); }
+    ret settle_exchange(session, slot);
 }
 
-fun pump_streams(index: usize, now: time.Time) Step {
-    val session:    *Session = ?sessions[index];
+fun pump_streams(session: *Session, now: time.Time) Step {
     var progressed: bool     = false;
     var i:          usize    = 0;
     for (i < MAX_STREAMS) {
-        val stepped: Step = pump_slot(index, ?session.slots[i], now);
+        val stepped: Step = pump_slot(session, ?session.slots[i], now);
         if (stepped == STEP_ERROR)    { ret STEP_ERROR; }
         if (stepped == STEP_PROGRESS) { progressed = true; }
         i = i + 1;
@@ -1211,17 +1153,15 @@ fun pump_streams(index: usize, now: time.Time) Step {
     ret STEP_BLOCKED;
 }
 
-fun runnable(index: usize) bool {
-    if (index >= MAX_SESSIONS || !sessions[index].live
-        || !sessions[index].engine_started) { ret false; }
-    ret sessions[index].engine.state != engine_h2.CLOSED
-        && sessions[index].engine.state != engine_h2.FAILED;
+fun runnable(session: *Session) bool {
+    if (session == nil || !session.live
+        || !session.engine_started) { ret false; }
+    ret session.engine.state != engine_h2.CLOSED
+        && session.engine.state != engine_h2.FAILED;
 }
 
-pub fun step(index: usize, now: time.Time) Step {
-    prepare();
-    if (!runnable(index)) { ret STEP_DONE; }
-    val session: *Session = ?sessions[index];
+pub fun step(session: *Session, now: time.Time) Step {
+    if (!runnable(session)) { ret STEP_DONE; }
     if (session.state != ACTIVE && session.state != CLOSING) { ret STEP_DONE; }
     # the engine frames its own preface, settings, acknowledgements and window
     # updates, and only `submit_write` discovers there is something to frame.
@@ -1231,7 +1171,7 @@ pub fun step(index: usize, now: time.Time) Step {
         session.last_step = STEP_PROGRESS;
         ret STEP_PROGRESS;
     }
-    val pumped: Step = pump_streams(index, now);
+    val pumped: Step = pump_streams(session, now);
     if (pumped == STEP_ERROR) {
         session.state     = FAILED;
         session.last_step = STEP_ERROR;
@@ -1258,17 +1198,16 @@ pub fun step(index: usize, now: time.Time) Step {
             ret STEP_PROGRESS;
         }
     }
-    val taken: Step = apply(index, engine_h2.process(?session.engine), now);
+    val taken: Step = apply(session, engine_h2.process(?session.engine), now);
     session.last_step = taken;
     ret taken;
 }
 
-pub fun advance(index: usize, now: time.Time) Step {
-    prepare();
-    if (index >= MAX_SESSIONS || !sessions[index].live) { ret STEP_ERROR; }
+pub fun advance(session: *Session, now: time.Time) Step {
+    if (session == nil || !session.live) { ret STEP_ERROR; }
     var steps: usize = 0;
     for (steps < MAX_STEPS) {
-        val progress: Step = step(index, now);
+        val progress: Step = step(session, now);
         if (progress != STEP_PROGRESS) { ret progress; }
         steps = steps + 1;
     }
@@ -1278,34 +1217,31 @@ pub fun advance(index: usize, now: time.Time) Step {
 # one transport completion settles the engine and the event it returns is the
 # next event this connection will ever produce, so it is applied rather than
 # dropped
-pub fun complete_io(index: usize, settled: *transport.Completion,
+pub fun complete_io(session: *Session, settled: *transport.Completion,
     now: time.Time) Step {
-    prepare();
     # terminal engine state stops new protocol work, but every submitted
     # transport operation still owns a completion slot that must be settled
     # before the session storage can be destroyed.
-    if (index >= MAX_SESSIONS || !sessions[index].live
-        || !sessions[index].engine_started) { ret STEP_DONE; }
-    val event: engine_h2.Event = engine_h2.complete_io(?sessions[index].engine,
+    if (session == nil || !session.live
+        || !session.engine_started) { ret STEP_DONE; }
+    val event: engine_h2.Event = engine_h2.complete_io(?session.engine,
         settled);
-    if (!runnable(index)) { ret STEP_DONE; }
-    ret apply(index, event, now);
+    if (!runnable(session)) { ret STEP_DONE; }
+    ret apply(session, event, now);
 }
 
-pub fun begin_graceful(index: usize) bool {
-    prepare();
-    if (index >= MAX_SESSIONS || !sessions[index].live
-        || !sessions[index].engine_started) { ret false; }
-    if (sessions[index].state == CLOSING) { ret true; }
-    sessions[index].state             = CLOSING;
-    sessions[index].final_goaway_sent = false;
-    ret engine_h2.begin_graceful(?sessions[index].engine);
+pub fun begin_graceful(session: *Session) bool {
+    if (session == nil || !session.live
+        || !session.engine_started) { ret false; }
+    if (session.state == CLOSING) { ret true; }
+    session.state             = CLOSING;
+    session.final_goaway_sent = false;
+    ret engine_h2.begin_graceful(?session.engine);
 }
 
-pub fun requests(index: usize) u64 {
-    prepare();
-    if (index >= MAX_SESSIONS) { ret 0; }
-    ret sessions[index].requests;
+pub fun requests(session: *Session) u64 {
+    if (session == nil) { ret 0; }
+    ret session.requests;
 }
 
 pub rec Snapshot {
@@ -1317,10 +1253,9 @@ pub rec Snapshot {
     active_streams: usize;
 }
 
-pub fun snapshot(index: usize) Snapshot {
-    prepare();
+pub fun snapshot(session: *Session) Snapshot {
     var value: Snapshot;
-    if (index >= MAX_SESSIONS || !sessions[index].live) {
+    if (session == nil || !session.live) {
         value.state          = CLOSED;
         value.engine_state   = 0;
         value.last_event     = engine_h2.EVENT_NONE;
@@ -1329,7 +1264,6 @@ pub fun snapshot(index: usize) Snapshot {
         value.active_streams = 0;
         ret value;
     }
-    val session: *Session = ?sessions[index];
     value.state        = session.state;
     value.engine_state = session.engine.state;
     value.last_event   = session.last_event;
@@ -1574,7 +1508,7 @@ test "h2: request body dispositions retain their distinct ownership" {
     state.reader                 = make_disposition_reader(?state, ?scope, 101);
     slot.request.body            = ?state.reader;
     slot.active_call.disposition = call.BODY_DRAIN;
-    val drained: body.Progress = settle_request_body(0, ?slot);
+    val drained: body.Progress = settle_request_body(nil, ?slot);
     if (drained.status != body.COMPLETE || state.finish_calls != 1
         || state.finish_mode != body.DRAIN) {
         operation_ok(cancel.destroy(?scope));
@@ -1584,7 +1518,7 @@ test "h2: request body dispositions retain their distinct ownership" {
     state.reader                 = make_disposition_reader(?state, ?scope, 102);
     slot.request.body            = ?state.reader;
     slot.active_call.disposition = call.BODY_REJECT;
-    val rejected: body.Progress = settle_request_body(0, ?slot);
+    val rejected: body.Progress = settle_request_body(nil, ?slot);
     if (rejected.status != body.REJECTED || state.finish_calls != 1
         || state.finish_mode != body.REJECT) {
         operation_ok(cancel.destroy(?scope));
@@ -1594,7 +1528,7 @@ test "h2: request body dispositions retain their distinct ownership" {
     state.reader                 = make_disposition_reader(?state, ?scope, 103);
     slot.request.body            = ?state.reader;
     slot.active_call.disposition = call.BODY_DELIVER;
-    val delivered: body.Progress = settle_request_body(0, ?slot);
+    val delivered: body.Progress = settle_request_body(nil, ?slot);
     if (delivered.status != body.ERROR || state.finish_calls != 0
         || body.reader_terminal_state(?state.reader)) {
         body.cancel_reader(?state.reader);
@@ -1603,37 +1537,61 @@ test "h2: request body dispositions retain their distinct ownership" {
     }
     body.cancel_reader(?state.reader);
 
-    val index: usize = acquire();
-    if (index == NO_SESSION) {
+    var a: A.Allocator;
+    page.make(?a);
+    var sessions: storage.Recycler[Session];
+    if (!storage.make[Session](?sessions, ?a, 1)) {
         operation_ok(cancel.destroy(?scope));
         ret 5;
     }
-    sessions[index].state        = CLOSING;
+    val session: *Session = acquire(?sessions);
+    if (session == nil) {
+        operation_ok(cancel.destroy(?scope));
+        ret 5;
+    }
+    session.state                = CLOSING;
     state.reader                 = make_disposition_reader(?state, ?scope, 104);
     slot.request.body            = ?state.reader;
     slot.active_call.disposition = call.BODY_CLOSE;
     slot.close_disposition       = false;
-    val closed: body.Progress = settle_request_body(index, ?slot);
+    val closed: body.Progress = settle_request_body(session, ?slot);
     if (closed.status != body.CANCELLED || state.finish_calls != 1
         || state.finish_mode != body.CANCEL || !slot.close_disposition) {
-        release(index);
+        release_status(?sessions, session);
         operation_ok(cancel.destroy(?scope));
         ret 6;
     }
-    if (!release(index) || !operation_ok(cancel.destroy(?scope))) { ret 7; }
+    if (release_status(?sessions, session) != RELEASE_OK
+        || !storage.destroy[Session](?sessions)
+        || !operation_ok(cancel.destroy(?scope))) { ret 7; }
     ret 0;
 }
 
-test "h2: the session table is bounded and reusable" {
-    val before: usize = live();
-    val first:  usize = acquire();
-    val second: usize = acquire();
-    if (first == NO_SESSION || second == NO_SESSION || first == second) { ret 1; }
-    if (live() != before + 2)                                           { ret 2; }
-    if (!release(first) || live() != before + 1)                        { ret 3; }
-    if (acquire() != first)                                             { ret 4; }
-    if (!release(first) || !release(second) || live() != before)        { ret 5; }
-    if (release(NO_SESSION))                                            { ret 6; }
+test "h2: sessions are claimed per connection and recycled" {
+    var a: A.Allocator;
+    page.make(?a);
+    var sessions: storage.Recycler[Session];
+    if (!storage.make[Session](?sessions, ?a, 1)) { ret 1; }
+    # far past the sixteen sessions the table used to hold
+    var held: [40]*Session;
+    var i: usize = 0;
+    for (i < 40) {
+        held[i] = acquire(?sessions);
+        if (held[i] == nil || held[i].live == false) { ret 2; }
+        i = i + 1;
+    }
+    if (storage.held[Session](?sessions) != 40) { ret 3; }
+    val returned: *Session = held[39];
+    if (release_status(?sessions, returned) != RELEASE_OK) { ret 4; }
+    if (release_status(?sessions, returned) != RELEASE_FAILED) { ret 5; }
+    held[39] = acquire(?sessions);
+    if (held[39] != returned) { ret 6; }
+    i = 0;
+    for (i < 40) {
+        if (release_status(?sessions, held[i]) != RELEASE_OK) { ret 7; }
+        i = i + 1;
+    }
+    if (!storage.destroy[Session](?sessions)) { ret 8; }
     ret 0;
 }
 
