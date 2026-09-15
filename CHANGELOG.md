@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-15
+
+### Added
+- `server.limits.call_memory_bytes` and `service.<name>.memory_bytes` bound the memory one request may hold, and a registered application declares what it needs as the last argument to `service.register_application`. See Request memory in doc/CONFIGURATION.md (#84).
+- A request that exhausts its memory bound is logged as a `memory_exhausted` error naming its route and bound, and counted by `hedge_request_memory_refusals_total`. The minimum `telemetry.metric_series` is now 6 (#84).
+- `composition.Options.applications`: the registry `kind = "laurel"` services resolve against, owned by the embedding program, at startup and at every reload (#81).
+
+### Changed
+- Request memory is claimed in chunks as a request asks for it and returned when it settles, instead of a fixed 32 KiB arena carried inline by every HTTP/1 connection, HTTP/2 stream and HTTP/3 request slot (#84).
+- An HTTP/2 session is claimed per connection instead of from a table of 16, so the 17th concurrent HTTP/2 connection is no longer refused (part of #92).
+- TLS session storage grows with the connections that negotiate TLS instead of refusing the 65th (#112).
+- The connection pool sweeps only live slots, so a large `max_connections` no longer costs throughput when idle (#88).
+- `hedge.service.laurel.make` takes only the application. The adapter dispatches through the application's own router and fallback, so routes with typed and wildcard parameters work (#82).
+- `serve.make` takes the allocator per-protocol storage is claimed from.
+- Dependencies: mach-crypto v0.9.1, mach-tls v0.3.1, mach-quic v0.6.1, mach-http v0.8.2, mach-acme v0.2.1, laurel v0.9.2. On the same machine and release build, the server CPU for a TLS 1.3 connection's handshake and first request drops from 573 ms to 20 ms, and for a kept-alive 1 KiB request from 5.25 ms to 0.30 ms (#91, #72).
+
+### Fixed
+- A service that suspends on the request body receives it on HTTP/1.1, HTTP/2 and HTTP/3. The host no longer completes the service's own suspended read (#83).
+- One QUIC connection's failure no longer shuts down the server, and shutdown completes (#89).
+- A process that served an HTTP/3 request exits on SIGTERM instead of spinning. A force-released QUIC connection now cancels its scope before destroying it (#118).
+
 ## [0.3.1] - 2026-09-13
 
 ### Fixed
