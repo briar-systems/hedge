@@ -16,6 +16,7 @@ use hedge.listener;
 use hedge.protocol.h2;
 use hedge.storage;
 use A: std.allocator;
+use std.allocator.page;
 use hedge.protocol.prologue;
 use hedge.protocol.proxy_protocol;
 use hedge.protocol.secure;
@@ -79,7 +80,6 @@ pub val TRAILER_SLOTS:          usize = 16;
 pub val SCRATCH_BYTES:          usize = 4096;
 pub val READ_BYTES:             usize = 8192;
 pub val WRITE_BYTES:            usize = 8192;
-pub val ARENA_BYTES:            usize = 32768;
 pub val RESPONSE_FIELD_SLOTS:   usize = 32;
 pub val RESPONSE_TRAILER_SLOTS: usize = 8;
 pub val INFORMATIONAL_SLOTS:    usize = 4;
@@ -148,17 +148,20 @@ pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Comp
 # owned by the runtime and shared by every connection it drives
 pub rec Storage {
     h2_sessions: storage.Recycler[h2.Session];
+    chunks:      storage.Chunks;
 }
 
 pub fun make_storage(shared: *Storage, a: *A.Allocator) bool {
     if (shared == nil) { ret false; }
-    ret storage.make[h2.Session](?shared.h2_sessions, a, 1);
+    ret storage.make[h2.Session](?shared.h2_sessions, a, 1)
+        && storage.make_chunks(?shared.chunks, a);
 }
 
 # every connection must have released what it claimed
 pub fun destroy_storage(shared: *Storage) bool {
     if (shared == nil) { ret false; }
-    ret storage.destroy[h2.Session](?shared.h2_sessions);
+    val sessions: bool = storage.destroy[h2.Session](?shared.h2_sessions);
+    ret storage.destroy_chunks(?shared.chunks) && sessions;
 }
 
 pub rec Config {
@@ -167,6 +170,7 @@ pub rec Config {
     request_timeout_ns: u64;
     # bounds the prologue and, on a TLS listener, the handshake behind it
     prologue_timeout_ns: u64;
+    call_memory_bytes:   usize;
 }
 
 pub fun config_from(graph: *schema.Graph) Config {
@@ -193,7 +197,8 @@ pub fun config_from(graph: *schema.Graph) Config {
     if (engine.parser.max_chunk_line > LINE_BYTES)       { engine.parser.max_chunk_line = LINE_BYTES; }
     ret Config{engine: engine, max_streams: max_streams,
         request_timeout_ns:  graph.timeouts.request_ms * 1000000,
-        prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000};
+        prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000,
+        call_memory_bytes:   graph.limits.call_memory_bytes};
 }
 
 # the exchange limits a service sees must admit everything the parser will accept,
@@ -278,7 +283,6 @@ pub rec Connection {
     response_trailers:      [RESPONSE_TRAILER_SLOTS]field.Field;
     informationals:         [INFORMATIONAL_SLOTS]message.Informational;
     captures:               [CAPTURE_SLOTS]router.Capture;
-    arena:                  [ARENA_BYTES]u8;
     memory:                 call.Memory;
     trace:                  telemetry_trace.Context;
     exchange:               exchange.Exchange;
@@ -729,7 +733,9 @@ pub fun make(
         i = i + 1;
     }
     owner.engine.initialized = false;
-    if (!call.make_memory(?owner.memory, ?owner.arena[0], ARENA_BYTES)) { ret false; }
+    if (!call.make_memory(?owner.memory, ?shared.chunks, configured.call_memory_bytes)) {
+        ret false;
+    }
     # the engine is not started here: which engine to start is what the prologue
     # decides, and starting one first would mean guessing
     owner.initialized = true;
@@ -785,7 +791,8 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
             owner.peer_port),
             endpoint_metadata(owner.local_kind, ?owner.local_text[0],
             owner.local_len, owner.local_port),
-            owner.configured.request_timeout_ns)) {
+            owner.configured.request_timeout_ns, ?owner.shared.chunks,
+            owner.configured.call_memory_bytes)) {
             ret refuse(owner, prologue.REFUSED_UNBOUND);
         }
         owner.engine_live = true;
@@ -1107,7 +1114,7 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
         ?owner.informationals[0], INFORMATIONAL_SLOTS, ?owner.request_scope,
         owner.request_generation, owner.limits)) { ret SETUP_EXCHANGE; }
     if (!exchange.begin(?owner.exchange)) { ret SETUP_BEGIN; }
-    call.reset_memory(?owner.memory);
+    call.reset_memory(?owner.memory, owner.configured.call_memory_bytes);
     if (!telemetry_trace.make_root(?owner.trace, false)) { ret SETUP_TRACE; }
     if (!call.bind(?owner.active_call, ?owner.exchange, ?owner.memory, ?owner.trace,
         owner.plan.generation, owner.listener_name)) { ret SETUP_BIND; }
@@ -1939,6 +1946,10 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
     val configured: message.Limits = message.limits_default();
     val generation: u64            = 81;
     var owner:      Connection;
+    var heap:       A.Allocator;
+    page.make(?heap);
+    var chunks:     storage.Chunks;
+    if (!storage.make_chunks(?chunks, ?heap)) { ret 1; }
     if (!operation_ok(cancel.make_root(?owner.request_scope, false,
         time.Time{sec: 0, nsec: 0}))) { ret 1; }
     var request_body:   body.Reader  = body.empty_reader(generation);
@@ -1984,7 +1995,7 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
         generation, configured)
         || !exchange.begin(?owner.exchange)
         || exchange.commit(?owner.exchange, configured) != message.RESPONSE_OK
-        || !call.make_memory(?owner.memory, ?owner.arena[0], ARENA_BYTES)
+        || !call.make_memory(?owner.memory, ?chunks, storage.MIN_CHUNK)
         || !telemetry_trace.make_root(?owner.trace, false)
         || !call.bind(?owner.active_call, ?owner.exchange, ?owner.memory,
         ?owner.trace, generation, "test")) {
