@@ -9,16 +9,17 @@
 # live here and nowhere else.
 #
 # a TLS session is secret-welded, so no public pointer may name one and a session
-# cannot be reached through a callback context. sessions are therefore held in
-# one bounded table and addressed by index, while every callback context is a
-# public `Channel` beside its session. that split is what the secrecy rules
-# require, not a convenience: a public alias into secret state is exactly what
-# they exist to prevent.
+# cannot be reached through a callback context. sessions are therefore held in a
+# secret table and addressed by index, while every callback context is a public
+# `Channel` at the same index in a public table. that split is what the secrecy
+# rules require, not a convenience: a public alias into secret state is exactly
+# what they exist to prevent.
 #
-# the table is fixed, and its size is this build's concurrent TLS connection
-# bound. a cleartext deployment never touches a page of it.
+# both tables grow a chunk at a time as connections negotiate TLS, and nothing
+# in either moves once it exists. a cleartext deployment never allocates them.
 
 use hedge.listener;
+use hedge.storage;
 use hedge.protocol.tls;
 use http_transport: http.core.transport;
 use std.chrono.time;
@@ -37,6 +38,10 @@ use std.types.char.char;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
+use std.collections.vector;
+use std.types.option.opt;
+use A: std.allocator;
+use std.allocator.page;
 use tls.cert;
 use tls_engine:    tls.engine;
 use tls_error:     tls.error;
@@ -58,9 +63,7 @@ fun is_err_bool_io_error_error(outcome: res[bool, io_error.Error]) bool {
 }
 
 pub val WIRE_BYTES: usize = tls_record.HEADER_SIZE + tls_record.MAX_CIPHERTEXT;
-# this build's concurrent TLS connection bound
-pub val MAX_SESSIONS: usize = 64;
-pub val NO_SESSION:   usize = MAX_SESSIONS;
+pub val NO_SESSION: usize = (-1)::usize;
 
 pub def State: u8;
 pub val IDLE:        State = 0;
@@ -133,8 +136,12 @@ rec Session {
     stream_started:       bool;
 }
 
-var sessions:   [MAX_SESSIONS]Session;
-var channels:   [MAX_SESSIONS]Channel;
+var sessions:   storage.SecretTable[Session];
+var channels:   storage.Table[Channel];
+var heap:       A.Allocator;
+# released indices, reused before the tables grow again
+var released:   vector.Vector[usize];
+var claimed:    usize;
 var prepared:   bool;
 var live_count: usize;
 
@@ -168,21 +175,25 @@ fun reset_channel(value: *Channel, index: usize) {
 
 fun prepare() {
     if (prepared) { ret; }
-    var i: usize = 0;
-    for (i < MAX_SESSIONS) {
-        reset_channel(?channels[i], i);
-        sessions[i].root_live            = false;
-        sessions[i].operation_scope_live = false;
-        sessions[i].engine_started       = false;
-        sessions[i].stream_started       = false;
-        i                                = i + 1;
-    }
+    page.make(?heap);
+    storage.make_secret_table[Session](?sessions);
+    storage.make_table[Channel](?channels, ?heap);
+    released   = vector.init[usize](?heap);
+    claimed    = 0;
     live_count = 0;
     prepared   = true;
 }
 
-pub fun capacity() usize {
-    ret MAX_SESSIONS;
+fun session_at(index: usize) *Session {
+    ret storage.secret_table_at[Session](?sessions, index);
+}
+
+fun channel_at(index: usize) *Channel {
+    ret storage.table_at[Channel](?channels, index);
+}
+
+fun claimed_index(index: usize) bool {
+    ret index < claimed && channel_at(index).live;
 }
 
 pub fun live() usize {
@@ -190,51 +201,65 @@ pub fun live() usize {
     ret live_count;
 }
 
-# a listener that has run out of sessions refuses the connection rather than
-# overcommitting the record storage every handshake needs
+# an index is reused before either table grows, and a table that cannot grow
+# refuses the connection rather than overcommitting record storage
 pub fun acquire() usize {
     prepare();
-    var i: usize = 0;
-    for (i < MAX_SESSIONS) {
-        if (!channels[i].live) {
-            reset_channel(?channels[i], i);
-            channels[i].live = true;
-            live_count       = live_count + 1;
-            ret i;
+    var index: usize = NO_SESSION;
+    val reused: opt[usize] = vector.pop[usize](?released);
+    if (sel reused.some) { index = reused.some; }
+    or {
+        # sessions grow first, so every claimable channel index has a session
+        if (claimed == channels.capacity) {
+            if (sessions.capacity == channels.capacity
+                && !storage.grow_secret_table[Session](?sessions)) { ret NO_SESSION; }
+            if (!storage.grow_table[Channel](?channels)) { ret NO_SESSION; }
         }
-        i = i + 1;
+        index   = claimed;
+        claimed = claimed + 1;
     }
-    ret NO_SESSION;
+    val value: *Channel = channel_at(index);
+    reset_channel(value, index);
+    value.live = true;
+    val record: *Session = session_at(index);
+    record.root_live            = false;
+    record.operation_scope_live = false;
+    record.engine_started       = false;
+    record.stream_started       = false;
+    live_count = live_count + 1;
+    ret index;
 }
 
 fun destroy_scopes(index: usize) {
-    if (sessions[index].operation_scope_live) {
-        cancel.destroy(?sessions[index].operation_scope);
-        sessions[index].operation_scope_live = false;
+    if (session_at(index).operation_scope_live) {
+        cancel.destroy(?session_at(index).operation_scope);
+        session_at(index).operation_scope_live = false;
     }
-    if (sessions[index].root_live) {
-        cancel.destroy(?sessions[index].root);
-        sessions[index].root_live = false;
+    if (session_at(index).root_live) {
+        cancel.destroy(?session_at(index).root);
+        session_at(index).root_live = false;
     }
 }
 
 pub fun release(index: usize) bool {
     prepare();
-    if (index >= MAX_SESSIONS || !channels[index].live) { ret false; }
-    if (sessions[index].stream_started) {
-        tls_stream.destroy_operation(?sessions[index].stream);
-        tls_stream.destroy(?sessions[index].stream);
-        sessions[index].stream_started = false;
+    if (!claimed_index(index)) { ret false; }
+    if (session_at(index).stream_started) {
+        tls_stream.destroy_operation(?session_at(index).stream);
+        tls_stream.destroy(?session_at(index).stream);
+        session_at(index).stream_started = false;
     }
-    if (sessions[index].engine_started) {
+    if (session_at(index).engine_started) {
         # destroying the engine releases the credential lease it took at the
         # ClientHello, which is what lets a retired generation be reclaimed
-        tls_server.destroy(?sessions[index].engine);
-        sessions[index].engine_started = false;
+        tls_server.destroy(?session_at(index).engine);
+        session_at(index).engine_started = false;
     }
     destroy_scopes(index);
-    reset_channel(?channels[index], index);
+    reset_channel(channel_at(index), index);
     if (live_count > 0) { live_count = live_count - 1; }
+    # an index the free list cannot take is simply never reused
+    vector.push[usize](?released, index);
     ret true;
 }
 
@@ -388,37 +413,37 @@ fun next_token(value: *Channel) tls_transport.Token {
 }
 
 fun renew_operation_scope(index: usize) bool {
-    if (sessions[index].operation_scope_live) {
-        cancel.destroy(?sessions[index].operation_scope);
-        sessions[index].operation_scope_live = false;
+    if (session_at(index).operation_scope_live) {
+        cancel.destroy(?session_at(index).operation_scope);
+        session_at(index).operation_scope_live = false;
     }
-    if (!operation_ok(cancel.make_child(?sessions[index].operation_scope, ?sessions[index].root,
+    if (!operation_ok(cancel.make_child(?session_at(index).operation_scope, ?session_at(index).root,
         false, time.Time{sec: 0, nsec: 0}))) { ret false; }
-    sessions[index].operation_scope_live = true;
+    session_at(index).operation_scope_live = true;
     ret true;
 }
 
 fun begin_operation(index: usize, kind: Kind) bool {
-    val value: *Channel = ?channels[index];
+    val value: *Channel = channel_at(index);
     val slot:  *Pending = pending_for(value, kind);
     if (slot == nil || !renew_operation_scope(index)) { ret false; }
     val token:   tls_transport.Token = next_token(value);
     var started: bool                = false;
     if (kind == KIND_READ) {
-        started = tls_stream.read(?sessions[index].stream,
-            ?sessions[index].operation_scope, token, slot.buffer, slot.length, 0);
+        started = tls_stream.read(?session_at(index).stream,
+            ?session_at(index).operation_scope, token, slot.buffer, slot.length, 0);
     }
     or (kind == KIND_WRITE) {
-        started = tls_stream.write(?sessions[index].stream,
-            ?sessions[index].operation_scope, token, slot.buffer, slot.length, 0);
+        started = tls_stream.write(?session_at(index).stream,
+            ?session_at(index).operation_scope, token, slot.buffer, slot.length, 0);
     }
     or (kind == KIND_SHUTDOWN) {
-        started = tls_stream.half_close(?sessions[index].stream,
-            ?sessions[index].operation_scope, token, 0);
+        started = tls_stream.half_close(?session_at(index).stream,
+            ?session_at(index).operation_scope, token, 0);
     }
     or {
-        started = tls_stream.close(?sessions[index].stream,
-            ?sessions[index].operation_scope, token, 0);
+        started = tls_stream.close(?session_at(index).stream,
+            ?session_at(index).operation_scope, token, 0);
     }
     if (!started) { ret false; }
     value.current = kind;
@@ -454,7 +479,7 @@ fun fail_next(value: *Channel, failure: tls_error.Error) bool {
 }
 
 fun publish(index: usize, kind: Kind, snapshot: tls_transport.Snapshot) {
-    val value: *Channel = ?channels[index];
+    val value: *Channel = channel_at(index);
     val slot:  *Pending = pending_for(value, kind);
     if (slot == nil || !slot.active) { ret; }
     slot.active = false;
@@ -479,8 +504,8 @@ fun publish(index: usize, kind: Kind, snapshot: tls_transport.Snapshot) {
 }
 
 fun observe(index: usize) {
-    val value: *Channel            = ?channels[index];
-    val view:  tls_stream.Snapshot = tls_stream.snapshot(?sessions[index].stream);
+    val value: *Channel            = channel_at(index);
+    val view:  tls_stream.Snapshot = tls_stream.snapshot(?session_at(index).stream);
     value.peer_closed = view.peer_closed;
     value.lower_eof   = view.state == tls_stream.CLOSED;
 }
@@ -488,15 +513,15 @@ fun observe(index: usize) {
 # resolve the stream operation if it has finished, and publish at most one
 # transport completion for the engine to collect
 fun settle(index: usize) bool {
-    val value: *Channel = ?channels[index];
+    val value: *Channel = channel_at(index);
     if (value.current == KIND_NONE) { ret false; }
     val snapshot: tls_transport.Snapshot = tls_transport.snapshot(
-        ?sessions[index].stream.operation);
+        ?session_at(index).stream.operation);
     if (snapshot.state != tls_transport.OPERATION_TERMINAL) { ret false; }
     val kind: Kind = value.current;
     value.current = KIND_NONE;
     observe(index);
-    tls_stream.destroy_operation(?sessions[index].stream);
+    tls_stream.destroy_operation(?session_at(index).stream);
     if (kind == KIND_HANDSHAKE) {
         value.handshake_settled = true;
         value.handshake_error   = snapshot.terminal_error;
@@ -515,8 +540,8 @@ fun settle(index: usize) bool {
 # read is never in flight at a moment when a response could still appear.
 pub fun drive(index: usize, reads: bool) bool {
     prepare();
-    if (index >= MAX_SESSIONS || !channels[index].live) { ret false; }
-    val value: *Channel = ?channels[index];
+    if (!claimed_index(index) || !channel_at(index).live) { ret false; }
+    val value: *Channel = channel_at(index);
     if (value.ready) { ret true; }
     if (value.state == FAILED || value.state == CLOSED) {
         ret fail_next(value, tls_error.INTERNAL_ERROR);
@@ -581,29 +606,29 @@ pub fun adapter(index: usize) http_transport.Adapter {
     value.submit_write          = adapter_write;
     value.submit_shutdown_write = adapter_shutdown;
     value.submit_close          = adapter_close;
-    if (index >= MAX_SESSIONS || channels[index].driver == nil) { ret value; }
-    value.runtime = channels[index].driver.runtime;
-    value.context = (?channels[index])::ptr;
+    if (!claimed_index(index) || channel_at(index).driver == nil) { ret value; }
+    value.runtime = channel_at(index).driver.runtime;
+    value.context = (channel_at(index))::ptr;
     ret value;
 }
 
 pub fun channel(index: usize) *Channel {
     prepare();
-    if (index >= MAX_SESSIONS) { ret nil; }
-    ret ?channels[index];
+    if (!claimed_index(index)) { ret nil; }
+    ret channel_at(index);
 }
 
 # --- lifecycle ---
 
 fun handshake_storage(index: usize) tls_server.Storage {
     var value: tls_server.Storage;
-    value.input                    = ?sessions[index].handshake_input[0];
+    value.input                    = ?session_at(index).handshake_input[0];
     value.input_capacity           = tls.HANDSHAKE_INPUT_BYTES;
-    value.output                   = ?sessions[index].handshake_output[0];
+    value.output                   = ?session_at(index).handshake_output[0];
     value.output_capacity          = tls.HANDSHAKE_OUTPUT_BYTES;
-    value.hello                    = ?sessions[index].hello[0];
+    value.hello                    = ?session_at(index).hello[0];
     value.hello_capacity           = tls.HELLO_BYTES;
-    value.certificates             = ?sessions[index].peer_certificates[0];
+    value.certificates             = ?session_at(index).peer_certificates[0];
     value.certificate_capacity     = tls.PEER_CERTIFICATES;
     value.peer_parameters          = nil;
     value.peer_parameters_capacity = 0;
@@ -612,9 +637,9 @@ fun handshake_storage(index: usize) tls_server.Storage {
 
 fun wire_storage(index: usize) tls_stream.Storage {
     var value: tls_stream.Storage;
-    value.wire_input           = ?sessions[index].wire_input[0];
+    value.wire_input           = ?session_at(index).wire_input[0];
     value.wire_input_capacity  = WIRE_BYTES;
-    value.wire_output          = ?sessions[index].wire_output[0];
+    value.wire_output          = ?session_at(index).wire_output[0];
     value.wire_output_capacity = WIRE_BYTES;
     ret value;
 }
@@ -624,57 +649,57 @@ fun wire_storage(index: usize) tls_stream.Storage {
 pub fun attach(index: usize, driver: *net_async.Driver, socket: *tcp.Stream,
     owner: ptr, staged: StagedFun) bool {
     prepare();
-    if (index >= MAX_SESSIONS || !channels[index].live || driver == nil
+    if (!claimed_index(index) || !channel_at(index).live || driver == nil
         || socket == nil) { ret false; }
-    channels[index].driver = driver;
-    channels[index].socket = socket;
-    channels[index].owner  = owner;
-    channels[index].staged = staged;
+    channel_at(index).driver = driver;
+    channel_at(index).socket = socket;
+    channel_at(index).owner  = owner;
+    channel_at(index).staged = staged;
     ret true;
 }
 
 pub fun begin(index: usize, policy: *tls.Policy, verification_time: i64) bool {
     prepare();
-    if (index >= MAX_SESSIONS || !channels[index].live || policy == nil
-        || !policy.live || channels[index].driver == nil) { ret false; }
-    val value: *Channel = ?channels[index];
+    if (!claimed_index(index) || !channel_at(index).live || policy == nil
+        || !policy.live || channel_at(index).driver == nil) { ret false; }
+    val value: *Channel = channel_at(index);
     value.state               = IDLE;
     value.current             = KIND_NONE;
     value.ready               = false;
     value.handshake_settled   = false;
     value.handshake_error     = tls_error.OK;
-    sessions[index].transport = lower_transport(value);
-    if (!operation_ok(cancel.make_root(?sessions[index].root, false, time.Time{sec: 0, nsec: 0}))) {
+    session_at(index).transport = lower_transport(value);
+    if (!operation_ok(cancel.make_root(?session_at(index).root, false, time.Time{sec: 0, nsec: 0}))) {
         ret false;
     }
-    sessions[index].root_live = true;
+    session_at(index).root_live = true;
     var extra: tls_server.ExtraExtension;
     extra.kind      = 0;
     extra.data.data = nil;
     extra.data.len  = 0;
-    if (!tls_server.init_with_credential_selector(?sessions[index].engine,
+    if (!tls_server.init_with_credential_selector(?session_at(index).engine,
         ?policy.configuration, handshake_storage(index), extra, 0,
         tls.tls_alpn_selector(policy))) {
         destroy_scopes(index);
         ret false;
     }
-    sessions[index].engine_started = true;
+    session_at(index).engine_started = true;
     if (!renew_operation_scope(index)) {
-        tls_server.destroy(?sessions[index].engine);
-        sessions[index].engine_started = false;
+        tls_server.destroy(?session_at(index).engine);
+        session_at(index).engine_started = false;
         destroy_scopes(index);
         ret false;
     }
-    if (!tls_stream.serve(?sessions[index].stream, ?sessions[index].engine,
-        wire_storage(index), ?sessions[index].transport,
-        ?sessions[index].operation_scope, next_token(value), verification_time,
+    if (!tls_stream.serve(?session_at(index).stream, ?session_at(index).engine,
+        wire_storage(index), ?session_at(index).transport,
+        ?session_at(index).operation_scope, next_token(value), verification_time,
         0)) {
-        tls_server.destroy(?sessions[index].engine);
-        sessions[index].engine_started = false;
+        tls_server.destroy(?session_at(index).engine);
+        session_at(index).engine_started = false;
         destroy_scopes(index);
         ret false;
     }
-    sessions[index].stream_started = true;
+    session_at(index).stream_started = true;
     value.state                    = HANDSHAKING;
     value.current                  = KIND_HANDSHAKE;
     settle(index);
@@ -685,47 +710,47 @@ pub fun begin(index: usize, policy: *tls.Policy, verification_time: i64) bool {
 # finished
 pub fun accept(index: usize, completion: *io_runtime.Completion) bool {
     prepare();
-    if (index >= MAX_SESSIONS || !channels[index].live
-        || !sessions[index].stream_started) { ret false; }
-    if (!tls_stream.accept(?sessions[index].stream, completion)) { ret false; }
+    if (!claimed_index(index) || !channel_at(index).live
+        || !session_at(index).stream_started) { ret false; }
+    if (!tls_stream.accept(?session_at(index).stream, completion)) { ret false; }
     settle(index);
     ret true;
 }
 
 pub fun handshake_settled(index: usize) bool {
     prepare();
-    ret index < MAX_SESSIONS && channels[index].live
-        && channels[index].handshake_settled;
+    ret claimed_index(index) && channel_at(index).live
+        && channel_at(index).handshake_settled;
 }
 
 pub fun handshake_error(index: usize) tls_error.Error {
     prepare();
-    if (index >= MAX_SESSIONS) { ret tls_error.INTERNAL_ERROR; }
-    ret channels[index].handshake_error;
+    if (!claimed_index(index)) { ret tls_error.INTERNAL_ERROR; }
+    ret channel_at(index).handshake_error;
 }
 
 pub fun negotiated(index: usize) tls_engine.Snapshot {
     prepare();
-    if (index >= MAX_SESSIONS || !sessions[index].stream_started) {
+    if (!claimed_index(index) || !session_at(index).stream_started) {
         ret tls_engine.empty_snapshot();
     }
-    ret tls_stream.negotiated(?sessions[index].stream);
+    ret tls_stream.negotiated(?session_at(index).stream);
 }
 
 pub fun open(index: usize) bool {
     prepare();
-    ret index < MAX_SESSIONS && channels[index].live
-        && channels[index].state == OPEN;
+    ret claimed_index(index) && channel_at(index).live
+        && channel_at(index).state == OPEN;
 }
 
 # collect the one completion this session has published, if any
 pub fun take(index: usize, settled: *http_transport.Completion) bool {
     prepare();
-    if (index >= MAX_SESSIONS || !channels[index].ready || settled == nil) {
+    if (!claimed_index(index) || !channel_at(index).ready || settled == nil) {
         ret false;
     }
-    @settled              = channels[index].ready_completion;
-    channels[index].ready = false;
+    @settled              = channel_at(index).ready_completion;
+    channel_at(index).ready = false;
     ret true;
 }
 
@@ -742,7 +767,7 @@ pub rec Snapshot {
 pub fun snapshot(index: usize) Snapshot {
     prepare();
     var value: Snapshot;
-    if (index >= MAX_SESSIONS) {
+    if (!claimed_index(index)) {
         value.state             = CLOSED;
         value.current           = KIND_NONE;
         value.read_queued       = false;
@@ -752,7 +777,7 @@ pub fun snapshot(index: usize) Snapshot {
         value.handshake_error   = tls_error.INTERNAL_ERROR;
         ret value;
     }
-    val entry: *Channel = ?channels[index];
+    val entry: *Channel = channel_at(index);
     value.state             = entry.state;
     value.current           = entry.current;
     value.read_queued       = entry.read.active;
@@ -766,7 +791,7 @@ pub fun snapshot(index: usize) Snapshot {
 test "secure: a queued write takes the stream ahead of a queued read" {
     val index: usize = acquire();
     if (index == NO_SESSION) { ret 1; }
-    val entry: *Channel = ?channels[index];
+    val entry: *Channel = channel_at(index);
     entry.state       = OPEN;
     entry.read.active = true;
     if (next_kind(entry) != KIND_READ) {
@@ -804,8 +829,8 @@ test "secure: a queued write takes the stream ahead of a queued read" {
 test "secure: an operation the engine did not submit is refused" {
     val index: usize = acquire();
     if (index == NO_SESSION) { ret 1; }
-    channels[index].state = OPEN;
-    val context:  ptr                       = (?channels[index])::ptr;
+    channel_at(index).state = OPEN;
+    val context:  ptr                       = (channel_at(index))::ptr;
     val accepted: res[bool, io_error.Error] = adapter_read(context,
         http_transport.Token{index: 0, generation: 1}, nil, nil, 0);
     if (sel accepted.err) {
@@ -820,10 +845,10 @@ test "secure: an operation the engine did not submit is refused" {
         ret 3;
     }
     # and a session that is not live accepts nothing at all
-    channels[index].live = false;
+    channel_at(index).live = false;
     val dead: res[bool, io_error.Error] = adapter_write(context,
         http_transport.Token{index: 1, generation: 1}, nil, nil, 0);
-    channels[index].live = true;
+    channel_at(index).live = true;
     if (sel dead.ok) {
         release(index);
         ret 4;
@@ -835,7 +860,7 @@ test "secure: an operation the engine did not submit is refused" {
 test "secure: a failed session settles its queued operations rather than hanging" {
     val index: usize = acquire();
     if (index == NO_SESSION) { ret 1; }
-    val entry: *Channel = ?channels[index];
+    val entry: *Channel = channel_at(index);
     entry.state       = FAILED;
     entry.read.active = true;
     entry.read.token  = http_transport.Token{index: 0, generation: 7};
@@ -869,19 +894,31 @@ test "secure: a failed session settles its queued operations rather than hanging
     ret 0;
 }
 
-test "secure: the session table is bounded and reusable" {
+test "secure: sessions grow past any fixed table and never move" {
     val before: usize = live();
     val first:  usize = acquire();
-    val second: usize = acquire();
-    if (first == NO_SESSION || second == NO_SESSION || first == second) { ret 1; }
-    if (live() != before + 2)                                           { ret 2; }
-    if (!release(first) || live() != before + 1)                        { ret 3; }
-    # the released slot is the one handed out next, so the table does not drift
-    val third: usize = acquire();
-    if (third != first)                      { ret 4; }
-    if (!release(third) || !release(second)) { ret 5; }
-    if (live() != before)                    { ret 6; }
-    if (release(NO_SESSION))                 { ret 7; }
-    if (release(first))                      { ret 8; }
+    if (first == NO_SESSION) { ret 1; }
+    val anchor: *Channel = channel_at(first);
+    # far past the sixty-four sessions the table used to hold
+    var held: [200]usize;
+    var i: usize = 0;
+    for (i < 200) {
+        held[i] = acquire();
+        if (held[i] == NO_SESSION || held[i] == first) { ret 2; }
+        i = i + 1;
+    }
+    if (live() != before + 201) { ret 3; }
+    if (channel_at(first) != anchor || !anchor.live || anchor.index != first) { ret 4; }
+    if (!release(held[150]) || live() != before + 200) { ret 5; }
+    # the released index is the one handed out next, so the tables do not drift
+    val reused: usize = acquire();
+    if (reused != held[150]) { ret 6; }
+    i = 0;
+    for (i < 200) {
+        if (!release(held[i])) { ret 7; }
+        i = i + 1;
+    }
+    if (!release(first) || live() != before) { ret 8; }
+    if (release(NO_SESSION) || release(first)) { ret 9; }
     ret 0;
 }
