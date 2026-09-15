@@ -14,6 +14,9 @@ use hedge.dispatch.call;
 use hedge.dispatch.plan;
 use hedge.listener;
 use hedge.protocol.h2;
+use hedge.storage;
+use A: std.allocator;
+use std.allocator.page;
 use hedge.protocol.prologue;
 use hedge.protocol.proxy_protocol;
 use hedge.protocol.secure;
@@ -77,7 +80,6 @@ pub val TRAILER_SLOTS:          usize = 16;
 pub val SCRATCH_BYTES:          usize = 4096;
 pub val READ_BYTES:             usize = 8192;
 pub val WRITE_BYTES:            usize = 8192;
-pub val ARENA_BYTES:            usize = 12288;
 pub val RESPONSE_FIELD_SLOTS:   usize = 32;
 pub val RESPONSE_TRAILER_SLOTS: usize = 8;
 pub val INFORMATIONAL_SLOTS:    usize = 4;
@@ -142,12 +144,33 @@ pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Comp
     operation.settle(operation.owner, operation.token_context, completion);
 }
 
+# storage a connection claims only once it selects a protocol that needs it,
+# owned by the runtime and shared by every connection it drives
+pub rec Storage {
+    h2_sessions: storage.Recycler[h2.Session];
+    chunks:      storage.Chunks;
+}
+
+pub fun make_storage(shared: *Storage, a: *A.Allocator) bool {
+    if (shared == nil) { ret false; }
+    ret storage.make[h2.Session](?shared.h2_sessions, a, 1)
+        && storage.make_chunks(?shared.chunks, a);
+}
+
+# every connection must have released what it claimed
+pub fun destroy_storage(shared: *Storage) bool {
+    if (shared == nil) { ret false; }
+    val sessions: bool = storage.destroy[h2.Session](?shared.h2_sessions);
+    ret storage.destroy_chunks(?shared.chunks) && sessions;
+}
+
 pub rec Config {
     engine:             connection.Config;
     max_streams:        usize;
     request_timeout_ns: u64;
     # bounds the prologue and, on a TLS listener, the handshake behind it
     prologue_timeout_ns: u64;
+    call_memory_bytes:   usize;
 }
 
 pub fun config_from(graph: *schema.Graph) Config {
@@ -174,7 +197,8 @@ pub fun config_from(graph: *schema.Graph) Config {
     if (engine.parser.max_chunk_line > LINE_BYTES)       { engine.parser.max_chunk_line = LINE_BYTES; }
     ret Config{engine: engine, max_streams: max_streams,
         request_timeout_ns:  graph.timeouts.request_ms * 1000000,
-        prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000};
+        prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000,
+        call_memory_bytes:   graph.limits.call_memory_bytes};
 }
 
 # the exchange limits a service sees must admit everything the parser will accept,
@@ -199,11 +223,13 @@ pub fun message_limits(graph: *schema.Graph, configured: Config) message.Limits 
 # pending when the connection has not read them yet, so backpressure reaches the
 # service instead of being buffered behind its back
 rec RequestBody {
-    owner:         *Connection;
-    slot:          usize;
-    reader:        body.Reader;
-    pending_token: u64;
-    next_token:    u64;
+    owner:            *Connection;
+    slot:             usize;
+    reader:           body.Reader;
+    pending_token:    u64;
+    next_token:       u64;
+    pending_output:   *u8;
+    pending_capacity: usize;
 }
 
 pub rec Connection {
@@ -257,7 +283,6 @@ pub rec Connection {
     response_trailers:      [RESPONSE_TRAILER_SLOTS]field.Field;
     informationals:         [INFORMATIONAL_SLOTS]message.Informational;
     captures:               [CAPTURE_SLOTS]router.Capture;
-    arena:                  [ARENA_BYTES]u8;
     memory:                 call.Memory;
     trace:                  telemetry_trace.Context;
     exchange:               exchange.Exchange;
@@ -295,7 +320,8 @@ pub rec Connection {
     prologue_scope_live:    bool;
     tls_policy:             usize;
     session:                usize;
-    h2_session:             usize;
+    h2_session:             *h2.Session;
+    shared:                 *Storage;
     handshaking:            bool;
     close_started:          bool;
     close_pending:          bool;
@@ -442,7 +468,7 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
     var settled: transport.Completion;
     if (!translate(?settled, completion, token_context)) { ret; }
     val now: time.Time = wall_now();
-    if (owner.h2_session != h2.NO_SESSION) {
+    if (owner.h2_session != nil) {
         val stepped: Step = from_h2(h2.complete_io(owner.h2_session, ?settled, now));
         if (stepped == STEP_DONE || stepped == STEP_ERROR) {
             owner.state = CLOSING;
@@ -601,16 +627,18 @@ pub fun make(
     limits: message.Limits,
     owned: *listener.OwnedListener,
     policy: usize,
+    shared: *Storage,
     now: time.Time,
 ) bool {
     if (owner == nil || source == nil || net_driver == nil || active_plan == nil
-        || owned == nil || id == 0 || generation == 0) { ret false; }
+        || owned == nil || shared == nil || id == 0 || generation == 0) { ret false; }
     # a TLS listener whose policy did not resolve must not fall back to
     # cleartext, so the connection is refused before it is admitted
     if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
     owner.tls_policy           = policy;
     owner.session              = secure.NO_SESSION;
-    owner.h2_session           = h2.NO_SESSION;
+    owner.h2_session           = nil;
+    owner.shared               = shared;
     owner.handshaking          = false;
     owner.close_started        = false;
     owner.close_pending        = false;
@@ -705,7 +733,9 @@ pub fun make(
         i = i + 1;
     }
     owner.engine.initialized = false;
-    if (!call.make_memory(?owner.memory, ?owner.arena[0], ARENA_BYTES)) { ret false; }
+    if (!call.make_memory(?owner.memory, ?shared.chunks, configured.call_memory_bytes)) {
+        ret false;
+    }
     # the engine is not started here: which engine to start is what the prologue
     # decides, and starting one first would mean guessing
     owner.initialized = true;
@@ -749,8 +779,8 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
         ret STEP_PROGRESS;
     }
     if (owner.protocol == selection.HTTP2) {
-        owner.h2_session = h2.acquire();
-        if (owner.h2_session == h2.NO_SESSION) {
+        owner.h2_session = h2.acquire(?owner.shared.h2_sessions);
+        if (owner.h2_session == nil) {
             ret refuse(owner, prologue.REFUSED_EXHAUSTED);
         }
         if (!h2.begin(owner.h2_session, ?owner.channel, ?owner.engine_scope,
@@ -761,7 +791,8 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
             owner.peer_port),
             endpoint_metadata(owner.local_kind, ?owner.local_text[0],
             owner.local_len, owner.local_port),
-            owner.configured.request_timeout_ns)) {
+            owner.configured.request_timeout_ns, ?owner.shared.chunks,
+            owner.configured.call_memory_bytes)) {
             ret refuse(owner, prologue.REFUSED_UNBOUND);
         }
         owner.engine_live = true;
@@ -949,19 +980,27 @@ fun body_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Field
         if (!connection.consume_body(engine, state.slot, count)) {
             ret body.failed("request body consumption was refused", body.REUSE_FORBIDDEN);
         }
+        state.pending_output   = nil;
+        state.pending_capacity = 0;
         ret body.data(count);
     }
     if (state.owner.engine_slots[state.slot].inbound_complete) {
+        state.pending_output   = nil;
+        state.pending_capacity = 0;
         ret body.complete(body.REUSE_ALLOWED);
     }
-    state.next_token    = state.next_token + 1;
-    state.pending_token = state.next_token;
+    state.pending_output   = output;
+    state.pending_capacity = capacity;
+    state.next_token       = state.next_token + 1;
+    state.pending_token    = state.next_token;
     ret body.pending(state.pending_token);
 }
 
 fun body_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
     val state: *RequestBody = context::*RequestBody;
     if (state == nil || state.owner == nil) { ret body.failed("request body has no owner", body.REUSE_FORBIDDEN); }
+    state.pending_output   = nil;
+    state.pending_capacity = 0;
     if (mode == body.CANCEL)                { ret body.cancelled(body.REUSE_FORBIDDEN); }
     if (mode == body.TIMEOUT)               { ret body.timed_out(body.REUSE_FORBIDDEN); }
     if (mode == body.REJECT) {
@@ -982,11 +1021,21 @@ fun body_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progre
     if (state == nil || state.owner == nil || token != state.pending_token) {
         ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
     }
-    state.pending_token = 0;
-    if (state.owner.engine_slots[state.slot].inbound_complete) {
-        ret body.complete(body.REUSE_ALLOWED);
+    val kind:     body.Operation = state.reader.pending_kind;
+    val output:   *u8            = state.pending_output;
+    val capacity: usize          = state.pending_capacity;
+    state.pending_token    = 0;
+    state.pending_output   = nil;
+    state.pending_capacity = 0;
+    if (kind == body.OP_FINISH) {
+        if (state.owner.engine_slots[state.slot].inbound_complete) {
+            ret body.complete(body.REUSE_ALLOWED);
+        }
+        state.next_token    = state.next_token + 1;
+        state.pending_token = state.next_token;
+        ret body.pending(state.pending_token);
     }
-    ret body_read(context, nil, 0, trailers);
+    ret body_read(context, output, capacity, trailers);
 }
 
 fun body_release(context: ptr) {}
@@ -1012,10 +1061,12 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
     owner.request_scope_live = false;
     if (!operation_ok(cancel.make_child(?owner.request_scope, ?owner.engine_scope, has_deadline, deadline))) { ret SETUP_SCOPE; }
     owner.request_scope_live         = true;
-    owner.request_body.owner         = owner;
-    owner.request_body.slot          = slot;
-    owner.request_body.pending_token = 0;
-    owner.request_body.next_token    = 0;
+    owner.request_body.owner            = owner;
+    owner.request_body.slot             = slot;
+    owner.request_body.pending_token    = 0;
+    owner.request_body.next_token       = 0;
+    owner.request_body.pending_output   = nil;
+    owner.request_body.pending_capacity = 0;
     # the parser already resolved framing; it stays the single authority for length
     val length_known: bool = parsed.plan.mode == framing.FRAME_NONE
         || parsed.plan.mode == framing.FRAME_LENGTH;
@@ -1063,7 +1114,7 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
         ?owner.informationals[0], INFORMATIONAL_SLOTS, ?owner.request_scope,
         owner.request_generation, owner.limits)) { ret SETUP_EXCHANGE; }
     if (!exchange.begin(?owner.exchange)) { ret SETUP_BEGIN; }
-    call.reset_memory(?owner.memory);
+    call.reset_memory(?owner.memory, owner.configured.call_memory_bytes);
     if (!telemetry_trace.make_root(?owner.trace, false)) { ret SETUP_TRACE; }
     if (!call.bind(?owner.active_call, ?owner.exchange, ?owner.memory, ?owner.trace,
         owner.plan.generation, owner.listener_name)) { ret SETUP_BIND; }
@@ -1279,7 +1330,7 @@ fun pump_response(owner: *Connection, now: time.Time) Step {
 fun runnable(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || !owner.engine_live
         || owner.state != ACTIVE) { ret false; }
-    if (owner.h2_session != h2.NO_SESSION) { ret true; }
+    if (owner.h2_session != nil) { ret true; }
     ret owner.engine.state != connection.CLOSED && owner.engine.state != connection.FAILED;
 }
 
@@ -1364,9 +1415,12 @@ fun apply(owner: *Connection, event: connection.Event, now: time.Time) Step {
         }
         ret start_exchange(owner, event.slot, now);
     }
+    # a pending service completes its own suspended operation when it is resumed,
+    # so the host only completes what was left outstanding after the service returned
     if (event.kind == connection.EVENT_REQUEST_BODY
         || event.kind == connection.EVENT_REQUEST_COMPLETE) {
-        if (owner.exchange_live && owner.request_body.pending_token != 0) {
+        if (owner.exchange_live && !owner.service_pending
+            && owner.request_body.pending_token != 0) {
             body.complete_reader(owner.request.body, owner.request_body.pending_token);
         }
         ret STEP_PROGRESS;
@@ -1396,7 +1450,7 @@ pub fun step(owner: *Connection, now: time.Time) Step {
     if (owner.session != secure.NO_SESSION && owner.engine_live) {
         var settled: transport.Completion;
         if (secure.take(owner.session, ?settled)) {
-            if (owner.h2_session != h2.NO_SESSION) {
+            if (owner.h2_session != nil) {
                 val stepped: Step = from_h2(h2.complete_io(owner.h2_session,
                     ?settled, now));
                 if (stepped == STEP_DONE || stepped == STEP_ERROR) {
@@ -1414,7 +1468,7 @@ pub fun step(owner: *Connection, now: time.Time) Step {
         }
     }
     if (owner.state != ACTIVE) { ret STEP_DONE; }
-    if (owner.h2_session != h2.NO_SESSION) {
+    if (owner.h2_session != nil) {
         val stepped: Step = from_h2(h2.step(owner.h2_session, now));
         # whatever the engine queued in this step has to start now. leaving it
         # for the next completion strands the last frame of a response behind a
@@ -1494,7 +1548,7 @@ pub fun begin_graceful(owner: *Connection) bool {
         owner.state = CLOSING;
         ret true;
     }
-    if (owner.h2_session != h2.NO_SESSION) { ret h2.begin_graceful(owner.h2_session); }
+    if (owner.h2_session != nil) { ret h2.begin_graceful(owner.h2_session); }
     # an engine that is already draining or ending needs no signal; only an
     # open engine has something to be asked
     if (owner.engine.state != connection.OPEN) { ret true; }
@@ -1608,15 +1662,15 @@ pub fun close(owner: *Connection) bool {
             abandon_exchange_close(owner);
         }
     }
-    if (owner.h2_session != h2.NO_SESSION) {
+    if (owner.h2_session != nil) {
         owner.requests = h2.requests(owner.h2_session);
-        val released: h2.ReleaseStatus = h2.release_status(owner.h2_session);
+        val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions, owner.h2_session);
         if (released == h2.RELEASE_PENDING) {
             owner.close_pending = true;
             ret false;
         }
         if (released == h2.RELEASE_FAILED) { owner.close_failed = true; }
-        owner.h2_session  = h2.NO_SESSION;
+        owner.h2_session  = nil;
         owner.engine_live = false;
     }
     or (owner.engine_live) {
@@ -1786,6 +1840,75 @@ test "connection: a pending response read completes into the retained stage" {
     ret 0;
 }
 
+test "connection: a pending request body read completes into the retained buffer" {
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    var owner: Connection;
+    owner.engine.initialized               = true;
+    owner.engine.capacity                  = PIPELINE_DEPTH;
+    owner.engine.role                      = connection.SERVER;
+    owner.engine.slots                     = ?owner.engine_slots[0];
+    owner.engine.held_slot                 = connection.NO_SLOT;
+    owner.engine.held_length               = 0;
+    owner.engine_slots[0].state            = connection.SLOT_LIVE;
+    owner.engine_slots[0].inbound_complete = false;
+    owner.request_body.owner               = ?owner;
+    owner.request_body.slot                = 0;
+    owner.request_body.pending_token       = 0;
+    owner.request_body.next_token          = 0;
+    owner.request_body.pending_output      = nil;
+    owner.request_body.pending_capacity    = 0;
+    var reader: body.Reader = body.init_reader(
+        (?owner.request_body)::ptr,
+        body_read,
+        body_finish,
+        body_complete,
+        body_release,
+        body.OWNER_APPLICATION,
+        1,
+        true,
+        4,
+        body.limits(4, 4, 2),
+        nil,
+        ?scope,
+    );
+    if (!reader.valid) {
+        cancel.destroy(?scope);
+        ret 2;
+    }
+    var buffer: [4]u8;
+    val initial: body.Progress = body.read(?reader, ?buffer[0], 4);
+    if (initial.status != body.PENDING || reader.pending_kind != body.OP_READ
+        || owner.request_body.pending_output != ?buffer[0]
+        || owner.request_body.pending_capacity != 4) {
+        cancel.destroy(?scope);
+        ret 3;
+    }
+    var chunk: [4]u8;
+    chunk[0] = 'h';
+    chunk[1] = 'e';
+    chunk[2] = 'l';
+    chunk[3] = 'p';
+    owner.engine.held_slot   = 0;
+    owner.engine.held_length = 4;
+    owner.engine.held_body   = ?chunk[0];
+    val completed: body.Progress = body.complete_reader(?reader, initial.token);
+    if (completed.status != body.DATA || completed.count != 4
+        || buffer[0] != 'h' || buffer[1] != 'e' || buffer[2] != 'l' || buffer[3] != 'p'
+        || owner.request_body.pending_output != nil || owner.request_body.pending_capacity != 0) {
+        cancel.destroy(?scope);
+        ret 4;
+    }
+    owner.engine_slots[0].inbound_complete = true;
+    val terminal: body.Progress = body.read(?reader, ?buffer[0], 4);
+    if (terminal.status != body.COMPLETE) {
+        cancel.destroy(?scope);
+        ret 5;
+    }
+    cancel.destroy(?scope);
+    ret 0;
+}
+
 rec PendingCloseTest {
     finish_calls:  usize;
     release_calls: usize;
@@ -1823,6 +1946,10 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
     val configured: message.Limits = message.limits_default();
     val generation: u64            = 81;
     var owner:      Connection;
+    var heap:       A.Allocator;
+    page.make(?heap);
+    var chunks:     storage.Chunks;
+    if (!storage.make_chunks(?chunks, ?heap)) { ret 1; }
     if (!operation_ok(cancel.make_root(?owner.request_scope, false,
         time.Time{sec: 0, nsec: 0}))) { ret 1; }
     var request_body:   body.Reader  = body.empty_reader(generation);
@@ -1868,7 +1995,7 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
         generation, configured)
         || !exchange.begin(?owner.exchange)
         || exchange.commit(?owner.exchange, configured) != message.RESPONSE_OK
-        || !call.make_memory(?owner.memory, ?owner.arena[0], ARENA_BYTES)
+        || !call.make_memory(?owner.memory, ?chunks, storage.MIN_CHUNK)
         || !telemetry_trace.make_root(?owner.trace, false)
         || !call.bind(?owner.active_call, ?owner.exchange, ?owner.memory,
         ?owner.trace, generation, "test")) {

@@ -32,7 +32,9 @@ use call: hedge.dispatch.call;
 use plan: hedge.dispatch.plan;
 use middleware: hedge.dispatch.middleware;
 use prologue: hedge.protocol.prologue;
-use wire: hedgetest.wire;
+use wire: hedge.test.runtime.wire;
+use heap_allocator: std.allocator;
+use std.allocator.page;
 
 val MAX_ROUTES: usize = 8;
 val MAX_SEGMENTS: usize = 64;
@@ -174,6 +176,7 @@ rec Harness {
     plan: plan.Plan;
     slots: [POOL]serve.Slot;
     connections: [POOL]connection.Connection;
+    heap:    heap_allocator.Allocator;
     runtime: serve.Runtime;
     applications: service.Applications;
     application_slots: [4]service.Application;
@@ -245,8 +248,9 @@ fun compile(harness: *Harness, generation: u64) bool {
 
 fun boot(harness: *Harness, generation: u64) bool {
     var quic_controls: quic_runtime.ControlView;
+    page.make(?harness.heap);
     if (!serve.make(?harness.runtime, ?harness.slots[0], ?harness.connections[0], POOL,
-        ?harness.plan, ?harness.graph)) { ret false; }
+        ?harness.plan, ?harness.graph, ?harness.heap)) { ret false; }
     schema.reset_diagnostics(?harness.diagnostics);
     if (!serve.start(?quic_controls, ?harness.runtime, generation, ?harness.graph, ?harness.diagnostics)) {
         ret false;
@@ -557,6 +561,62 @@ test "protocol: prior knowledge serves a real HTTP/2 request" {
     ret 0;
 }
 
+fun build_body_reader(context: ptr, configured: *schema.Service,
+    handler: *service.Handler) bool {
+    @handler = service.Handler{ctx: context, serve: wire.body_reading_serve};
+    ret true;
+}
+
+test "protocol: an HTTP/2 service that suspends on the request body receives it" {
+    var quic_controls: quic_runtime.ControlView;
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
+        schema.PROXY_OFF);
+    var state: wire.BodyReader = wire.BodyReader{suspensions: 0, token: 0, length: 0};
+    service.make_applications(?harness.applications, ?harness.application_slots[0], 4);
+    harness.resolver = service.no_resolver();
+    harness.resolver.applications = ?harness.applications;
+    harness.resolver.native = service.Factory{ctx: (?state)::ptr, build: build_body_reader};
+    if (!plan.make_storage(?harness.storage,
+        ?harness.routes[0], MAX_ROUTES,
+        ?harness.segments[0], MAX_SEGMENTS,
+        ?harness.specs[0], MAX_ROUTES,
+        ?harness.entries[0], MAX_ROUTES,
+        ?harness.services[0], MAX_SERVICES,
+        ?harness.middlewares[0], 4,
+        ?harness.text[0], PLAN_TEXT)) { ret 1; }
+    if (plan.compile(?harness.plan, 1, ?harness.graph, harness.storage,
+        ?harness.resolver, nil).status != plan.PLAN_OK
+        || !boot(?harness, 1)) { ret 2; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { serve.stop(?quic_controls, ?harness.runtime); ret 3; }
+    var request: [256]u8;
+    var length: usize = wire.put_connection_start(?request[0]);
+    length = wire.put_open_request(?request[0], length, 1);
+    if (!send_bytes(?client, ?request[0], length)) {
+        tcp.stream_close(?client); serve.stop(?quic_controls, ?harness.runtime); ret 4;
+    }
+    # the body is held back until the service has entered and suspended on it
+    var polls: usize = 0;
+    for (polls < 40 && state.suspensions == 0) {
+        serve.poll(?quic_controls, ?harness.runtime, 2);
+        polls = polls + 1;
+    }
+    length = wire.put_frame(?request[0], 0, 11, 0x00, 0x01, 1);
+    length = wire.put_text(?request[0], length, "hello world");
+    if (state.suspensions == 0 || !send_bytes(?client, ?request[0], length)) {
+        tcp.stream_close(?client); serve.stop(?quic_controls, ?harness.runtime); ret 5;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val received: usize = wire.collect(?harness.runtime, ?client, ?response[0],
+        RESPONSE_BYTES, "hello world");
+    tcp.stream_close(?client);
+    serve.stop(?quic_controls, ?harness.runtime);
+    if (received == 0 || !wire.contains(?response[0], received, "hello world")) { ret 6; }
+    if (state.length != 11) { ret 7; }
+    ret 0;
+}
+
 test "protocol: an HTTP/2 finalizer failure closes the owning session" {
     var quic_controls: quic_runtime.ControlView;
     var harness: Harness;
@@ -607,6 +667,68 @@ test "protocol: an HTTP/2 finalizer failure closes the owning session" {
     if (received == 0) { ret 41; }
     if (finalizer.calls != 1) { ret 42; }
     if (!closed) { ret 43; }
+    ret 0;
+}
+
+val CONCURRENT: usize = 20;
+
+test "protocol: more concurrent HTTP/2 connections than sessions ever preallocated" {
+    var quic_controls: quic_runtime.ControlView;
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2,
+        schema.PROXY_OFF);
+    harness.graph.limits.max_connections = CONCURRENT;
+    harness.graph.limits.max_connections_per_peer = CONCURRENT;
+    harness.graph.listeners[0].backlog = CONCURRENT;
+    if (!compile(?harness, 1)) { ret 1; }
+    page.make(?harness.heap);
+    val slots: res[*serve.Slot, heap_allocator.Error] =
+        heap_allocator.allocate[serve.Slot](?harness.heap, CONCURRENT);
+    val connections: res[*connection.Connection, heap_allocator.Error] =
+        heap_allocator.allocate[connection.Connection](?harness.heap, CONCURRENT);
+    if (sel slots.err)       { ret 2; }
+    if (sel connections.err) { ret 2; }
+    if (!serve.make(?harness.runtime, slots.ok, connections.ok, CONCURRENT,
+        ?harness.plan, ?harness.graph, ?harness.heap)) { ret 3; }
+    schema.reset_diagnostics(?harness.diagnostics);
+    if (!serve.start(?quic_controls, ?harness.runtime, 1, ?harness.graph,
+        ?harness.diagnostics)) { ret 4; }
+    val owned: *listener.OwnedListener = listener.active_listener(?harness.runtime.owner, 0);
+    if (owned == nil || !owned.has_bound_endpoint) { serve.stop(?quic_controls, ?harness.runtime); ret 5; }
+    var clients: [CONCURRENT]tcp.Stream;
+    var request: [256]u8;
+    var length: usize = wire.put_connection_start(?request[0]);
+    length = wire.put_request(?request[0], length, 1);
+    var opened: usize = 0;
+    for (opened < CONCURRENT) {
+        if (!wire.connect(owned.bound_endpoint, ?clients[opened])) { brk; }
+        opened = opened + 1;
+        if (!send_bytes(?clients[opened - 1], ?request[0], length)) { brk; }
+        serve.poll(?quic_controls, ?harness.runtime, 2);
+    }
+    var answered: usize = 0;
+    var i: usize = 0;
+    for (i < opened) {
+        var response: [RESPONSE_BYTES]u8;
+        val received: usize = wire.collect(?harness.runtime, ?clients[i], ?response[0],
+            RESPONSE_BYTES, ";");
+        if (received != 0 && wire.contains(?response[0], received, " wire=2 ")) {
+            answered = answered + 1;
+        }
+        i = i + 1;
+    }
+    # every connection is still open, so every session is held at once
+    val live: usize = harness.runtime.live;
+    i = 0;
+    for (i < opened) {
+        tcp.stream_close(?clients[i]);
+        i = i + 1;
+    }
+    val stopped: bool = serve.stop(?quic_controls, ?harness.runtime);
+    if (opened != CONCURRENT) { ret 6; }
+    if (answered != CONCURRENT) { ret 7; }
+    if (live != CONCURRENT) { ret 8; }
+    if (!stopped) { ret 9; }
     ret 0;
 }
 
@@ -717,8 +839,9 @@ test "protocol: a datagram listener requires an attached quic runtime" {
     configured.transport = schema.TRANSPORT_QUIC;
     schema.set_text(?configured.tls_policy, "public");
     if (!compile(?harness, 1)) { ret 1; }
+    page.make(?harness.heap);
     if (!serve.make(?harness.runtime, ?harness.slots[0], ?harness.connections[0], POOL,
-        ?harness.plan, ?harness.graph)) { ret 2; }
+        ?harness.plan, ?harness.graph, ?harness.heap)) { ret 2; }
     schema.reset_diagnostics(?harness.diagnostics);
     # a caller that omits the quic plane cannot publish only its udp socket
     if (serve.start(?quic_controls, ?harness.runtime, 1, ?harness.graph, ?harness.diagnostics)) {
@@ -737,8 +860,9 @@ test "protocol: a TLS listener whose policy never loaded does not become ready" 
     val configured: *schema.Listener = ?harness.graph.listeners[0];
     schema.set_text(?configured.tls_policy, "public");
     if (!compile(?harness, 1)) { ret 1; }
+    page.make(?harness.heap);
     if (!serve.make(?harness.runtime, ?harness.slots[0], ?harness.connections[0], POOL,
-        ?harness.plan, ?harness.graph)) { ret 2; }
+        ?harness.plan, ?harness.graph, ?harness.heap)) { ret 2; }
     schema.reset_diagnostics(?harness.diagnostics);
     # the credential generation was never published, so the listener must not
     # accept connections it would then refuse one handshake at a time

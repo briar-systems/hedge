@@ -1,0 +1,366 @@
+# per-connection storage claimed on demand
+#
+# a record claimed here never moves while it is held: io completion contexts,
+# cancellation scopes and body readers keep pointers into it. released records
+# are kept for the next claim, so steady-state serving does not map and unmap
+# storage per connection.
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use A: std.allocator;
+use std.allocator.page;
+use crypto.contracts;
+use crypto.secret;
+
+# count is how many T make one claim, so a byte buffer and a record share one pool
+pub rec Recycler[T] {
+    allocator: *A.Allocator;
+    count:     usize;
+    free:      vector.Vector[*T];
+    held:      usize;
+    live:      bool;
+}
+
+pub fun make[T](recycler: *Recycler[T], a: *A.Allocator, count: usize) bool {
+    if (recycler == nil || a == nil || count == 0) { ret false; }
+    recycler.allocator = a;
+    recycler.count     = count;
+    recycler.free      = vector.init[*T](a);
+    recycler.held      = 0;
+    recycler.live      = true;
+    ret true;
+}
+
+# nil when the allocator refuses, which is the only way a claim fails
+pub fun claim[T](recycler: *Recycler[T]) *T {
+    if (recycler == nil || !recycler.live) { ret nil; }
+    val reused: opt[*T] = vector.pop[*T](?recycler.free);
+    if (sel reused.some) {
+        recycler.held = recycler.held + 1;
+        ret reused.some;
+    }
+    val allocated: res[*T, A.Error] = A.allocate[T](recycler.allocator, recycler.count);
+    if (sel allocated.err) { ret nil; }
+    recycler.held = recycler.held + 1;
+    ret allocated.ok;
+}
+
+# a record the free list cannot take is returned to the allocator instead
+pub fun release[T](recycler: *Recycler[T], value: *T) bool {
+    if (recycler == nil || !recycler.live || value == nil || recycler.held == 0) {
+        ret false;
+    }
+    recycler.held = recycler.held - 1;
+    val kept: res[usize, A.Error] = vector.push[*T](?recycler.free, value);
+    if (sel kept.ok) { ret true; }
+    val returned: err[A.Error] = A.deallocate[T](recycler.allocator, value, recycler.count);
+    ret sel returned.ok;
+}
+
+pub fun held[T](recycler: *Recycler[T]) usize {
+    if (recycler == nil) { ret 0; }
+    ret recycler.held;
+}
+
+# every claim must have been released first
+pub fun destroy[T](recycler: *Recycler[T]) bool {
+    if (recycler == nil || !recycler.live || recycler.held != 0) { ret false; }
+    var ok: bool = true;
+    for {
+        val kept: opt[*T] = vector.pop[*T](?recycler.free);
+        if (!(sel kept.some)) { brk; }
+        val returned: err[A.Error] = A.deallocate[T](recycler.allocator, kept.some,
+            recycler.count);
+        if (sel returned.err) { ok = false; }
+    }
+    val freed: err[A.Error] = vector.dnit[*T](?recycler.free);
+    if (sel freed.err) { ok = false; }
+    recycler.live = false;
+    ret ok;
+}
+
+# byte chunks in power-of-two classes from MIN_CHUNK up, each class recycled on
+# its own, so memory claimed per request is reused rather than remapped
+pub val MIN_CHUNK:     usize = 16384;
+pub val CHUNK_CLASSES: usize = 16;
+
+pub rec Chunks {
+    classes: [CHUNK_CLASSES]Recycler[u8];
+}
+
+pub fun make_chunks(chunks: *Chunks, a: *A.Allocator) bool {
+    if (chunks == nil || a == nil) { ret false; }
+    var i: usize = 0;
+    for (i < CHUNK_CLASSES) {
+        if (!make[u8](?chunks.classes[i], a, MIN_CHUNK << i)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the size a claim of at least bytes actually receives, or zero past the largest class
+pub fun chunk_class_size(bytes: usize) usize {
+    var i: usize = 0;
+    for (i < CHUNK_CLASSES) {
+        if (bytes <= MIN_CHUNK << i) { ret MIN_CHUNK << i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun class_index(size: usize) usize {
+    var i: usize = 0;
+    for (i < CHUNK_CLASSES && MIN_CHUNK << i != size) { i = i + 1; }
+    ret i;
+}
+
+# size must be a class size from chunk_class_size
+pub fun claim_chunk(chunks: *Chunks, size: usize) *u8 {
+    if (chunks == nil) { ret nil; }
+    val index: usize = class_index(size);
+    if (index == CHUNK_CLASSES) { ret nil; }
+    ret claim[u8](?chunks.classes[index]);
+}
+
+pub fun release_chunk(chunks: *Chunks, chunk: *u8, size: usize) bool {
+    if (chunks == nil) { ret false; }
+    val index: usize = class_index(size);
+    if (index == CHUNK_CLASSES) { ret false; }
+    ret release[u8](?chunks.classes[index], chunk);
+}
+
+# every chunk must have been released first, and nothing is destroyed otherwise
+pub fun destroy_chunks(chunks: *Chunks) bool {
+    if (chunks == nil) { ret false; }
+    var i: usize = 0;
+    for (i < CHUNK_CLASSES) {
+        if (held[u8](?chunks.classes[i]) != 0) { ret false; }
+        i = i + 1;
+    }
+    var ok: bool = true;
+    i = 0;
+    for (i < CHUNK_CLASSES) {
+        if (!destroy[u8](?chunks.classes[i])) { ok = false; }
+        i = i + 1;
+    }
+    ret ok;
+}
+
+# index-addressed tables for records paired by index or reachable only by index.
+# chunk k holds FIRST_CHUNK << k records, so the directory never allocates and a
+# record never moves once its chunk exists.
+pub val TABLE_CHUNKS: usize = 32;
+pub val FIRST_CHUNK:  usize = 16;
+
+fun chunk_size(chunk: usize) usize {
+    ret FIRST_CHUNK << chunk;
+}
+
+fun chunk_start(chunk: usize) usize {
+    ret FIRST_CHUNK * ((1::usize << chunk) - 1);
+}
+
+fun chunk_of(index: usize) usize {
+    var chunk: usize = 0;
+    for (index >= chunk_start(chunk + 1)) { chunk = chunk + 1; }
+    ret chunk;
+}
+
+pub rec Table[T] {
+    allocator: *A.Allocator;
+    chunks:    [TABLE_CHUNKS]*T;
+    count:     usize;
+    capacity:  usize;
+}
+
+pub fun make_table[T](table: *Table[T], a: *A.Allocator) bool {
+    if (table == nil || a == nil) { ret false; }
+    table.allocator = a;
+    table.count     = 0;
+    table.capacity  = 0;
+    ret true;
+}
+
+# adds the next chunk. zeroed, because a fresh record must read as unused
+pub fun grow_table[T](table: *Table[T]) bool {
+    if (table == nil || table.allocator == nil || table.count == TABLE_CHUNKS) { ret false; }
+    val allocated: res[*T, A.Error] = A.zallocate[T](table.allocator,
+        chunk_size(table.count));
+    if (sel allocated.err) { ret false; }
+    table.chunks[table.count] = allocated.ok;
+    table.capacity            = table.capacity + chunk_size(table.count);
+    table.count               = table.count + 1;
+    ret true;
+}
+
+pub fun table_at[T](table: *Table[T], index: usize) *T {
+    if (table == nil || index >= table.capacity) { ret nil; }
+    val chunk: usize = chunk_of(index);
+    ret ?table.chunks[chunk][index - chunk_start(chunk)];
+}
+
+pub fun destroy_table[T](table: *Table[T]) bool {
+    if (table == nil) { ret false; }
+    var ok: bool = true;
+    for (table.count > 0) {
+        table.count = table.count - 1;
+        val returned: err[A.Error] = A.deallocate[T](table.allocator,
+            table.chunks[table.count], chunk_size(table.count));
+        if (sel returned.err) { ok = false; }
+        table.chunks[table.count] = nil;
+    }
+    table.capacity = 0;
+    ret ok;
+}
+
+# the same shape for secret-welded records, which only crypto.secret may allocate
+pub rec SecretTable[T] {
+    allocator: secret.ArrayAllocator[T];
+    chunks:    [TABLE_CHUNKS]secret.SecretArray[T];
+    count:     usize;
+    capacity:  usize;
+}
+
+pub fun make_secret_table[T](table: *SecretTable[T]) bool {
+    if (table == nil) { ret false; }
+    table.allocator = secret.system_array_allocator[T]();
+    var i: usize = 0;
+    for (i < TABLE_CHUNKS) {
+        table.chunks[i] = secret.empty_array[T]();
+        i = i + 1;
+    }
+    table.count    = 0;
+    table.capacity = 0;
+    ret true;
+}
+
+pub fun grow_secret_table[T](table: *SecretTable[T]) bool {
+    if (table == nil || table.count == TABLE_CHUNKS) { ret false; }
+    if (secret.init_array[T](?table.chunks[table.count], ?table.allocator,
+        chunk_size(table.count)) != contracts.OK) { ret false; }
+    table.capacity = table.capacity + chunk_size(table.count);
+    table.count    = table.count + 1;
+    ret true;
+}
+
+pub fun secret_table_at[T](table: *SecretTable[T], index: usize) *T {
+    if (table == nil || index >= table.capacity) { ret nil; }
+    val chunk: usize = chunk_of(index);
+    val data:  *T    = secret.array_data[T](?table.chunks[chunk]);
+    if (data == nil) { ret nil; }
+    ret ?data[index - chunk_start(chunk)];
+}
+
+pub fun destroy_secret_table[T](table: *SecretTable[T]) bool {
+    if (table == nil) { ret false; }
+    var ok: bool = true;
+    for (table.count > 0) {
+        table.count = table.count - 1;
+        if (secret.destroy_array[T](?table.chunks[table.count]) != contracts.OK) {
+            ok = false;
+        }
+    }
+    table.capacity = 0;
+    ret ok;
+}
+
+rec Probe {
+    value: u64;
+    bytes: [64]u8;
+}
+
+test "storage: a released claim is reused and never moves while held" {
+    var a: A.Allocator;
+    page.make(?a);
+    var recycler: Recycler[Probe];
+    if (!make[Probe](?recycler, ?a, 1)) { ret 1; }
+    val first:  *Probe = claim[Probe](?recycler);
+    val second: *Probe = claim[Probe](?recycler);
+    if (first == nil || second == nil || first == second) { ret 2; }
+    first.value = 7;
+    if (held[Probe](?recycler) != 2) { ret 3; }
+    if (!release[Probe](?recycler, second)) { ret 4; }
+    val third: *Probe = claim[Probe](?recycler);
+    if (third != second || first.value != 7) { ret 5; }
+    if (destroy[Probe](?recycler)) { ret 6; }
+    if (!release[Probe](?recycler, first) || !release[Probe](?recycler, third)) { ret 7; }
+    if (release[Probe](?recycler, first)) { ret 8; }
+    if (!destroy[Probe](?recycler)) { ret 9; }
+    ret 0;
+}
+
+test "storage: a claim spans count records" {
+    var a: A.Allocator;
+    page.make(?a);
+    var recycler: Recycler[u8];
+    if (!make[u8](?recycler, ?a, 32768)) { ret 1; }
+    val buffer: *u8 = claim[u8](?recycler);
+    if (buffer == nil) { ret 2; }
+    buffer[32767] = 1;
+    if (!release[u8](?recycler, buffer) || !destroy[u8](?recycler)) { ret 3; }
+    ret 0;
+}
+
+test "storage: a table grows by chunks and never moves a record" {
+    var a: A.Allocator;
+    page.make(?a);
+    var table: Table[Probe];
+    if (!make_table[Probe](?table, ?a) || table_at[Probe](?table, 0) != nil) { ret 1; }
+    if (!grow_table[Probe](?table) || table.capacity != FIRST_CHUNK) { ret 2; }
+    val first: *Probe = table_at[Probe](?table, 0);
+    val last:  *Probe = table_at[Probe](?table, FIRST_CHUNK - 1);
+    if (first == nil || last == nil || first.value != 0 || table_at[Probe](?table, FIRST_CHUNK) != nil) { ret 3; }
+    first.value = 11;
+    last.value  = 12;
+    if (!grow_table[Probe](?table) || !grow_table[Probe](?table)) { ret 4; }
+    if (table.capacity != FIRST_CHUNK * 7) { ret 5; }
+    if (table_at[Probe](?table, 0) != first || first.value != 11 || last.value != 12) { ret 6; }
+    # the first record of the third chunk sits at the start of its chunk
+    if (table_at[Probe](?table, FIRST_CHUNK * 3) != ?table.chunks[2][0]
+        || table_at[Probe](?table, FIRST_CHUNK * 7 - 1) != ?table.chunks[2][FIRST_CHUNK * 4 - 1]) { ret 7; }
+    if (!destroy_table[Probe](?table) || table.capacity != 0) { ret 8; }
+    ret 0;
+}
+
+rec SecretProbe {
+    key:   [8]^u8;
+    index: usize;
+}
+
+test "storage: a secret table grows without exposing its records" {
+    var table: SecretTable[SecretProbe];
+    if (!make_secret_table[SecretProbe](?table)) { ret 1; }
+    if (!grow_secret_table[SecretProbe](?table) || !grow_secret_table[SecretProbe](?table)) { ret 2; }
+    val record: *SecretProbe = secret_table_at[SecretProbe](?table, FIRST_CHUNK + 1);
+    if (record == nil || record.index != 0) { ret 3; }
+    record.index  = 5;
+    record.key[0] = 9;
+    if (secret_table_at[SecretProbe](?table, FIRST_CHUNK * 3) != nil) { ret 4; }
+    if (!destroy_secret_table[SecretProbe](?table)) { ret 5; }
+    ret 0;
+}
+
+test "storage: chunks round up to a class and are reused within it" {
+    var a: A.Allocator;
+    page.make(?a);
+    var chunks: Chunks;
+    if (!make_chunks(?chunks, ?a)) { ret 1; }
+    if (chunk_class_size(1) != MIN_CHUNK || chunk_class_size(MIN_CHUNK + 1) != MIN_CHUNK * 2
+        || chunk_class_size(MIN_CHUNK << CHUNK_CLASSES) != 0) { ret 2; }
+    val small: *u8 = claim_chunk(?chunks, MIN_CHUNK);
+    val large: *u8 = claim_chunk(?chunks, MIN_CHUNK * 4);
+    if (small == nil || large == nil || claim_chunk(?chunks, MIN_CHUNK + 1) != nil) { ret 3; }
+    large[MIN_CHUNK * 4 - 1] = 1;
+    if (!release_chunk(?chunks, small, MIN_CHUNK)) { ret 4; }
+    if (claim_chunk(?chunks, MIN_CHUNK) != small) { ret 5; }
+    if (destroy_chunks(?chunks)) { ret 6; }
+    if (!release_chunk(?chunks, small, MIN_CHUNK) || !release_chunk(?chunks, large, MIN_CHUNK * 4)
+        || !destroy_chunks(?chunks)) { ret 7; }
+    ret 0;
+}
