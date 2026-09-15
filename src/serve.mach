@@ -46,15 +46,20 @@ pub val READY:    State = 2;
 pub val DRAINING: State = 3;
 pub val STOPPED:  State = 4;
 
+pub val NO_SLOT: usize = (-1)::usize;
+
 pub rec Slot {
-    live:     bool;
-    retiring: bool;
+    live:      bool;
+    retiring:  bool;
     # accepted and holding a place in its budget's queue, not yet being served
-    waiting: bool;
-    token:   listener.ConnectionToken;
-    handle:  *connection.Connection;
-    budgets: *budget.Set;
-    charge:  budget.Charge;
+    waiting:   bool;
+    token:     listener.ConnectionToken;
+    handle:    *connection.Connection;
+    budgets:   *budget.Set;
+    charge:    budget.Charge;
+    prev_live: usize;
+    next_live: usize;
+    next_free: usize;
 }
 
 rec BudgetGeneration {
@@ -88,6 +93,8 @@ pub rec Runtime {
     connections:      *connection.Connection;
     capacity:         usize;
     live:             usize;
+    live_head:        usize;
+    free_head:        usize;
     next_id:          u64;
     plan:             *plan.Plan;
     graph:            *schema.Graph;
@@ -133,15 +140,15 @@ fun next_budget_deadline(runtime: *Runtime,
     output: *time.Time) bool {
     if (runtime == nil || output == nil) { ret false; }
     var found: bool  = false;
-    var i:     usize = 0;
-    for (i < runtime.capacity) {
+    var i:     usize = runtime.live_head;
+    for (i != NO_SLOT) {
         val slot:     *Slot = ?runtime.slots[i];
         var deadline: time.Time;
         if (slot.live && slot.waiting
             && budget.deadline(?slot.charge, ?deadline)) {
             found = earlier_deadline(found, deadline, output);
         }
-        i = i + 1;
+        i = slot.next_live;
     }
     if (runtime.quic != nil && !runtime.quic_released) {
         var deadline: time.Time;
@@ -231,16 +238,22 @@ pub fun make(
     runtime.quic_released     = false;
     if (!configure_budgets(?runtime.budget_generations[0], graph)) { ret false; }
     runtime.active_budgets = ?runtime.budget_generations[0].set;
+    runtime.live_head      = NO_SLOT;
+    runtime.free_head      = 0;
     var i: usize = 0;
     for (i < capacity) {
-        slots[i].live     = false;
-        slots[i].retiring = false;
-        slots[i].waiting  = false;
-        slots[i].budgets  = nil;
-        slots[i].charge   = budget.no_charge();
-        slots[i].handle   = ?connections[i];
-        i                 = i + 1;
+        slots[i].live      = false;
+        slots[i].retiring  = false;
+        slots[i].waiting   = false;
+        slots[i].budgets   = nil;
+        slots[i].charge    = budget.no_charge();
+        slots[i].handle    = ?connections[i];
+        slots[i].prev_live = NO_SLOT;
+        slots[i].next_live = NO_SLOT;
+        slots[i].next_free = i + 1;
+        i                  = i + 1;
     }
+    slots[capacity - 1].next_free = NO_SLOT;
     i = 0;
     for (i < schema.MAX_LISTENERS) {
         runtime.quic_handle_live[i] = false;
@@ -500,13 +513,44 @@ pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation
     ret true;
 }
 
-fun free_slot(runtime: *Runtime) usize {
-    var i: usize = 0;
-    for (i < runtime.capacity) {
-        if (!runtime.slots[i].live) { ret i; }
-        i = i + 1;
+fun link_live(runtime: *Runtime, index: usize) {
+    val slot: *Slot = ?runtime.slots[index];
+    slot.prev_live = NO_SLOT;
+    slot.next_live = runtime.live_head;
+    if (runtime.live_head != NO_SLOT) {
+        runtime.slots[runtime.live_head].prev_live = index;
     }
-    ret runtime.capacity;
+    runtime.live_head = index;
+}
+
+fun unlink_live(runtime: *Runtime, index: usize) {
+    val slot: *Slot = ?runtime.slots[index];
+    if (slot.prev_live != NO_SLOT) {
+        runtime.slots[slot.prev_live].next_live = slot.next_live;
+    }
+    or (runtime.live_head == index) {
+        runtime.live_head = slot.next_live;
+    }
+    if (slot.next_live != NO_SLOT) {
+        runtime.slots[slot.next_live].prev_live = slot.prev_live;
+    }
+    slot.prev_live = NO_SLOT;
+    slot.next_live = NO_SLOT;
+}
+
+fun free_slot(runtime: *Runtime) usize {
+    val index: usize = runtime.free_head;
+    if (index >= runtime.capacity) { ret runtime.capacity; }
+    runtime.free_head = runtime.slots[index].next_free;
+    runtime.slots[index].next_free = NO_SLOT;
+    ret index;
+}
+
+fun return_slot(runtime: *Runtime, index: usize) {
+    if (index >= runtime.capacity) { ret; }
+    val slot: *Slot = ?runtime.slots[index];
+    slot.next_free = runtime.free_head;
+    runtime.free_head = index;
 }
 
 # admit every queued connection the pool can hold and refuse the rest at once
@@ -521,6 +565,9 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
             runtime.rejected = runtime.rejected + 1;
             if (!listener.close_connection(?runtime.owner, token)) {
                 runtime.teardown_failures = runtime.teardown_failures + 1;
+            }
+            if (index < runtime.capacity) {
+                return_slot(runtime, index);
             }
             cnt;
         }
@@ -538,6 +585,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
             if (!listener.close_connection(?runtime.owner, token)) {
                 runtime.teardown_failures = runtime.teardown_failures + 1;
             }
+            return_slot(runtime, index);
             cnt;
         }
         slot.live        = true;
@@ -545,6 +593,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
         slot.waiting     = false;
         slot.budgets     = runtime.active_budgets;
         slot.token       = token;
+        link_live(runtime, index);
         runtime.next_id  = runtime.next_id + 1;
         runtime.live     = runtime.live + 1;
         runtime.accepted = runtime.accepted + 1;
@@ -579,24 +628,23 @@ fun listener_budget(runtime: *Runtime, index: usize) usize {
 # when it has waited longer than the budget allows
 fun admit_waiting(runtime: *Runtime, now: time.Time) usize {
     var admitted: usize = 0;
-    var i:        usize = 0;
-    for (i < runtime.capacity) {
+    var i:        usize = runtime.live_head;
+    for (i != NO_SLOT) {
         val slot: *Slot = ?runtime.slots[i];
-        if (!slot.live || !slot.waiting) {
-            i = i + 1;
-            cnt;
+        val next: usize = slot.next_live;
+        if (slot.live && slot.waiting) {
+            val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge,
+                now);
+            if (outcome == budget.ADMITTED) {
+                slot.waiting = false;
+                admitted     = admitted + 1;
+            }
+            or (outcome != budget.QUEUED) {
+                runtime.expired = runtime.expired + 1;
+                retire(runtime, i);
+            }
         }
-        val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge,
-            now);
-        if (outcome == budget.ADMITTED) {
-            slot.waiting = false;
-            admitted     = admitted + 1;
-        }
-        or (outcome != budget.QUEUED) {
-            runtime.expired = runtime.expired + 1;
-            retire(runtime, i);
-        }
-        i = i + 1;
+        i = next;
     }
     ret admitted;
 }
@@ -623,6 +671,8 @@ fun retire(runtime: *Runtime, index: usize) {
     }
     slot.live     = false;
     slot.retiring = false;
+    unlink_live(runtime, index);
+    return_slot(runtime, index);
     if (runtime.live > 0) { runtime.live = runtime.live - 1; }
 }
 
@@ -677,15 +727,17 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
     admit_waiting(runtime, now);
     if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
-    var i: usize = 0;
-    for (i < runtime.capacity) {
+    var i: usize = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
+        val next: usize = slot.next_live;
         # a connection still waiting for its budget is not driven, which is what
         # makes the queue a queue rather than a label
-        if (runtime.slots[i].live && !runtime.slots[i].waiting) {
-            if (runtime.slots[i].retiring) { retire(runtime, i); }
-            or                             { drive(runtime, i, now); }
+        if (slot.live && !slot.waiting) {
+            if (slot.retiring) { retire(runtime, i); }
+            or                 { drive(runtime, i, now); }
         }
-        i = i + 1;
+        i = next;
     }
     # plane and tcp progress can release shared budget capacity for quic
     val settled: time.Time = wall_now();
@@ -696,13 +748,15 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     }
     val promoted: usize = admit_waiting(runtime, settled);
     if (promoted != 0) {
-        i = 0;
-        for (i < runtime.capacity) {
-            if (runtime.slots[i].live && !runtime.slots[i].waiting) {
-                if (runtime.slots[i].retiring) { retire(runtime, i); }
-                or                             { drive(runtime, i, settled); }
+        i = runtime.live_head;
+        for (i != NO_SLOT) {
+            val slot: *Slot = ?runtime.slots[i];
+            val next: usize = slot.next_live;
+            if (slot.live && !slot.waiting) {
+                if (slot.retiring) { retire(runtime, i); }
+                or                 { drive(runtime, i, settled); }
             }
-            i = i + 1;
+            i = next;
         }
     }
     if (lifecycle.serving(?runtime.shutdown)) {
@@ -737,13 +791,14 @@ fun run_signal(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
         && quic_runtime.graceful_all(controls, runtime.quic, monotonic_ns())
         != quic_runtime.OK) { ok = false; }
     runtime.state = DRAINING;
-    var i: usize = 0;
-    for (i < runtime.capacity) {
+    var i: usize = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
         # HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
         # reading. the engine decides which; the runtime only asks.
-        if (runtime.slots[i].live
-            && !connection.begin_graceful(runtime.slots[i].handle)) { ok = false; }
-        i = i + 1;
+        if (slot.live
+            && !connection.begin_graceful(slot.handle)) { ok = false; }
+        i = slot.next_live;
     }
     ret ok;
 }
@@ -756,10 +811,12 @@ fun run_cancel(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
         && quic_runtime.cancel_all(controls, runtime.quic) != quic_runtime.OK) {
         quic_ok = false;
     }
-    var i: usize = 0;
-    for (i < runtime.capacity) {
-        if (runtime.slots[i].live) { retire(runtime, i); }
-        i = i + 1;
+    var i: usize = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
+        val next: usize = slot.next_live;
+        if (slot.live) { retire(runtime, i); }
+        i = next;
     }
     ret quic_ok && runtime.teardown_failures == failures;
 }
@@ -852,11 +909,12 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     if (runtime.active_budgets == ?runtime.budget_generations[0].set) {
         next = ?runtime.budget_generations[1];
     }
-    var i: usize = 0;
-    for (i < runtime.capacity) {
-        if (runtime.slots[i].live
-            && runtime.slots[i].budgets == ?next.set) { ret false; }
-        i = i + 1;
+    var i: usize = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
+        if (slot.live
+            && slot.budgets == ?next.set) { ret false; }
+        i = slot.next_live;
     }
     if (runtime.quic_count != 0
         && quic_runtime.budgets_in_use(controls, runtime.quic, ?next.set)) { ret false; }
@@ -897,17 +955,18 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     runtime.limits           = connection.message_limits(graph, runtime.configured);
     runtime.drain_timeout_ns = drain_timeout_ns;
     var signalled: bool = true;
-    i = 0;
-    for (i < runtime.capacity) {
+    i = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
         # every connection from an older generation finishes what it is doing
         # and then closes, independently of the ones accepted since
-        if (runtime.slots[i].live
-            && runtime.slots[i].handle.generation != generation) {
-            if (!connection.begin_graceful(runtime.slots[i].handle)) {
+        if (slot.live
+            && slot.handle.generation != generation) {
+            if (!connection.begin_graceful(slot.handle)) {
                 signalled = false;
             }
         }
-        i = i + 1;
+        i = slot.next_live;
     }
     # publication already happened, so a signalling failure cannot be reported
     # as a rejected reload. enter the ordered shutdown path and surface it there.
@@ -954,13 +1013,14 @@ fun listeners_changed(runtime: *Runtime, graph: *schema.Graph) bool {
 pub fun superseded(controls: *quic_runtime.ControlView, runtime: *Runtime) usize {
     if (runtime == nil) { ret 0; }
     var count: usize = 0;
-    var i:     usize = 0;
-    for (i < runtime.capacity) {
-        if (runtime.slots[i].live
-            && runtime.slots[i].handle.generation != runtime.generation) {
+    var i:     usize = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
+        if (slot.live
+            && slot.handle.generation != runtime.generation) {
             count = count + 1;
         }
-        i = i + 1;
+        i = slot.next_live;
     }
     if (runtime.quic != nil && !runtime.quic_released) {
         val quic_count: usize = quic_runtime.superseded(controls, runtime.quic);
@@ -1097,3 +1157,43 @@ test "serve: poll timeout rounds budget deadlines without oversleeping" {
         time.Time{sec: 10, nsec: 0}) != 0) { ret 1; }
     ret 0;
 }
+
+test "serve: the live list holds exactly the live connection slots" {
+    var runtime: Runtime;
+    var slots: [3]Slot;
+    runtime.slots = ?slots[0];
+    runtime.capacity = 3;
+    runtime.live_head = NO_SLOT;
+    runtime.free_head = 0;
+    var i: usize = 0;
+    for (i < 3) {
+        slots[i].live = false;
+        slots[i].prev_live = NO_SLOT;
+        slots[i].next_live = NO_SLOT;
+        slots[i].next_free = i + 1;
+        i = i + 1;
+    }
+    slots[2].next_free = NO_SLOT;
+
+    val first: usize = free_slot(?runtime);
+    val second: usize = free_slot(?runtime);
+    val third: usize = free_slot(?runtime);
+    if (first != 0 || second != 1 || third != 2 || free_slot(?runtime) != 3) { ret 1; }
+
+    link_live(?runtime, first);
+    link_live(?runtime, second);
+    if (runtime.live_head != second || slots[second].next_live != first
+        || slots[first].prev_live != second || slots[first].next_live != NO_SLOT) { ret 2; }
+
+    unlink_live(?runtime, second);
+    if (runtime.live_head != first || slots[first].prev_live != NO_SLOT) { ret 3; }
+
+    return_slot(?runtime, second);
+    val reused: usize = free_slot(?runtime);
+    if (reused != second) { ret 4; }
+
+    unlink_live(?runtime, first);
+    if (runtime.live_head != NO_SLOT) { ret 5; }
+    ret 0;
+}
+
