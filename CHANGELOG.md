@@ -13,6 +13,16 @@
 - Dependencies: laurel v0.11.0, mach-crypto v0.9.2. laurel's handler and middleware signatures changed in v0.11.0: a middleware is now a `before`/`resume`/`after` triple, and a handler returns `handler.Result` (#116). hedge stays on mach-std v2.1.0, which laurel v0.11.0 supports even though it pins v2.2.0 for itself; that bump belongs to #122.
 - `test/acme` declares `mach-crypto` itself, as it already declares `mach-std`. laurel reaches crypto with a different selection than hedge's other dependencies, and hedge's own root declaration cannot settle a graph where hedge is not the root (#116).
 
+### Added
+
+- `cache: a response is stored when its client stops writing before the answer` constructs the two-completions-in-one-wait pairing rather than waiting for the runtime to produce it, by half-closing the client before the server answers, so it guards the fixes below at any mach-std pin (#133).
+
+### Fixed
+
+- A proxy link that received its whole response is returned to the idle pool even when the client goes away in the same turn the last of that response arrived (#133). The link settles what it already holds before its reusability is judged, and reusability is read from the upstream rather than from how the downstream exchange ended.
+- A connection arriving while a finished one is still being torn down waits for its slot instead of being refused, and a poll retires what finished before it admits what arrived (#133). A pool full of live connections still refuses, which is what `max_connections` means; a pool holding a slot open for a teardown does not.
+- A connection advances its engine after every completion it settles, not only when the settlement itself reported progress (#133). Two completions for one connection arrive together whenever both are ready at the same native collect, and the second was being applied to an engine that had never been advanced past the first, which discarded a finished response.
+
 ## [0.4.1] - 2026-09-15
 
 ### Changed
