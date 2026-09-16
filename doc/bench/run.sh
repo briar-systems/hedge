@@ -117,7 +117,6 @@ name = "bench"
 # rather than the server. Caddy applies no equivalent default, so raising it is
 # what makes the two comparable.
 [server.limits]
-max_connections = 10000
 max_connections_per_peer = 1024
 
 [[listener]]
