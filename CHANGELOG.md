@@ -13,6 +13,10 @@
 - Dependencies: laurel v0.11.0, mach-crypto v0.9.2. laurel's handler and middleware signatures changed in v0.11.0: a middleware is now a `before`/`resume`/`after` triple, and a handler returns `handler.Result` (#116). hedge stays on mach-std v2.1.0, which laurel v0.11.0 supports even though it pins v2.2.0 for itself; that bump belongs to #122.
 - `test/acme` declares `mach-crypto` itself, as it already declares `mach-std`. laurel reaches crypto with a different selection than hedge's other dependencies, and hedge's own root declaration cannot settle a graph where hedge is not the root (#116).
 
+### Fixed
+
+- A connection advances its engine after every completion it settles, not only when the settlement itself reported progress (#133). Two completions for one connection arrive together whenever both are ready at the same native collect, and the second was being applied to an engine that had never been advanced past the first, which discarded a finished response.
+
 ## [0.4.1] - 2026-09-15
 
 ### Changed
