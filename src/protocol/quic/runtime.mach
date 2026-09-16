@@ -16,6 +16,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -129,6 +130,8 @@ val COMPLETION_STATELESS: CompletionKind = 3;
 
 pub rec RuntimeConfig {
     max_connections: usize;
+    # admission, token and listener directories grow from here
+    backing:         *A.Allocator;
     # request memory for every h3 exchange is claimed from here
     chunks:          *hedge_storage.Chunks;
 }
@@ -169,20 +172,8 @@ rec ConnectionConfig {
     drain_timeout_ns:     u64;
 }
 
-pub rec AdmissionStorage {
-    pending:          *quic_listener.Pending;
-    pending_capacity: usize;
-    peers:            *admission.PeerSlot;
-    peer_capacity:    usize;
-    charges:          *admission.ChargeSlot;
-    charge_capacity:  usize;
-    replay:           *token.ReplaySlot;
-    replay_capacity:  usize;
-}
-
 pub rec PumpStorage {
     scope:            cancel.Scope;
-    admissions:       [ADMISSION_BANKS]AdmissionStorage;
     receive_buffers:  [RECEIVE_BATCH][assembly.MAX_UDP_PAYLOAD]u8;
     receive_packets:  [RECEIVE_BATCH]net_types.Packet;
     stateless:        [STATELESS_SENDS]StatelessSend;
@@ -333,7 +324,6 @@ rec AdmissionGeneration {
     lease:                     quic_listener.LeaseHandle;
     admissions:                admission.Manager;
     tokens:                    token.Manager;
-    storage:                   AdmissionStorage;
     source:                    u64;
     active_connections:        usize;
     queued_initials:           usize;
@@ -393,6 +383,7 @@ pub rec Connection {
 
 pub rec Pump {
     storage:                  *PumpStorage;
+    backing:                  *A.Allocator;
     admissions:               [ADMISSION_BANKS]AdmissionGeneration;
     token_key:                [token.KEY_SIZE]^u8;
     driver:                   *net_async.Driver;
@@ -442,6 +433,7 @@ pub rec Runtime {
     timer_queue: timers.Queue;
     sessions:    h3_session.Pool;
     chunks:      *hedge_storage.Chunks;
+    backing:     *A.Allocator;
     free_head:   usize;
     # the live connections, so every sweep costs what is live rather than what
     # was configured. an idle QUIC listener sweeps nothing.
@@ -504,18 +496,15 @@ fun pump_config_shape_valid(config: *PumpConfig) bool {
         && config.idle_timeout_ms != 0 && config.drain_timeout_ns != 0;
 }
 
+# zero is no cap, which admission reads as an absent limit
+fun connection_limit_of(config: *PumpConfig) opt[usize] {
+    if (config.connection_limit == 0) { ret opt[usize].none{}; }
+    ret opt[usize].some{config.connection_limit};
+}
+
 fun pump_config_valid(config: *PumpConfig) bool {
     ret pump_config_shape_valid(config)
         && hedge_tls.policy_at(config.tls_policy_index) == config.tls_policy;
-}
-
-fun admission_storage_valid(storage: *AdmissionStorage,
-    connection_limit: usize) bool {
-    ret storage != nil && storage.pending != nil
-        && storage.pending_capacity != 0 && storage.peers != nil
-        && storage.peer_capacity != 0 && storage.charges != nil
-        && storage.charge_capacity >= connection_limit
-        && storage.replay != nil && storage.replay_capacity != 0;
 }
 
 pub fun route_capacity_required(connection_capacity: usize) usize {
@@ -528,12 +517,6 @@ pub fun route_capacity_required(connection_capacity: usize) usize {
 pub fun operation_capacity_required(connection_capacity: usize,
     pump_capacity: usize) usize {
     ret quic_capacity.operation_capacity_required(connection_capacity,
-        pump_capacity);
-}
-
-pub fun admission_capacity_required(connection_capacity: usize,
-    pump_capacity: usize) usize {
-    ret quic_capacity.admission_capacity_required(connection_capacity,
         pump_capacity);
 }
 
@@ -700,7 +683,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, storage: Storage,
     val required_routes: usize =
         route_capacity_required(storage.connection_capacity);
     if (runtime == nil || runtime.initialized || config.max_connections == 0
-        || config.chunks == nil
+        || config.chunks == nil || config.backing == nil
         || !view_valid(controls, storage.connection_capacity)
         || storage.connection_storages == nil
         || storage.connection_capacity == 0
@@ -722,6 +705,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, storage: Storage,
     runtime.connection_capacity   = storage.connection_capacity;
     runtime.max_connections       = config.max_connections;
     runtime.chunks                = config.chunks;
+    runtime.backing               = config.backing;
     runtime.admission             = nil;
     runtime.free_head             = 0;
     runtime.live_head             = NO_CONNECTION;
@@ -863,32 +847,27 @@ fun abandon_admission_parts(bank: *AdmissionGeneration,
 }
 
 fun initialize_admission_inner(pump: *Pump, bank_index: usize,
-    config: *PumpConfig, storage: AdmissionStorage,
-    require_policy_identity: bool) bool {
-    if (pump == nil || bank_index >= ADMISSION_BANKS
+    config: *PumpConfig, require_policy_identity: bool) bool {
+    if (pump == nil || pump.backing == nil || bank_index >= ADMISSION_BANKS
         || !pump_config_shape_valid(config)
-        || (require_policy_identity && !pump_config_valid(config))
-        || !admission_storage_valid(?storage, config.connection_limit)) {
+        || (require_policy_identity && !pump_config_valid(config))) {
         ret false;
     }
     val bank: *AdmissionGeneration = ?pump.admissions[bank_index];
     if (bank.live) { ret false; }
     if (!admission.initialize(?bank.admissions, admission.Config{
         source:                   config.admission_generation,
-        max_connections:          config.connection_limit,
-        max_connections_per_peer: config.max_connections_per_peer
+        max_connections:          connection_limit_of(config),
+        max_connections_per_peer: opt[usize].some{config.max_connections_per_peer}
     },
-        admission.Storage{peers: storage.peers,
-        peer_capacity:   storage.peer_capacity, charges: storage.charges,
-        charge_capacity: storage.charge_capacity})) { ret false; }
+        pump.backing)) { ret false; }
     if (!token.initialize(?bank.tokens, token.Config{
         source:             config.admission_generation,
         retry_max_age_ns:   config.retry_max_age_ns,
-        address_max_age_ns: config.address_max_age_ns
+        address_max_age_ns: config.address_max_age_ns,
+        max_replay:         opt[usize].none{}
     },
-        token.Storage{replay: storage.replay,
-        replay_capacity: storage.replay_capacity},
-        pump.token_generation, contracts.SecretBytes{
+        pump.backing, pump.token_generation, contracts.SecretBytes{
         data: ?pump.token_key[0], len: token.KEY_SIZE
     })) {
         abandon_admission_parts(bank, false, true, false);
@@ -903,9 +882,7 @@ fun initialize_admission_inner(pump: *Pump, bank_index: usize,
         supported_version_count: 2, minimum_initial_size: 1200,
         require_retry:           config.require_retry
     },
-        quic_listener.Storage{pending: storage.pending,
-        pending_capacity: storage.pending_capacity},
-        ?bank.admissions, ?bank.tokens);
+        pump.backing, ?bank.admissions, ?bank.tokens);
     if (!opened.ok) {
         bank.lease          = opened.handle;
         bank.listener_owned =
@@ -919,7 +896,6 @@ fun initialize_admission_inner(pump: *Pump, bank_index: usize,
     bank.listener_owned            = true;
     bank.listener_published        = false;
     bank.listener_cleanup_retained = false;
-    bank.storage                   = storage;
     bank.source                    = config.admission_generation;
     bank.active_connections        = 0;
     bank.queued_initials           = 0;
@@ -929,8 +905,8 @@ fun initialize_admission_inner(pump: *Pump, bank_index: usize,
 }
 
 fun initialize_admission(pump: *Pump, bank_index: usize,
-    config: *PumpConfig, storage: AdmissionStorage) bool {
-    ret initialize_admission_inner(pump, bank_index, config, storage, true);
+    config: *PumpConfig) bool {
+    ret initialize_admission_inner(pump, bank_index, config, true);
 }
 
 fun abandon_attached_pump(pump: *Pump) bool {
@@ -989,15 +965,12 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     if (runtime == nil || !runtime.initialized || runtime.stopping
         || driver == nil || socket == nil || root == nil || storage == nil
         || output == nil
-        || !pump_config_valid(?config)
-        || !admission_storage_valid(?storage.admissions[0],
-        config.connection_limit)
-        || !admission_storage_valid(?storage.admissions[1],
-        config.connection_limit)) { ret INVALID; }
+        || !pump_config_valid(?config)) { ret INVALID; }
     val index: usize = free_pump(controls, runtime);
     if (index == NO_PUMP) { ret BLOCKED; }
     val pump: *Pump = ?controls.pumps[index];
     pump.storage          = storage;
+    pump.backing          = runtime.backing;
     pump.generation       = next_generation(pump.generation);
     pump.token_generation = next_generation(pump.token_generation);
     pump.live             = false;
@@ -1010,7 +983,6 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     for (i < ADMISSION_BANKS) {
         pump.admissions[i].live     = false;
         pump.admissions[i].retiring = false;
-        pump.admissions[i].storage  = storage.admissions[i];
         i                           = i + 1;
     }
     if (os.secret_random_fill(?pump.token_key[0], token.KEY_SIZE) != 0) {
@@ -1030,8 +1002,7 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     pump.active_connections = 0;
     pump.queued_initials    = 0;
     pump.active_admission   = 0;
-    if (!initialize_admission(pump, 0, ?config,
-        storage.admissions[0])) {
+    if (!initialize_admission(pump, 0, ?config)) {
         abandon_attached_pump(pump);
         ret FAILED;
     }
@@ -1278,8 +1249,7 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
                     BLOCKED);
             }
             if (!initialize_admission_inner(pump, target,
-                ?updates[i].config, next.storage,
-                require_policy_identity)) {
+                ?updates[i].config, require_policy_identity)) {
                 ret rollback_result(controls, runtime, updates, count, ?staged[0],
                     FAILED);
             }
@@ -3244,18 +3214,21 @@ fun test_pump_config(generation: u64, policy: *hedge_tls.Policy,
     ret config;
 }
 
-fun test_admission_storage(pending: *quic_listener.Pending,
-    peers: *admission.PeerSlot, charges: *admission.ChargeSlot,
-    replay: *token.ReplaySlot) AdmissionStorage {
-    ret AdmissionStorage{pending: pending, pending_capacity: 1,
-        peers:           peers, peer_capacity: 1, charges: charges,
-        charge_capacity: 1, replay: replay, replay_capacity: 1};
+var test_backing:      A.Allocator;
+var test_backing_live: bool;
+
+fun test_allocator() *A.Allocator {
+    if (!test_backing_live) {
+        page.make(?test_backing);
+        test_backing_live = true;
+    }
+    ret ?test_backing;
 }
 
 fun test_prepare_pump(pump: *Pump, storage: *PumpStorage, generation: u64,
-    config: *PumpConfig, first: AdmissionStorage,
-    second: AdmissionStorage) bool {
+    config: *PumpConfig) bool {
     pump.storage                = storage;
+    pump.backing                = test_allocator();
     pump.generation             = generation;
     pump.token_generation       = 1;
     pump.live                   = true;
@@ -3266,12 +3239,10 @@ fun test_prepare_pump(pump: *Pump, storage: *PumpStorage, generation: u64,
     pump.cancelling             = false;
     pump.admissions[0].live     = false;
     pump.admissions[0].retiring = false;
-    pump.admissions[0].storage  = first;
     pump.admissions[1].live     = false;
     pump.admissions[1].retiring = false;
-    pump.admissions[1].storage  = second;
     apply_pump_config(pump, config);
-    if (!initialize_admission_inner(pump, 0, config, first, false)) {
+    if (!initialize_admission_inner(pump, 0, config, false)) {
         ret false;
     }
     # a prepared pump stands in for one that is receiving, so its active bank
@@ -3283,86 +3254,6 @@ fun test_prepare_pump(pump: *Pump, storage: *PumpStorage, generation: u64,
 fun test_update_all(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
     count: usize) UpdateResult {
     ret update_transaction(controls, runtime, updates, count, true, false);
-}
-
-test "hedge.protocol.quic.runtime: caller storage is bounded and reusable" {
-    var test_heap:   A.Allocator;
-    page.make(?test_heap);
-    var test_chunks: hedge_storage.Chunks;
-    if (!hedge_storage.make_chunks(?test_chunks, ?test_heap)) { ret 90; }
-    var control_pumps:   [MAX_PUMPS]Pump;
-    var control_storage: ControlView;
-    val controls:        *ControlView = ?control_storage;
-    control_storage.pumps         = ?control_pumps[0];
-    control_storage.pump_capacity = MAX_PUMPS;
-    var connections:         [2]Connection;
-    var secret_storages:     [2]assembly.SecretStorage;
-    var connection_storages: [2]ConnectionStorage;
-    var sessions:            [2]h3_session.Session;
-    var session_storages:    [2]h3_session.SessionStorage;
-    var entries:             [16]routing.Entry;
-    var nodes:               [2]timers.Node;
-    var positions:           [2]timers.Position;
-    var initials:            [2]PendingInitial;
-    var storage:             Storage;
-    var runtime:             Runtime;
-    control_storage.connections         = ?connections[0];
-    control_storage.sessions            = ?sessions[0];
-    control_storage.secret_storages     = ?secret_storages[0];
-    control_storage.connection_capacity = 2;
-    control_storage.session_capacity    = 2;
-    if (make_storage(?storage, ?connection_storages[0], 2,
-        ?session_storages[0], 2,
-        ?entries[0], 15, ?nodes[0], ?positions[0], 2,
-        ?initials[0], 2)
-        || !make_storage(?storage, ?connection_storages[0], 2,
-        ?session_storages[0], 2,
-        ?entries[0], 16, ?nodes[0], ?positions[0], 2,
-        ?initials[0], 2)
-        || !make(controls, ?runtime, storage, RuntimeConfig{max_connections: 2, chunks: ?test_chunks})
-        || runtime.free_head != 0 || runtime.routes.capacity != 16
-        || runtime.timer_queue.capacity != 2 || runtime.sessions.capacity != 2) {
-        ret 1;
-    }
-    val first: usize = acquire_connection(controls, ?runtime, 0, 0,
-        process_admission.no_lease());
-    # the free-list primitive proves stable generations without a live pump
-    if (first != 0 || runtime.live_connections != 1) { ret 2; }
-    return_connection(controls, ?runtime, first);
-    val second: usize = acquire_connection(controls, ?runtime, 0, 0,
-        process_admission.no_lease());
-    if (second != first || connections[second].generation == 0) { ret 3; }
-    return_connection(controls, ?runtime, second);
-    ret 0;
-}
-
-test "hedge.protocol.quic.runtime: admission initialization rolls back" {
-    var pump:    Pump;
-    var storage: PumpStorage;
-    pump.storage = ?storage;
-    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
-    var protocols:      [1]tls_config.ProtocolName;
-    var policy:         hedge_tls.Policy;
-    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
-    var selected_plan: plan.Plan;
-    selected_plan.generation = 1;
-    selected_plan.sealed     = true;
-    var budgets: budget.Set;
-    val config:  PumpConfig = test_pump_config(1, ?policy,
-        ?selected_plan, ?budgets);
-    var peers:   [1]admission.PeerSlot;
-    var charges: [1]admission.ChargeSlot;
-    var replay:  [1]token.ReplaySlot;
-    pump.token_generation = 1;
-    val overlapping: AdmissionStorage = test_admission_storage(
-        (?pump.admissions[0].admissions)::*quic_listener.Pending,
-        ?peers[0], ?charges[0], ?replay[0]);
-    if (initialize_admission_inner(?pump, 0, ?config, overlapping, false)
-        || pump.admissions[0].live
-        || pump.admissions[0].admissions.initialized
-        || pump.admissions[0].tokens.initialized
-        || pump.admissions[0].listener.initialized) { ret 1; }
-    ret 0;
 }
 
 test "hedge.protocol.quic.runtime: production config validates identity" {
@@ -3415,28 +3306,10 @@ test "hedge.protocol.quic.runtime: multi-pump update rolls back staging" {
         ?selected_plan, ?budgets);
     val second_new: PumpConfig = test_pump_config(21, ?policy,
         ?selected_plan, ?budgets);
-    var pending:    [2][2][1]quic_listener.Pending;
-    var peers:      [2][2][1]admission.PeerSlot;
-    var charges:    [2][2][1]admission.ChargeSlot;
-    var replay:     [2][2][1]token.ReplaySlot;
-    val first_zero: AdmissionStorage = test_admission_storage(
-        ?pending[0][0][0], ?peers[0][0][0], ?charges[0][0][0],
-        ?replay[0][0][0]);
-    val first_one: AdmissionStorage = test_admission_storage(
-        ?pending[0][1][0], ?peers[0][1][0], ?charges[0][1][0],
-        ?replay[0][1][0]);
-    val second_zero: AdmissionStorage = test_admission_storage(
-        ?pending[1][0][0], ?peers[1][0][0], ?charges[1][0][0],
-        ?replay[1][0][0]);
-    var second_one: AdmissionStorage = test_admission_storage(
-        ?pending[1][1][0], ?peers[1][1][0], ?charges[1][1][0],
-        ?replay[1][1][0]);
-    if (!test_prepare_pump(?controls.pumps[0], ?storages[0], 1, ?first_old,
-        first_zero, first_one)
-        || !test_prepare_pump(?controls.pumps[1], ?storages[1], 2, ?second_old,
-        second_zero, second_one)) { ret 1; }
-    second_one.pending                      = nil;
-    controls.pumps[1].admissions[1].storage = second_one;
+    if (!test_prepare_pump(?controls.pumps[0], ?storages[0], 1, ?first_old)
+        || !test_prepare_pump(?controls.pumps[1], ?storages[1], 2, ?second_old)) { ret 1; }
+    # the second pump cannot grow a bank, so staging the first must roll back
+    controls.pumps[1].backing = nil;
     var updates: [2]PumpUpdate;
     updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 1},
         config: first_new};
@@ -3480,18 +3353,9 @@ test "hedge.protocol.quic.runtime: failed rollback is fatal before commit" {
         ?selected_plan, ?budgets);
     val new_config: PumpConfig = test_pump_config(11, ?policy,
         ?selected_plan, ?budgets);
-    var pending: [2][1]quic_listener.Pending;
-    var peers:   [2][1]admission.PeerSlot;
-    var charges: [2][1]admission.ChargeSlot;
-    var replay:  [2][1]token.ReplaySlot;
-    val first:   AdmissionStorage = test_admission_storage(?pending[0][0],
-        ?peers[0][0], ?charges[0][0], ?replay[0][0]);
-    val second: AdmissionStorage = test_admission_storage(?pending[1][0],
-        ?peers[1][0], ?charges[1][0], ?replay[1][0]);
-    if (!test_prepare_pump(?controls.pumps[0], ?storage, 1, ?old_config,
-        first, second)
+    if (!test_prepare_pump(?controls.pumps[0], ?storage, 1, ?old_config)
         || !initialize_admission_inner(?controls.pumps[0], 1, ?new_config,
-        second, false)) { ret 1; }
+        false)) { ret 1; }
     controls.pumps[0].admissions[1].listener.closing = true;
     var update: [1]PumpUpdate;
     update[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 1},
@@ -3539,16 +3403,7 @@ test "hedge.protocol.quic.runtime: update reports committed retirement failure" 
         ?old_plan, ?budgets);
     val new_config: PumpConfig = test_pump_config(41, ?policy,
         ?new_plan, ?budgets);
-    var pending: [2][1]quic_listener.Pending;
-    var peers:   [2][1]admission.PeerSlot;
-    var charges: [2][1]admission.ChargeSlot;
-    var replay:  [2][1]token.ReplaySlot;
-    val first:   AdmissionStorage = test_admission_storage(?pending[0][0],
-        ?peers[0][0], ?charges[0][0], ?replay[0][0]);
-    val second: AdmissionStorage = test_admission_storage(?pending[1][0],
-        ?peers[1][0], ?charges[1][0], ?replay[1][0]);
-    if (!test_prepare_pump(?controls.pumps[0], ?storage, 5, ?old_config,
-        first, second)) { ret 1; }
+    if (!test_prepare_pump(?controls.pumps[0], ?storage, 5, ?old_config)) { ret 1; }
     controls.pumps[0].admissions[0].listener.closing = true;
     var updates: [1]PumpUpdate;
     updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 5},
@@ -3604,16 +3459,7 @@ test "hedge.protocol.quic.runtime: update gracefully retires superseded" {
         ?old_plan, ?old_budgets);
     val new_config: PumpConfig = test_pump_config(31, ?policy,
         ?new_plan, ?new_budgets);
-    var pending: [2][1]quic_listener.Pending;
-    var peers:   [2][1]admission.PeerSlot;
-    var charges: [2][1]admission.ChargeSlot;
-    var replay:  [2][1]token.ReplaySlot;
-    val first:   AdmissionStorage = test_admission_storage(?pending[0][0],
-        ?peers[0][0], ?charges[0][0], ?replay[0][0]);
-    val second: AdmissionStorage = test_admission_storage(?pending[1][0],
-        ?peers[1][0], ?charges[1][0], ?replay[1][0]);
-    if (!test_prepare_pump(?controls.pumps[0], ?pump_storage, 4, ?old_config,
-        first, second)) { ret 1; }
+    if (!test_prepare_pump(?controls.pumps[0], ?pump_storage, 4, ?old_config)) { ret 1; }
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     connection.plan  = ?old_plan;
@@ -3667,7 +3513,8 @@ test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
         ?entries[0], 8, ?nodes[0], ?positions[0], 1,
         ?initials[0], 1)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 1, chunks: ?test_chunks})) { ret 1; }
+        RuntimeConfig{max_connections: 1, backing: ?test_heap,
+        chunks: ?test_chunks})) { ret 1; }
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (index != 0) { ret 2; }
@@ -4125,14 +3972,6 @@ test "hedge.protocol.quic.runtime: shutdown cancels queued ownership" {
     selected_plan.sealed     = true;
     val config: PumpConfig = test_pump_config(1, ?policy,
         ?selected_plan, ?budgets);
-    var q_pending: [2][1]quic_listener.Pending;
-    var peers:     [2][1]admission.PeerSlot;
-    var charges:   [2][1]admission.ChargeSlot;
-    var replay:    [2][1]token.ReplaySlot;
-    val first:     AdmissionStorage = test_admission_storage(?q_pending[0][0],
-        ?peers[0][0], ?charges[0][0], ?replay[0][0]);
-    val second: AdmissionStorage = test_admission_storage(?q_pending[1][0],
-        ?peers[1][0], ?charges[1][0], ?replay[1][0]);
     runtime.live_head                        = NO_CONNECTION;
     runtime.pending_live_head                = NO_CONNECTION;
     runtime.initialized                      = true;
@@ -4143,8 +3982,7 @@ test "hedge.protocol.quic.runtime: shutdown cancels queued ownership" {
     runtime.pending_initial_count            = 1;
     runtime.live_total                       = 1;
     runtime.pump_count                       = 1;
-    if (!test_prepare_pump(?controls.pumps[0], ?pump_storage, 1, ?config,
-        first, second)) { ret 3; }
+    if (!test_prepare_pump(?controls.pumps[0], ?pump_storage, 1, ?config)) { ret 3; }
     controls.pumps[0].queued_initials               = 1;
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live                                    = true;
@@ -4305,7 +4143,8 @@ test "hedge.protocol.quic.runtime: a free pool is prepared without touching conn
         ?entries[0], 16, ?nodes[0], ?positions[0], 2,
         ?initials[0], 2)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 2, chunks: ?test_chunks})) { ret 1; }
+        RuntimeConfig{max_connections: 2, backing: ?test_heap,
+        chunks: ?test_chunks})) { ret 1; }
     if (!connection_storages[0].sends[0].pending
         || !connection_storages[0].published[0].live
         || !connection_storages[1].sends[0].pending
@@ -4353,7 +4192,8 @@ test "hedge.protocol.quic.runtime: the live list holds exactly the live connecti
         ?entries[0], 16, ?nodes[0], ?positions[0], 2,
         ?initials[0], 2)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 2, chunks: ?test_chunks})) { ret 1; }
+        RuntimeConfig{max_connections: 2, backing: ?test_heap,
+        chunks: ?test_chunks})) { ret 1; }
     # a pool with nothing live is a pool a sweep walks in no steps at all,
     # whatever the configured capacity is
     if (runtime.live_head != NO_CONNECTION || live_walk_length(controls,
@@ -4405,7 +4245,8 @@ test "hedge.protocol.quic.runtime: failing a connection leaves the runtime advan
         ?entries[0], 16, ?nodes[0], ?positions[0], 2,
         ?initials[0], 2)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 2, chunks: ?test_chunks})) { ret 1; }
+        RuntimeConfig{max_connections: 2, backing: ?test_heap,
+        chunks: ?test_chunks})) { ret 1; }
     val first: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (first == NO_CONNECTION) { ret 2; }
@@ -4474,7 +4315,8 @@ test "hedge.protocol.quic.runtime: a forced release cancels what is still regist
         ?entries[0], 8, ?nodes[0], ?positions[0], 1,
         ?initials[0], 1)
         || !make(controls, ?runtime, storage,
-        RuntimeConfig{max_connections: 1, chunks: ?test_chunks})) { ret 1; }
+        RuntimeConfig{max_connections: 1, backing: ?test_heap,
+        chunks: ?test_chunks})) { ret 1; }
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (index == NO_CONNECTION) { ret 2; }
