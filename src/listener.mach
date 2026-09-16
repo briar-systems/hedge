@@ -4,6 +4,9 @@ use process_admission: hedge.admission;
 use hedge.config.schema;
 use quic_capacity: hedge.protocol.quic.capacity;
 use hedge.protocol.trust;
+use hedge_storage: hedge.storage;
+use A:             std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use io_error:  std.io.error;
 use io_handle: std.io.handle;
@@ -147,7 +150,7 @@ pub rec OwnedListener {
     backlog:            usize;
     accept_depth:       usize;
     accept_pending:     usize;
-    connection_limit:   usize;
+    connection_limit:   opt[usize];
     active_connections: usize;
     tcp_listener:       tcp.Listener;
     udp_socket:         udp.Socket;
@@ -214,29 +217,30 @@ pub rec Snapshot {
 pub rec Owner {
     # sockets this owner accepted and then could not close. a discarded close
     # failure is a descriptor leak nobody can see, so it is counted.
-    leaked_descriptors:       u64;
-    state:                    u8;
-    generation:               u64;
-    runtime_initialized:      bool;
-    network_initialized:      bool;
-    local_initialized:        bool;
-    process_initialized:      bool;
-    root_scope_initialized:   bool;
-    sigpipe_configured:       bool;
-    reload_requested:         bool;
-    stop_requested:           bool;
-    active_set:               usize;
-    connection_capacity:      usize;
+    leaked_descriptors:     u64;
+    state:                  u8;
+    generation:             u64;
+    runtime_initialized:    bool;
+    network_initialized:    bool;
+    local_initialized:      bool;
+    process_initialized:    bool;
+    root_scope_initialized: bool;
+    sigpipe_configured:     bool;
+    reload_requested:       bool;
+    stop_requested:         bool;
+    active_set:             usize;
+    # slots ever handed out, which is what a sweep costs and what bounds a token
+    claimed_connections:      usize;
     connection_count:         usize;
     queued_connection_count:  usize;
-    max_connections_per_peer: usize;
+    max_connections:          opt[usize];
+    max_connections_per_peer: opt[usize];
     free_head:                usize;
     queue_head:               usize;
     queue_tail:               usize;
     next_connection_id:       u64;
-    connections:              *Connection;
-    admission_peers:          *process_admission.PeerSlot;
-    admission_leases:         *process_admission.LeaseSlot;
+    connections:              hedge_storage.Table[Connection];
+    heap:                     A.Allocator;
     admission:                process_admission.Manager;
     connection_ctx:           ptr;
     connection_completions:   ConnectionCompletionFun;
@@ -305,55 +309,53 @@ fun parse_local_endpoint(text: str, output: *local_endpoint.Endpoint) bool {
     ret true;
 }
 
+fun connection_at(owner: *Owner, index: usize) *Connection {
+    ret hedge_storage.table_at[Connection](?owner.connections, index);
+}
+
 fun connection_for(owner: *Owner, token: ConnectionToken) *Connection {
-    if (owner == nil || token.index::usize >= owner.connection_capacity || token.generation == 0) { ret nil; }
-    val connection: *Connection = ?owner.connections[token.index::usize];
+    if (owner == nil || token.index::usize >= owner.claimed_connections || token.generation == 0) { ret nil; }
+    val connection: *Connection = connection_at(owner, token.index::usize);
+    if (connection == nil)                                                                { ret nil; }
     if (connection.state == CONNECTION_FREE || connection.generation != token.generation) { ret nil; }
     ret connection;
 }
 
-fun initialize_connections(owner: *Owner, capacity: usize,
-    max_connections_per_peer: usize) bool {
-    val bytes:       usize = $size_of(Connection) * capacity;
-    val peer_bytes:  usize = $size_of(process_admission.PeerSlot) * capacity;
-    val lease_bytes: usize = $size_of(process_admission.LeaseSlot) * capacity;
-    if (capacity == 0 || bytes / $size_of(Connection) != capacity
-        || peer_bytes / $size_of(process_admission.PeerSlot) != capacity
-        || lease_bytes / $size_of(process_admission.LeaseSlot) != capacity) {
-        ret false;
-    }
-    owner.connection_capacity = capacity;
-    owner.connections         = os.allocate(bytes)::*Connection;
-    owner.admission_peers     = os.allocate(peer_bytes)::*process_admission.PeerSlot;
-    owner.admission_leases    =
-        os.allocate(lease_bytes)::*process_admission.LeaseSlot;
-    if (owner.connections == nil || owner.admission_peers == nil
-        || owner.admission_leases == nil
-        || !process_admission.make(?owner.admission,
-        process_admission.Storage{peers: owner.admission_peers,
-        peer_capacity:  capacity, leases: owner.admission_leases,
-        lease_capacity: capacity}, capacity,
-        max_connections_per_peer)) { ret false; }
+fun initialize_connections(owner: *Owner, max_connections: opt[usize],
+    max_connections_per_peer: opt[usize]) bool {
+    page.make(?owner.heap);
+    if (!hedge_storage.make_table[Connection](?owner.connections, ?owner.heap)
+        || !process_admission.make(?owner.admission, ?owner.heap,
+        max_connections, max_connections_per_peer)) { ret false; }
+    owner.claimed_connections     = 0;
     owner.connection_count        = 0;
     owner.queued_connection_count = 0;
     owner.queue_head              = NO_INDEX;
     owner.queue_tail              = NO_INDEX;
-    owner.free_head               = 0;
-    var i: usize = 0;
-    for (i < capacity) {
-        val connection: *Connection = ?owner.connections[i];
-        connection.state         = CONNECTION_FREE;
-        connection.generation    = 0;
-        connection.next          = i + 1;
-        connection.close_pending = false;
-        if (i + 1 == capacity) { connection.next = NO_INDEX; }
-        i = i + 1;
-    }
+    owner.free_head               = NO_INDEX;
     ret true;
 }
 
+# a released slot is reused before the directory grows again. a grown chunk is
+# zeroed, so a fresh slot already reads as free with generation zero
+fun claim_connection_slot(owner: *Owner) usize {
+    if (owner.free_head != NO_INDEX) {
+        val index: usize = owner.free_head;
+        owner.free_head = connection_at(owner, index).next;
+        ret index;
+    }
+    if (owner.claimed_connections == owner.connections.capacity
+        && !hedge_storage.grow_table[Connection](?owner.connections)) {
+        ret NO_INDEX;
+    }
+    val index: usize = owner.claimed_connections;
+    owner.claimed_connections = owner.claimed_connections + 1;
+    ret index;
+}
+
 fun release_connection_slot(owner: *Owner, index: usize) bool {
-    val connection: *Connection = ?owner.connections[index];
+    val connection: *Connection = connection_at(owner, index);
+    if (connection == nil) { ret false; }
     if (connection.state == CONNECTION_FREE
         || !process_admission.release(?owner.admission,
         connection.lease)) { ret false; }
@@ -381,15 +383,19 @@ fun release_connection_slot(owner: *Owner, index: usize) bool {
 }
 
 fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, transport: u8, peer: *ip.Endpoint) *Connection {
-    if (owner.free_head == NO_INDEX || listener_index >= set.listener_count) { ret nil; }
+    if (listener_index >= set.listener_count) { ret nil; }
     val listener: *OwnedListener = ?set.listeners[listener_index];
     if (!listener_can_admit(owner, listener)) { ret nil; }
     var lease: process_admission.Lease;
     if (!process_admission.acquire(?owner.admission, peer, ?lease)) { ret nil; }
-    val index:      usize       = owner.free_head;
-    val connection: *Connection = ?owner.connections[index];
-    owner.free_head = connection.next;
-    var generation: u32 = connection.generation + 1;
+    # storage that cannot grow refuses the connection, and the lease goes back
+    val index: usize = claim_connection_slot(owner);
+    if (index == NO_INDEX) {
+        process_admission.release(?owner.admission, lease);
+        ret nil;
+    }
+    val connection: *Connection = connection_at(owner, index);
+    var generation: u32         = connection.generation + 1;
     if (generation == 0) { generation = 1; }
     connection.generation    = generation;
     connection.state         = CONNECTION_QUEUED;
@@ -414,8 +420,8 @@ fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, tr
         owner.queue_tail = index;
     }
     or {
-        owner.connections[owner.queue_tail].next = index;
-        owner.queue_tail                         = index;
+        connection_at(owner, owner.queue_tail).next = index;
+        owner.queue_tail                            = index;
     }
     owner.connection_count        = owner.connection_count + 1;
     owner.queued_connection_count = owner.queued_connection_count + 1;
@@ -423,11 +429,23 @@ fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, tr
     ret connection;
 }
 
+fun listener_limit_valid(listener: *OwnedListener) bool {
+    if (sel listener.connection_limit.some) { ret listener.connection_limit.some != 0; }
+    ret true;
+}
+
+fun under_listener_limit(listener: *OwnedListener) bool {
+    if (sel listener.connection_limit.some) {
+        ret listener.active_connections < listener.connection_limit.some;
+    }
+    ret true;
+}
+
 fun listener_can_admit(owner: *Owner, listener: *OwnedListener) bool {
     ret owner.state == OWNER_READY
         && !owner.stop_requested
         && process_admission.available(?owner.admission)
-        && listener.active_connections < listener.connection_limit;
+        && under_listener_limit(listener);
 }
 
 fun submit_accept_slot(owner: *Owner, set: *ListenerSet, listener_index: usize, slot_index: usize) bool {
@@ -584,8 +602,8 @@ fun dispatch_completion(owner: *Owner, completion: io_runtime.Completion) {
         ret;
     }
     if (context.kind == CONTEXT_LOCAL_STREAM_CLOSE) {
-        if (context.connection_index < owner.connection_capacity) {
-            val connection: *Connection = ?owner.connections[context.connection_index];
+        if (context.connection_index < owner.claimed_connections) {
+            val connection: *Connection = connection_at(owner, context.connection_index);
             connection.close_completion = completion;
             connection.close_pending    = false;
         }
@@ -900,7 +918,7 @@ fun prepare_set(owner: *Owner, set_index: usize, generation: u64, graph: *schema
     i = 0;
     for (i < graph.listener_count) {
         val listener: *OwnedListener = ?set.listeners[i];
-        if (listener.backlog == 0 || listener.backlog > 2147483647 || listener.accept_depth == 0 || listener.accept_depth > MAX_ACCEPT_DEPTH || listener.connection_limit == 0) {
+        if (listener.backlog == 0 || listener.backlog > 2147483647 || listener.accept_depth == 0 || listener.accept_depth > MAX_ACCEPT_DEPTH || !listener_limit_valid(listener)) {
             diagnose(diagnostics, schema.RESOURCE_LIMIT, schema.text(?listener.name), "listener admission configuration is outside the runtime bounds");
             drain_set(owner, set);
             ret false;
@@ -947,6 +965,39 @@ fun submit_initial_accepts(owner: *Owner, set: *ListenerSet, diagnostics: *schem
     ret true;
 }
 
+fun limit_or(limit: opt[usize], fallback: usize) usize {
+    if (sel limit.some) { ret limit.some; }
+    ret fallback;
+}
+
+fun limits_valid(graph: *schema.Graph) bool {
+    if (sel graph.limits.max_connections.some) {
+        if (graph.limits.max_connections.some == 0) { ret false; }
+        if (sel graph.limits.max_connections_per_peer.some) {
+            if (graph.limits.max_connections_per_peer.some
+                > graph.limits.max_connections.some) { ret false; }
+        }
+    }
+    if (sel graph.limits.max_connections_per_peer.some) {
+        if (graph.limits.max_connections_per_peer.some == 0) { ret false; }
+    }
+    ret true;
+}
+
+fun release_connection_storage(owner: *Owner) bool {
+    var ok: bool = true;
+    if (owner.admission.initialized
+        && !process_admission.destroy(?owner.admission)) { ok = false; }
+    if (!hedge_storage.destroy_table[Connection](?owner.connections)) { ok = false; }
+    owner.claimed_connections = 0;
+    owner.free_head           = NO_INDEX;
+    ret ok;
+}
+
+# the io runtime grows on demand, so a configured cap is only a good first
+# guess at the peak. without one a listener starts here and grows with load.
+val INITIAL_CONNECTIONS: usize = 256;
+
 fun runtime_capacity(graph: *schema.Graph, output: *usize) bool {
     var accepts:    usize = 0;
     var quic_count: usize = 0;
@@ -958,11 +1009,13 @@ fun runtime_capacity(graph: *schema.Graph, output: *usize) bool {
         or { quic_count = quic_count + 1; }
         i = i + 1;
     }
+    val connections: usize = limit_or(graph.limits.max_connections,
+        INITIAL_CONNECTIONS);
     var capacity: usize = 0;
-    if (!add_checked(graph.limits.max_connections, accepts, ?capacity)) { ret false; }
+    if (!add_checked(connections, accepts, ?capacity)) { ret false; }
     if (quic_count != 0) {
         val quic: usize = quic_capacity.operation_capacity_required(
-            graph.limits.max_connections, quic_count);
+            connections, quic_count);
         if (quic == 0 || !add_checked(capacity, quic, ?capacity)) { ret false; }
     }
     if (!add_checked(capacity, RUNTIME_RESERVE, ?capacity)) { ret false; }
@@ -1000,26 +1053,13 @@ fun cleanup_start_failure(owner: *Owner) {
         cancel.destroy(?owner.root_scope);
         owner.root_scope_initialized = false;
     }
-    if (owner.connections != nil) {
-        os.deallocate(owner.connections::ptr, $size_of(Connection) * owner.connection_capacity);
-        owner.connections = nil;
-    }
-    if (owner.admission_peers != nil) {
-        os.deallocate(owner.admission_peers::ptr,
-            $size_of(process_admission.PeerSlot) * owner.connection_capacity);
-        owner.admission_peers = nil;
-    }
-    if (owner.admission_leases != nil) {
-        os.deallocate(owner.admission_leases::ptr,
-            $size_of(process_admission.LeaseSlot) * owner.connection_capacity);
-        owner.admission_leases = nil;
-    }
+    release_connection_storage(owner);
     owner.admission.initialized = false;
     owner.state                 = OWNER_STOPPED;
 }
 
 pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
-    if (owner == nil || graph == nil || diagnostics == nil || generation == 0 || graph.listener_count == 0 || graph.listener_count > schema.MAX_LISTENERS || graph.limits.max_connections == 0 || graph.limits.max_connections_per_peer == 0 || graph.limits.max_connections_per_peer > graph.limits.max_connections) {
+    if (owner == nil || graph == nil || diagnostics == nil || generation == 0 || graph.listener_count == 0 || graph.listener_count > schema.MAX_LISTENERS || !limits_valid(graph)) {
         diagnose(diagnostics, schema.INVALID_VALUE, "server", "runtime configuration is invalid");
         ret false;
     }
@@ -1035,14 +1075,12 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
     owner.stop_requested            = false;
     owner.leaked_descriptors        = 0;
     owner.active_set                = NO_INDEX;
-    owner.connection_capacity       = 0;
-    owner.connections               = nil;
-    owner.admission_peers           = nil;
-    owner.admission_leases          = nil;
+    owner.claimed_connections       = 0;
     owner.admission.initialized     = false;
     owner.connection_ctx            = nil;
     owner.connection_completions    = (0::usize)::ConnectionCompletionFun;
     owner.next_connection_id        = 1;
+    owner.max_connections           = graph.limits.max_connections;
     owner.max_connections_per_peer  = graph.limits.max_connections_per_peer;
     owner.sets[0].scope_initialized = false;
     owner.sets[0].state             = SET_UNUSED;
@@ -1124,10 +1162,17 @@ pub fun admission_manager(owner: *Owner) *process_admission.Manager {
 }
 
 pub fun reload(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
-    if (owner == nil || graph == nil || diagnostics == nil || owner.state != OWNER_READY || generation <= owner.generation || graph.limits.max_connections != owner.connection_capacity || graph.limits.max_connections_per_peer != owner.max_connections_per_peer) {
-        diagnose(diagnostics, schema.CONFLICT, "reload", "reload cannot change process-wide connection budgets or generation order");
+    if (owner == nil || graph == nil || diagnostics == nil || owner.state != OWNER_READY || generation <= owner.generation || !limits_valid(graph)) {
+        diagnose(diagnostics, schema.CONFLICT, "reload", "reload cannot change generation order or set an unusable connection limit");
         ret false;
     }
+    if (!process_admission.retune(?owner.admission, graph.limits.max_connections,
+        graph.limits.max_connections_per_peer)) {
+        diagnose(diagnostics, schema.CONFLICT, "reload", "process connection limits could not be retuned");
+        ret false;
+    }
+    owner.max_connections          = graph.limits.max_connections;
+    owner.max_connections_per_peer = graph.limits.max_connections_per_peer;
     val candidate_index: usize = 1 - owner.active_set;
     if (!prepare_set(owner, candidate_index, generation, graph, diagnostics))      { ret false; }
     if (!submit_initial_accepts(owner, ?owner.sets[candidate_index], diagnostics)) { ret false; }
@@ -1155,7 +1200,7 @@ pub fun attach_connections(owner: *Owner, context: ptr, handler: ConnectionCompl
 pub fun take_connection(owner: *Owner, output: *ConnectionToken) bool {
     if (owner == nil || output == nil || owner.queue_head == NO_INDEX) { ret false; }
     val index:      usize       = owner.queue_head;
-    val connection: *Connection = ?owner.connections[index];
+    val connection: *Connection = connection_at(owner, index);
     owner.queue_head = connection.next;
     if (owner.queue_head == NO_INDEX) { owner.queue_tail = NO_INDEX; }
     connection.next  = NO_INDEX;
@@ -1260,8 +1305,8 @@ pub fun stop(owner: *Owner) bool {
         i = i + 1;
     }
     i = 0;
-    for (i < owner.connection_capacity) {
-        val connection: *Connection = ?owner.connections[i];
+    for (i < owner.claimed_connections) {
+        val connection: *Connection = connection_at(owner, i);
         if (connection.state != CONNECTION_FREE) {
             val token: ConnectionToken = ConnectionToken{index: i::u32, generation: connection.generation};
             if (!close_connection(owner, token)) { success = false; }
@@ -1307,27 +1352,9 @@ pub fun stop(owner: *Owner) bool {
         if (!operation_ok(cancel.destroy(?owner.root_scope))) { success = false; }
         owner.root_scope_initialized = false;
     }
-    if (owner.connections != nil) {
-        if (os.deallocate(owner.connections::ptr, $size_of(Connection) * owner.connection_capacity) < 0) { success = false; }
-        owner.connections = nil;
-    }
-    if (owner.admission_peers != nil) {
-        if (os.deallocate(owner.admission_peers::ptr,
-            $size_of(process_admission.PeerSlot) * owner.connection_capacity) < 0) {
-            success = false;
-        }
-        owner.admission_peers = nil;
-    }
-    if (owner.admission_leases != nil) {
-        if (os.deallocate(owner.admission_leases::ptr,
-            $size_of(process_admission.LeaseSlot) * owner.connection_capacity) < 0) {
-            success = false;
-        }
-        owner.admission_leases = nil;
-    }
+    if (!release_connection_storage(owner)) { success = false; }
     owner.admission.initialized   = false;
     owner.active_set              = NO_INDEX;
-    owner.connection_capacity     = 0;
     owner.connection_count        = 0;
     owner.queued_connection_count = 0;
     owner.state                   = OWNER_STOPPED;
