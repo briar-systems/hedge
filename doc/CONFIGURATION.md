@@ -146,6 +146,8 @@ than being read as the start of a request.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and are reloadable.
 
+A QUIC listener sizes its UDP socket's buffers with `receive_buffer_bytes` and `send_buffer_bytes`. When they are absent it asks for 4 MiB to receive and 1 MiB to send, because the kernel default (212 KiB on Linux, about 166 full-size datagrams) overflows under a burst of handshakes, and every dropped Initial costs a client a retransmission timeout. The kernel decides what it grants: Linux doubles the request and caps it at `net.core.rmem_max` and `net.core.wmem_max`. So hedge reads the size back and logs both at startup, as `hedge: socket buffers <listener> receive <granted> (asked <requested>) send <granted> (asked <requested>)`. If the granted size is well below the request, raise those sysctls. Either key on a TCP or local listener is a configuration error, as are zero and sizes past the native signed 32-bit range. Changing either needs a restart, like `backlog`, because the size is applied when the socket is bound.
+
 `server.limits.max_connections` is optional and absent by default. For TCP and
 local listeners, connection storage grows with what is actually connected, so
 leaving it out does not mean an unbounded server: it means the ceiling is the
