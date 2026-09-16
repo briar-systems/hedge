@@ -35,6 +35,7 @@
 - A connection arriving while a finished one is still being torn down waits for its slot instead of being refused, and a poll retires what finished before it admits what arrived (#133). A pool full of live connections still refuses, which is what `max_connections` means; a pool holding a slot open for a teardown does not.
 - A connection advances its engine after every completion it settles, not only when the settlement itself reported progress (#133). Two completions for one connection arrive together whenever both are ready at the same native collect, and the second was being applied to an engine that had never been advanced past the first, which discarded a finished response.
 - A QUIC connection cancelled on its first delivery, or while its routes and timer were first published, starts its close and is released at the drain deadline (#141). It used to stay cancelling for the life of the process, holding its slot and admission lease, and it kept SIGTERM from ever stopping the server.
+- A QUIC connection accepts datagrams as large as the pump receives, rather than the 1200 bytes mach-quic declares by default (#140). quic-go pads its Initials to 1280 bytes and browsers send more than 1200, so no such client could connect: its first delivery was refused and every later datagram with it.
 
 ## [0.4.1] - 2026-09-15
 
