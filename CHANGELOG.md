@@ -16,6 +16,7 @@
 ### Changed
 
 - **Breaking.** `quic_runtime.STATELESS_SENDS` and `quic_capacity.STATELESS_SENDS` are replaced by `MAX_STATELESS_PENDING`, a ceiling rather than a pool size, and `operation_capacity_required` counts one operation per pump (#159).
+- Dependencies: mach-quic v0.9.1, mach-crypto v0.10.3, mach-tls v0.4.1, mach-http v0.9.0, mach-acme v0.3.0 and laurel v0.12.0, and mach-std v3.3.0, so every dependency in hedge's graph builds on one mach-std (std and crypto also in `test/acme/mach.toml`). mach-quic no longer enforces the TLS handshake deadline once the handshake is complete, so an HTTP/3 connection that outlives `handshake_ms` (a slow reader, or any long transfer) is no longer failed at that moment (#145). mach-acme v0.3.0 keeps its store owner-only on Windows (#149).
 
 ## [0.5.0] - 2026-09-16
 
