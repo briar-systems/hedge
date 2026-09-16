@@ -6,6 +6,7 @@
 
 - A burst of concurrent HTTP/3 connections no longer leaves the QUIC listener deaf (#145). A connection force-released at its drain deadline skipped the transport's `finish_close` and ignored a refused `assembly.release_closed`, so its slot was reused over a live TLS server and refused every later connection it was given. Each refusal was reported as a runtime failure, which released every QUIC pump and cancelled the pending receive, so the socket was never read again. The forced release now releases the h3 session, finishes the transport's close, destroys the scope and releases the assembly, retrying on later passes until each step completes, and never frees the slot before then.
 - A datagram or connection that cannot be handled no longer fails the QUIC runtime (#145). A failed datagram is dropped and a failed connection step is retried or the connection is failed, and both are counted in `quic_runtime.Snapshot` (`datagram_failures`, `connection_failures`). `advance` returns `FAILED` only when a pump can no longer receive.
+- TCP connections and QUIC listener sockets close through `net.async` rather than directly (#157). A direct close left any operation the driver still held on a backend resource keyed by the old descriptor, where the next socket to reuse that descriptor would pick it up (briar-systems/mach-std#716). Closing now settles those operations before the descriptor is released. A TCP listener still closes directly, since `net.async` has no listener close and its accepts are drained first.
 
 ### Added
 
