@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-15
+
 ### Changed
 
 - `hedge.service.laurel` ends the application's middleware chain through laurel's exported `router.terminal_handler` rather than its own copy of the mapping (#125). Dependencies: laurel v0.10.0.
