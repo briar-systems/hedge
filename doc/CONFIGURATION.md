@@ -146,13 +146,25 @@ than being read as the start of a request.
 
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and are reloadable.
 
-`server.limits.max_connections` is optional and absent by default. Connection
-storage grows with what is actually connected, so leaving it out does not mean
-an unbounded server: it means the ceiling is the descriptor table and the
-memory the allocator will give, rather than a number an operator has to guess
-and then keep raising. Setting it makes it a policy cap, and admission refuses
-past it exactly as a preallocated pool did. A value of zero is a configuration
-error, not a way to spell no limit, and is reported rather than accepted.
+`server.limits.max_connections` is optional and absent by default. For TCP and
+local listeners, connection storage grows with what is actually connected, so
+leaving it out does not mean an unbounded server: it means the ceiling is the
+descriptor table and the memory the allocator will give, rather than a number
+an operator has to guess and then keep raising. Setting it makes it a policy
+cap on every transport, and admission refuses past it exactly as a preallocated
+pool did. A value of zero is a configuration error, not a way to spell no
+limit, and is reported rather than accepted.
+
+**A QUIC listener is not yet included in the growth.** Its per-connection
+pools — the QUIC connection record, its assembly storage and the HTTP/3 session
+storage — are still allocated once at startup. When `max_connections` is set
+they are sized from it; when it is absent they are sized from an internal
+default of 1024. So a server with a QUIC listener and no configured
+`max_connections` is capped at 1024 concurrent QUIC connections, while its TCP
+listeners are uncapped. If you serve HTTP/3 above that, set `max_connections`
+explicitly to the peak you intend to carry and size the host for it, because
+that number is preallocated rather than grown into. Removing this asymmetry is
+the remaining half of hedge#113.
 
 Under memory pressure an absent limit moves the refusal from a known number to
 an unpredictable one. A connection the allocator cannot find storage for is
