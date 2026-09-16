@@ -558,22 +558,48 @@ fun return_slot(runtime: *Runtime, index: usize) {
     runtime.free_head = index;
 }
 
+# a slot whose connection is in teardown is spoken for but about to be free, and
+# the completion that frees it cannot arrive before the next wait
+fun teardown_pending(runtime: *Runtime) bool {
+    var i: usize = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
+        if (slot.live && slot.retiring) { ret true; }
+        i = slot.next_live;
+    }
+    ret false;
+}
+
 # admit every queued connection the pool can hold and refuse the rest at once
 fun admit(runtime: *Runtime, now: time.Time) usize {
     var admitted: usize = 0;
     for (true) {
+        val index: usize = free_slot(runtime);
+        if (index >= runtime.capacity) {
+            # a pool full of live connections is a refusal, but one holding a
+            # slot open for a teardown is not: that arrival waits a turn instead
+            # of being destroyed for a slot that is already spent
+            if (teardown_pending(runtime)) { brk; }
+            var refused: listener.ConnectionToken;
+            if (!listener.take_connection(?runtime.owner, ?refused)) { brk; }
+            runtime.rejected = runtime.rejected + 1;
+            if (!listener.close_connection(?runtime.owner, refused)) {
+                runtime.teardown_failures = runtime.teardown_failures + 1;
+            }
+            cnt;
+        }
         var token: listener.ConnectionToken;
-        if (!listener.take_connection(?runtime.owner, ?token)) { brk; }
+        if (!listener.take_connection(?runtime.owner, ?token)) {
+            return_slot(runtime, index);
+            brk;
+        }
         val source: *listener.Connection = listener.inspect_connection(?runtime.owner, token);
-        val index:  usize                = free_slot(runtime);
-        if (source == nil || index >= runtime.capacity) {
+        if (source == nil) {
             runtime.rejected = runtime.rejected + 1;
             if (!listener.close_connection(?runtime.owner, token)) {
                 runtime.teardown_failures = runtime.teardown_failures + 1;
             }
-            if (index < runtime.capacity) {
-                return_slot(runtime, index);
-            }
+            return_slot(runtime, index);
             cnt;
         }
         val slot:  *Slot                   = ?runtime.slots[index];
@@ -693,6 +719,22 @@ fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
     ret false;
 }
 
+# retire what has finished and drive what has not
+fun sweep(runtime: *Runtime, now: time.Time) {
+    var i: usize = runtime.live_head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = ?runtime.slots[i];
+        val next: usize = slot.next_live;
+        # a connection still waiting for its budget is not driven, which is what
+        # makes the queue a queue rather than a label
+        if (slot.live && !slot.waiting) {
+            if (slot.retiring) { retire(runtime, i); }
+            or                 { drive(runtime, i, now); }
+        }
+        i = next;
+    }
+}
+
 pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms: i32) bool {
     if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) { ret false; }
     var bounded_timeout: i32       = timeout_ms;
@@ -730,21 +772,14 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
         == quic_runtime.FAILED) {
         quic_ok = false;
     }
+    # the completions just settled may have finished a connection, and a finished
+    # connection holds its pool slot until it is retired. admitting before that
+    # refuses an arrival for a slot that this turn already freed
+    sweep(runtime, now);
     if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
     admit_waiting(runtime, now);
     if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
-    var i: usize = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
-        val next: usize = slot.next_live;
-        # a connection still waiting for its budget is not driven, which is what
-        # makes the queue a queue rather than a label
-        if (slot.live && !slot.waiting) {
-            if (slot.retiring) { retire(runtime, i); }
-            or                 { drive(runtime, i, now); }
-        }
-        i = next;
-    }
+    sweep(runtime, now);
     # plane and tcp progress can release shared budget capacity for quic
     val settled: time.Time = wall_now();
     if (runtime.quic != nil && !runtime.quic_released
@@ -753,18 +788,7 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
         quic_ok = false;
     }
     val promoted: usize = admit_waiting(runtime, settled);
-    if (promoted != 0) {
-        i = runtime.live_head;
-        for (i != NO_SLOT) {
-            val slot: *Slot = ?runtime.slots[i];
-            val next: usize = slot.next_live;
-            if (slot.live && !slot.waiting) {
-                if (slot.retiring) { retire(runtime, i); }
-                or                 { drive(runtime, i, settled); }
-            }
-            i = next;
-        }
-    }
+    if (promoted != 0) { sweep(runtime, settled); }
     if (lifecycle.serving(?runtime.shutdown)) {
         listener.resume_admission(?runtime.owner);
     }
