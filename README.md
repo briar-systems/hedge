@@ -33,7 +33,7 @@ and HTTP/2 clients into timeouts. The measured state, against Caddy, is in
 - graceful configuration reload and connection draining
 - strict resource bounds and hostile-input handling
 - structured logs, metrics, traces, health, and readiness
-- native Linux, Darwin, and Windows operation
+- native Linux, Darwin, and Windows operation (Windows builds today but is not supported at runtime yet, see #149)
 - small idle footprint and pay-for-what-is-enabled composition
 
 Lightweight does not mean omitting production duties. It means that protocol engines, storage, observability, and optional services are independent components with explicit ownership and no mandatory framework runtime.
