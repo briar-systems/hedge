@@ -45,11 +45,15 @@ pub rec Adapter {
     bound:       bool;
 }
 
+# one exchange's laurel state, allocated from the request arena and reached
+# again through the call on every re-entry. the execution is laurel's cursor
+# across suspensions, so it must outlive the entry that started it.
 rec RequestState {
     application: *app.App;
     terminal:    router.Terminal;
     context:     context.Context;
     recorder:    observability.Recorder;
+    execution:   middleware.Execution;
     outcome:     middleware.Outcome;
     identifier:  [32]char;
     bound:       bool;
@@ -65,6 +69,13 @@ fun finalize_request(owner: ptr, active: *call.Call) bool {
     if (!state.bound) { ret true; }
     val active_scope: *cancel.Scope = call.scope(active);
     if (state.application == nil || active_scope == nil) { ret false; }
+    # the exchange is going away while a step still holds it: every middleware
+    # exit half that is owed runs here, and a context that still owns an
+    # execution refuses to unbind, so this is what keeps the request from leaking
+    if (middleware.suspended(?state.execution)) {
+        state.outcome = app.abandon(state.application, ?state.execution,
+            ?state.context);
+    }
     val released: bool = app.release_context(state.application, ?state.context,
         app.Termination{outcome: state.outcome, reason: cancel.reason(active_scope),
         status:   active.exchange.completion.status,
@@ -102,22 +113,51 @@ fun status_for(outcome: middleware.Outcome) exchange.ServiceStatus {
     ret exchange.SERVICE_FAILED;
 }
 
-pub fun serve(owner: ptr, active: *call.Call) exchange.ServiceStatus {
-    if (owner == nil || active == nil || !call.entered(active)) {
-        ret exchange.SERVICE_FAILED;
-    }
-    val adapter: *Adapter = owner::*Adapter;
-    if (!adapter.bound || adapter.application == nil) {
-        ret exchange.SERVICE_FAILED;
+# the outcome laurel reached is the response's fate
+#
+# a pending outcome is not a termination: the handler is waiting on body i/o the
+# connection has yet to deliver, and the call is entered again once it has.
+fun settle(state: *RequestState, active: *call.Call) exchange.ServiceStatus {
+    if (state.outcome.status == middleware.EXECUTION_PENDING) {
+        ret exchange.SERVICE_PENDING;
     }
     val bound: *exchange.Exchange = active.exchange;
-    val arena: *A.Allocator       = call.allocator_of(active);
-    if (bound == nil || arena == nil || call.cancelled(active)) {
+    val served: exchange.ServiceStatus = status_for(state.outcome);
+    if (served != exchange.SERVICE_COMPLETE) { ret served; }
+    if (bound.response.committed) {
+        if (!call.resolve_body(active, call.BODY_DRAIN)) {
+            ret exchange.SERVICE_FAILED;
+        }
+    }
+    or (bound.response.body_kind == message.BODY_NONE) {
+        if (service.commit_bodyless(active, call.BODY_DRAIN)
+            != exchange.SERVICE_COMPLETE) { ret exchange.SERVICE_FAILED; }
+    }
+    or (!call.resolve_body(active, call.BODY_DRAIN)
+        || service.commit(active) != message.RESPONSE_OK) {
         ret exchange.SERVICE_FAILED;
     }
+    ret served;
+}
 
-    # laurel's context, recorder, outcome, and identifier live until the owning
-    # exchange settles, so no concurrent calls share request state
+# re-enter the suspended step, and only it. nothing that already ran runs again,
+# so the handler does its work once however many times it suspends. a scope that
+# died while the request waited abandons here rather than resuming.
+fun resume_request(state: *RequestState,
+    active: *call.Call) exchange.ServiceStatus {
+    if (!state.bound || state.application == nil
+        || !middleware.suspended(?state.execution)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    state.outcome = app.resume(state.application, ?state.execution,
+        ?state.context);
+    ret settle(state, active);
+}
+
+fun start_request(adapter: *Adapter, active: *call.Call,
+    bound: *exchange.Exchange, arena: *A.Allocator) exchange.ServiceStatus {
+    # laurel's context, recorder, execution, outcome, and identifier live until
+    # the owning exchange settles, so no concurrent calls share request state
     val allocated: res[*RequestState, A.Error] =
         A.zallocate[RequestState](arena, 1);
     if (sel allocated.err) {
@@ -128,6 +168,8 @@ pub fun serve(owner: ptr, active: *call.Call) exchange.ServiceStatus {
     if (!render_request_id(active.telemetry, ?state.identifier[0])) {
         ret exchange.SERVICE_FAILED;
     }
+    # the finalizer both tears the request down and is how the next entry finds
+    # this state again, so it is attached before anything laurel owns is bound
     if (!call.attach_finalizer(active, call.Finalizer{
         ctx: state::ptr, finish: finalize_request
     })) {
@@ -152,25 +194,30 @@ pub fun serve(owner: ptr, active: *call.Call) exchange.ServiceStatus {
         ret exchange.SERVICE_FAILED;
     }
     state.bound = true;
-
-    state.outcome = app.execute(adapter.application,
+    state.outcome = app.execute(adapter.application, ?state.execution,
         router.terminal_handler(?state.terminal), ?state.context);
-    val served: exchange.ServiceStatus = status_for(state.outcome);
-    if (served != exchange.SERVICE_COMPLETE) { ret served; }
-    if (bound.response.committed) {
-        if (!call.resolve_body(active, call.BODY_DRAIN)) {
-            ret exchange.SERVICE_FAILED;
-        }
-    }
-    or (bound.response.body_kind == message.BODY_NONE) {
-        if (service.commit_bodyless(active, call.BODY_DRAIN)
-            != exchange.SERVICE_COMPLETE) { ret exchange.SERVICE_FAILED; }
-    }
-    or (!call.resolve_body(active, call.BODY_DRAIN)
-        || service.commit(active) != message.RESPONSE_OK) {
+    ret settle(state, active);
+}
+
+pub fun serve(owner: ptr, active: *call.Call) exchange.ServiceStatus {
+    if (owner == nil || active == nil || !call.entered(active)) {
         ret exchange.SERVICE_FAILED;
     }
-    ret served;
+    val adapter: *Adapter = owner::*Adapter;
+    if (!adapter.bound || adapter.application == nil) {
+        ret exchange.SERVICE_FAILED;
+    }
+    val bound: *exchange.Exchange = active.exchange;
+    val arena: *A.Allocator       = call.allocator_of(active);
+    if (bound == nil || arena == nil) { ret exchange.SERVICE_FAILED; }
+    # an exchange that already reached laurel is resumed, never dispatched,
+    # bound or executed a second time
+    val started: ptr = call.finalizer_state(active, finalize_request);
+    if (started != nil) {
+        ret resume_request(started::*RequestState, active);
+    }
+    if (call.cancelled(active)) { ret exchange.SERVICE_FAILED; }
+    ret start_request(adapter, active, bound, arena);
 }
 
 # the application's own router and fallback decide every request
