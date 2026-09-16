@@ -47,20 +47,3 @@ each. `mach test` runs its cases as parallel processes sharing one machine, so a
 case that saturates the box would change what every other case measures. It
 belongs in a CI lane against a release build instead.
 
-## Why it is not in CI yet
-
-The TLS cell does not pass on this branch, and it is not supposed to. It fails
-on mach-std v2.1.0, which is what `dev` pins, with around half the connections
-served less than half of what the median connection got. That is
-[#122](https://github.com/briar-systems/hedge/issues/122), still open, and this
-lane is the thing that measures it.
-
-Wiring it into `.github/workflows/ci.yml` therefore waits for the pin bump in
-[#128](https://github.com/briar-systems/hedge/pull/128), which is where it first
-goes green. Adding the step here would only put a permanently red check on
-`dev`, and a check that always fails is ignored as quickly as one that can never
-fail.
-
-Until then it is run by hand, which is the point of landing it early: anything
-touching how the connection plane schedules work can be measured against it
-before the pin moves.

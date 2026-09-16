@@ -5,13 +5,15 @@
 ### Added
 
 - `call.finalizer_state`: the service that attached a call's finalizer reclaims the per-exchange state it owns when the call is entered again, so a service that reports itself pending needs no registry of its own (#116).
+- `test/load/`, a harness that holds 256 connections open against the real executable and requires every one of them to be served, wired into CI here because it only passes once the mach-std pin has moved. Cleartext runs beside TLS as the control (#122).
 
 ### Changed
 
 - `hedge.service.laurel` resumes a suspended laurel request instead of re-running it (#116). `RequestState` gains laurel's `middleware.Execution`, a pending execution is reported as `SERVICE_PENDING`, and re-entry calls `app.resume` rather than dispatching, binding and executing a second time. The handler is entered once however many reads its body takes.
 - The laurel adapter calls `app.abandon` before releasing a context whose execution is still suspended, so a connection that dies mid-suspension still runs every middleware exit half that is owed and cannot leak an admission slot (#116).
-- Dependencies: laurel v0.11.0, mach-crypto v0.9.2. laurel's handler and middleware signatures changed in v0.11.0: a middleware is now a `before`/`resume`/`after` triple, and a handler returns `handler.Result` (#116). hedge stays on mach-std v2.1.0, which laurel v0.11.0 supports even though it pins v2.2.0 for itself; that bump belongs to #122.
+- Dependencies: laurel v0.11.0, mach-crypto v0.9.2. laurel's handler and middleware signatures changed in v0.11.0: a middleware is now a `before`/`resume`/`after` triple, and a handler returns `handler.Result` (#116). laurel v0.11.0 supports mach-std v2.1.0 as well as the v2.2.0 it pins for itself; hedge takes v2.2.0 in #122.
 - `test/acme` declares `mach-crypto` itself, as it already declares `mach-std`. laurel reaches crypto with a different selection than hedge's other dependencies, and hedge's own root declaration cannot settle a graph where hedge is not the root (#116).
+- Dependencies: mach-std v2.2.0, in `mach.toml` and in `test/acme/mach.toml`, which declares its own and is the root of its own graph. `io.runtime.wait` now collects native readiness on every call, so one connection streaming a response no longer keeps any other socket's readiness from being collected. Concurrent TLS connections are served evenly rather than starved (#122, briar-systems/mach-std#658).
 
 ### Added
 
