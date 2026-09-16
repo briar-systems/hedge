@@ -155,16 +155,12 @@ cap on every transport, and admission refuses past it exactly as a preallocated
 pool did. A value of zero is a configuration error, not a way to spell no
 limit, and is reported rather than accepted.
 
-**A QUIC listener is not yet included in the growth.** Its per-connection
-pools — the QUIC connection record, its assembly storage and the HTTP/3 session
-storage — are still allocated once at startup. When `max_connections` is set
-they are sized from it; when it is absent they are sized from an internal
-default of 1024. So a server with a QUIC listener and no configured
-`max_connections` is capped at 1024 concurrent QUIC connections, while its TCP
-listeners are uncapped. If you serve HTTP/3 above that, set `max_connections`
-explicitly to the peak you intend to carry and size the host for it, because
-that number is preallocated rather than grown into. Removing this asymmetry is
-the remaining half of hedge#113.
+QUIC listeners grow the same way. A QUIC connection's record, its assembly and
+TLS storage, its HTTP/3 session, its routes, its timer and any initial packet
+queued for it are all claimed as the connection is admitted and given back when
+it retires, so a server with a QUIC listener and no configured
+`max_connections` is no more capped on HTTP/3 than it is on TCP, and an idle
+QUIC listener holds none of that storage.
 
 Under memory pressure an absent limit moves the refusal from a known number to
 an unpredictable one. A connection the allocator cannot find storage for is
