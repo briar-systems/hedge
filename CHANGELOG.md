@@ -18,6 +18,7 @@
 
 - `call.finalizer_state`: the service that attached a call's finalizer reclaims the per-exchange state it owns when the call is entered again, so a service that reports itself pending needs no registry of its own (#116).
 - `test/load/`, a harness that holds 256 connections open against the real executable and requires every one of them to be served, wired into CI here because it only passes once the mach-std pin has moved. Cleartext runs beside TLS as the control (#122).
+- `test/load/` QUIC cells (#138). One server with no limit has to serve 1100 concurrent HTTP/3 connections, and a server capped at 48 has to admit QUIC to exactly what 32 held TCP connections leave, refuse the rest, and then refuse TCP while QUIC holds its share. The served-1100 cell does not pass yet (#145) and is not wired into CI. `test/load/h3load` is a quic-go client kept for when mach-quic accepts Initials above 1200 bytes (#140).
 
 ### Changed
 
