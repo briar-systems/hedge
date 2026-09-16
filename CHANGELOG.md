@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A burst of concurrent HTTP/3 connections no longer leaves the QUIC listener deaf (#145). A connection force-released at its drain deadline skipped the transport's `finish_close` and ignored a refused `assembly.release_closed`, so its slot was reused over a live TLS server and refused every later connection it was given. Each refusal was reported as a runtime failure, which released every QUIC pump and cancelled the pending receive, so the socket was never read again. The forced release now releases the h3 session, finishes the transport's close, destroys the scope and releases the assembly, retrying on later passes until each step completes, and never frees the slot before then.
+- A datagram or connection that cannot be handled no longer fails the QUIC runtime (#145). A failed datagram is dropped and a failed connection step is retried or the connection is failed, and both are counted in `quic_runtime.Snapshot` (`datagram_failures`, `connection_failures`). `advance` returns `FAILED` only when a pump can no longer receive.
+
 ### Added
 
 - QUIC listeners size their UDP socket buffers (#153). `receive_buffer_bytes` and `send_buffer_bytes` on a `[[listener]]` set them, and an absent value asks for 4 MiB to receive and 1 MiB to send rather than the kernel default that a handshake burst overflowed. The size the kernel granted is read back and logged at startup next to the request, since Linux doubles and caps it. The keys are refused on TCP and local listeners, and changing them needs a restart.

@@ -1,4 +1,12 @@
 # caller-owned quic and http/3 socket runtime
+#
+# failure scope. a datagram that cannot be handled costs that datagram, and a
+# connection that cannot be served costs that connection: it is failed, and its
+# release is retried on later passes until everything it holds is returned.
+# neither ever fails the runtime, because the runtime failing releases every
+# pump and with it every other connection. `advance` returns FAILED only when a
+# pump can no longer receive, since a pump that stops reading is an outage
+# nothing on a later pass would repair. `snapshot` counts the scoped failures.
 
 use std.chrono.time;
 use std.crypto.ct;
@@ -401,14 +409,17 @@ pub rec Pump {
 }
 
 pub rec Snapshot {
-    pumps:       usize;
-    live:        usize;
-    superseded:  usize;
-    routes:      usize;
-    timers:      usize;
-    broken:      usize;
-    stopping:    bool;
-    initialized: bool;
+    pumps:      usize;
+    live:       usize;
+    superseded: usize;
+    routes:     usize;
+    timers:     usize;
+    broken:     usize;
+    # datagrams dropped and connection steps that failed, since make
+    datagram_failures:   u64;
+    connection_failures: u64;
+    stopping:            bool;
+    initialized:         bool;
 }
 
 pub rec Runtime {
@@ -423,11 +434,13 @@ pub rec Runtime {
     free_head:           usize;
     # the live connections, so every sweep costs what is live rather than what
     # was configured. an idle QUIC listener sweeps nothing.
-    live_head:         usize;
-    admission:         *process_admission.Manager;
-    live_connections:  usize;
-    live_total:        usize;
-    pending_free_head: usize;
+    live_head:           usize;
+    admission:           *process_admission.Manager;
+    live_connections:    usize;
+    live_total:          usize;
+    datagram_failures:   u64;
+    connection_failures: u64;
+    pending_free_head:   usize;
     # the queued initials, so a sweep costs what is queued rather than what
     # the configured connection limit reserved
     pending_live_head:     usize;
@@ -724,6 +737,8 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.live_head             = NO_CONNECTION;
     runtime.live_connections      = 0;
     runtime.live_total            = 0;
+    runtime.datagram_failures     = 0;
+    runtime.connection_failures   = 0;
     runtime.pending_free_head     = NO_CONNECTION;
     runtime.pending_live_head     = NO_CONNECTION;
     runtime.pending_initial_count = 0;
@@ -2202,17 +2217,22 @@ fun fail_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     }
 }
 
+# the abortive counterpart of release_connection. each step either completes
+# or leaves the connection live to be retried on a later pass, and the slot is
+# only finalized once the transport and the assembly are both released: a slot
+# reused over an unreleased assembly refuses every connection it is given.
 fun force_release_connection(controls: *ControlView, runtime: *Runtime,
-    index: usize) Status {
+    index: usize, now: time.Time, now_ns: u64) Status {
     val value: *Connection = connection_at(controls, index);
     if (!value.live) { ret OK; }
+    value.state = CONNECTION_BROKEN;
     if (!value.timer_disarmed) {
         timers.disarm(?runtime.timer_queue, index, value.generation);
         value.timer_disarmed = true;
     }
     if (!value.routes_removed) {
         reconcile_routes(controls, runtime, index);
-        remove_routes(runtime, value);
+        if (!remove_routes(runtime, value)) { ret FAILED; }
         value.routes_removed = true;
     }
     val pump: *Pump                = ?controls.pumps[value.pump];
@@ -2225,6 +2245,26 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
         budget.release(value.budgets, ?value.budget_charge);
         value.budget_charge_live = false;
     }
+    if (value.h3_session != h3_session.NO_SESSION) {
+        val session: *h3_session.Session = h3_session.session_at(
+            ?runtime.sessions, controls.sessions, value.h3_session);
+        if (session != nil && !value.h3_cancelled) {
+            h3_session.cancel_session(session);
+            value.h3_cancelled = true;
+        }
+        if (!drive_h3(controls, runtime, value, now, now_ns)
+            || value.h3_session != h3_session.NO_SESSION) { ret BLOCKED; }
+    }
+    # finishing the close unregisters the transport from the connection scope
+    # and clears its operation scope, which release_closed requires
+    if (value.assembly_attempted && !value.transport_finished) {
+        qt.cancel_connection[binding.Binding](?value.assembly.driver);
+        val finished: qt.OperationResult =
+            qt.finish_close[binding.Binding](?value.assembly.driver);
+        if (finished.status == qt.STATUS_BLOCKED) { ret BLOCKED; }
+        if (finished.status != qt.STATUS_OK)      { ret FAILED; }
+        value.transport_finished = true;
+    }
     # an operation still registered on the scope settles through its own
     # cancellation, so the scope is released on a later pass rather than orphaned
     if (value.scope_live) {
@@ -2234,8 +2274,9 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
         if (!operation_ok(cancel.destroy(?value.storage.scope))) { ret BLOCKED; }
         value.scope_live = false;
     }
-    if (!value.assembly_released) {
-        assembly.release_closed(?value.assembly);
+    # an assembly that was never initialized holds nothing to release
+    if (value.assembly_attempted && !value.assembly_released) {
+        if (!assembly.release_closed(?value.assembly)) { ret FAILED; }
         value.assembly_released = true;
     }
     value.state = CONNECTION_FINALIZING;
@@ -2498,7 +2539,9 @@ fun settle_receive(controls: *ControlView, runtime: *Runtime, context: *Completi
         for (i < completion.items) {
             val applied: Status = process_datagram(controls, runtime, context.pump,
                 ?pump.storage.receive_packets[i], now, now_ns);
-            if (applied == FAILED) { status = FAILED; }
+            if (applied == FAILED) {
+                runtime.datagram_failures = runtime.datagram_failures + 1;
+            }
             i = i + 1;
         }
     }
@@ -2691,10 +2734,10 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     }
     if (!value.live || value.state == CONNECTION_CLEANUP) { ret BLOCKED; }
     if (value.state == CONNECTION_BROKEN) {
-        ret force_release_connection(controls, runtime, index);
+        ret force_release_connection(controls, runtime, index, now, now_ns);
     }
     if (value.close_deadline_ns != 0 && now_ns >= value.close_deadline_ns) {
-        ret force_release_connection(controls, runtime, index);
+        ret force_release_connection(controls, runtime, index, now, now_ns);
     }
     if (!value.transport_finished) {
         observe_transport_close(value, now_ns);
@@ -2714,7 +2757,7 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
         if (finished.status == qt.STATUS_BLOCKED) { ret BLOCKED; }
         if (finished.status != qt.STATUS_OK) {
             value.state = CONNECTION_BROKEN;
-            ret force_release_connection(controls, runtime, index);
+            ret force_release_connection(controls, runtime, index, now, now_ns);
         }
         if (!value.timer_disarmed) {
             if (timers.disarm(?runtime.timer_queue, index,
@@ -2751,7 +2794,7 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     if (!value.assembly_released) {
         if (!assembly.release_closed(?value.assembly)) {
             value.state = CONNECTION_BROKEN;
-            ret force_release_connection(controls, runtime, index);
+            ret force_release_connection(controls, runtime, index, now, now_ns);
         }
         value.assembly_released = true;
     }
@@ -2867,6 +2910,10 @@ fun cancel_pending_bank(controls: *ControlView, runtime: *Runtime, pump_index: u
     ret success;
 }
 
+fun connection_failed(runtime: *Runtime) {
+    runtime.connection_failures = runtime.connection_failures + 1;
+}
+
 pub fun advance(controls: *ControlView, runtime: *Runtime, now: time.Time,
     now_ns: u64) Status {
     if (runtime == nil || !runtime.initialized || now_ns == 0) { ret INVALID; }
@@ -2881,7 +2928,10 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now: time.Time,
         # connection waiting on io this call cannot deliver. re-arm it and
         # yield, or the loop starves the completions it is waiting for.
         if (value != nil && value.timer_pass == runtime.advance_pass) {
-            if (!refresh_timer(controls, runtime, index)) { status = FAILED; }
+            if (!refresh_timer(controls, runtime, index)) {
+                connection_failed(runtime);
+                fail_connection(controls, runtime, index, now_ns);
+            }
             brk;
         }
         if (value != nil) {
@@ -2907,14 +2957,14 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now: time.Time,
         val value: *Connection = connection_at(controls, i);
         val next:  usize       = value.next_live;
         if (value.state == CONNECTION_CLEANUP) {
-            if (!cleanup_accepting(controls, runtime, i)) { status = FAILED; }
+            if (!cleanup_accepting(controls, runtime, i)) { connection_failed(runtime); }
         }
         or (value.state == CONNECTION_FINALIZING) {
-            if (finalize_connection(controls, runtime, i) == FAILED) { status = FAILED; }
+            if (finalize_connection(controls, runtime, i) == FAILED) { connection_failed(runtime); }
         }
         or (value.state == CONNECTION_BROKEN) {
             if (release_connection(controls, runtime, i, now, now_ns) == FAILED) {
-                status = FAILED;
+                connection_failed(runtime);
             }
         }
         or {
@@ -2922,12 +2972,15 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now: time.Time,
                 fail_connection(controls, runtime, i, now_ns);
             }
             val released: Status = release_connection(controls, runtime, i, now, now_ns);
-            if (released == FAILED) { status = FAILED; }
+            if (released == FAILED) {
+                connection_failed(runtime);
+                fail_connection(controls, runtime, i, now_ns);
+            }
         }
         i = next;
     }
     if (advance_pending_initials(controls, runtime, now, now_ns) == FAILED) {
-        status = FAILED;
+        connection_failed(runtime);
     }
     ret status;
 }
@@ -3181,13 +3234,15 @@ pub fun budgets_in_use(controls: *ControlView, runtime: *Runtime, target: *budge
 pub fun snapshot(controls: *ControlView, runtime: *Runtime) Snapshot {
     var value: Snapshot;
     if (runtime == nil || !runtime.initialized) { ret value; }
-    value.pumps       = runtime.pump_count;
-    value.live        = runtime.live_total;
-    value.superseded  = superseded(controls, runtime);
-    value.routes      = runtime.routes.len;
-    value.timers      = runtime.timer_queue.len;
-    value.stopping    = runtime.stopping;
-    value.initialized = true;
+    value.pumps               = runtime.pump_count;
+    value.live                = runtime.live_total;
+    value.superseded          = superseded(controls, runtime);
+    value.routes              = runtime.routes.len;
+    value.timers              = runtime.timer_queue.len;
+    value.datagram_failures   = runtime.datagram_failures;
+    value.connection_failures = runtime.connection_failures;
+    value.stopping            = runtime.stopping;
+    value.initialized         = true;
     var i: usize = runtime.live_head;
     for (i != NO_CONNECTION) {
         if (connection_at(controls, i).state == CONNECTION_BROKEN) {
@@ -4331,5 +4386,63 @@ test "hedge.protocol.quic.runtime: a failed first delivery is released at the dr
         value.close_deadline_ns) != OK) { ret 5; }
     if (value.live || runtime.live_connections != 0
         || runtime.free_head != index) { ret 6; }
+    ret 0;
+}
+
+# a connection that cannot finish its cleanup costs that connection. failing
+# the runtime instead released every pump, and the pending receive with them,
+# so the listener never read again (#145)
+test "hedge.protocol.quic.runtime: a connection that cannot finish cleanup does not fail the runtime" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    var manager:  process_admission.Manager;
+    if (!process_admission.make(?manager, test_allocator(),
+        opt[usize].some{1}, opt[usize].some{1})) { ret 1; }
+    var lease: process_admission.Lease;
+    if (!process_admission.reserve(?manager, nil, ?lease)
+        || !process_admission.commit(?manager, lease)) { ret 2; }
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    runtime.admission = ?manager;
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0, lease);
+    if (index == NO_CONNECTION) { ret 91; }
+    val connection: *Connection = connection_at(controls, index);
+    connection.state = CONNECTION_CLEANUP;
+    # the lease cannot be returned, so the cleanup cannot finish this pass
+    runtime.admission = nil;
+    if (advance(controls, ?runtime, time.Time{sec: 1, nsec: 0}, 1) != OK
+        || !connection.live
+        || snapshot(controls, ?runtime).connection_failures != 1) { ret 3; }
+    runtime.admission = ?manager;
+    if (advance(controls, ?runtime, time.Time{sec: 1, nsec: 0}, 2) != OK
+        || connection.live || process_admission.in_use(?manager) != 0) { ret 4; }
+    ret 0;
+}
+
+# a slot reused over an assembly that was never released refuses every
+# connection it is given, so a forced release that cannot release the assembly
+# keeps the slot and retries rather than freeing it (#145)
+test "hedge.protocol.quic.runtime: a forced release keeps a slot whose assembly is not released" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret 91; }
+    val value: *Connection = connection_at(controls, index);
+    # an attempted assembly whose transport never initialized cannot be released
+    value.assembly_attempted = true;
+    value.transport_finished = true;
+    value.close_started      = true;
+    value.close_deadline_ns  = 5;
+    value.state              = CONNECTION_RELEASING;
+    if (release_connection(controls, ?runtime, index,
+        time.Time{sec: 1, nsec: 0}, 10) == OK) { ret 1; }
+    if (!value.live || value.assembly_released || runtime.free_head == index
+        || value.state != CONNECTION_BROKEN) { ret 2; }
+    val other: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (other == index || other == NO_CONNECTION) { ret 3; }
     ret 0;
 }
