@@ -13,6 +13,10 @@
 - Dependencies: laurel v0.11.0, mach-crypto v0.9.2. laurel's handler and middleware signatures changed in v0.11.0: a middleware is now a `before`/`resume`/`after` triple, and a handler returns `handler.Result` (#116). hedge stays on mach-std v2.1.0, which laurel v0.11.0 supports even though it pins v2.2.0 for itself; that bump belongs to #122.
 - `test/acme` declares `mach-crypto` itself, as it already declares `mach-std`. laurel reaches crypto with a different selection than hedge's other dependencies, and hedge's own root declaration cannot settle a graph where hedge is not the root (#116).
 
+### Added
+
+- `cache: a response is stored when its client stops writing before the answer` constructs the two-completions-in-one-wait pairing rather than waiting for the runtime to produce it, by half-closing the client before the server answers, so it guards the fixes below at any mach-std pin (#133).
+
 ### Fixed
 
 - A proxy link that received its whole response is returned to the idle pool even when the client goes away in the same turn the last of that response arrived (#133). The link settles what it already holds before its reusability is judged, and reusability is read from the upstream rather than from how the downstream exchange ended.
