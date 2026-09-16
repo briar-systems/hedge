@@ -1,9 +1,24 @@
 # process-wide connection admission
+#
+# peer and lease storage grows with what is connected rather than being sized
+# from a configured ceiling. `max_connections` is a policy cap: absent means the
+# only ceiling this manager imposes is what the allocator will give, present
+# means it refuses past that count exactly as a preallocated pool did. storage
+# a caller preallocates for its own connections is its own bound, not this one.
 
+use hedge.storage;
+use A: std.allocator;
+use std.allocator.page;
+use std.collections.map;
+use std.crypto.rand;
+use io_error: std.io.error;
 use std.net.ip;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 
 pub val NO_SLOT: usize = (-1)::usize;
@@ -13,9 +28,10 @@ val SLOT_RESERVED:  u8 = 1;
 val SLOT_COMMITTED: u8 = 2;
 
 pub rec PeerSlot {
-    address: ip.Addr;
-    count:   usize;
-    live:    bool;
+    address:   ip.Addr;
+    count:     usize;
+    next_free: usize;
+    live:      bool;
 }
 
 pub rec LeaseSlot {
@@ -25,23 +41,24 @@ pub rec LeaseSlot {
     state:      u8;
 }
 
-pub rec Storage {
-    peers:          *PeerSlot;
-    peer_capacity:  usize;
-    leases:         *LeaseSlot;
-    lease_capacity: usize;
-}
-
 pub rec Lease {
     index:      usize;
     generation: u64;
 }
 
 pub rec Manager {
-    storage:                  Storage;
-    max_connections:          usize;
-    max_connections_per_peer: usize;
-    free_head:                usize;
+    allocator: *A.Allocator;
+    peers:     storage.Table[PeerSlot];
+    leases:    storage.Table[LeaseSlot];
+    # address to peer slot, so admitting a peer costs a lookup rather than a
+    # scan of everything the pool has ever grown to
+    index:                    map.Map[ip.Addr, usize];
+    max_connections:          opt[usize];
+    max_connections_per_peer: opt[usize];
+    peer_free_head:           usize;
+    lease_free_head:          usize;
+    claimed_peers:            usize;
+    claimed_leases:           usize;
     live:                     usize;
     initialized:              bool;
 }
@@ -96,62 +113,164 @@ fun address_equal(left: ip.Addr, right: ip.Addr) bool {
     ret true;
 }
 
-fun find_peer(manager: *Manager, address: ip.Addr) usize {
-    var i: usize = 0;
-    for (i < manager.storage.peer_capacity) {
-        val slot: *PeerSlot = ?manager.storage.peers[i];
-        if (slot.live && address_equal(slot.address, address)) { ret i; }
-        i = i + 1;
+# the peer key is what a remote chooses, so the index is seeded once per process
+# and a flood of crafted addresses cannot be made to collide
+var hash_seed:      u64;
+var hash_seed_live: bool;
+
+fun seed() u64 {
+    if (!hash_seed_live) {
+        val filled: err[io_error.Error] = rand.fill((?hash_seed)::*u8, 8);
+        if (sel filled.err) { hash_seed = 0x9e3779b97f4a7c15; }
+        hash_seed_live = true;
     }
-    ret NO_SLOT;
+    ret hash_seed;
 }
 
-fun free_peer(manager: *Manager) usize {
-    var i: usize = 0;
-    for (i < manager.storage.peer_capacity) {
-        if (!manager.storage.peers[i].live) { ret i; }
-        i = i + 1;
+fun hash_address(key: ptr) u64 {
+    val address: *ip.Addr = key::*ip.Addr;
+    var value:   u64      = seed() ^ 0xcbf29ce484222325;
+    var count:   usize    = 4;
+    var octets:  *u8      = ?address.v4.octets[0];
+    if (address.is_v6 != 0) {
+        count  = 16;
+        octets = ?address.v6.octets[0];
     }
-    ret NO_SLOT;
+    value = (value ^ (address.is_v6::u64)) * 0x100000001b3;
+    var i: usize = 0;
+    for (i < count) {
+        value = (value ^ (octets[i]::u64)) * 0x100000001b3;
+        i     = i + 1;
+    }
+    ret value;
 }
 
-pub fun make(manager: *Manager, storage: Storage, max_connections: usize,
-    max_connections_per_peer: usize) bool {
-    if (manager == nil || manager.initialized || max_connections == 0
-        || max_connections_per_peer == 0
-        || max_connections_per_peer > max_connections || storage.peers == nil
-        || storage.peer_capacity < max_connections || storage.leases == nil
-        || storage.lease_capacity < max_connections) { ret false; }
-    manager.storage                  = storage;
-    manager.max_connections          = max_connections;
-    manager.max_connections_per_peer = max_connections_per_peer;
-    manager.free_head                = 0;
-    manager.live                     = 0;
-    var i: usize = 0;
-    for (i < storage.peer_capacity) {
-        storage.peers[i].live  = false;
-        storage.peers[i].count = 0;
-        i                      = i + 1;
-    }
-    i = 0;
-    for (i < storage.lease_capacity) {
-        storage.leases[i].state      = SLOT_FREE;
-        storage.leases[i].generation = 0;
-        storage.leases[i].peer       = NO_SLOT;
-        storage.leases[i].next_free  = i + 1;
-        if (i + 1 == storage.lease_capacity) {
-            storage.leases[i].next_free = NO_SLOT;
-        }
-        i = i + 1;
-    }
-    manager.initialized = true;
+fun equal_address(left: ptr, right: ptr) bool {
+    ret address_equal(@(left::*ip.Addr), @(right::*ip.Addr));
+}
+
+fun limit_valid(limit: opt[usize]) bool {
+    if (sel limit.some) { ret limit.some != 0; }
     ret true;
 }
 
+fun limits_ordered(max_connections: opt[usize],
+    max_connections_per_peer: opt[usize]) bool {
+    if (sel max_connections.some) {
+        if (sel max_connections_per_peer.some) {
+            ret max_connections_per_peer.some <= max_connections.some;
+        }
+    }
+    ret true;
+}
+
+pub fun make(manager: *Manager, a: *A.Allocator, max_connections: opt[usize],
+    max_connections_per_peer: opt[usize]) bool {
+    if (manager == nil || manager.initialized || a == nil
+        || !limit_valid(max_connections)
+        || !limit_valid(max_connections_per_peer)) { ret false; }
+    if (!limits_ordered(max_connections, max_connections_per_peer)) { ret false; }
+    if (!storage.make_table[PeerSlot](?manager.peers, a)
+        || !storage.make_table[LeaseSlot](?manager.leases, a)) { ret false; }
+    manager.allocator = a;
+    manager.index     = map.init[ip.Addr, usize](a, hash_address,
+        equal_address);
+    manager.max_connections          = max_connections;
+    manager.max_connections_per_peer = max_connections_per_peer;
+    manager.peer_free_head           = NO_SLOT;
+    manager.lease_free_head          = NO_SLOT;
+    manager.claimed_peers            = 0;
+    manager.claimed_leases           = 0;
+    manager.live                     = 0;
+    manager.initialized              = true;
+    ret true;
+}
+
+# a reload may move the policy caps. storage is not sized from them, so the
+# only rule is that a lowered cap stops new admissions rather than evicting
+# leases already held above it.
+pub fun retune(manager: *Manager, max_connections: opt[usize],
+    max_connections_per_peer: opt[usize]) bool {
+    if (manager == nil || !manager.initialized
+        || !limit_valid(max_connections)
+        || !limit_valid(max_connections_per_peer)) { ret false; }
+    if (!limits_ordered(max_connections, max_connections_per_peer)) { ret false; }
+    manager.max_connections          = max_connections;
+    manager.max_connections_per_peer = max_connections_per_peer;
+    ret true;
+}
+
+pub fun destroy(manager: *Manager) bool {
+    if (manager == nil || !manager.initialized || manager.live != 0) { ret false; }
+    val dropped: err[A.Error] = map.dnit[ip.Addr, usize](?manager.index);
+    var ok:      bool         = sel dropped.ok;
+    if (!storage.destroy_table[PeerSlot](?manager.peers))   { ok = false; }
+    if (!storage.destroy_table[LeaseSlot](?manager.leases)) { ok = false; }
+    manager.initialized = false;
+    ret ok;
+}
+
+fun peer_at(manager: *Manager, index: usize) *PeerSlot {
+    ret storage.table_at[PeerSlot](?manager.peers, index);
+}
+
+fun lease_at(manager: *Manager, index: usize) *LeaseSlot {
+    ret storage.table_at[LeaseSlot](?manager.leases, index);
+}
+
+# a released slot is reused before the table grows again, and a table that
+# cannot grow refuses rather than overcommitting
+fun claim_peer(manager: *Manager) usize {
+    if (manager.peer_free_head != NO_SLOT) {
+        val index: usize = manager.peer_free_head;
+        manager.peer_free_head = peer_at(manager, index).next_free;
+        ret index;
+    }
+    if (manager.claimed_peers == manager.peers.capacity
+        && !storage.grow_table[PeerSlot](?manager.peers)) { ret NO_SLOT; }
+    val index: usize = manager.claimed_peers;
+    manager.claimed_peers = manager.claimed_peers + 1;
+    ret index;
+}
+
+fun claim_lease(manager: *Manager) usize {
+    if (manager.lease_free_head != NO_SLOT) {
+        val index: usize = manager.lease_free_head;
+        manager.lease_free_head = lease_at(manager, index).next_free;
+        ret index;
+    }
+    if (manager.claimed_leases == manager.leases.capacity
+        && !storage.grow_table[LeaseSlot](?manager.leases)) { ret NO_SLOT; }
+    val index: usize = manager.claimed_leases;
+    manager.claimed_leases = manager.claimed_leases + 1;
+    ret index;
+}
+
+# whether policy still allows a connection. growth may still refuse one, which
+# is only known at the claim
 pub fun available(manager: *Manager) bool {
-    ret manager != nil && manager.initialized
-        && manager.live < manager.max_connections
-        && manager.free_head != NO_SLOT;
+    if (manager == nil || !manager.initialized) { ret false; }
+    if (sel manager.max_connections.some) {
+        ret manager.live < manager.max_connections.some;
+    }
+    ret true;
+}
+
+fun find_peer(manager: *Manager, address: ip.Addr) usize {
+    var key:   ip.Addr     = address;
+    val found: opt[*usize] = map.get[ip.Addr, usize](?manager.index, ?key);
+    if (!(sel found.some)) { ret NO_SLOT; }
+    ret @found.some;
+}
+
+fun release_peer(manager: *Manager, index: usize) {
+    val slot: *PeerSlot = peer_at(manager, index);
+    var key:  ip.Addr   = slot.address;
+    map.remove[ip.Addr, usize](?manager.index, ?key);
+    slot.live              = false;
+    slot.count             = 0;
+    slot.next_free         = manager.peer_free_head;
+    manager.peer_free_head = index;
 }
 
 fun allocate_lease(manager: *Manager, peer: *ip.Endpoint,
@@ -161,30 +280,49 @@ fun allocate_lease(manager: *Manager, peer: *ip.Endpoint,
     if (!available(manager)
         || (state != SLOT_RESERVED && state != SLOT_COMMITTED)) { ret false; }
     var peer_index: usize = NO_SLOT;
+    var fresh_peer: bool  = false;
     if (peer != nil) {
         val address: ip.Addr = normalize(peer.addr);
         peer_index = find_peer(manager, address);
         if (peer_index == NO_SLOT) {
-            peer_index = free_peer(manager);
+            peer_index = claim_peer(manager);
             if (peer_index == NO_SLOT) { ret false; }
-            manager.storage.peers[peer_index].address = address;
-            manager.storage.peers[peer_index].count   = 0;
-            manager.storage.peers[peer_index].live    = true;
+            val inserted: res[bool, A.Error] =
+                map.insert[ip.Addr, usize](?manager.index, address, peer_index);
+            if (sel inserted.err) {
+                val slot: *PeerSlot = peer_at(manager, peer_index);
+                slot.next_free         = manager.peer_free_head;
+                manager.peer_free_head = peer_index;
+                ret false;
+            }
+            val slot: *PeerSlot = peer_at(manager, peer_index);
+            slot.address = address;
+            slot.count   = 0;
+            slot.live    = true;
+            fresh_peer   = true;
         }
-        if (manager.storage.peers[peer_index].count
-            >= manager.max_connections_per_peer) { ret false; }
+        val slot: *PeerSlot = peer_at(manager, peer_index);
+        if (sel manager.max_connections_per_peer.some) {
+            if (slot.count >= manager.max_connections_per_peer.some) {
+                if (fresh_peer) { release_peer(manager, peer_index); }
+                ret false;
+            }
+        }
     }
-    val index: usize      = manager.free_head;
-    val slot:  *LeaseSlot = ?manager.storage.leases[index];
-    manager.free_head = slot.next_free;
-    slot.next_free    = NO_SLOT;
-    slot.generation   = next_generation(slot.generation);
-    slot.peer         = peer_index;
-    slot.state        = state;
-    manager.live      = manager.live + 1;
+    val index: usize = claim_lease(manager);
+    if (index == NO_SLOT) {
+        if (fresh_peer) { release_peer(manager, peer_index); }
+        ret false;
+    }
+    val slot: *LeaseSlot = lease_at(manager, index);
+    slot.next_free  = NO_SLOT;
+    slot.generation = next_generation(slot.generation);
+    slot.peer       = peer_index;
+    slot.state      = state;
+    manager.live    = manager.live + 1;
     if (peer_index != NO_SLOT) {
-        manager.storage.peers[peer_index].count =
-            manager.storage.peers[peer_index].count + 1;
+        val owner: *PeerSlot = peer_at(manager, peer_index);
+        owner.count = owner.count + 1;
     }
     @output = Lease{index: index, generation: slot.generation};
     ret true;
@@ -202,11 +340,10 @@ pub fun acquire(manager: *Manager, peer: *ip.Endpoint,
 
 fun lease_slot(manager: *Manager, lease: Lease) *LeaseSlot {
     if (manager == nil || !manager.initialized || lease.generation == 0
-        || lease.index >= manager.storage.lease_capacity) { ret nil; }
-    val slot: *LeaseSlot = ?manager.storage.leases[lease.index];
-    if (slot.state == SLOT_FREE || slot.generation != lease.generation) {
-        ret nil;
-    }
+        || lease.index >= manager.claimed_leases) { ret nil; }
+    val slot: *LeaseSlot = lease_at(manager, lease.index);
+    if (slot == nil || slot.state == SLOT_FREE
+        || slot.generation != lease.generation) { ret nil; }
     ret slot;
 }
 
@@ -222,19 +359,19 @@ pub fun release(manager: *Manager, lease: Lease) bool {
     if (slot == nil || manager.live == 0) { ret false; }
     var peer: *PeerSlot = nil;
     if (slot.peer != NO_SLOT) {
-        if (slot.peer >= manager.storage.peer_capacity) { ret false; }
-        peer = ?manager.storage.peers[slot.peer];
-        if (!peer.live || peer.count == 0) { ret false; }
+        if (slot.peer >= manager.claimed_peers) { ret false; }
+        peer = peer_at(manager, slot.peer);
+        if (peer == nil || !peer.live || peer.count == 0) { ret false; }
     }
     if (peer != nil) {
         peer.count = peer.count - 1;
-        if (peer.count == 0) { peer.live = false; }
+        if (peer.count == 0) { release_peer(manager, slot.peer); }
     }
-    manager.live      = manager.live - 1;
-    slot.state        = SLOT_FREE;
-    slot.peer         = NO_SLOT;
-    slot.next_free    = manager.free_head;
-    manager.free_head = lease.index;
+    manager.live            = manager.live - 1;
+    slot.state              = SLOT_FREE;
+    slot.peer               = NO_SLOT;
+    slot.next_free          = manager.lease_free_head;
+    manager.lease_free_head = lease.index;
     ret true;
 }
 
@@ -243,12 +380,19 @@ pub fun in_use(manager: *Manager) usize {
     ret manager.live;
 }
 
+fun capped(value: usize) opt[usize] {
+    ret opt[usize].some{value};
+}
+
+fun uncapped() opt[usize] {
+    ret opt[usize].none{};
+}
+
 test "hedge.admission: tcp then quic share the exact global cap" {
-    var peers:   [2]PeerSlot;
-    var slots:   [2]LeaseSlot;
+    var a: A.Allocator;
+    page.make(?a);
     var manager: Manager;
-    if (!make(?manager, Storage{peers: ?peers[0], peer_capacity: 2,
-        leases: ?slots[0], lease_capacity: 2}, 2, 2)) { ret 1; }
+    if (!make(?manager, ?a, capped(2), capped(2))) { ret 1; }
     val endpoint: ip.Endpoint = ip.endpoint(192, 0, 2, 1, 1000);
     var tcp:      Lease;
     var quic:     Lease;
@@ -260,15 +404,15 @@ test "hedge.admission: tcp then quic share the exact global cap" {
     }
     if (!release(?manager, tcp) || !release(?manager, quic)
         || in_use(?manager) != 0) { ret 3; }
+    if (!destroy(?manager)) { ret 4; }
     ret 0;
 }
 
 test "hedge.admission: quic then tcp share normalized peer limits" {
-    var peers:   [2]PeerSlot;
-    var slots:   [2]LeaseSlot;
+    var a: A.Allocator;
+    page.make(?a);
     var manager: Manager;
-    if (!make(?manager, Storage{peers: ?peers[0], peer_capacity: 2,
-        leases: ?slots[0], lease_capacity: 2}, 2, 1)) { ret 1; }
+    if (!make(?manager, ?a, capped(2), capped(1))) { ret 1; }
     var mapped: ip.Endpoint;
     mapped.addr.is_v6 = 1;
     var i: usize = 0;
@@ -291,5 +435,79 @@ test "hedge.admission: quic then tcp share normalized peer limits" {
     }
     if (!release(?manager, quic) || !acquire(?manager, ?native, ?tcp)
         || !release(?manager, tcp)) { ret 3; }
+    if (!destroy(?manager)) { ret 4; }
+    ret 0;
+}
+
+test "hedge.admission: an absent cap admits past any preallocated ceiling" {
+    var a: A.Allocator;
+    page.make(?a);
+    var manager: Manager;
+    if (!make(?manager, ?a, uncapped(), uncapped())) { ret 1; }
+    # past the first chunk of both tables, which is where a fixed pool stopped
+    val count:  usize = storage.FIRST_CHUNK * 4 + 1;
+    var leases: [storage.FIRST_CHUNK * 4 + 1]Lease;
+    var i:      usize = 0;
+    for (i < count) {
+        val endpoint: ip.Endpoint = ip.endpoint(10, 0,
+            (i / 256)::u8, (i % 256)::u8, 1000);
+        if (!available(?manager)
+            || !acquire(?manager, ?endpoint, ?leases[i])) { ret 2; }
+        i = i + 1;
+    }
+    if (in_use(?manager) != count) { ret 3; }
+    i = 0;
+    for (i < count) {
+        if (!release(?manager, leases[i])) { ret 4; }
+        i = i + 1;
+    }
+    if (in_use(?manager) != 0 || !destroy(?manager)) { ret 5; }
+    ret 0;
+}
+
+test "hedge.admission: a configured cap is still refused at its exact number" {
+    var a: A.Allocator;
+    page.make(?a);
+    var manager: Manager;
+    # a cap above the first chunk proves the refusal is the policy, not the table
+    val cap:            usize = storage.FIRST_CHUNK + 3;
+    var manager_leases: [storage.FIRST_CHUNK + 3]Lease;
+    if (!make(?manager, ?a, capped(cap), uncapped())) { ret 1; }
+    var i: usize = 0;
+    for (i < cap) {
+        val endpoint: ip.Endpoint = ip.endpoint(10, 0,
+            (i / 256)::u8, (i % 256)::u8, 1000);
+        if (!acquire(?manager, ?endpoint, ?manager_leases[i])) { ret 2; }
+        i = i + 1;
+    }
+    val over:    ip.Endpoint = ip.endpoint(10, 1, 1, 1, 1000);
+    var refused: Lease;
+    if (available(?manager) || acquire(?manager, ?over, ?refused)
+        || in_use(?manager) != cap) { ret 3; }
+    if (!release(?manager, manager_leases[0]))                       { ret 4; }
+    if (!available(?manager) || !acquire(?manager, ?over, ?refused)) { ret 5; }
+    ret 0;
+}
+
+test "hedge.admission: a peer slot is reused once its last lease is released" {
+    var a: A.Allocator;
+    page.make(?a);
+    var manager: Manager;
+    if (!make(?manager, ?a, uncapped(), capped(2))) { ret 1; }
+    val endpoint: ip.Endpoint = ip.endpoint(198, 51, 100, 7, 443);
+    var first:    Lease;
+    var second:   Lease;
+    var refused:  Lease;
+    if (!acquire(?manager, ?endpoint, ?first)
+        || !acquire(?manager, ?endpoint, ?second)
+        || acquire(?manager, ?endpoint, ?refused)) { ret 2; }
+    if (manager.claimed_peers != 1)                              { ret 3; }
+    if (!release(?manager, first) || !release(?manager, second)) { ret 4; }
+    # the peer is forgotten, so the next claim takes the same slot back
+    if (manager.peer_free_head == NO_SLOT) { ret 5; }
+    if (!acquire(?manager, ?endpoint, ?first) || manager.claimed_peers != 1) {
+        ret 6;
+    }
+    if (!release(?manager, first) || !destroy(?manager)) { ret 7; }
     ret 0;
 }

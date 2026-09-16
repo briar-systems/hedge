@@ -68,6 +68,8 @@ application = "site"
 
 A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application, binds it with `hedge.service.laurel.make`, registers `bound_handler` under that name in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `composition.stop` returns. The program also owns the application's lifecycle, so it starts the application before `composition.start` and drains and stops it after `composition.stop`. A configuration that names an unregistered application fails with `no application is registered under this name`. Register an application with the request memory it needs (see [Request memory](#request-memory)). A laurel application's per-request state alone is several kilobytes before its sessions, forms and response bodies.
 
+A laurel handler that waits on a request body suspends rather than blocking. The adapter reports the request as pending, the connection keeps reading, and when the body advances the adapter resumes laurel at the step that suspended: the handler is entered once however many reads its body takes. A suspended request holds its exchange, its request memory and one of the application's `max_active_requests` slots until it finishes, so a body that never arrives is bounded by the listener's request timeout rather than by the application. A connection that dies while a handler is suspended is abandoned through laurel, which runs every middleware exit half that is owed before the request's context is released.
+
 The implemented schema accepts these top-level sections:
 
 - `server` with bounded `limits`, `timeouts`, and feature selection
@@ -142,7 +144,38 @@ routing, and forwarded headers all name the same client. Both the v1 text and v2
 binary forms are accepted, and a malformed header closes the connection rather
 than being read as the start of a request.
 
-Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and are reloadable.
+
+`server.limits.max_connections` is optional and absent by default. For TCP and
+local listeners, connection storage grows with what is actually connected, so
+leaving it out does not mean an unbounded server: it means the ceiling is the
+descriptor table and the memory the allocator will give, rather than a number
+an operator has to guess and then keep raising. Setting it makes it a policy
+cap on every transport, and admission refuses past it exactly as a preallocated
+pool did. A value of zero is a configuration error, not a way to spell no
+limit, and is reported rather than accepted.
+
+QUIC listeners grow the same way. A QUIC connection's record, its assembly and
+TLS storage, its HTTP/3 session, its routes, its timer and any initial packet
+queued for it are all claimed as the connection is admitted and given back when
+it retires, so a server with a QUIC listener and no configured
+`max_connections` is no more capped on HTTP/3 than it is on TCP, and an idle
+QUIC listener holds none of that storage.
+
+Under memory pressure an absent limit moves the refusal from a known number to
+an unpredictable one. A connection the allocator cannot find storage for is
+refused, not stalled and not crashed. Which layer refuses decides what the
+client sees. When the listener cannot grow its pool the accepted socket is
+closed abortively and the admission lease it took is returned, so the peer sees
+a reset rather than a hang. When the listener admitted it but the serving pool
+cannot grow, the connection is closed the same way and counted as rejected.
+Storage already held by live connections is never disturbed to make room, so a
+refusal costs the connection that arrived and nothing that is already being
+served.
+
+Both limits are reloadable. Neither sizes any storage, so a reload retunes them
+like any other policy value. Lowering one below what is already connected stops
+new admissions rather than evicting connections that are already being served.
 
 `server.limits.max_connections_per_peer` defaults to 100 and is charged against
 the address the transport reported when the connection was accepted, which is

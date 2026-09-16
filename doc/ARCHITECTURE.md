@@ -38,13 +38,15 @@ The control plane publishes immutable runtime generations. A listener and every 
 
 The executable and runtime tests enter those planes through one production
 composition module. Its runtime record owns every binding array and compiled
-plan for the process lifetime. It also owns the public QUIC backing: the
-connection-ID route, timer, pending-initial, and per-listener admission pools,
-and the public connection and session storage. The welded control records for
-the pump, the connection, its deep-secret assembly storage, and the HTTP/3
-session are owned separately by a typed secret owner the executable holds for
-the process lifetime. No public record retains one; code that needs them
-borrows a stack-local view for the duration of a call. Startup
+plan for the process lifetime. The QUIC runtime inside it owns the public QUIC
+state, all of which grows with what is connected: the connection-ID routes, the
+timers, the pending initials, and the connection and session storage claimed
+per connection. The welded control records for the pump, the connection, its
+deep-secret assembly storage, and the HTTP/3 session are owned separately by a
+typed secret owner the executable holds for the process lifetime. Its tables
+start empty and the runtime grows them, and a record never moves once it
+exists. No public record retains one; code that needs them borrows a
+stack-local view for the duration of a call. Startup
 constructs cache bindings before the resolver and compiles only after both are
 stable. Teardown cancels and releases QUIC operations before closing their UDP
 sockets, then closes certificate management, TLS credentials, proxy state,
