@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- QUIC listeners size their UDP socket buffers (#153). `receive_buffer_bytes` and `send_buffer_bytes` on a `[[listener]]` set them, and an absent value asks for 4 MiB to receive and 1 MiB to send rather than the kernel default that a handshake burst overflowed. The size the kernel granted is read back and logged at startup next to the request, since Linux doubles and caps it. The keys are refused on TCP and local listeners, and changing them needs a restart.
+
 ## [0.5.0] - 2026-09-16
 
 ### Changed
