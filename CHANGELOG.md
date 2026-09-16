@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `hedge.service.laurel` ends the application's middleware chain through laurel's exported `router.terminal_handler` rather than its own copy of the mapping (#125). Dependencies: laurel v0.10.0.
+
 ### Removed
 
 - `example/`, which `demo/` replaced on 2026-09-02 and which nothing has touched since (#123). The `fixed` and `redirect` service kinds it showed are documented in doc/CONFIGURATION.md, and the multi-origin `upstream` form it carried is a commented alternative in `demo/proxy/hedge.toml`.
