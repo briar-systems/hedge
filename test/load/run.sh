@@ -95,10 +95,10 @@ cat > "$work/hedge.toml" <<EOF
 [server]
 name = "load"
 
-# the whole load comes from one peer, so the per-peer default would refuse it
-# and the run would measure the admission bound instead of the runtime.
+# no global limit, so connection storage grows with the load rather than the
+# run measuring a configured ceiling. the whole load comes from one peer, so
+# the per-peer default would refuse it and has to be raised.
 [server.limits]
-max_connections = 4096
 max_connections_per_peer = 4096
 
 [[listener]]

@@ -10,6 +10,8 @@ use hedge.connection;
 use hedge.dispatch.plan;
 use hedge.lifecycle;
 use hedge.listener;
+use hedge.protocol.prologue;
+use hedge_storage: hedge.storage;
 use h3_session:   hedge.protocol.h3.session;
 use quic_runtime: hedge.protocol.quic.runtime;
 use hedge_tls:    hedge.protocol.tls;
@@ -24,6 +26,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use A: std.allocator;
+use std.allocator.page;
 
 fun wall_now() time.Time {
     val sampled: time.Clock = time.now();
@@ -91,9 +94,13 @@ pub rec Runtime {
     plane_quiesce:    PlaneQuiesceFun;
     generation:       u64;
     owner:            listener.Owner;
-    slots:            *Slot;
-    connections:      *connection.Connection;
-    capacity:         usize;
+    # the slot directory grows and a record never moves, so a completion
+    # context or a body reader may hold a pointer into one for its life
+    slots:            hedge_storage.Table[Slot];
+    connections:      hedge_storage.Recycler[connection.Connection];
+    claimed_slots:    usize;
+    # the QUIC pools are still sized once, and this is what they were sized to
+    quic_capacity:    usize;
     live:             usize;
     live_head:        usize;
     free_head:        usize;
@@ -105,6 +112,9 @@ pub rec Runtime {
     observability:    *telemetry.Runtime;
     served:           u64;
     accepted:         u64;
+    # why the most recently retired connection ended, which outlives the record
+    # now that the record goes back to the pool
+    last_refusal:     prologue.Refusal;
     rejected:         u64;
     shutdown:         lifecycle.State;
     drain_timeout_ns: u64;
@@ -144,7 +154,7 @@ fun next_budget_deadline(runtime: *Runtime,
     var found: bool  = false;
     var i:     usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot:     *Slot = ?runtime.slots[i];
+        val slot:     *Slot = slot_at(runtime, i);
         var deadline: time.Time;
         if (slot.live && slot.waiting
             && budget.deadline(?slot.charge, ?deadline)) {
@@ -202,21 +212,22 @@ fun configure_budgets(target: *BudgetGeneration, graph: *schema.Graph) bool {
 
 pub fun make(
     runtime: *Runtime,
-    slots: *Slot,
-    connections: *connection.Connection,
-    capacity: usize,
+    quic_capacity: usize,
     active_plan: *plan.Plan,
     graph: *schema.Graph,
     a: *A.Allocator,
 ) bool {
-    if (runtime == nil || slots == nil || connections == nil || capacity == 0
+    if (runtime == nil || a == nil
         || active_plan == nil || !plan.sealed(active_plan) || graph == nil
-        || !connection.make_storage(?runtime.storage, a)) { ret false; }
+        || !connection.make_storage(?runtime.storage, a)
+        || !hedge_storage.make_table[Slot](?runtime.slots, a)
+        || !hedge_storage.make[connection.Connection](?runtime.connections, a, 1)) {
+        ret false;
+    }
     runtime.state         = NEW;
     runtime.generation    = 0;
-    runtime.slots         = slots;
-    runtime.connections   = connections;
-    runtime.capacity      = capacity;
+    runtime.claimed_slots = 0;
+    runtime.quic_capacity = quic_capacity;
     runtime.live          = 0;
     runtime.next_id       = 1;
     runtime.plan          = active_plan;
@@ -229,6 +240,7 @@ pub fun make(
     runtime.plane_quiesce = (0::usize)::PlaneQuiesceFun;
     runtime.served        = 0;
     runtime.accepted      = 0;
+    runtime.last_refusal  = prologue.REFUSED_NONE;
     runtime.rejected      = 0;
     runtime.shutdown      = lifecycle.make();
     if (!timeout_nanoseconds(graph.timeouts.drain_ms,
@@ -243,22 +255,8 @@ pub fun make(
     if (!configure_budgets(?runtime.budget_generations[0], graph)) { ret false; }
     runtime.active_budgets = ?runtime.budget_generations[0].set;
     runtime.live_head      = NO_SLOT;
-    runtime.free_head      = 0;
+    runtime.free_head      = NO_SLOT;
     var i: usize = 0;
-    for (i < capacity) {
-        slots[i].live      = false;
-        slots[i].retiring  = false;
-        slots[i].waiting   = false;
-        slots[i].budgets   = nil;
-        slots[i].charge    = budget.no_charge();
-        slots[i].handle    = ?connections[i];
-        slots[i].prev_live = NO_SLOT;
-        slots[i].next_live = NO_SLOT;
-        slots[i].next_free = i + 1;
-        i                  = i + 1;
-    }
-    slots[capacity - 1].next_free = NO_SLOT;
-    i = 0;
     for (i < schema.MAX_LISTENERS) {
         runtime.quic_handle_live[i] = false;
         i                           = i + 1;
@@ -350,8 +348,13 @@ fun quic_config(runtime: *Runtime, graph: *schema.Graph, index: usize,
     val policy_index: usize             = hedge_tls.find(schema.text(?configured.name));
     val policy:       *hedge_tls.Policy = hedge_tls.policy_at(policy_index);
     if (policy == nil) { ret false; }
-    var per_peer: usize = graph.limits.max_connections_per_peer;
-    if (per_peer > runtime.capacity) { per_peer = runtime.capacity; }
+    # an absent per-peer limit is the pool itself, which is the only ceiling
+    # the QUIC pump can express today
+    var per_peer: usize = runtime.quic_capacity;
+    if (sel graph.limits.max_connections_per_peer.some) {
+        per_peer = graph.limits.max_connections_per_peer.some;
+    }
+    if (per_peer > runtime.quic_capacity) { per_peer = runtime.quic_capacity; }
     var named_budget: usize = budget.NO_BUDGET;
     if (configured.budget.len != 0) {
         named_budget = budget.find(budgets,
@@ -364,7 +367,7 @@ fun quic_config(runtime: *Runtime, graph: *schema.Graph, index: usize,
     }
     @output = quic_runtime.PumpConfig{
         admission_generation:     generation,
-        connection_limit:         runtime.capacity,
+        connection_limit:         runtime.quic_capacity,
         max_connections_per_peer: per_peer,
         require_retry:            true,
         retry_max_age_ns:         QUIC_RETRY_MAX_AGE_NS,
@@ -518,42 +521,96 @@ pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation
     ret true;
 }
 
+# every slot must have been retired first, which is what `stop` waits for
+fun release_pool(runtime: *Runtime) bool {
+    var ok: bool = hedge_storage.destroy[connection.Connection](?runtime.connections);
+    if (!hedge_storage.destroy_table[Slot](?runtime.slots)) { ok = false; }
+    runtime.claimed_slots = 0;
+    runtime.free_head     = NO_SLOT;
+    runtime.live_head     = NO_SLOT;
+    ret ok;
+}
+
+# the connection record a claimed slot holds, or nil when the slot is free
+pub fun slot_connection(runtime: *Runtime, index: usize) *connection.Connection {
+    if (runtime == nil || index >= runtime.claimed_slots) { ret nil; }
+    ret hedge_storage.table_at[Slot](?runtime.slots, index).handle;
+}
+
+pub fun last_refusal(runtime: *Runtime) prologue.Refusal {
+    if (runtime == nil) { ret prologue.REFUSED_NONE; }
+    ret runtime.last_refusal;
+}
+
+# a claimed slot, so a caller can observe its lifecycle without owning the pool
+pub fun slot_at(runtime: *Runtime, index: usize) *Slot {
+    ret hedge_storage.table_at[Slot](?runtime.slots, index);
+}
+
 fun link_live(runtime: *Runtime, index: usize) {
-    val slot: *Slot = ?runtime.slots[index];
+    val slot: *Slot = slot_at(runtime, index);
     slot.prev_live = NO_SLOT;
     slot.next_live = runtime.live_head;
     if (runtime.live_head != NO_SLOT) {
-        runtime.slots[runtime.live_head].prev_live = index;
+        slot_at(runtime, runtime.live_head).prev_live = index;
     }
     runtime.live_head = index;
 }
 
 fun unlink_live(runtime: *Runtime, index: usize) {
-    val slot: *Slot = ?runtime.slots[index];
+    val slot: *Slot = slot_at(runtime, index);
     if (slot.prev_live != NO_SLOT) {
-        runtime.slots[slot.prev_live].next_live = slot.next_live;
+        slot_at(runtime, slot.prev_live).next_live = slot.next_live;
     }
     or (runtime.live_head == index) {
         runtime.live_head = slot.next_live;
     }
     if (slot.next_live != NO_SLOT) {
-        runtime.slots[slot.next_live].prev_live = slot.prev_live;
+        slot_at(runtime, slot.next_live).prev_live = slot.prev_live;
     }
     slot.prev_live = NO_SLOT;
     slot.next_live = NO_SLOT;
 }
 
+# a released slot is reused before the directory grows. storage the allocator
+# refuses is the only reason a claim fails, and that is a refusal like a full
+# pool was, not a crash
 fun free_slot(runtime: *Runtime) usize {
-    val index: usize = runtime.free_head;
-    if (index >= runtime.capacity) { ret runtime.capacity; }
-    runtime.free_head = runtime.slots[index].next_free;
-    runtime.slots[index].next_free = NO_SLOT;
+    var index: usize = runtime.free_head;
+    if (index != NO_SLOT) {
+        runtime.free_head              = slot_at(runtime, index).next_free;
+        slot_at(runtime, index).next_free = NO_SLOT;
+    }
+    or {
+        if (runtime.claimed_slots == runtime.slots.capacity
+            && !hedge_storage.grow_table[Slot](?runtime.slots)) { ret NO_SLOT; }
+        index = runtime.claimed_slots;
+        runtime.claimed_slots = runtime.claimed_slots + 1;
+        val fresh: *Slot = slot_at(runtime, index);
+        fresh.prev_live = NO_SLOT;
+        fresh.next_live = NO_SLOT;
+        fresh.next_free = NO_SLOT;
+        fresh.charge    = budget.no_charge();
+    }
+    val slot: *Slot = slot_at(runtime, index);
+    slot.handle =
+        hedge_storage.claim[connection.Connection](?runtime.connections);
+    if (slot.handle == nil) {
+        slot.next_free    = runtime.free_head;
+        runtime.free_head = index;
+        ret NO_SLOT;
+    }
     ret index;
 }
 
 fun return_slot(runtime: *Runtime, index: usize) {
-    if (index >= runtime.capacity) { ret; }
-    val slot: *Slot = ?runtime.slots[index];
+    if (index >= runtime.claimed_slots) { ret; }
+    val slot: *Slot = slot_at(runtime, index);
+    if (slot.handle != nil) {
+        hedge_storage.release[connection.Connection](?runtime.connections,
+            slot.handle);
+        slot.handle = nil;
+    }
     slot.next_free = runtime.free_head;
     runtime.free_head = index;
 }
@@ -563,7 +620,7 @@ fun return_slot(runtime: *Runtime, index: usize) {
 fun teardown_pending(runtime: *Runtime) bool {
     var i: usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         if (slot.live && slot.retiring) { ret true; }
         i = slot.next_live;
     }
@@ -575,7 +632,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
     var admitted: usize = 0;
     for (true) {
         val index: usize = free_slot(runtime);
-        if (index >= runtime.capacity) {
+        if (index == NO_SLOT) {
             # a pool full of live connections is a refusal, but one holding a
             # slot open for a teardown is not: that arrival waits a turn instead
             # of being destroyed for a slot that is already spent
@@ -602,7 +659,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
             return_slot(runtime, index);
             cnt;
         }
-        val slot:  *Slot                   = ?runtime.slots[index];
+        val slot:  *Slot                   = slot_at(runtime, index);
         val owned: *listener.OwnedListener = listener.active_listener(?runtime.owner,
             source.listener_index);
         var policy: usize = hedge_tls.NO_POLICY;
@@ -662,7 +719,7 @@ fun admit_waiting(runtime: *Runtime, now: time.Time) usize {
     var admitted: usize = 0;
     var i:        usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         val next: usize = slot.next_live;
         if (slot.live && slot.waiting) {
             val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge,
@@ -682,8 +739,8 @@ fun admit_waiting(runtime: *Runtime, now: time.Time) usize {
 }
 
 fun retire(runtime: *Runtime, index: usize) {
-    if (index >= runtime.capacity) { ret; }
-    val slot: *Slot = ?runtime.slots[index];
+    if (index >= runtime.claimed_slots) { ret; }
+    val slot: *Slot = slot_at(runtime, index);
     if (!slot.live) { ret; }
     if (!slot.retiring) {
         slot.retiring = true;
@@ -696,8 +753,9 @@ fun retire(runtime: *Runtime, index: usize) {
         runtime.teardown_failures = runtime.teardown_failures + 1;
     }
     if (slot.charge.live) { budget.release(slot.budgets, ?slot.charge); }
-    slot.budgets   = nil;
-    runtime.served = runtime.served + slot.handle.requests;
+    slot.budgets        = nil;
+    runtime.last_refusal = slot.handle.refusal;
+    runtime.served       = runtime.served + slot.handle.requests;
     if (!listener.release_connection(?runtime.owner, slot.token)) {
         runtime.teardown_failures = runtime.teardown_failures + 1;
     }
@@ -710,7 +768,7 @@ fun retire(runtime: *Runtime, index: usize) {
 
 # drive one connection until it blocks on I/O or finishes
 fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
-    val slot:     *Slot           = ?runtime.slots[index];
+    val slot:     *Slot           = slot_at(runtime, index);
     val progress: connection.Step = connection.advance(slot.handle, now);
     if (progress == connection.STEP_DONE || progress == connection.STEP_ERROR) {
         retire(runtime, index);
@@ -723,7 +781,7 @@ fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
 fun sweep(runtime: *Runtime, now: time.Time) {
     var i: usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         val next: usize = slot.next_live;
         # a connection still waiting for its budget is not driven, which is what
         # makes the queue a queue rather than a label
@@ -823,7 +881,7 @@ fun run_signal(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     runtime.state = DRAINING;
     var i: usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         # HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
         # reading. the engine decides which; the runtime only asks.
         if (slot.live
@@ -843,7 +901,7 @@ fun run_cancel(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     }
     var i: usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         val next: usize = slot.next_live;
         if (slot.live) { retire(runtime, i); }
         i = next;
@@ -941,7 +999,7 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     }
     var i: usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         if (slot.live
             && slot.budgets == ?next.set) { ret false; }
         i = slot.next_live;
@@ -987,7 +1045,7 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     var signalled: bool = true;
     i = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         # every connection from an older generation finishes what it is doing
         # and then closes, independently of the ones accepted since
         if (slot.live
@@ -1045,7 +1103,7 @@ pub fun superseded(controls: *quic_runtime.ControlView, runtime: *Runtime) usize
     var count: usize = 0;
     var i:     usize = runtime.live_head;
     for (i != NO_SLOT) {
-        val slot: *Slot = ?runtime.slots[i];
+        val slot: *Slot = slot_at(runtime, i);
         if (slot.live
             && slot.handle.generation != runtime.generation) {
             count = count + 1;
@@ -1119,7 +1177,8 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
                 }
                 or {
                     runtime.state = STOPPED;
-                    if (!connection.destroy_storage(?runtime.storage)) {
+                    if (!connection.destroy_storage(?runtime.storage)
+                        || !release_pool(runtime)) {
                         runtime.teardown_failures = runtime.teardown_failures + 1;
                     }
                 }
@@ -1192,41 +1251,42 @@ test "serve: poll timeout rounds budget deadlines without oversleeping" {
 }
 
 test "serve: the live list holds exactly the live connection slots" {
+    var a: A.Allocator;
+    page.make(?a);
     var runtime: Runtime;
-    var slots: [3]Slot;
-    runtime.slots = ?slots[0];
-    runtime.capacity = 3;
-    runtime.live_head = NO_SLOT;
-    runtime.free_head = 0;
-    var i: usize = 0;
-    for (i < 3) {
-        slots[i].live = false;
-        slots[i].prev_live = NO_SLOT;
-        slots[i].next_live = NO_SLOT;
-        slots[i].next_free = i + 1;
-        i = i + 1;
+    if (!hedge_storage.make_table[Slot](?runtime.slots, ?a)
+        || !hedge_storage.make[connection.Connection](?runtime.connections, ?a, 1)) {
+        ret 1;
     }
-    slots[2].next_free = NO_SLOT;
+    runtime.claimed_slots = 0;
+    runtime.live_head     = NO_SLOT;
+    runtime.free_head     = NO_SLOT;
 
-    val first: usize = free_slot(?runtime);
+    val first:  usize = free_slot(?runtime);
     val second: usize = free_slot(?runtime);
-    val third: usize = free_slot(?runtime);
-    if (first != 0 || second != 1 || third != 2 || free_slot(?runtime) != 3) { ret 1; }
+    val third:  usize = free_slot(?runtime);
+    if (first != 0 || second != 1 || third != 2) { ret 2; }
+    # a fourth claim is where a three-slot pool refused
+    val fourth: usize = free_slot(?runtime);
+    if (fourth != 3 || runtime.claimed_slots != 4) { ret 3; }
+    return_slot(?runtime, fourth);
 
     link_live(?runtime, first);
     link_live(?runtime, second);
-    if (runtime.live_head != second || slots[second].next_live != first
-        || slots[first].prev_live != second || slots[first].next_live != NO_SLOT) { ret 2; }
+    if (runtime.live_head != second
+        || slot_at(?runtime, second).next_live != first
+        || slot_at(?runtime, first).prev_live != second
+        || slot_at(?runtime, first).next_live != NO_SLOT) { ret 4; }
 
     unlink_live(?runtime, second);
-    if (runtime.live_head != first || slots[first].prev_live != NO_SLOT) { ret 3; }
+    if (runtime.live_head != first
+        || slot_at(?runtime, first).prev_live != NO_SLOT) { ret 5; }
 
     return_slot(?runtime, second);
-    val reused: usize = free_slot(?runtime);
-    if (reused != second) { ret 4; }
+    if (free_slot(?runtime) != second) { ret 6; }
 
     unlink_live(?runtime, first);
-    if (runtime.live_head != NO_SLOT) { ret 5; }
+    if (runtime.live_head != NO_SLOT) { ret 7; }
     ret 0;
 }
 

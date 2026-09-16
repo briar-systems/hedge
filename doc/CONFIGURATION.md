@@ -144,7 +144,42 @@ routing, and forwarded headers all name the same client. Both the v1 text and v2
 binary forms are accepted, and a malformed header closes the connection rather
 than being read as the start of a request.
 
-Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and require restart to change.
+Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and are reloadable.
+
+`server.limits.max_connections` is optional and absent by default. For TCP and
+local listeners, connection storage grows with what is actually connected, so
+leaving it out does not mean an unbounded server: it means the ceiling is the
+descriptor table and the memory the allocator will give, rather than a number
+an operator has to guess and then keep raising. Setting it makes it a policy
+cap on every transport, and admission refuses past it exactly as a preallocated
+pool did. A value of zero is a configuration error, not a way to spell no
+limit, and is reported rather than accepted.
+
+**A QUIC listener is not yet included in the growth.** Its per-connection
+pools — the QUIC connection record, its assembly storage and the HTTP/3 session
+storage — are still allocated once at startup. When `max_connections` is set
+they are sized from it; when it is absent they are sized from an internal
+default of 1024. So a server with a QUIC listener and no configured
+`max_connections` is capped at 1024 concurrent QUIC connections, while its TCP
+listeners are uncapped. If you serve HTTP/3 above that, set `max_connections`
+explicitly to the peak you intend to carry and size the host for it, because
+that number is preallocated rather than grown into. Removing this asymmetry is
+the remaining half of hedge#113.
+
+Under memory pressure an absent limit moves the refusal from a known number to
+an unpredictable one. A connection the allocator cannot find storage for is
+refused, not stalled and not crashed. Which layer refuses decides what the
+client sees. When the listener cannot grow its pool the accepted socket is
+closed abortively and the admission lease it took is returned, so the peer sees
+a reset rather than a hang. When the listener admitted it but the serving pool
+cannot grow, the connection is closed the same way and counted as rejected.
+Storage already held by live connections is never disturbed to make room, so a
+refusal costs the connection that arrived and nothing that is already being
+served.
+
+Both limits are reloadable. Neither sizes any storage, so a reload retunes them
+like any other policy value. Lowering one below what is already connected stops
+new admissions rather than evicting connections that are already being served.
 
 `server.limits.max_connections_per_peer` defaults to 100 and is charged against
 the address the transport reported when the connection was accepted, which is

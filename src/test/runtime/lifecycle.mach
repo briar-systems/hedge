@@ -8,6 +8,7 @@
 # drained connection close at all.
 
 use std.runtime;
+use std.types.option.opt;
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
@@ -86,8 +87,6 @@ rec Harness {
     replacement_text: [PLAN_TEXT]u8;
     replacement_storage: plan.Storage;
     replacement_plan: plan.Plan;
-    slots: [POOL]serve.Slot;
-    connections: [POOL]connection.Connection;
     heap:    heap_allocator.Allocator;
     runtime: serve.Runtime;
     applications: service.Applications;
@@ -113,11 +112,10 @@ fun compile_replacement(harness: *Harness, generation: u64) bool {
 fun base_graph(graph: *schema.Graph, protocols: u8, drain_ms: u64, stuck: bool) {
     schema.reset_graph(graph);
     schema.set_text(?graph.server_name, "lifecycle-test");
-    # the listener is given more room than the connection pool on purpose, so
-    # the pool is the bound under test. with both equal the listener stops
-    # accepting first and a test cannot say which layer refused.
-    graph.limits.max_connections = POOL + 4;
-    graph.limits.max_connections_per_peer = POOL + 4;
+    # storage grows, so the configured cap is the only bound a test can place.
+    # a case that wants no bound clears these after calling this.
+    graph.limits.max_connections = opt[usize].some{POOL + 4};
+    graph.limits.max_connections_per_peer = opt[usize].some{POOL + 4};
     graph.timeouts.drain_ms = drain_ms;
     graph.listener_count = 1;
     val configured: *schema.Listener = ?graph.listeners[0];
@@ -171,7 +169,7 @@ fun start(harness: *Harness, generation: u64) bool {
     if (plan.compile(?harness.plan, generation, ?harness.graph, harness.storage,
         ?harness.resolver, nil).status != plan.PLAN_OK) { ret false; }
     page.make(?harness.heap);
-    if (!serve.make(?harness.runtime, ?harness.slots[0], ?harness.connections[0], POOL,
+    if (!serve.make(?harness.runtime, POOL,
         ?harness.plan, ?harness.graph, ?harness.heap)) { ret false; }
     schema.reset_diagnostics(?harness.diagnostics);
     if (!serve.start(?quic_controls, ?harness.runtime, generation, ?harness.graph, ?harness.diagnostics)) {
@@ -363,13 +361,18 @@ test "lifecycle: stop without a deadline ends at once and says so" {
     ret 0;
 }
 
-test "lifecycle: a full connection pool refuses what it cannot hold, and recovers" {
+# every client here is 127.0.0.1, so a per-peer limit is the cap this harness
+# can actually reach. the exact global cap is pinned in hedge.admission.
+test "lifecycle: a configured per-peer limit is honoured and then recovers" {
     var quic_controls: quic_runtime.ControlView;
     var harness: Harness;
     base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    # no global cap, so the per-peer limit is unambiguously what refuses
+    harness.graph.limits.max_connections          = opt[usize].none{};
+    harness.graph.limits.max_connections_per_peer = opt[usize].some{POOL};
     if (!start(?harness, 1)) { ret 1; }
     # each client is served and then holds its connection open on keep-alive,
-    # so the pool fills with connections that are idle rather than stuck
+    # so the cap is reached by connections that are idle rather than stuck
     var clients: [POOL]tcp.Stream;
     var opened: usize = 0;
     for (opened < POOL) {
@@ -388,23 +391,20 @@ test "lifecycle: a full connection pool refuses what it cannot hold, and recover
     }
     if (harness.runtime.live != POOL) { serve.stop(?quic_controls, ?harness.runtime); ret 4; }
 
-    # one more than the pool holds. the listener has room and accepts it, so it
-    # is the connection pool that must refuse, and it must say so rather than
-    # starving the peer quietly.
-    val refused_before: u64 = harness.runtime.rejected;
+    # one past the limit, from the same peer. storage would grow for it, so a
+    # refusal here is the policy and nothing else
     var extra: tcp.Stream;
     if (!wire.connect(harness.endpoint, ?extra)) { serve.stop(?quic_controls, ?harness.runtime); ret 5; }
     wire.send(?extra, REQUEST);
     var response: [RESPONSE_BYTES]u8;
-    val body: usize = wire.drain(?harness.runtime, ?extra, ?response[0], RESPONSE_BYTES);
-    val refused_after: u64 = harness.runtime.rejected;
+    val body:         usize = wire.collect(?harness.runtime, ?extra, ?response[0],
+        RESPONSE_BYTES, "served");
+    val live_at_cap:  usize = harness.runtime.live;
     tcp.stream_close(?extra);
     if (body != 0) { serve.stop(?quic_controls, ?harness.runtime); ret 6; }
-    if (refused_after <= refused_before) { serve.stop(?quic_controls, ?harness.runtime); ret 7; }
-    if (harness.runtime.live != POOL) { serve.stop(?quic_controls, ?harness.runtime); ret 8; }
+    if (live_at_cap != POOL) { serve.stop(?quic_controls, ?harness.runtime); ret (50 + live_at_cap)::i32; }
 
-    # the bound is a bound, not a leak: freeing a slot lets the next peer be
-    # served rather than refused for the rest of the process
+    # the cap is a bound, not a leak: freeing one lets the next peer be served
     tcp.stream_close(?clients[0]);
     var i: usize = 0;
     for (i < 200 && harness.runtime.live == POOL) {
@@ -423,7 +423,46 @@ test "lifecycle: a full connection pool refuses what it cannot hold, and recover
     i = 1;
     for (i < POOL) { tcp.stream_close(?clients[i]); i = i + 1; }
     serve.stop(?quic_controls, ?harness.runtime);
-    if (length == 0) { ret 9; }
+    if (length == 0) { ret 8; }
+    ret 0;
+}
+
+# the number the old pool stopped at, so exceeding it is the whole point
+val PAST_OLD_POOL: usize = 24;
+
+test "lifecycle: an absent max_connections grows the pool past what it was made at" {
+    var quic_controls: quic_runtime.ControlView;
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    harness.graph.limits.max_connections          = opt[usize].none{};
+    harness.graph.limits.max_connections_per_peer = opt[usize].none{};
+    if (!start(?harness, 1)) { ret 1; }
+    var clients: [PAST_OLD_POOL]tcp.Stream;
+    var opened:  usize = 0;
+    for (opened < PAST_OLD_POOL) {
+        if (!wire.connect(harness.endpoint, ?clients[opened])) {
+            serve.stop(?quic_controls, ?harness.runtime);
+            ret 2;
+        }
+        wire.send(?clients[opened], REQUEST);
+        var served: [RESPONSE_BYTES]u8;
+        if (wire.collect(?harness.runtime, ?clients[opened], ?served[0],
+            RESPONSE_BYTES, "served") == 0) {
+            var i: usize = 0;
+            for (i <= opened) { tcp.stream_close(?clients[i]); i = i + 1; }
+            serve.stop(?quic_controls, ?harness.runtime);
+            ret (100 + opened)::i32;
+        }
+        opened = opened + 1;
+    }
+    val live:    usize = harness.runtime.live;
+    val claimed: usize = harness.runtime.claimed_slots;
+    var i: usize = 0;
+    for (i < PAST_OLD_POOL) { tcp.stream_close(?clients[i]); i = i + 1; }
+    serve.stop(?quic_controls, ?harness.runtime);
+    if (live != PAST_OLD_POOL) { ret 3; }
+    # the directory grew rather than the pool refusing at the size it was made
+    if (claimed < PAST_OLD_POOL) { ret 4; }
     ret 0;
 }
 
@@ -519,11 +558,11 @@ test "lifecycle: draining an HTTP/2 connection sends GOAWAY and closes it" {
     }
     if (!drained) {
         if (harness.runtime.live != 0) {
-            if (harness.slots[0].retiring) { ret 85; }
+            if (serve.slot_at(?harness.runtime, 0).retiring) { ret 85; }
             val connection_view: connection.Snapshot = connection.snapshot(
-                ?harness.connections[0]);
+                serve.slot_connection(?harness.runtime, 0));
             val h2_view: h2.Snapshot = h2.snapshot(
-                harness.connections[0].h2_session);
+                serve.slot_connection(?harness.runtime, 0).h2_session);
             ret (820 + connection_view.state::usize * 10
                 + h2_view.state::usize)::i32;
         }
@@ -559,7 +598,7 @@ test "lifecycle: a pending HTTP/2 close retains its slot token and budget" {
         "served") == 0 || harness.runtime.live != 1) {
         tcp.stream_close(?client); serve.stop(?quic_controls, ?harness.runtime); ret 4;
     }
-    val token: listener.ConnectionToken = harness.slots[0].token;
+    val token: listener.ConnectionToken = serve.slot_at(?harness.runtime, 0).token;
     val budget_index: usize = budget.find(harness.runtime.active_budgets,
         "public");
     if (budget_index == budget.NO_BUDGET
@@ -571,8 +610,8 @@ test "lifecycle: a pending HTTP/2 close retains its slot token and budget" {
     if (!serve.begin_shutdown(?quic_controls, ?harness.runtime, wall_now())) {
         tcp.stream_close(?client); serve.stop(?quic_controls, ?harness.runtime); ret 6;
     }
-    if (!harness.slots[0].live || !harness.slots[0].retiring
-     || !connection.close_waiting(?harness.connections[0])
+    if (!serve.slot_at(?harness.runtime, 0).live || !serve.slot_at(?harness.runtime, 0).retiring
+     || !connection.close_waiting(serve.slot_connection(?harness.runtime, 0))
      || listener.inspect_connection(?harness.runtime.owner, token) == nil
      || budget.snapshot(harness.runtime.active_budgets, budget_index).active != 1) {
         tcp.stream_close(?client); ret 7;
@@ -580,7 +619,7 @@ test "lifecycle: a pending HTTP/2 close retains its slot token and budget" {
     # stop blocks in the ordinary poll path until both completions have been
     # settled and only then releases the connection token and budget charge.
     if (!serve.stop(?quic_controls, ?harness.runtime)) { tcp.stream_close(?client); ret 8; }
-    if (harness.runtime.live != 0 || harness.slots[0].live
+    if (harness.runtime.live != 0 || serve.slot_at(?harness.runtime, 0).live
      || listener.inspect_connection(?harness.runtime.owner, token) != nil
      || budget.snapshot(harness.runtime.active_budgets, budget_index).active != 0) {
         tcp.stream_close(?client); ret 9;
@@ -608,7 +647,7 @@ test "lifecycle: a late HTTP/1 close settles before its pool slot is reused" {
         tcp.stream_close(?holder); serve.stop(?quic_controls, ?harness.runtime); ret 3;
     }
     var holder_index: usize = 0;
-    if (!harness.slots[0].live) { holder_index = 1; }
+    if (!serve.slot_at(?harness.runtime, 0).live) { holder_index = 1; }
     var first: tcp.Stream;
     if (!wire.connect(harness.endpoint, ?first)) {
         tcp.stream_close(?holder); serve.stop(?quic_controls, ?harness.runtime); ret 4;
@@ -625,20 +664,20 @@ test "lifecycle: a late HTTP/1 close settles before its pool slot is reused" {
     }
     var closing_index: usize = 0;
     if (holder_index == 0) { closing_index = 1; }
-    val old_token: listener.ConnectionToken = harness.slots[closing_index].token;
+    val old_token: listener.ConnectionToken = serve.slot_at(?harness.runtime, closing_index).token;
     tcp.stream_close(?first);
     rounds = 0;
     for (rounds < wire.MAX_ROUNDS
      && listener.inspect_connection(?harness.runtime.owner, old_token) != nil
-     && !harness.slots[closing_index].retiring) {
+     && !serve.slot_at(?harness.runtime, closing_index).retiring) {
         if (!serve.poll(?quic_controls, ?harness.runtime, -1)) { brk; }
         rounds = rounds + 1;
     }
-    val retained: bool = harness.slots[closing_index].live
-        && harness.slots[closing_index].retiring
-        && connection.close_waiting(harness.slots[closing_index].handle)
+    val retained: bool = serve.slot_at(?harness.runtime, closing_index).live
+        && serve.slot_at(?harness.runtime, closing_index).retiring
+        && connection.close_waiting(serve.slot_at(?harness.runtime, closing_index).handle)
         && listener.inspect_connection(?harness.runtime.owner, old_token) != nil;
-    val settled: bool = !harness.slots[closing_index].live
+    val settled: bool = !serve.slot_at(?harness.runtime, closing_index).live
         && listener.inspect_connection(?harness.runtime.owner, old_token) == nil;
     if (!retained && !settled) {
         tcp.stream_close(?holder); serve.stop(?quic_controls, ?harness.runtime); ret 6;
@@ -653,7 +692,7 @@ test "lifecycle: a late HTTP/1 close settles before its pool slot is reused" {
     }
     val length: usize = wire.collect(?harness.runtime, ?replacement,
         ?response[0], RESPONSE_BYTES, "served");
-    val new_token: listener.ConnectionToken = harness.slots[closing_index].token;
+    val new_token: listener.ConnectionToken = serve.slot_at(?harness.runtime, closing_index).token;
     tcp.stream_close(?replacement);
     tcp.stream_close(?holder);
     val stopped: bool = serve.stop(?quic_controls, ?harness.runtime);
@@ -998,7 +1037,7 @@ test "budget: a reload gives each generation an independent listener budget" {
     var i: usize = 0;
     for (i < 40) { serve.poll(?quic_controls, ?harness.runtime, 2); i = i + 1; }
     if (harness.runtime.live != 1
-     || !connection.snapshot(harness.runtime.slots[0].handle).service_pending) {
+     || !connection.snapshot(serve.slot_at(?harness.runtime, 0).handle).service_pending) {
         tcp.stream_close(?old_client); serve.stop(?quic_controls, ?harness.runtime); ret 3;
     }
     base_graph(?harness.replacement_graph, schema.PROTOCOL_HTTP1, 5000, true);
