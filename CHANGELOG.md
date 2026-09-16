@@ -10,7 +10,8 @@
 
 - `hedge.service.laurel` resumes a suspended laurel request instead of re-running it (#116). `RequestState` gains laurel's `middleware.Execution`, a pending execution is reported as `SERVICE_PENDING`, and re-entry calls `app.resume` rather than dispatching, binding and executing a second time. The handler is entered once however many reads its body takes.
 - The laurel adapter calls `app.abandon` before releasing a context whose execution is still suspended, so a connection that dies mid-suspension still runs every middleware exit half that is owed and cannot leak an admission slot (#116).
-- Dependencies: laurel v0.11.0. laurel's handler and middleware signatures changed in v0.11.0: a middleware is now a `before`/`resume`/`after` triple, and a handler returns `handler.Result` (#116). laurel v0.11.0 pins mach-std v2.2.0 and mach-crypto v0.9.2 for itself, but hedge stays on mach-std v2.1.0 and mach-crypto v0.9.1: mach-std v2.2.0 regresses hedge's cache, so that bump belongs to #122.
+- Dependencies: laurel v0.11.0, mach-crypto v0.9.2. laurel's handler and middleware signatures changed in v0.11.0: a middleware is now a `before`/`resume`/`after` triple, and a handler returns `handler.Result` (#116). hedge stays on mach-std v2.1.0, which laurel v0.11.0 supports even though it pins v2.2.0 for itself: mach-std v2.2.0 regresses hedge's cache, so that bump belongs to #122.
+- `test/acme` declares `mach-crypto` itself, as it already declares `mach-std`. laurel reaches crypto with a different selection than hedge's other dependencies, and hedge's own root declaration cannot settle a graph where hedge is not the root (#116).
 
 ## [0.4.1] - 2026-09-15
 
