@@ -254,6 +254,22 @@ Precedence between names is by specificity and never by the order they are writt
 
 Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
 
+Two of those kinds answer without touching a filesystem or an upstream. `fixed` returns one body to every request, and `redirect` returns a location.
+
+```toml
+[service.greeting]
+kind = "fixed"
+body = "hello from hedge\n"
+content_type = "text/plain; charset=utf-8"
+
+[service.docs]
+kind = "redirect"
+target = "https://example.test/docs/"
+status = 308
+```
+
+A `fixed` service defaults to status 200 and `text/plain; charset=utf-8`. A `redirect` defaults to 302 and accepts 300 through 308, so a permanent redirect states its 301 or 308 explicitly.
+
 ## Automatic certificate management
 
 ```toml
