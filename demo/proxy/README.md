@@ -49,8 +49,8 @@ true` nothing in the proxy subsystem is constructed and a `proxy` service fails
 to load, rather than being built and left unused.
 
 `upstream` takes a comma-separated list, so `"127.0.0.1:8082, 127.0.0.1:8083"`
-balances across two origins. `example/proxy.toml` in this repository shows that
-form.
+balances across two origins. `hedge.toml` beside this README carries that form
+as a commented alternative.
 
 ## What a real edge adds
 

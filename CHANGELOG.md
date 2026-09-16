@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Removed
+
+- `example/`, which `demo/` replaced on 2026-09-02 and which nothing has touched since (#123). The `fixed` and `redirect` service kinds it showed are documented in doc/CONFIGURATION.md, and the multi-origin `upstream` form it carried is a commented alternative in `demo/proxy/hedge.toml`.
+
 ## [0.4.0] - 2026-09-15
 
 ### Added
