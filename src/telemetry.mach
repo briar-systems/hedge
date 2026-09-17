@@ -2,6 +2,7 @@
 
 use hedge.config.schema;
 use hedge.dispatch.call;
+use hedge_memory:      hedge.memory;
 use telemetry_admin:   hedge.telemetry.admin;
 use telemetry_health:  hedge.telemetry.health;
 use telemetry_log:     hedge.telemetry.log;
@@ -69,7 +70,14 @@ pub rec Runtime {
     replay_full:       telemetry_metrics.Token;
     # the last QUIC replay refusal total reported, so each report adds the rise
     replay_full_seen: u64;
-    initialized:      bool;
+    # the worker pool, lane by lane, and the connections it could not admit
+    memory_held:         [5]telemetry_metrics.Token;
+    memory_refused:      [5]telemetry_metrics.Token;
+    memory_timeouts:     [5]telemetry_metrics.Token;
+    refused_connections: telemetry_metrics.Token;
+    memory_seen:         [5]hedge_memory.LaneCounters;
+    refused_memory_seen: u64;
+    initialized:         bool;
 }
 
 pub rec Access {
@@ -140,14 +148,21 @@ pub fun make(
 ) bool {
     if (runtime == nil || graph == nil || check_storage == nil || check_capacity == 0)                                                                 { ret false; }
     if (graph.telemetry.traces && (graph.telemetry.trace_state_bytes == 0 || graph.telemetry.trace_state_bytes > telemetry_trace.TRACESTATE_CAPACITY)) { ret false; }
-    runtime.logs_enabled      = graph.telemetry.logs;
-    runtime.metrics_enabled   = graph.telemetry.metrics;
-    runtime.traces_enabled    = graph.telemetry.traces;
-    runtime.admin_enabled     = graph.admin.enabled;
-    runtime.trace_state_bytes = graph.telemetry.trace_state_bytes;
-    runtime.replay_full_seen  = 0;
-    runtime.flush_context     = flush_context;
-    runtime.flush             = flush;
+    runtime.logs_enabled        = graph.telemetry.logs;
+    runtime.metrics_enabled     = graph.telemetry.metrics;
+    runtime.traces_enabled      = graph.telemetry.traces;
+    runtime.admin_enabled       = graph.admin.enabled;
+    runtime.trace_state_bytes   = graph.telemetry.trace_state_bytes;
+    runtime.replay_full_seen    = 0;
+    runtime.refused_memory_seen = 0;
+    var lane: usize = 0;
+    for (lane < LANE_COUNT) {
+        runtime.memory_seen[lane] = hedge_memory.LaneCounters{held: 0, peak: 0,
+            refusals: 0, exhausted: 0, timeouts: 0};
+        lane = lane + 1;
+    }
+    runtime.flush_context = flush_context;
+    runtime.flush         = flush;
     if (!telemetry_health.make(?runtime.health, check_storage, check_capacity)) { ret false; }
     if (runtime.logs_enabled) {
         if (output == nil || graph.telemetry.log_record_bytes == 0 || graph.telemetry.log_record_bytes > record.MAX_RECORD_BYTES) { ret false; }
@@ -193,7 +208,11 @@ pub fun make(
             nil, 0, ?runtime.memory_refusals)
             || !telemetry_metrics.register(?runtime.metrics,
             telemetry_metrics.COUNTER, "hedge_quic_retry_replay_full_total", nil, 0,
-            nil, 0, ?runtime.replay_full)) { ret false; }
+            nil, 0, ?runtime.replay_full)
+            || !telemetry_metrics.register(?runtime.metrics,
+            telemetry_metrics.COUNTER, "hedge_connections_refused_memory_total", nil, 0,
+            nil, 0, ?runtime.refused_connections)
+            || !register_lanes(runtime)) { ret false; }
     }
     if (runtime.admin_enabled) {
         var metrics_context:  ptr                       = render_context;
@@ -447,6 +466,77 @@ pub fun quic_replay_full(runtime: *Runtime, total: u64) {
     runtime.replay_full_seen = total;
 }
 
+val LANE_COUNT: usize = 5;
+
+fun lane_name(lane: usize) str {
+    if (lane == hedge_memory.LANE_SEND::usize)    { ret "send"; }
+    if (lane == hedge_memory.LANE_RECEIVE::usize) { ret "receive"; }
+    if (lane == hedge_memory.LANE_TLS::usize)     { ret "tls"; }
+    if (lane == hedge_memory.LANE_IO::usize)      { ret "io"; }
+    ret "request";
+}
+
+fun register_lanes(runtime: *Runtime) bool {
+    var lane: usize = 0;
+    for (lane < LANE_COUNT) {
+        var label: [1]telemetry_metrics.LabelView = [1]telemetry_metrics.LabelView{
+            telemetry_metrics.LabelView{key: "lane", value: lane_name(lane)}
+        };
+        if (!telemetry_metrics.register(?runtime.metrics, telemetry_metrics.GAUGE,
+            "hedge_memory_held_bytes", ?label[0], 1, nil, 0,
+            ?runtime.memory_held[lane])
+            || !telemetry_metrics.register(?runtime.metrics, telemetry_metrics.COUNTER,
+            "hedge_memory_refusals_total", ?label[0], 1, nil, 0,
+            ?runtime.memory_refused[lane])
+            || !telemetry_metrics.register(?runtime.metrics, telemetry_metrics.COUNTER,
+            "hedge_memory_timeouts_total", ?label[0], 1, nil, 0,
+            ?runtime.memory_timeouts[lane])) { ret false; }
+        lane = lane + 1;
+    }
+    ret true;
+}
+
+fun rise(total: u64, seen: u64) u64 {
+    if (total <= seen) { ret 0; }
+    ret total - seen;
+}
+
+# report a worker pool's running totals, so each report adds only the rise.
+# a refusal is any acquire the lane could not fund, whether or not it waited
+pub fun memory(runtime: *Runtime, pool: hedge_memory.Snapshot, refused_connections: u64) {
+    if (runtime == nil) { ret; }
+    if (runtime.metrics_enabled) {
+        var lane: usize = 0;
+        for (lane < LANE_COUNT) {
+            val now:  hedge_memory.LaneCounters  = pool.lanes[lane];
+            val seen: *hedge_memory.LaneCounters = ?runtime.memory_seen[lane];
+            telemetry_metrics.gauge_set(?runtime.metrics, runtime.memory_held[lane],
+                now.held::i64);
+            val refused: u64 = rise(now.refusals + now.exhausted,
+                seen.refusals + seen.exhausted);
+            if (refused != 0) {
+                telemetry_metrics.counter_add(?runtime.metrics,
+                    runtime.memory_refused[lane], refused);
+            }
+            val timeouts: u64 = rise(now.timeouts, seen.timeouts);
+            if (timeouts != 0) {
+                telemetry_metrics.counter_add(?runtime.metrics,
+                    runtime.memory_timeouts[lane], timeouts);
+            }
+            lane = lane + 1;
+        }
+        val connections: u64 = rise(refused_connections, runtime.refused_memory_seen);
+        if (connections != 0) {
+            telemetry_metrics.counter_add(?runtime.metrics, runtime.refused_connections,
+                connections);
+        }
+    }
+    runtime.memory_seen = pool.lanes;
+    if (refused_connections > runtime.refused_memory_seen) {
+        runtime.refused_memory_seen = refused_connections;
+    }
+}
+
 pub fun observer(runtime: *Runtime) call.Observer {
     if (runtime == nil || !runtime.initialized) { ret call.no_observer(); }
     ret call.Observer{ctx: runtime::ptr, begin: observe_begin, end: observe_end};
@@ -694,5 +784,41 @@ test "telemetry: QUIC replay refusals are counted once each" {
     var sampled: telemetry_metrics.Sample;
     if (!telemetry_metrics.sample(?runtime.metrics, runtime.replay_full, ?sampled)) { ret 2; }
     if (sampled.value != 5)                                                         { ret (10 + sampled.value)::i32; }
+    ret 0;
+}
+
+test "telemetry: pool lanes report held bytes and add only the rise in refusals" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs          = false;
+    graph.telemetry.metrics       = true;
+    graph.telemetry.metric_series = BUILT_IN_METRIC_SERIES;
+    graph.admin.enabled           = false;
+    var series:  [BUILT_IN_METRIC_SERIES]telemetry_metrics.Series;
+    var checks:  [2]telemetry_health.Check;
+    var runtime: Runtime;
+    if (!make(?runtime, ?graph, nil, ?series[0], BUILT_IN_METRIC_SERIES,
+        ?checks[0], 2, nil, test_auth, nil, test_render, test_render,
+        nil, (0::usize)::FlushFun)) { ret 1; }
+    var pool: hedge_memory.Snapshot;
+    val io:   usize = hedge_memory.LANE_IO::usize;
+    pool.lanes[io].held      = 4096;
+    pool.lanes[io].refusals  = 1;
+    pool.lanes[io].exhausted = 2;
+    pool.lanes[io].timeouts  = 1;
+    memory(?runtime, pool, 2);
+    memory(?runtime, pool, 2);
+    pool.lanes[io].held     = 0;
+    pool.lanes[io].timeouts = 3;
+    memory(?runtime, pool, 5);
+    var sampled: telemetry_metrics.Sample;
+    if (!telemetry_metrics.sample(?runtime.metrics, runtime.memory_held[io], ?sampled)
+        || sampled.signed_value != 0) { ret 2; }
+    if (!telemetry_metrics.sample(?runtime.metrics, runtime.memory_refused[io], ?sampled)
+        || sampled.value != 3) { ret 3; }
+    if (!telemetry_metrics.sample(?runtime.metrics, runtime.memory_timeouts[io], ?sampled)
+        || sampled.value != 3) { ret 4; }
+    if (!telemetry_metrics.sample(?runtime.metrics, runtime.refused_connections, ?sampled)
+        || sampled.value != 5) { ret 5; }
     ret 0;
 }
