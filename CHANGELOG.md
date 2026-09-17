@@ -43,6 +43,7 @@
 
 - A burst of QUIC handshakes larger than the server can complete within its clients' timeouts collapses (#164). With 1100 clients dialling at once, about half connect. The same 1100 arriving at 40 per second almost all connect. Bursts of 200 connect in under 5 seconds.
 - hedge builds for `windows-x86_64` but is not supported at runtime on Windows (#149). The CI leg for Windows is build-only until that is fixed.
+- On Windows, the TLS read preemption from 0.5.3 (#196) can drop bytes, which fails the connection (#149). A socket read whose completion races its cancel is discarded by mach-std's Windows backend, including on the mach-std 4.2.0 hedge pins, so a record that arrives just as a response is queued never reaches mach-tls. Linux and darwin are unaffected: their backends are readiness-based and read only inside `poll`, which hands every finished read out before hedge can cancel it. mach-std 5.3.0 delivers a raced read as cancelled with its bytes, and the preemption then works on Windows unchanged.
 - The TLS stall fix merged from 0.5.2 (#189) bounds a TLS operation through the deadline std's cancel scope carries. That is temporary: stage 3c-2 (#195) runs TLS channels by events, and the scope deadline goes with it. The HTTP/2 adapter's connection deadlines are likewise temporary until briar-systems/mach-http#110.
 
 ## [0.5.3] - 2026-09-17
