@@ -1,0 +1,533 @@
+# connection memory: one buffer pool per serving runtime and one account per
+# connection
+#
+# every variable-size buffer a connection uses (its TLS records, its HTTP read
+# and write buffers, the memory each request borrows, QUIC stream and CRYPTO
+# bytes) comes from this pool on demand and goes back when it is not needed, so
+# an idle connection holds only its protocol state. the engines borrow through
+# a `buffers.Source`, and the source they are given is this module's wrapper
+# over std's pool, which keeps per-lane totals the pool itself does not.
+#
+# an account is charged on fixed lanes, the same on every connection:
+#   LANE_SEND, LANE_RECEIVE  QUIC stream and CRYPTO bytes (quic fixes these two)
+#   LANE_TLS                 TLS handshake and record buffers
+#   LANE_IO                  HTTP connection buffers: read, write, frame, output
+#   LANE_REQUEST             what each HTTP request borrows while it is live
+# a connection's lane budgets follow one stated rule over its configuration
+# (see `connection_budgets`), and the pool's global budget bounds the sum.
+#
+# a waiting account is woken by the pool, and the wake goes straight onto the
+# worker's wake queue under the account's handle, which is the connection's
+# owner tag. the pool is serialized-use and belongs to one worker, like the
+# queue it wakes.
+
+use hedge.wake;
+use A: std.allocator;
+use std.memory.buffers;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub val LANE_SEND:    u8 = 0;
+pub val LANE_RECEIVE: u8 = 1;
+pub val LANE_TLS:     u8 = 2;
+pub val LANE_IO:      u8 = 3;
+pub val LANE_REQUEST: u8 = 4;
+pub val LANES:        u8 = 5;
+
+# the TLS lane of one connection: mach-tls's recommended budget, which covers a
+# full handshake flight and a record in each direction
+pub val TLS_BUDGET: usize = 65536;
+
+# admission may use only this share of the global budget, in 64ths, so a burst
+# of accepts cannot take the memory established connections need to finish
+pub val ADMISSION_SHARE: usize = 56;
+
+# plain classes: a ladder that serves every size the engines ask for within a
+# factor of two, with the TLS record size between steps. larger requests take
+# the pool's oversize path
+val PLAIN_CLASSES: usize     = 12;
+val PLAIN_SIZES:   [12]usize = [12]usize{
+    256, 512, 1024, 2048, 4096, 8192, 16384, 17408, 32768, 65536, 131072, 262144
+};
+# secret classes: the sizes mach-tls asks for
+val SECRET_CLASSES: usize    = 3;
+val SECRET_SIZES:   [3]usize = [3]usize{512, 4096, 17408};
+val CLASS_COUNT:    usize    = 15;
+# released chunks each class keeps for reuse
+val HIGH_WATER: usize = 64;
+
+# the size a request of `bytes` is charged at, which is what a budget must allow
+pub fun charged(bytes: usize) usize {
+    if (bytes == 0) { ret 0; }
+    var i: usize = 0;
+    for (i < PLAIN_CLASSES) {
+        if (bytes <= PLAIN_SIZES[i]) { ret PLAIN_SIZES[i]; }
+        i = i + 1;
+    }
+    ret bytes;
+}
+
+# held bytes and refusals, per lane
+pub rec LaneCounters {
+    held:      usize;
+    peak:      usize;
+    refusals:  u64;
+    exhausted: u64;
+    timeouts:  u64;
+}
+
+pub rec Memory {
+    pool:     buffers.Pool;
+    classes:  [15]buffers.ClassConfig;
+    lanes:    [5]LaneCounters;
+    wakes:    *wake.Queue;
+    budget:   usize;
+    admitted: usize;
+    refused:  u64;
+    made:     bool;
+}
+
+fun notify_wake(context: ptr, handle: u64) {
+    val value: *Memory = context::*Memory;
+    if (value == nil || value.wakes == nil) { ret; }
+    var waker: wake.Waker = wake.waker(value.wakes, handle);
+    wake.wake(?waker);
+}
+
+fun ignore_misuse(context: ptr) {}
+
+# `budget` is the global byte budget. `wakes` receives every woken account
+pub fun make(value: *Memory, budget: usize, wakes: *wake.Queue, a: *A.Allocator) bool {
+    if (value == nil || value.made || budget == 0 || wakes == nil || a == nil) { ret false; }
+    var i: usize = 0;
+    for (i < PLAIN_CLASSES) {
+        value.classes[i] = buffers.ClassConfig{size: PLAIN_SIZES[i], align: 0,
+            secret: false, high_water: HIGH_WATER};
+        i = i + 1;
+    }
+    var s: usize = 0;
+    for (s < SECRET_CLASSES) {
+        value.classes[PLAIN_CLASSES + s] = buffers.ClassConfig{size: SECRET_SIZES[s],
+            align: 0, secret: true, high_water: HIGH_WATER};
+        s = s + 1;
+    }
+    var config: buffers.Config;
+    config.classes        = ?value.classes[0];
+    config.class_count    = CLASS_COUNT;
+    config.lanes          = LANES;
+    config.global_budget  = budget;
+    config.initial_slots  = 0;
+    config.notify         = notify_wake;
+    config.notify_context = value::ptr;
+    config.trap           = ignore_misuse;
+    config.trap_context   = nil;
+    if (!buffers.make(?value.pool, config, a)) { ret false; }
+    var l: usize = 0;
+    for (l < LANES::usize) {
+        value.lanes[l] = LaneCounters{held: 0, peak: 0, refusals: 0, exhausted: 0,
+            timeouts: 0};
+        l = l + 1;
+    }
+    value.wakes    = wakes;
+    value.budget   = budget;
+    value.admitted = 0;
+    value.refused  = 0;
+    value.made     = true;
+    ret true;
+}
+
+# false while any account is still open or any chunk is still held
+pub fun destroy(value: *Memory) bool {
+    if (value == nil || !value.made)   { ret false; }
+    if (!buffers.destroy(?value.pool)) { ret false; }
+    value.made = false;
+    ret true;
+}
+
+fun sum_used(account: *buffers.Account, output: *usize) {
+    var l: usize = 0;
+    for (l < LANES::usize) {
+        output[l] = account.used[l];
+        l         = l + 1;
+    }
+}
+
+# fold what an account's lanes changed by into the totals
+fun account_for(value: *Memory, account: *buffers.Account, before: *usize) {
+    var l: usize = 0;
+    for (l < LANES::usize) {
+        val lane: *LaneCounters = ?value.lanes[l];
+        val now:  usize         = account.used[l];
+        if (now >= before[l]) { lane.held = lane.held + (now - before[l]); }
+        or {
+            val less: usize = before[l] - now;
+            if (less > lane.held) { lane.held = 0; }
+            or                    { lane.held = lane.held - less; }
+        }
+        if (lane.held > lane.peak) { lane.peak = lane.held; }
+        l = l + 1;
+    }
+}
+
+fun refused_on(value: *Memory, lane: u8, reason: buffers.Reason) {
+    if (lane >= LANES) { ret; }
+    val counters: *LaneCounters = ?value.lanes[lane::usize];
+    val waits:    bool          = (sel reason.exhausted) || (sel reason.memory);
+    if (waits) {
+        counters.exhausted = counters.exhausted + 1;
+    }
+    or { counters.refusals = counters.refusals + 1; }
+}
+
+# admission: an account is opened only while the reservations stay inside the
+# admission share of the global budget, so the headroom above it is left for
+# accounts already open to make progress
+fun admit(value: *Memory, account: *buffers.Account, handle: u64, budgets: *usize,
+    reserve: usize) buffers.Reason {
+    val limit: usize = value.budget / 64 * ADMISSION_SHARE;
+    if (value.pool.reserved_total > limit || reserve > limit - value.pool.reserved_total) {
+        value.refused = value.refused + 1;
+        ret buffers.Reason.exhausted{};
+    }
+    val opened: buffers.Reason = buffers.open_account(?value.pool, account, handle,
+        budgets, reserve);
+    if (sel opened.none) { value.admitted = value.admitted + 1; }
+    or                   { value.refused = value.refused + 1; }
+    ret opened;
+}
+
+fun source_open(context: ptr, account: *buffers.Account, handle: u64, budgets: *usize,
+    reserve: usize) buffers.Reason {
+    ret admit(context::*Memory, account, handle, budgets, reserve);
+}
+
+fun source_close(context: ptr, account: *buffers.Account) buffers.Reason {
+    val value: *Memory = context::*Memory;
+    ret buffers.close_account(?value.pool, account);
+}
+
+fun source_acquire(context: ptr, account: *buffers.Account, request: buffers.Request,
+    register: bool) buffers.Acquired {
+    val value:  *Memory = context::*Memory;
+    var before: [5]usize;
+    sum_used(account, ?before[0]);
+    val got: buffers.Acquired = buffers.acquire(?value.pool, account, request, register);
+    if (sel got.status.ok) { account_for(value, account, ?before[0]); }
+    or                     { refused_on(value, request.lane, got.reason); }
+    ret got;
+}
+
+fun source_acquire_n(context: ptr, account: *buffers.Account, requests: *buffers.Request,
+    count: usize, out: *buffers.Chunk, register: bool) buffers.Acquired {
+    val value:  *Memory = context::*Memory;
+    var before: [5]usize;
+    sum_used(account, ?before[0]);
+    val got: buffers.Acquired = buffers.acquire_n(?value.pool, account, requests, count,
+        out, register);
+    if (sel got.status.ok) { account_for(value, account, ?before[0]); }
+    or {
+        var lane: u8 = LANE_REQUEST;
+        if (count != 0) { lane = requests[0].lane; }
+        refused_on(value, lane, got.reason);
+    }
+    ret got;
+}
+
+fun source_release(context: ptr, account: *buffers.Account, chunk: buffers.Chunk) buffers.Reason {
+    val value:  *Memory = context::*Memory;
+    var before: [5]usize;
+    sum_used(account, ?before[0]);
+    val released: buffers.Reason = buffers.release(?value.pool, account, chunk);
+    account_for(value, account, ?before[0]);
+    ret released;
+}
+
+fun pool_of(context: ptr) *buffers.Pool {
+    val value: *Memory = context::*Memory;
+    ret ?value.pool;
+}
+
+fun source_data(context: ptr, ref: buffers.Ref) *u8 {
+    ret buffers.data(pool_of(context), ref);
+}
+
+fun source_retain(context: ptr, ref: buffers.Ref) buffers.Reason {
+    ret buffers.retain(pool_of(context), ref);
+}
+
+fun source_settle(context: ptr, ref: buffers.Ref) buffers.Reason {
+    ret buffers.settle(pool_of(context), ref);
+}
+
+fun source_in_flight(context: ptr, ref: buffers.Ref) bool {
+    ret buffers.in_flight(pool_of(context), ref);
+}
+
+fun source_ready(context: ptr, output: *u64, capacity: usize) usize {
+    ret buffers.ready(pool_of(context), output, capacity);
+}
+
+fun secret_acquire(context: ptr, account: *buffers.Account, request: buffers.Request,
+    register: bool) buffers.Acquired {
+    ret source_acquire(context, account, request, register);
+}
+
+fun secret_view(context: ptr, chunk: buffers.Chunk) *^u8 {
+    ret buffers.secret(pool_of(context), chunk);
+}
+
+# the pool's plain source, the one every borrower forwards to
+fun source(value: *Memory) buffers.Source {
+    ret buffers.Source{
+        ctx:              value::ptr,
+        fn_open_account:  source_open,
+        fn_close_account: source_close,
+        fn_acquire:       source_acquire,
+        fn_acquire_n:     source_acquire_n,
+        fn_release:       source_release,
+        fn_data:          source_data,
+        fn_retain:        source_retain,
+        fn_settle:        source_settle,
+        fn_in_flight:     source_in_flight,
+        fn_ready:         source_ready,
+    };
+}
+
+# the source TLS borrows secret chunks through. its holder is welded
+fun secret_source(value: *Memory) buffers.SecretSource {
+    ret buffers.SecretSource{
+        ctx:              value::ptr,
+        fn_open_account:  source_open,
+        fn_close_account: source_close,
+        fn_acquire:       secret_acquire,
+        fn_release:       source_release,
+        fn_view:          secret_view,
+    };
+}
+
+# what one connection's account may hold, lane by lane, and what it reserves
+pub rec Budgets {
+    lanes:   [5]usize;
+    reserve: usize;
+}
+
+pub fun no_budgets() Budgets {
+    ret Budgets{lanes: [5]usize{0, 0, 0, 0, 0}, reserve: 0};
+}
+
+# the lane rule. a connection with `total` bytes gives the TLS lane `tls`, the
+# IO lane `io`, the QUIC lanes `send` and `receive`, and the request lane
+# whatever is left. `reserve` is what the connection needs to make any progress
+# at all, and admission refuses a connection it cannot fund
+pub fun connection_budgets(total: usize, tls: usize, io: usize, send: usize,
+    receive: usize, reserve: usize) Budgets {
+    var value: Budgets = no_budgets();
+    val fixed: usize   = tls + io + send + receive;
+    value.lanes[LANE_SEND::usize]    = send;
+    value.lanes[LANE_RECEIVE::usize] = receive;
+    value.lanes[LANE_TLS::usize]     = tls;
+    value.lanes[LANE_IO::usize]      = io;
+    if (total > fixed) { value.lanes[LANE_REQUEST::usize] = total - fixed; }
+    value.reserve = reserve;
+    ret value;
+}
+
+# how many request sets of `set_bytes` the request lane funds
+pub fun request_capacity(budgets: Budgets, set_bytes: usize) usize {
+    if (set_bytes == 0) { ret 0; }
+    ret budgets.lanes[LANE_REQUEST::usize] / set_bytes;
+}
+
+# open a connection's account, or refuse it when admission is past its share
+# of the global budget
+# one connection's view of the pool. every engine on the connection borrows
+# through the sources it hands out, and the connection opens its account either
+# itself, with `open`, or through an engine that opens its own. such an engine
+# names only its first `given` lanes, and the borrower supplies the budgets of
+# the lanes after those and the handle the account is woken under, so an engine
+# that knows nothing of hedge's lanes or wake owners still gets a whole account.
+# the borrower also remembers the lane its last wait registered on, which is the
+# lane a memory timeout is charged to. it must stay put while its sources are in
+# use
+pub rec Borrower {
+    memory:  *Memory;
+    handle:  u64;
+    given:   u8;
+    waited:  u8;
+    budgets: Budgets;
+}
+
+pub fun borrower(value: *Borrower, memory_value: *Memory, handle: u64, given: u8,
+    budgets: Budgets) {
+    value.memory  = memory_value;
+    value.handle  = handle;
+    value.given   = given;
+    value.waited  = LANES;
+    value.budgets = budgets;
+}
+
+# open the account from the borrower's own budgets, or refuse it at admission
+pub fun open(value: *Borrower, account: *buffers.Account) bool {
+    if (value == nil || value.memory == nil || !value.memory.made || account == nil
+        || value.given != 0) { ret false; }
+    var none:   usize          = 0;
+    val opened: buffers.Reason = borrowed_open(value::ptr, account, value.handle, ?none,
+        value.budgets.reserve);
+    ret sel opened.none;
+}
+
+fun noted(value: *Borrower, lane: u8, got: buffers.Acquired) {
+    if (sel got.status.ok)                                     { ret; }
+    if ((sel got.reason.exhausted) || (sel got.reason.memory)) { value.waited = lane; }
+}
+
+fun lender(context: ptr) *Memory {
+    val value: *Borrower = context::*Borrower;
+    ret value.memory;
+}
+
+fun borrowed_open(context: ptr, account: *buffers.Account, handle: u64, budgets: *usize,
+    reserve: usize) buffers.Reason {
+    val value: *Borrower = context::*Borrower;
+    if (value.given > LANES) { ret buffers.Reason.misuse{}; }
+    var lanes: [5]usize = value.budgets.lanes;
+    var l:     usize    = 0;
+    for (l < value.given::usize) {
+        lanes[l] = budgets[l];
+        l        = l + 1;
+    }
+    ret admit(value.memory, account, value.handle, ?lanes[0], reserve);
+}
+
+fun borrowed_close(context: ptr, account: *buffers.Account) buffers.Reason {
+    ret source_close(lender(context)::ptr, account);
+}
+
+fun borrowed_acquire(context: ptr, account: *buffers.Account, request: buffers.Request,
+    register: bool) buffers.Acquired {
+    val got: buffers.Acquired = source_acquire(lender(context)::ptr, account, request,
+        register);
+    noted(context::*Borrower, request.lane, got);
+    ret got;
+}
+
+fun borrowed_acquire_n(context: ptr, account: *buffers.Account, requests: *buffers.Request,
+    count: usize, out: *buffers.Chunk, register: bool) buffers.Acquired {
+    val got: buffers.Acquired = source_acquire_n(lender(context)::ptr, account, requests,
+        count, out, register);
+    if (count != 0) { noted(context::*Borrower, requests[0].lane, got); }
+    ret got;
+}
+
+fun borrowed_view(context: ptr, chunk: buffers.Chunk) *^u8 {
+    ret secret_view(lender(context)::ptr, chunk);
+}
+
+fun borrowed_release(context: ptr, account: *buffers.Account,
+    chunk: buffers.Chunk) buffers.Reason {
+    ret source_release(lender(context)::ptr, account, chunk);
+}
+
+fun borrowed_data(context: ptr, ref: buffers.Ref) *u8 {
+    ret source_data(lender(context)::ptr, ref);
+}
+
+fun borrowed_retain(context: ptr, ref: buffers.Ref) buffers.Reason {
+    ret source_retain(lender(context)::ptr, ref);
+}
+
+fun borrowed_settle(context: ptr, ref: buffers.Ref) buffers.Reason {
+    ret source_settle(lender(context)::ptr, ref);
+}
+
+fun borrowed_in_flight(context: ptr, ref: buffers.Ref) bool {
+    ret source_in_flight(lender(context)::ptr, ref);
+}
+
+fun borrowed_ready(context: ptr, output: *u64, capacity: usize) usize {
+    ret source_ready(lender(context)::ptr, output, capacity);
+}
+
+# the secret source TLS borrows through. its holder is welded
+pub fun borrowed_secret_source(value: *Borrower) buffers.SecretSource {
+    ret buffers.SecretSource{
+        ctx:              value::ptr,
+        fn_open_account:  borrowed_open,
+        fn_close_account: borrowed_close,
+        fn_acquire:       borrowed_acquire,
+        fn_release:       borrowed_release,
+        fn_view:          borrowed_view,
+    };
+}
+
+pub fun borrowed_source(value: *Borrower) buffers.Source {
+    ret buffers.Source{
+        ctx:              value::ptr,
+        fn_open_account:  borrowed_open,
+        fn_close_account: borrowed_close,
+        fn_acquire:       borrowed_acquire,
+        fn_acquire_n:     borrowed_acquire_n,
+        fn_release:       borrowed_release,
+        fn_data:          borrowed_data,
+        fn_retain:        borrowed_retain,
+        fn_settle:        borrowed_settle,
+        fn_in_flight:     borrowed_in_flight,
+        fn_ready:         borrowed_ready,
+    };
+}
+
+# false while the account still holds a chunk
+pub fun close(value: *Memory, account: *buffers.Account) bool {
+    if (value == nil || !value.made || account == nil || !account.open) { ret false; }
+    val closed: buffers.Reason = buffers.close_account(?value.pool, account);
+    ret sel closed.none;
+}
+
+# a connection closed because it waited on memory past its bound. the timeout
+# is charged to the lane its last wait registered on
+pub fun timed_out(value: *Borrower) {
+    if (value == nil || value.memory == nil || value.waited >= LANES) { ret; }
+    val lane: *LaneCounters = ?value.memory.lanes[value.waited::usize];
+    lane.timeouts = lane.timeouts + 1;
+}
+
+# whether the account is registered for a wake, which is what arms the
+# connection's memory-wait deadline
+pub fun waiting(account: *buffers.Account) bool {
+    ret account != nil && account.open && account.waiting;
+}
+
+pub rec Snapshot {
+    lanes:    [5]LaneCounters;
+    budget:   usize;
+    reserved: usize;
+    live:     usize;
+    accounts: usize;
+    waiters:  usize;
+    admitted: usize;
+    refused:  u64;
+    oversize: usize;
+    backing:  u64;
+    misuse:   u64;
+}
+
+pub fun snapshot(value: *Memory) Snapshot {
+    var result: Snapshot;
+    if (value == nil || !value.made) { ret result; }
+    var pool: buffers.Snapshot;
+    buffers.snapshot(?value.pool, ?pool);
+    result.lanes    = value.lanes;
+    result.budget   = value.budget;
+    result.reserved = pool.reserved;
+    result.live     = pool.bytes_live;
+    result.accounts = pool.accounts;
+    result.waiters  = pool.waiters;
+    result.admitted = value.admitted;
+    result.refused  = value.refused;
+    result.oversize = pool.oversize_bytes;
+    result.backing  = pool.backing_allocations;
+    result.misuse   = pool.misuse;
+    ret result;
+}
