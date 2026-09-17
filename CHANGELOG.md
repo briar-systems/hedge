@@ -22,6 +22,8 @@
 
 ### Changed
 
+- The QUIC runtime runs only the connections that have work (#180, part of #172). A settled completion, a fired timer or a state change marks its connection ready, and `advance` services only the ready list, in arrival order. QUIC transport and drain deadlines live in the serving runtime's timing wheel, which also sets the poll timeout, and `hedge.protocol.quic.timers` is removed. 100 held idle HTTP/3 connections cost about 2% CPU, down from 66%. Until #181 gives them wakes of their own, a connection with a request in service, or with a teardown step that waits on nothing that wakes it, is still visited every turn.
+- **Breaking.** `quic_runtime.RuntimeConfig` takes the worker's `timers`, `quic_runtime.next_deadline` is removed in favour of the wheel's, and `quic_runtime.fire`, `owns_timer` and `has_ready` are new. `quic_runtime.Snapshot.timers` counts armed wheel entries.
 - hedge is copyright Briar Systems LLC (#184). The MIT license terms are unchanged.
 - **Breaking.** Dependencies move to the mach-std 4 stack (#171): mach-std v4.2.0, mach-crypto v0.12.0, mach-tls v0.5.1, mach-quic v0.11.0, mach-http v0.11.0, mach-acme v0.4.2 and laurel v0.13.3. Both `mach.toml` and `test/acme/mach.toml` carry the std and crypto pins (#171, #186). Errors hedge raises itself now name their kind (`io_error.make`), as std 4 requires. `listener.apply_stream_policy` takes a socket handle rather than a raw descriptor. `connection.stream_released` reports whether the driver has taken a connection's socket. `quic_runtime.PumpConfig.max_replay` is required.
 - **Breaking.** `telemetry.metric_series` must now cover seven built-in series, up from six, for `hedge_quic_retry_replay_full_total`.
