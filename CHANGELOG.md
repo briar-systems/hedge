@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-17
+
+### Security
+
+- Timeouts were never enforced on a TLS listener once a client had sent its first byte (#189). The TLS adapter ran every TLS operation under a scope root of its own, detached from the connection, so an engine timeout never reached the TLS read in flight, and the handshake ran with no deadline at all. A client that sent part of a ClientHello, finished the handshake and went silent, sent part of a request, or sat idle after a response kept its connection slot, admission lease and descriptor indefinitely. The TLS session now descends from the connection's scope, each engine operation runs under the scope the engine submitted it with, and the handshake runs under the prologue scope that carries `timeouts.handshake_ms`.
+- HTTP/2 connections had no connection timeouts (#189). mach-http's HTTP/2 engine has no timeout support, so `header_ms`, `keep_alive_ms` and `write_ms` never applied to HTTP/2. As a stopgap, hedge's HTTP/2 adapter now enforces them itself: `header_ms` until the first request, `keep_alive_ms` while no stream is open, and `write_ms` while a write is pending. The real fix belongs in the engine (briar-systems/mach-http#110), and the stopgap is removed once that lands.
+- Mutual TLS was completely broken in 0.5.1 (#190). #168 moved the connection's clock to monotonic time, and the TLS verification time was still derived from it, so client certificates were checked against seconds since boot and every one was refused as expired. The same value drove session ticket key rotation, against a key ring initialised in wall time, so ticket keys never rotated in 0.5.1. Every time hedge hands mach-tls now comes from the wall clock, and the call sites say so. Ticket keys and the replay window live only in memory and are minted fresh in each process, so no ticket survives a restart, whatever the clock. That is why there is no restart test.
+
+Measured with release builds and the default timeouts (`handshake_ms` 10000, `header_ms` 10000, `keep_alive_ms` 75000, `write_ms` 30000). Each probe waited 100 s. The 0.5.1 column is from the #189 report.
+
+| client behaviour over TLS | 0.5.1 | dev before this fix | 0.5.2 |
+|---|---|---|---|
+| half a ClientHello | still open | still open | closed at 10.0 s |
+| full ClientHello, never finishes the handshake | still open | still open | closed at 10.0 s |
+| HTTP/1.1: silent after the handshake | still open | still open | closed at 75.1 s |
+| HTTP/1.1: partial request header | still open | still open | closed at 10.1 s |
+| HTTP/1.1: idle after a response | still open | still open | closed at 75.1 s |
+| HTTP/2: silent after the handshake | still open | still open | closed at 10.0 s |
+| HTTP/2: preface only | still open | still open | closed at 10.0 s |
+| HTTP/2: stalls inside HEADERS | still open | still open | closed at 10.0 s |
+| HTTP/2: header block that never ends | still open | still open | closed at 10.0 s |
+| HTTP/2: idle after a response | still open | still open | closed at 75.1 s |
+| HTTP/1.1: stops reading a 12 MB response | | still open | closed at 30.2 s |
+| HTTP/2: stops reading a 12 MB response, with a large flow-control window | | still open | closed at 31.2 s |
+
+A client that stops reading a response is covered by `write_ms` on both protocols. An HTTP/1.1 connection that has sent no request byte yet is idle, so `keep_alive_ms` bounds it rather than `header_ms`, which starts at a request's first byte. The HTTP/2 stopgap applies `header_ms` until the first request.
+
+### Fixed
+
+- Stopping hedge could hang forever on a TLS connection waiting for its next request (#192). The engine's read sat in the TLS adapter's queue, not yet started, and a closing connection never started or failed it, so the connection could not be torn down. A 0.5.1 server with one idle TLS keep-alive client was still running 40 s after SIGTERM. The adapter now settles a queued operation as cancelled or timed out once its scope has ended, without starting it.
+- An HTTP/2 connection that failed with a stream the adapter had not yet opened could not be torn down (#189). The adapter now releases such streams before it destroys the engine.
+
 ## [0.5.1] - 2026-09-17
 
 ### Security
