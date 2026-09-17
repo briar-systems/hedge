@@ -17,6 +17,8 @@
 - A budget queue whose head expires now admits the waiters that head was holding back (#181). They used to wait for an unrelated release.
 - A connection still making progress at the end of its turn runs again on the next turn (#181). Without this, an HTTP/2 upload over TLS larger than its flow-control window could stall until the request timeout.
 - The interop matrix's telemetry leg configures the seven built-in metric series. It was refused at startup, which stopped the matrix before its remaining legs ran.
+- A proxied response body held behind a client's flow-control window no longer spins its connection (#196). The HTTP/1 upstream engine reports the same held bytes on every step, and each report counted as progress, so the connection ran every turn until the window opened. The same held bytes now count as backpressure.
+- Every configuration the interop and cache lanes run is built by the loader in the unit suite (#196), so a lane configuration the loader refuses fails `mach test` instead of skipping lane legs.
 
 ### Added
 
@@ -39,10 +41,19 @@
 
 ### Known issues
 
-- A proxied response body only reaches the client over cleartext HTTP/1.1 (#196). Over TLS it stops after 8192 bytes, and over HTTP/2 and HTTP/3 the request is cancelled after its headers.
 - A burst of QUIC handshakes larger than the server can complete within its clients' timeouts collapses (#164). With 1100 clients dialling at once, about half connect. The same 1100 arriving at 40 per second almost all connect. Bursts of 200 connect in under 5 seconds.
 - hedge builds for `windows-x86_64` but is not supported at runtime on Windows (#149). The CI leg for Windows is build-only until that is fixed.
+- On Windows, the TLS read preemption from 0.5.3 (#196) can drop bytes, which fails the connection (#149). A socket read whose completion races its cancel is discarded by mach-std's Windows backend, including on the mach-std 4.2.0 hedge pins, so a record that arrives just as a response is queued never reaches mach-tls. Linux and darwin are unaffected: their backends are readiness-based and read only inside `poll`, which hands every finished read out before hedge can cancel it. mach-std 5.3.0 delivers a raced read as cancelled with its bytes, and the preemption then works on Windows unchanged.
 - The TLS stall fix merged from 0.5.2 (#189) bounds a TLS operation through the deadline std's cancel scope carries. That is temporary: stage 3c-2 (#195) runs TLS channels by events, and the scope deadline goes with it. The HTTP/2 adapter's connection deadlines are likewise temporary until briar-systems/mach-http#110.
+
+## [0.5.3] - 2026-09-17
+
+### Fixed
+
+- A proxied response body only reached the client over cleartext HTTP/1.1 (#196). Two causes.
+  - Over TLS the connection had already started a read for its next request when a late response became ready, and the TLS channel runs one operation at a time, so the response waited behind a read that only the client could end. HTTP/1.1 stopped after its first 8192 bytes and HTTP/2 never sent the body. A write queued behind a read now cancels that read through its own operation scope, the writes run, and the read starts again unseen by the engine, keeping every byte it had already received. A write is never cancelled this way.
+  - HTTP/2 and HTTP/3 carry field names in lowercase only, and the engines refuse anything else. An upstream's `Content-Type` or `Last-Modified` was passed through as written, so the response was refused and the request logged as `cancelled`. hedge now lowers every name it sends on those protocols, headers and trailers alike, and refuses a list it cannot lower rather than truncating it.
+- The interop lane now proxies a 156000-byte body over TLS HTTP/1.1, HTTP/2 and HTTP/3 and compares it byte for byte.
 
 ## [0.5.2] - 2026-09-17
 
