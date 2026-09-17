@@ -17,6 +17,7 @@ use hedge.clock;
 use hedge.dispatch;
 use hedge.dispatch.call;
 use hedge.dispatch.plan;
+use hedge_memory: hedge.memory;
 use hedge.protocol.names;
 use hedge.service;
 use hedge.storage;
@@ -27,6 +28,7 @@ use http.core.exchange;
 use http.core.field;
 use http.core.message;
 use http.core.method;
+use http.core.records;
 use http.core.status;
 use http.core.target;
 use http.core.transport;
@@ -36,10 +38,12 @@ use http.router.router;
 use A: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
+use std.memory.buffers;
 use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
@@ -53,13 +57,12 @@ fun scope_active(scope: *cancel.Scope) bool {
     ret sel reason.active;
 }
 
-# concurrent request streams on one connection. the engine's own table is one
-# wider, because it validates its stream limit as strictly below its capacity.
-pub val MAX_STREAMS:     usize = 8;
-pub val STREAM_CAPACITY: usize = MAX_STREAMS + 1;
+# concurrent request streams on one connection
+pub val MAX_STREAMS: usize = 8;
+# stream records the engine takes at init, before it borrows another chunk
+pub val INITIAL_STREAMS: usize = 4;
 
 pub val READ_BYTES:          usize = 8192;
-pub val WRITE_BYTES:         usize = 8192;
 pub val FRAME_PAYLOAD_BYTES: usize = 16384;
 pub val HEADER_OUTPUT_BYTES: usize = 4096;
 pub val CONTROL_SLOTS:       usize = 16;
@@ -175,30 +178,29 @@ pub rec Timeouts {
 }
 
 pub rec Session {
-    timeouts:         Timeouts;
-    idle:             bool;
-    idle_since:       time.Time;
-    writing:          bool;
-    writing_since:    time.Time;
-    live:             bool;
-    state:            State;
-    engine:           engine_h2.Engine;
-    streams:          [STREAM_CAPACITY]engine_h2.Stream;
-    memories:         [STREAM_CAPACITY]engine_h2.StreamMemory;
-    encoded:          [STREAM_CAPACITY][STREAM_ENCODED_BYTES]u8;
-    header_fields:    [STREAM_CAPACITY][STREAM_FIELD_SLOTS]field.Field;
-    strings:          [STREAM_CAPACITY][STREAM_STRING_BYTES]u8;
-    pending:          [STREAM_CAPACITY][STREAM_PENDING_ENTRIES]hpack.Entry;
+    timeouts:      Timeouts;
+    idle:          bool;
+    idle_since:    time.Instant;
+    writing:       bool;
+    writing_since: time.Instant;
+    live:          bool;
+    state:         State;
+    engine:        engine_h2.Engine;
+    # the connection's source and account, which outlive the engine
+    source:  buffers.Source;
+    account: *buffers.Account;
+    # decodes a header block whose stream was refused its memory, so HPACK
+    # stays in step with the peer
+    refused_encoded:  [STREAM_ENCODED_BYTES]u8;
+    refused_fields:   [STREAM_FIELD_SLOTS]field.Field;
+    refused_strings:  [STREAM_STRING_BYTES]u8;
+    refused_pending:  [STREAM_PENDING_ENTRIES]hpack.Entry;
     read_buffer:      [READ_BYTES]u8;
-    write_buffer:     [WRITE_BYTES]u8;
-    frame_payload:    [FRAME_PAYLOAD_BYTES]u8;
-    header_output:    [HEADER_OUTPUT_BYTES]u8;
     controls:         [CONTROL_SLOTS]engine_h2.Control;
     inbound_entries:  [TABLE_ENTRIES]hpack.Entry;
     inbound_storage:  [TABLE_STORAGE_BYTES]u8;
     outbound_entries: [TABLE_ENTRIES]hpack.Entry;
     outbound_storage: [TABLE_STORAGE_BYTES]u8;
-    encoder_pending:  [TABLE_ENTRIES]hpack.Entry;
     slots:            [MAX_STREAMS]Slot;
     # lowered field names and trailers for the one header list being offered
     names:              names.Scratch;
@@ -395,9 +397,10 @@ fun retire_closed_stream(session: *Session, slot: *Slot) Step {
 # will release it, and the engine refuses to be destroyed while it is live.
 fun release_unheld_streams(session: *Session) {
     var i: usize = 0;
-    for (i < STREAM_CAPACITY) {
-        val stream: *engine_h2.Stream = ?session.streams[i];
-        if (stream.live && stream.state == engine_h2.STREAM_CLOSED
+    for (i < session.engine.stream_capacity) {
+        val stream: *engine_h2.Stream =
+            records.at(?session.engine.records, i)::*engine_h2.Stream;
+        if (stream != nil && stream.live && stream.state == engine_h2.STREAM_CLOSED
             && slot_for(session, stream.id) == nil) {
             engine_h2.release_stream(?session.engine, stream.id, stream.generation);
         }
@@ -448,6 +451,11 @@ pub fun config_from(limits: message.Limits, max_streams: usize) engine_h2.Config
     }
     configured.local.header_table_size    = configured.hpack.max_dynamic_table_bytes::u32;
     configured.local.max_header_list_size = configured.hpack.max_header_list_bytes::u32;
+    configured.write_bytes                = FRAME_PAYLOAD_BYTES + 9;
+    configured.frame_payload_bytes        = FRAME_PAYLOAD_BYTES;
+    configured.initial_streams            = INITIAL_STREAMS;
+    configured.stream_lane                = hedge_memory.LANE_REQUEST;
+    configured.connection_lane            = hedge_memory.LANE_IO;
     ret configured;
 }
 
@@ -456,10 +464,14 @@ pub fun begin(session: *Session, channel: *transport.Transport, scope: *cancel.S
     max_streams: usize,
     listener_name: str,
     secure: bool, peer: message.Endpoint, local: message.Endpoint,
-    request_timeout_ns: u64, chunks: *storage.Chunks, call_memory_bytes: usize,
-    timeouts: Timeouts, waker: hedge_wake.Waker, now: time.Time) bool {
+    request_timeout_ns: u64, source: buffers.Source, account: *buffers.Account,
+    chunks: *storage.Chunks, call_memory_bytes: usize,
+    timeouts: Timeouts, waker: hedge_wake.Waker, now: time.Instant) bool {
     if (session == nil || !session.live || channel == nil
-        || scope == nil || active_plan == nil || chunks == nil) { ret false; }
+        || scope == nil || active_plan == nil || chunks == nil
+        || account == nil) { ret false; }
+    session.source             = source;
+    session.account            = account;
     session.waker              = waker;
     session.timeouts           = timeouts;
     session.idle               = true;
@@ -476,34 +488,26 @@ pub fun begin(session: *Session, channel: *transport.Transport, scope: *cancel.S
     session.local              = local;
     session.request_timeout_ns = request_timeout_ns;
     session.engine_scope       = scope;
-    var i: usize = 0;
-    for (i < STREAM_CAPACITY) {
-        session.memories[i] = engine_h2.StreamMemory{
-            encoded:          ?session.encoded[i][0],
-            encoded_capacity: STREAM_ENCODED_BYTES,
-            fields:           ?session.header_fields[i][0],
-            field_capacity:   STREAM_FIELD_SLOTS,
-            strings:          ?session.strings[i][0],
-            string_capacity:  STREAM_STRING_BYTES,
-            pending:          ?session.pending[i][0],
-            pending_capacity: STREAM_PENDING_ENTRIES,
-        };
-        i = i + 1;
-    }
+    var refused: engine_h2.StreamMemory;
+    refused.encoded          = ?session.refused_encoded[0];
+    refused.encoded_capacity = STREAM_ENCODED_BYTES;
+    refused.fields           = ?session.refused_fields[0];
+    refused.field_capacity   = STREAM_FIELD_SLOTS;
+    refused.strings          = ?session.refused_strings[0];
+    refused.string_capacity  = STREAM_STRING_BYTES;
+    refused.pending          = ?session.refused_pending[0];
+    refused.pending_capacity = STREAM_PENDING_ENTRIES;
     val configured: engine_h2.Config = config_from(limits, max_streams);
     session.engine.initialized = false;
     if (!engine_h2.init(?session.engine, engine_h2.SERVER, channel, scope,
-        ?session.streams[0], ?session.memories[0], STREAM_CAPACITY,
+        ?session.source, session.account,
         ?session.read_buffer[0], READ_BYTES,
-        ?session.write_buffer[0], WRITE_BYTES,
-        ?session.frame_payload[0], FRAME_PAYLOAD_BYTES,
-        ?session.header_output[0], HEADER_OUTPUT_BYTES,
         ?session.controls[0], CONTROL_SLOTS,
         ?session.inbound_entries[0], TABLE_ENTRIES,
         ?session.inbound_storage[0], TABLE_STORAGE_BYTES,
         ?session.outbound_entries[0], TABLE_ENTRIES,
         ?session.outbound_storage[0], TABLE_STORAGE_BYTES,
-        ?session.encoder_pending[0], TABLE_ENTRIES, configured)) {
+        refused, configured)) {
         ret false;
     }
     session.engine_started = true;
@@ -729,7 +733,7 @@ fun write_status(slot: *Slot, code: status.Status) view.View {
 }
 
 fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
-    now: time.Time) bool {
+    now: time.Instant) bool {
     session.requests = session.requests + 1;
     slot.deadline_ns = 0;
     if (session.request_timeout_ns != 0) {
@@ -740,7 +744,7 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     # mach-http requires the exchange scope to carry the request's deadline. the
     # wheel entry is what enforces it on a service that submits no io
     if (!operation_ok(cancel.make_child(?slot.scope, session.engine_scope,
-        slot.deadline_ns != 0, clock.from_ns(slot.deadline_ns)))) { ret false; }
+        clock.deadline(slot.deadline_ns)))) { ret false; }
     slot.scope_live            = true;
     slot.body.session          = session;
     slot.body.slot             = (slot)::usize - (?session.slots[0])::usize;
@@ -782,9 +786,8 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     metadata.peer       = session.peer;
     metadata.local      = session.local;
     # calendar time: telemetry and caching measure from it
-    metadata.received_at  = clock.wall();
-    metadata.has_deadline = slot.deadline_ns != 0;
-    metadata.deadline     = clock.from_ns(slot.deadline_ns);
+    metadata.received_at = clock.wall();
+    metadata.deadline    = clock.deadline(slot.deadline_ns);
     # the engine binds an exchange only when its request index is the stream id
     metadata.request_index = event.stream_id::u64;
     if (!message.init_request(?slot.request, method_of(event.headers.method),
@@ -1072,7 +1075,7 @@ fun resume_exchange(session: *Session, slot: *Slot) Step {
 
 # --- events ---
 
-fun open_stream(session: *Session, event: engine_h2.Event, now: time.Time) Step {
+fun open_stream(session: *Session, event: engine_h2.Event, now: time.Instant) Step {
     if (session.state != ACTIVE) {
         if (!engine_h2.cancel_stream(?session.engine, event.stream_id,
             engine_h2.H2_REFUSED_STREAM)
@@ -1109,13 +1112,16 @@ fun open_stream(session: *Session, event: engine_h2.Event, now: time.Time) Step 
     ret start_exchange(session, slot);
 }
 
-fun apply(session: *Session, event: engine_h2.Event, now: time.Time) Step {
+fun apply(session: *Session, event: engine_h2.Event, now: time.Instant) Step {
     session.last_event = event.kind;
     if (event.kind == engine_h2.EVENT_NEED_READ) {
         engine_h2.submit_read(?session.engine);
         ret STEP_BLOCKED;
     }
-    if (event.kind == engine_h2.EVENT_NONE) { ret STEP_BLOCKED; }
+    # a memory-blocked engine is woken through the connection's account
+    if (event.kind == engine_h2.EVENT_NONE
+        || event.kind == engine_h2.EVENT_MEMORY_BLOCKED) { ret STEP_BLOCKED; }
+    if (event.kind == engine_h2.EVENT_PENDING) { ret STEP_PROGRESS; }
     if (event.kind == engine_h2.EVENT_CLOSED
         || event.kind == engine_h2.EVENT_PEER_CLOSED
         || event.kind == engine_h2.EVENT_ERROR
@@ -1187,7 +1193,7 @@ fun return_event(session: *Session, event: engine_h2.Event) {
         event.generation);
 }
 
-fun pump_slot(session: *Session, slot: *Slot, now: time.Time) Step {
+fun pump_slot(session: *Session, slot: *Slot, now: time.Instant) Step {
     if (!slot.live || !slot.exchange_live) { ret STEP_IDLE; }
     # a handler that never completes submits no io under the stream scope, so
     # its request deadline is enforced here or not at all
@@ -1217,7 +1223,7 @@ fun pump_slot(session: *Session, slot: *Slot, now: time.Time) Step {
     ret settle_exchange(session, slot);
 }
 
-fun pump_streams(session: *Session, now: time.Time) Step {
+fun pump_streams(session: *Session, now: time.Instant) Step {
     var progressed: bool  = false;
     var i:          usize = 0;
     for (i < MAX_STREAMS) {
@@ -1246,12 +1252,12 @@ fun holds_stream(session: *Session) bool {
     ret false;
 }
 
-fun elapsed(since: time.Time, now: time.Time, limit_ns: u64) bool {
-    ret limit_ns != 0 && time.time_sub(now, since) >= limit_ns::i64;
+fun elapsed(since: time.Instant, now: time.Instant, limit_ns: u64) bool {
+    ret limit_ns != 0 && clock.between_ns(since, now) >= limit_ns;
 }
 
 # the stopgap described at `Timeouts`
-fun deadline_passed(session: *Session, now: time.Time) bool {
+fun deadline_passed(session: *Session, now: time.Instant) bool {
     val busy: bool = holds_stream(session);
     if (busy) { session.idle = false; }
     or (!session.idle) {
@@ -1306,7 +1312,7 @@ pub fun next_deadline(session: *Session, output: *u64) bool {
     ret found;
 }
 
-pub fun step(session: *Session, now: time.Time) Step {
+pub fun step(session: *Session, now: time.Instant) Step {
     if (!runnable(session))                                  { ret STEP_DONE; }
     if (session.state != ACTIVE && session.state != CLOSING) { ret STEP_DONE; }
     # timing out the engine scope settles whatever io the engine has in flight,
@@ -1357,7 +1363,7 @@ pub fun step(session: *Session, now: time.Time) Step {
     ret taken;
 }
 
-pub fun advance(session: *Session, now: time.Time) Step {
+pub fun advance(session: *Session, now: time.Instant) Step {
     if (session == nil || !session.live) { ret STEP_ERROR; }
     var steps: usize = 0;
     for (steps < MAX_STEPS) {
@@ -1372,7 +1378,7 @@ pub fun advance(session: *Session, now: time.Time) Step {
 # next event this connection will ever produce, so it is applied rather than
 # dropped
 pub fun complete_io(session: *Session, settled: *transport.Completion,
-    now: time.Time) Step {
+    now: time.Instant) Step {
     # terminal engine state stops new protocol work, but every submitted
     # transport operation still owns a completion slot that must be settled
     # before the session storage can be destroyed.
@@ -1476,7 +1482,7 @@ fun pending_response_release(context: ptr) {}
 
 test "h2: a pending response read completes into the retained stage" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var state: PendingResponseTest;
     state.output   = nil;
     state.capacity = 0;
@@ -1545,7 +1551,7 @@ fun pending_cancel_release(context: ptr) {
 test "h2: pending exchange cancellation remains owned until settlement" {
     val configured: message.Limits = message.limits_default();
     var slot:       Slot;
-    if (!operation_ok(cancel.make_root(?slot.scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?slot.scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     slot.scope_live = true;
@@ -1562,8 +1568,7 @@ test "h2: pending exchange cancellation remains owned until settlement" {
     metadata.peer          = message.unspecified_endpoint();
     metadata.local         = message.unspecified_endpoint();
     metadata.received_at   = time.Time{sec: 0, nsec: 0};
-    metadata.has_deadline  = false;
-    metadata.deadline      = time.Time{sec: 0, nsec: 0};
+    metadata.deadline      = opt[time.Instant].none{};
     metadata.request_index = generation;
     if (!message.init_request(?slot.request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)),
@@ -1654,7 +1659,7 @@ fun make_disposition_reader(state: *DispositionTest, scope: *cancel.Scope,
 
 test "h2: request body dispositions retain their distinct ownership" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var slot:  Slot;
