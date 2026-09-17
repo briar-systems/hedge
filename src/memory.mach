@@ -16,13 +16,14 @@
 # a connection's lane budgets follow one stated rule over its configuration
 # (see `connection_budgets`), and the pool's global budget bounds the sum.
 #
-# a waiting account is woken by the pool, and the wake goes straight onto the
-# worker's wake queue under the account's handle, which is the connection's
-# owner tag. the pool is serialized-use and belongs to one worker, like the
-# queue it wakes.
+# a waiting account is woken onto the pool's ready list under its handle, which
+# is the connection's owner tag, and the worker drains that list with `woken`
+# every turn. an account stays on the list until it is drained and cannot wait
+# again before then, so the list is the one record of who was woken. the pool
+# is serialized-use and belongs to one worker.
 
-use hedge.wake;
 use A: std.allocator;
+use std.allocator.page;
 use std.memory.buffers;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -82,25 +83,17 @@ pub rec Memory {
     pool:     buffers.Pool;
     classes:  [15]buffers.ClassConfig;
     lanes:    [5]LaneCounters;
-    wakes:    *wake.Queue;
     budget:   usize;
     admitted: usize;
     refused:  u64;
     made:     bool;
 }
 
-fun notify_wake(context: ptr, handle: u64) {
-    val value: *Memory = context::*Memory;
-    if (value == nil || value.wakes == nil) { ret; }
-    var waker: wake.Waker = wake.waker(value.wakes, handle);
-    wake.wake(?waker);
-}
-
 fun ignore_misuse(context: ptr) {}
 
-# `budget` is the global byte budget. `wakes` receives every woken account
-pub fun make(value: *Memory, budget: usize, wakes: *wake.Queue, a: *A.Allocator) bool {
-    if (value == nil || value.made || budget == 0 || wakes == nil || a == nil) { ret false; }
+# `budget` is the global byte budget
+pub fun make(value: *Memory, budget: usize, a: *A.Allocator) bool {
+    if (value == nil || value.made || budget == 0 || a == nil) { ret false; }
     var i: usize = 0;
     for (i < PLAIN_CLASSES) {
         value.classes[i] = buffers.ClassConfig{size: PLAIN_SIZES[i], align: 0,
@@ -119,8 +112,8 @@ pub fun make(value: *Memory, budget: usize, wakes: *wake.Queue, a: *A.Allocator)
     config.lanes          = LANES;
     config.global_budget  = budget;
     config.initial_slots  = 0;
-    config.notify         = notify_wake;
-    config.notify_context = value::ptr;
+    config.notify         = (0::usize)::fun(ptr, u64);
+    config.notify_context = nil;
     config.trap           = ignore_misuse;
     config.trap_context   = nil;
     if (!buffers.make(?value.pool, config, a)) { ret false; }
@@ -130,12 +123,22 @@ pub fun make(value: *Memory, budget: usize, wakes: *wake.Queue, a: *A.Allocator)
             timeouts: 0};
         l = l + 1;
     }
-    value.wakes    = wakes;
     value.budget   = budget;
     value.admitted = 0;
     value.refused  = 0;
     value.made     = true;
     ret true;
+}
+
+# take up to `capacity` handles of accounts woken since the last call, oldest
+# first. a drained account can wait again
+pub fun woken(value: *Memory, output: *u64, capacity: usize) usize {
+    if (value == nil || !value.made) { ret 0; }
+    ret buffers.ready(?value.pool, output, capacity);
+}
+
+pub fun has_woken(value: *Memory) bool {
+    ret value != nil && value.made && value.pool.ready_count != 0;
 }
 
 # false while any account is still open or any chunk is still held
@@ -530,4 +533,83 @@ pub fun snapshot(value: *Memory) Snapshot {
     result.backing  = pool.backing_allocations;
     result.misuse   = pool.misuse;
     ret result;
+}
+
+fun test_request(bytes: usize, lane: u8) buffers.Request {
+    ret buffers.Request{bytes: bytes, align: 0, lane: lane, secret: false};
+}
+
+fun test_budgets() Budgets {
+    ret connection_budgets(1048576, 0, 1048576, 0, 0, 0);
+}
+
+test "memory: admission refuses an account past its share of the pool" {
+    var pages: A.Allocator;
+    page.make(?pages);
+    var pool: Memory;
+    if (!make(?pool, 65536, ?pages)) { ret 1; }
+    var budgets: Budgets = test_budgets();
+    budgets.reserve = 32768;
+    var first:  Borrower;
+    var second: Borrower;
+    var a:      buffers.Account;
+    var b:      buffers.Account;
+    borrower(?first, ?pool, 1, 0, budgets);
+    borrower(?second, ?pool, 2, 0, budgets);
+    # the share is seven eighths of 65536, and two reserves of 32768 exceed it
+    if (!open(?first, ?a)) { ret 2; }
+    if (open(?second, ?b)) { ret 3; }
+    val seen: Snapshot = snapshot(?pool);
+    if (seen.admitted != 1 || seen.refused != 1) { ret 4; }
+    if (!close(?pool, ?a) || !destroy(?pool))    { ret 5; }
+    ret 0;
+}
+
+test "memory: a woken account is drained once and can wait again" {
+    var pages: A.Allocator;
+    page.make(?pages);
+    var pool: Memory;
+    if (!make(?pool, 16384, ?pages)) { ret 1; }
+    var lender:  Borrower;
+    var account: buffers.Account;
+    borrower(?lender, ?pool, 42, 0, test_budgets());
+    if (!open(?lender, ?account)) { ret 2; }
+    var source: buffers.Source = borrowed_source(?lender);
+    var held:   [8]buffers.Chunk;
+    var count:  usize          = 0;
+    for (count < 8) {
+        val got: buffers.Acquired = buffers.source_acquire(?source, ?account,
+            test_request(4096, LANE_IO), true);
+        if (!(sel got.status.ok)) { brk; }
+        held[count] = got.chunk;
+        count       = count + 1;
+    }
+    if (count == 0 || count == 8 || !waiting(?account) || has_woken(?pool)) { ret 3; }
+    if (lender.waited != LANE_IO)                                           { ret 4; }
+    count = count - 1;
+    buffers.source_release(?source, ?account, held[count]);
+    var owners: [4]u64;
+    if (!has_woken(?pool) || waiting(?account))                                  { ret 5; }
+    if (woken(?pool, ?owners[0], 4) != 1 || owners[0] != 42 || has_woken(?pool)) { ret 6; }
+    # drained, the account registers for the next shortage
+    val again: buffers.Acquired = buffers.source_acquire(?source, ?account,
+        test_request(4096, LANE_IO), true);
+    if (!(sel again.status.ok)) { ret 7; }
+    held[count] = again.chunk;
+    count       = count + 1;
+    val short: buffers.Acquired = buffers.source_acquire(?source, ?account,
+        test_request(4096, LANE_IO), true);
+    if ((sel short.status.ok) || !waiting(?account)) { ret 8; }
+    timed_out(?lender);
+    val seen: Snapshot = snapshot(?pool);
+    if (seen.lanes[LANE_IO::usize].timeouts != 1
+        || seen.lanes[LANE_IO::usize].held != count * 4096
+        || seen.lanes[LANE_IO::usize].exhausted < 2) { ret 9; }
+    for (count != 0) {
+        count = count - 1;
+        buffers.source_release(?source, ?account, held[count]);
+    }
+    woken(?pool, ?owners[0], 4);
+    if (!close(?pool, ?account) || !destroy(?pool)) { ret 10; }
+    ret 0;
 }
