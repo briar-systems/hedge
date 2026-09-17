@@ -18,6 +18,7 @@ use hedge_tls:     hedge.protocol.tls;
 use hedge_storage: hedge.storage;
 use hedge.telemetry;
 use telemetry_health: hedge.telemetry.health;
+use hedge_timer:      hedge.timer;
 use http.core.message;
 use A: std.allocator;
 use std.allocator.page;
@@ -81,8 +82,13 @@ pub val PLANE_PENDING:  PlaneQuiesceStatus = 2;
 pub val PLANE_FAILED:   PlaneQuiesceStatus = 3;
 pub def PlaneQuiesceFun: fun(ptr, time.Time) PlaneQuiesceStatus;
 
+# how many fired timer owners one wheel advance hands back at a time
+val FIRE_BATCH: usize = 64;
+
 pub rec Runtime {
-    storage:       connection.Storage;
+    storage: connection.Storage;
+    # every deadline this worker decides, whichever protocol owns it
+    timers:        hedge_timer.Wheel;
     state:         State;
     plane_ctx:     ptr;
     plane:         PlaneFun;
@@ -206,6 +212,7 @@ pub fun make(
     if (runtime == nil || a == nil
         || active_plan == nil || !plan.sealed(active_plan) || graph == nil
         || !connection.make_storage(?runtime.storage, a)
+        || !hedge_timer.make(?runtime.timers, a, clock.monotonic_ns())
         || !hedge_storage.make_table[Slot](?runtime.slots, a)
         || !hedge_storage.make[connection.Connection](?runtime.connections, a, 1)) {
         ret false;
@@ -374,6 +381,7 @@ fun release_quic(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     var released: quic_runtime.Status = quic_runtime.release(controls, runtime.quic);
     for (released == quic_runtime.BLOCKED) {
         if (!listener.poll(?runtime.owner, 1)) { ret false; }
+        fire_timers(controls, runtime, clock.monotonic_ns());
         if (quic_runtime.advance(controls, runtime.quic, clock.wall(), clock.monotonic_ns())
             == quic_runtime.FAILED) { ret false; }
         released = quic_runtime.release(controls, runtime.quic);
@@ -779,26 +787,46 @@ fun sweep(runtime: *Runtime, now: time.Time) {
     }
 }
 
+# hand every entry now due to the protocol that armed it
+fun fire_timers(controls: *quic_runtime.ControlView, runtime: *Runtime, now_ns: u64) {
+    var owners: [FIRE_BATCH]u64;
+    for {
+        val fired: usize = hedge_timer.advance(?runtime.timers, now_ns,
+            ?owners[0], FIRE_BATCH);
+        var i: usize = 0;
+        for (i < fired) {
+            if (quic_runtime.owns_timer(owners[i]) && runtime.quic != nil
+                && !runtime.quic_released) {
+                quic_runtime.fire(controls, runtime.quic, owners[i], now_ns);
+            }
+            i = i + 1;
+        }
+        if (fired < FIRE_BATCH) { brk; }
+    }
+}
+
 pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms: i32) bool {
     if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) { ret false; }
     var bounded_timeout: i32       = timeout_ms;
     val poll_started_at: time.Time = clock.monotonic();
-    if (runtime.quic != nil && !runtime.quic_released) {
-        var deadline: u64 = 0;
-        if (quic_runtime.next_deadline(runtime.quic, ?deadline)
-            == quic_runtime.OK) {
-            val current: u64 = time.time_unix_nsec(poll_started_at)::u64;
-            var wait_ms: u64 = 0;
-            if (deadline > current) {
-                val remaining: u64 = deadline - current;
-                wait_ms = remaining / 1000000;
-                if (remaining % 1000000 != 0) { wait_ms = wait_ms + 1; }
-            }
-            if (wait_ms > 2147483647) { wait_ms = 2147483647; }
-            if (bounded_timeout < 0 || wait_ms < bounded_timeout::u64) {
-                bounded_timeout = wait_ms::i32;
-            }
+    var deadline:        u64       = 0;
+    if (hedge_timer.next_deadline(?runtime.timers, ?deadline)) {
+        val current: u64 = time.time_unix_nsec(poll_started_at)::u64;
+        var wait_ms: u64 = 0;
+        if (deadline > current) {
+            val remaining: u64 = deadline - current;
+            wait_ms = remaining / 1000000;
+            if (remaining % 1000000 != 0) { wait_ms = wait_ms + 1; }
         }
+        if (wait_ms > 2147483647) { wait_ms = 2147483647; }
+        if (bounded_timeout < 0 || wait_ms < bounded_timeout::u64) {
+            bounded_timeout = wait_ms::i32;
+        }
+    }
+    # work a previous turn left marked is done now rather than after a wait
+    if (runtime.quic != nil && !runtime.quic_released
+        && quic_runtime.has_ready(runtime.quic)) {
+        bounded_timeout = 0;
     }
     var budget_deadline: time.Time;
     if (next_budget_deadline(runtime, ?budget_deadline)) {
@@ -811,6 +839,7 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     val polled:  bool      = listener.poll(?runtime.owner, bounded_timeout);
     val now:     time.Time = clock.monotonic();
     var quic_ok: bool      = true;
+    fire_timers(controls, runtime, clock.monotonic_ns());
     if (runtime.quic != nil && !runtime.quic_released
         && quic_runtime.advance(controls, runtime.quic, clock.wall(), clock.monotonic_ns())
         == quic_runtime.FAILED) {
@@ -1168,7 +1197,8 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
                 or {
                     runtime.state = STOPPED;
                     if (!connection.destroy_storage(?runtime.storage)
-                        || !release_pool(runtime)) {
+                        || !release_pool(runtime)
+                        || !hedge_timer.destroy(?runtime.timers)) {
                         runtime.teardown_failures = runtime.teardown_failures + 1;
                     }
                 }
