@@ -12,6 +12,7 @@ use hedge.service;
 use hosting: hedge.service.laurel;
 use hedge.storage;
 use site_fixture: hedge.test.laurel;
+use hedge.test.runtime.tlswire;
 use hedge.test.runtime.wire;
 use laurel.app;
 use std.allocator;
@@ -29,6 +30,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use tls.session;
 
 fun page_ok(outcome: err[allocator.Error]) bool {
     ret sel outcome.ok;
@@ -878,13 +880,12 @@ test "composition: a silent cleartext peer is closed at the handshake timeout" {
     ret result;
 }
 
-test "composition: a silent TLS peer is closed at the handshake timeout" {
-    var controls: composition.Controls;
-    var harness:  Harness;
-    if (!prepare(?harness, false)) { ret 1; }
+# the fixture listener speaks TLS with the interop certificate for api.example.com
+fun secure_graph(harness: *Harness, protocols: u8) {
     val configured: *schema.Graph    = ?harness.graph;
     val public:     *schema.Listener = ?configured.listeners[0];
     schema.set_text(?public.tls_policy, "public");
+    public.protocols = protocols;
     schema.set_text(?configured.hosts[0].server_names[0], "api.example.com");
     configured.tls_policy_count = 1;
     val policy: *schema.TlsPolicy = ?configured.tls_policies[0];
@@ -899,10 +900,359 @@ test "composition: a silent TLS peer is closed at the handshake timeout" {
     policy.has_default = true;
     policy.client_auth = false;
     schema.clear_text(?policy.client_trust);
-    configured.timeouts.handshake_ms = SILENT_TIMEOUT_MS;
+}
+
+test "composition: a silent TLS peer is closed at the handshake timeout" {
+    var controls: composition.Controls;
+    var harness:  Harness;
+    if (!prepare(?harness, false)) { ret 1; }
+    secure_graph(?harness, schema.PROTOCOL_HTTP1);
+    harness.graph.timeouts.handshake_ms = SILENT_TIMEOUT_MS;
     val started: composition.StartReport = boot(?harness, ?controls, false);
     if (started.status != composition.START_OK) { ret 2; }
     val result: i32 = silent_peer_is_closed(?harness);
     composition.stop(harness.runtime, ?controls);
     ret result;
+}
+
+# a TLS client that stalls after its first byte (#189). each case holds a
+# connection the way a slow client would. the connection has to be gone within
+# ten times the timeout that governs that stall, and not sooner than half of it,
+# so a close for some other reason does not pass.
+
+val STALL_TIMEOUT_MS: u64 = 300;
+val LONG_TIMEOUT_MS:  u64 = 20000;
+
+fun stall_graph(harness: *Harness, protocols: u8, handshake_ms: u64) {
+    secure_graph(harness, protocols);
+    harness.graph.timeouts.handshake_ms  = handshake_ms;
+    harness.graph.timeouts.header_ms     = STALL_TIMEOUT_MS;
+    harness.graph.timeouts.keep_alive_ms = STALL_TIMEOUT_MS;
+}
+
+fun closed_within(harness: *Harness, since: time.Time, timeout_ms: u64) i32 {
+    var quic_controls: quic_runtime.ControlView;
+    var rounds:        usize = 0;
+    for (rounds < 400 && harness.runtime.serving.live == 0) {
+        serve.poll(?quic_controls, ?harness.runtime.serving, 1);
+        rounds = rounds + 1;
+    }
+    if (harness.runtime.serving.live == 0) { ret 20; }
+    val limit_ns: i64 = (timeout_ms * 10 * 1000000)::i64;
+    for (harness.runtime.serving.live != 0
+        && time.time_sub(clock.monotonic(), since) < limit_ns) {
+        serve.poll(?quic_controls, ?harness.runtime.serving, 5);
+    }
+    if (harness.runtime.serving.live != 0) { ret 21; }
+    val elapsed_ms: i64 = time.time_sub(clock.monotonic(), since) / 1000000;
+    if (elapsed_ms < (timeout_ms / 2)::i64) { ret 22; }
+    ret 0;
+}
+
+rec Stall {
+    controls: composition.Controls;
+    harness:  Harness;
+    client:   *tlswire.Client;
+}
+
+fun stall_start(stall: *Stall, protocols: u8, handshake_ms: u64, alpn: str) i32 {
+    if (!prepare(?stall.harness, false)) { ret 1; }
+    stall_graph(?stall.harness, protocols, handshake_ms);
+    val started: composition.StartReport = boot(?stall.harness, ?stall.controls, false);
+    if (started.status != composition.START_OK) { ret 2; }
+    stall.client = tlswire.allocate(?stall.harness.heap);
+    if (stall.client == nil
+        || !tlswire.make(stall.client, ?stall.harness.runtime.serving,
+        "api.example.com", alpn)) {
+        composition.stop(stall.harness.runtime, ?stall.controls);
+        ret 3;
+    }
+    ret 0;
+}
+
+fun stall_finish(stall: *Stall, result: i32) i32 {
+    if (stall.client != nil) { tlswire.release(stall.client); }
+    composition.stop(stall.harness.runtime, ?stall.controls);
+    ret result;
+}
+
+fun hello_stall(half: bool) i32 {
+    var stall:  Stall;
+    val opened: i32 = stall_start(?stall, schema.PROTOCOL_HTTP1, STALL_TIMEOUT_MS,
+        "http/1.1");
+    if (opened != 0)                                          { ret opened; }
+    if (!tlswire.hello(stall.client, stall.harness.endpoint)) { ret stall_finish(?stall, 4); }
+    var length: usize = tlswire.hello_length(stall.client);
+    if (half) { length = length / 2; }
+    val since: time.Time = clock.monotonic();
+    if (!tlswire.send_raw(stall.client, tlswire.hello_bytes(stall.client), length)) {
+        ret stall_finish(?stall, 5);
+    }
+    ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
+}
+
+test "composition: a TLS client that stalls inside its ClientHello is closed" {
+    ret hello_stall(true);
+}
+
+test "composition: a TLS client that never finishes its handshake is closed" {
+    ret hello_stall(false);
+}
+
+# the handshake completes under a long deadline, so only the HTTP timeout can close it
+fun open_stall(stall: *Stall, protocols: u8, alpn: str) i32 {
+    val opened: i32 = stall_start(stall, protocols, LONG_TIMEOUT_MS, alpn);
+    if (opened != 0)                                              { ret opened; }
+    if (!tlswire.handshake(stall.client, stall.harness.endpoint)) { ret 6; }
+    ret 0;
+}
+
+fun send_text(client: *tlswire.Client, text: str) bool {
+    var length: usize = 0;
+    for (text[length] != 0) { length = length + 1; }
+    ret tlswire.send(client, text::*u8, length);
+}
+
+# the HTTP/1.1 engine starts its header timer at a request's first byte, so a
+# connection that has sent none is idle and the keep-alive timeout governs it
+test "composition: a TLS client silent after its handshake is closed at the keep-alive timeout" {
+    var stall: Stall;
+    if (!prepare(?stall.harness, false)) { ret 1; }
+    stall_graph(?stall.harness, schema.PROTOCOL_HTTP1, LONG_TIMEOUT_MS);
+    stall.harness.graph.timeouts.header_ms = LONG_TIMEOUT_MS;
+    val started: composition.StartReport = boot(?stall.harness, ?stall.controls, false);
+    if (started.status != composition.START_OK) { ret stall_finish(?stall, 2); }
+    stall.client = tlswire.allocate(?stall.harness.heap);
+    if (stall.client == nil
+        || !tlswire.make(stall.client, ?stall.harness.runtime.serving,
+        "api.example.com", "http/1.1")
+        || !tlswire.handshake(stall.client, stall.harness.endpoint)) {
+        ret stall_finish(?stall, 3);
+    }
+    ret stall_finish(?stall, closed_within(?stall.harness, clock.monotonic(), STALL_TIMEOUT_MS));
+}
+
+test "composition: a partial request header over TLS is closed at the header timeout" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP1, "http/1.1");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    val since: time.Time = clock.monotonic();
+    if (!send_text(stall.client, "GET / HTTP/1.1\r\nHost: api.exa")) { ret stall_finish(?stall, 7); }
+    ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
+}
+
+test "composition: an idle TLS keep-alive connection is closed at the keep-alive timeout" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP1, "http/1.1");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    if (!send_text(stall.client, "GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")) {
+        ret stall_finish(?stall, 7);
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length:   usize = tlswire.receive(stall.client, ?response[0], RESPONSE_BYTES,
+        "hello from composition\n");
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
+        ret stall_finish(?stall, 8);
+    }
+    val since: time.Time = clock.monotonic();
+    ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
+}
+
+fun send_frames(client: *tlswire.Client, bytes: *u8, length: usize) bool {
+    ret tlswire.send(client, bytes, length);
+}
+
+test "composition: an HTTP/2 client silent after its handshake is closed at the header timeout" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    ret stall_finish(?stall, closed_within(?stall.harness, clock.monotonic(), STALL_TIMEOUT_MS));
+}
+
+test "composition: an HTTP/2 client that sends only its preface is closed at the header timeout" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    var frames: [256]u8;
+    val length: usize     = wire.put_connection_start(?frames[0]);
+    val since:  time.Time = clock.monotonic();
+    if (!send_frames(stall.client, ?frames[0], length)) { ret stall_finish(?stall, 7); }
+    ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
+}
+
+test "composition: an HTTP/2 client that stalls inside a HEADERS frame is closed at the header timeout" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    var frames: [256]u8;
+    val start:  usize = wire.put_connection_start(?frames[0]);
+    wire.put_request(?frames[0], start, 1);
+    # the frame header and the first bytes of its block, and nothing after
+    val since: time.Time = clock.monotonic();
+    if (!send_frames(stall.client, ?frames[0], start + 12)) { ret stall_finish(?stall, 7); }
+    ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
+}
+
+test "composition: an HTTP/2 header block that never ends is closed at the header timeout" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    var frames: [256]u8;
+    val start:  usize = wire.put_connection_start(?frames[0]);
+    # END_STREAM without END_HEADERS: the block waits for a CONTINUATION
+    val ended: usize = wire.put_request(?frames[0], start, 1);
+    frames[start + 4] = 0x01;
+    val since: time.Time = clock.monotonic();
+    if (!send_frames(stall.client, ?frames[0], ended)) { ret stall_finish(?stall, 7); }
+    ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
+}
+
+# true once the response on stream 1 has ended
+fun h2_response_ended(bytes: *u8, length: usize) bool {
+    var at: usize = 0;
+    for (at + 9 <= length) {
+        val size: usize = (bytes[at]::usize << 16) | (bytes[at + 1]::usize << 8)
+            | bytes[at + 2]::usize;
+        val kind:   u8  = bytes[at + 3];
+        val flags:  u8  = bytes[at + 4];
+        val stream: u32 = (bytes[at + 5]::u32 << 24) | (bytes[at + 6]::u32 << 16)
+            | (bytes[at + 7]::u32 << 8) | bytes[at + 8]::u32;
+        if (stream == 1 && (kind == 0x00 || kind == 0x01) && (flags & 0x01) != 0) {
+            ret true;
+        }
+        at = at + 9 + size;
+    }
+    ret false;
+}
+
+fun served_h2(client: *tlswire.Client) bool {
+    var frames: [256]u8;
+    val start:  usize = wire.put_connection_start(?frames[0]);
+    val ended:  usize = wire.put_request(?frames[0], start, 1);
+    if (!send_frames(client, ?frames[0], ended)) { ret false; }
+    var response: [RESPONSE_BYTES]u8;
+    var length:   usize = 0;
+    var reads:    usize = 0;
+    for (reads < 16 && !h2_response_ended(?response[0], length)) {
+        val got: usize = tlswire.receive(client, ?response[length],
+            RESPONSE_BYTES - length, nil);
+        if (got == 0) { brk; }
+        length = length + got;
+        reads  = reads + 1;
+    }
+    ret h2_response_ended(?response[0], length);
+}
+
+test "composition: an idle HTTP/2 connection is closed at the keep-alive timeout" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
+    if (opened != 0)              { ret stall_finish(?stall, opened); }
+    if (!served_h2(stall.client)) { ret stall_finish(?stall, 8); }
+    val since: time.Time = clock.monotonic();
+    ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
+}
+
+# a connection that has answered a request and is waiting for the next one, with
+# no timeout close enough to end it before the stop does
+fun between_requests(stall: *Stall, protocols: u8, alpn: str) i32 {
+    if (!prepare(?stall.harness, false)) { ret 1; }
+    stall_graph(?stall.harness, protocols, LONG_TIMEOUT_MS);
+    stall.harness.graph.timeouts.keep_alive_ms = LONG_TIMEOUT_MS;
+    val started: composition.StartReport = boot(?stall.harness, ?stall.controls, false);
+    if (started.status != composition.START_OK) { ret 2; }
+    stall.client = tlswire.allocate(?stall.harness.heap);
+    if (stall.client == nil
+        || !tlswire.make(stall.client, ?stall.harness.runtime.serving,
+        "api.example.com", alpn)) { ret 3; }
+    if (!tlswire.handshake(stall.client, stall.harness.endpoint)) { ret 4; }
+    ret 0;
+}
+
+test "composition: stop closes a TLS connection between requests" {
+    var stall:  Stall;
+    val opened: i32 = between_requests(?stall, schema.PROTOCOL_HTTP1, "http/1.1");
+    if (opened != 0)                 { ret stall_finish(?stall, opened); }
+    if (!served_hello(stall.client)) { ret stall_finish(?stall, 5); }
+    ret stall_finish(?stall, 0);
+}
+
+test "composition: stop closes an HTTP/2 connection between requests" {
+    var stall:  Stall;
+    val opened: i32 = between_requests(?stall, schema.PROTOCOL_HTTP2, "h2");
+    if (opened != 0)              { ret stall_finish(?stall, opened); }
+    if (!served_h2(stall.client)) { ret stall_finish(?stall, 5); }
+    ret stall_finish(?stall, 0);
+}
+
+# boot a TLS listener, optionally asking for client certificates or rotating
+# ticket keys every second, then ready a client for it
+fun tls_time_start(stall: *Stall, client_auth: bool, rotating: bool) i32 {
+    if (!prepare(?stall.harness, false)) { ret 1; }
+    stall_graph(?stall.harness, schema.PROTOCOL_HTTP1, LONG_TIMEOUT_MS);
+    val policy: *schema.TlsPolicy = ?stall.harness.graph.tls_policies[0];
+    if (client_auth) {
+        policy.client_auth = true;
+        schema.set_text(?policy.client_trust, "test/interop/fixtures/root.pem");
+    }
+    if (rotating) {
+        policy.resumption.enabled                    = true;
+        policy.resumption.key_lifetime_seconds       = 1;
+        policy.resumption.retirement_overlap_seconds = 1;
+        policy.resumption.ticket_lifetime_seconds    = 60;
+        policy.resumption.replay_policy              = schema.TLS_REPLAY_PERMISSIVE;
+        policy.resumption.tickets_per_connection     = 1;
+    }
+    val started: composition.StartReport = boot(?stall.harness, ?stall.controls, false);
+    if (started.status != composition.START_OK) { ret 2; }
+    stall.client = tlswire.allocate(?stall.harness.heap);
+    if (stall.client == nil
+        || !tlswire.make(stall.client, ?stall.harness.runtime.serving,
+        "api.example.com", "http/1.1")) { ret 3; }
+    ret 0;
+}
+
+fun served_hello(client: *tlswire.Client) bool {
+    if (!send_text(client, "GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")) { ret false; }
+    var response: [RESPONSE_BYTES]u8;
+    val length:   usize = tlswire.receive(client, ?response[0], RESPONSE_BYTES,
+        "hello from composition\n");
+    ret length != 0 && wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n");
+}
+
+test "composition: a valid client certificate is accepted over mutual TLS" {
+    var stall:  Stall;
+    val opened: i32 = tls_time_start(?stall, true, false);
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    if (!tlswire.present(stall.client, "test/interop/fixtures/client.pem",
+        "test/interop/fixtures/client.key")) { ret stall_finish(?stall, 4); }
+    if (!tlswire.handshake(stall.client, stall.harness.endpoint)) { ret stall_finish(?stall, 5); }
+    if (!served_hello(stall.client))                              { ret stall_finish(?stall, 6); }
+    ret stall_finish(?stall, 0);
+}
+
+fun ticket_generation() u64 {
+    val policy: *hedge_tls.Policy = hedge_tls.policy_at(hedge_tls.find("public"));
+    if (policy == nil) { ret 0; }
+    ret session.keyring_generation(?policy.ticket_ring);
+}
+
+test "composition: a ticket key past its lifetime rotates before the next handshake" {
+    var stall:  Stall;
+    val opened: i32 = tls_time_start(?stall, false, true);
+    if (opened != 0)                                              { ret stall_finish(?stall, opened); }
+    if (!tlswire.handshake(stall.client, stall.harness.endpoint)) { ret stall_finish(?stall, 4); }
+    val first: u64 = ticket_generation();
+    if (first == 0) { ret stall_finish(?stall, 5); }
+    tlswire.release(stall.client);
+    # the key lifetime is one wall-clock second, so wait out two
+    val until:         i64 = time.time_unix_sec(clock.wall()) + 2;
+    var quic_controls: quic_runtime.ControlView;
+    for (time.time_unix_sec(clock.wall()) <= until) {
+        serve.poll(?quic_controls, ?stall.harness.runtime.serving, 10);
+    }
+    if (!tlswire.make(stall.client, ?stall.harness.runtime.serving, "api.example.com",
+        "http/1.1")) { ret stall_finish(?stall, 6); }
+    if (!tlswire.handshake(stall.client, stall.harness.endpoint)) { ret stall_finish(?stall, 7); }
+    if (ticket_generation() != first + 1)                         { ret stall_finish(?stall, 8); }
+    ret stall_finish(?stall, 0);
 }
