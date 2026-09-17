@@ -150,8 +150,9 @@ pub rec RuntimeConfig {
 }
 
 # a wheel owner is tagged as QUIC so a worker sharing one wheel can route it
-val TIMER_TAG:  u64 = 0x5155000000000000;
-val TIMER_MASK: u64 = 0xffff000000000000;
+val TIMER_TAG:   u64 = 0x5155000000000000;
+val TIMER_MASK:  u64 = 0xffff000000000000;
+val PENDING_TAG: u64 = 0x5149000000000000;
 # how long a forced release that is still waiting sleeps before it looks again
 val BROKEN_RETRY_NS: u64 = 10000000;
 
@@ -258,6 +259,13 @@ pub rec PendingInitial {
     lease_live:            bool;
     cleanup_only:          bool;
     live:                  bool;
+    # a queued initial waits on its budget: a release wakes it and this entry
+    # fires when its queue deadline passes
+    timer:      wheel.Handle;
+    timer_live: bool;
+    ready:      bool;
+    ready_next: usize;
+    ready_prev: usize;
 }
 
 # the welded records are owned by the caller, which grows nothing itself. the
@@ -500,6 +508,8 @@ pub rec Runtime {
     # the queued initials, so a sweep costs what is queued rather than what
     # the configured connection limit reserved
     pending_live_head:     usize;
+    pending_ready_head:    usize;
+    pending_ready_tail:    usize;
     pending_initial_count: usize;
     pump_count:            usize;
     next_source:           u64;
@@ -677,6 +687,11 @@ fun thread_pending_initials(runtime: *Runtime, first: usize) {
         pending.live              = false;
         pending.next_live         = NO_CONNECTION;
         pending.prev_live         = NO_CONNECTION;
+        pending.timer             = wheel.no_handle();
+        pending.timer_live        = false;
+        pending.ready             = false;
+        pending.ready_next        = NO_CONNECTION;
+        pending.ready_prev        = NO_CONNECTION;
         pending.next_free         = runtime.pending_free_head;
         runtime.pending_free_head = i;
     }
@@ -752,6 +767,61 @@ fun link_pending_live(runtime: *Runtime, index: usize) {
     runtime.pending_live_head = index;
 }
 
+fun mark_pending_ready(runtime: *Runtime, index: usize) {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (pending == nil || !pending.live || pending.ready) { ret; }
+    pending.ready      = true;
+    pending.ready_next = NO_CONNECTION;
+    pending.ready_prev = runtime.pending_ready_tail;
+    if (runtime.pending_ready_tail != NO_CONNECTION) {
+        pending_at(runtime, runtime.pending_ready_tail).ready_next = index;
+    }
+    or { runtime.pending_ready_head = index; }
+    runtime.pending_ready_tail = index;
+}
+
+fun unmark_pending_ready(runtime: *Runtime, index: usize) {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (!pending.ready) { ret; }
+    if (pending.ready_prev != NO_CONNECTION) {
+        pending_at(runtime, pending.ready_prev).ready_next = pending.ready_next;
+    }
+    or { runtime.pending_ready_head = pending.ready_next; }
+    if (pending.ready_next != NO_CONNECTION) {
+        pending_at(runtime, pending.ready_next).ready_prev = pending.ready_prev;
+    }
+    or { runtime.pending_ready_tail = pending.ready_prev; }
+    pending.ready      = false;
+    pending.ready_next = NO_CONNECTION;
+    pending.ready_prev = NO_CONNECTION;
+}
+
+# claim and arm the wheel entry a queued charge waits on, before the charge
+# moves into the pending record, so a failure leaves it with the caller
+fun claim_pending_timer(runtime: *Runtime, index: usize, charge: *budget.Charge) bool {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    val handle:  wheel.Handle    = wheel.claim(runtime.timers, pending_owner(index));
+    if (handle.index == wheel.NONE) { ret false; }
+    var deadline: time.Time;
+    if (budget.deadline(charge, ?deadline)
+        && wheel.arm(runtime.timers, handle, clock.to_ns(deadline)) != wheel.OK) {
+        wheel.release(runtime.timers, handle);
+        ret false;
+    }
+    pending.timer      = handle;
+    pending.timer_live = true;
+    ret true;
+}
+
+# the queued charge moves into its pending record, and a release that admits
+# it wakes that record
+fun take_pending_charge(runtime: *Runtime, index: usize, budgets: *budget.Set,
+    charge: *budget.Charge) {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    budget.relocate(budgets, ?pending.budget_charge, charge);
+    pending.budget_charge.waker = hedge_wake.waker(runtime.wakes, pending_owner(index));
+}
+
 fun unlink_pending_live(runtime: *Runtime, index: usize) {
     val pending: *PendingInitial = pending_at(runtime, index);
     if (pending.prev_live != NO_CONNECTION) {
@@ -818,6 +888,8 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.connection_failures   = 0;
     runtime.pending_free_head     = NO_CONNECTION;
     runtime.pending_live_head     = NO_CONNECTION;
+    runtime.pending_ready_head    = NO_CONNECTION;
+    runtime.pending_ready_tail    = NO_CONNECTION;
     runtime.pending_initial_count = 0;
     runtime.pump_count            = 0;
     runtime.next_source           = 1;
@@ -1678,6 +1750,19 @@ pub fun owns_timer(owner: u64) bool {
     ret (owner & TIMER_MASK) == TIMER_TAG;
 }
 
+fun pending_owner(index: usize) u64 {
+    ret PENDING_TAG | index::u64;
+}
+
+fun owns_pending(owner: u64) bool {
+    ret (owner & TIMER_MASK) == PENDING_TAG;
+}
+
+# every owner this runtime hands to the wheel or to a waker
+pub fun owns(owner: u64) bool {
+    ret owns_timer(owner) || owns_pending(owner);
+}
+
 # the wheel entry follows the earliest thing this connection is waiting for in
 # time: the transport's deadline, the drain deadline once closing, and a short
 # retry while a forced release is still blocked
@@ -1770,7 +1855,8 @@ fun set_waiting(controls: *ControlView, runtime: *Runtime, index: usize, waiting
 
 pub fun has_ready(runtime: *Runtime) bool {
     ret runtime != nil && runtime.initialized
-        && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil);
+        && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil
+        || runtime.pending_ready_head != NO_CONNECTION);
 }
 
 fun copy_listener_name(value: *Connection, name: str) bool {
@@ -2157,8 +2243,13 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
         runtime.pending_free_head = index;
         ret false;
     }
+    if (!claim_pending_timer(runtime, index, named_charge)) {
+        pending.next_free         = runtime.pending_free_head;
+        runtime.pending_free_head = index;
+        ret false;
+    }
     pending.accepted = accepted;
-    budget.relocate(config_snapshot.budgets, ?pending.budget_charge, named_charge);
+    take_pending_charge(runtime, index, config_snapshot.budgets, named_charge);
     pending.lease              = lease;
     pending.pump               = pump_index;
     pending.pump_generation    = controls.pumps[pump_index].generation;
@@ -2207,6 +2298,7 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
     pending.cleanup_only       = true;
     pending.live               = true;
     link_pending_live(runtime, index);
+    mark_pending_ready(runtime, index);
     runtime.pending_initial_count              = runtime.pending_initial_count + 1;
     runtime.live_total                         = runtime.live_total + 1;
     controls.pumps[pump_index].queued_initials =
@@ -2248,7 +2340,13 @@ fun take_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize
     pending.lease_live                 = false;
     pending.cleanup_only               = false;
     pending.length                     = 0;
-    pending.live                       = false;
+    unmark_pending_ready(runtime, index);
+    if (pending.timer_live) {
+        wheel.release(runtime.timers, pending.timer);
+        pending.timer      = wheel.no_handle();
+        pending.timer_live = false;
+    }
+    pending.live = false;
     unlink_pending_live(runtime, index);
     pending.next_free         = runtime.pending_free_head;
     runtime.pending_free_head = index;
@@ -3082,13 +3180,20 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
 fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: time.Time,
     now_ns: u64) Status {
     var status: Status = OK;
-    var i:      usize  = runtime.pending_live_head;
-    for (i != NO_CONNECTION) {
+    # an initial marked while these are serviced waits for the next turn
+    val last: usize = runtime.pending_ready_tail;
+    var i:    usize = runtime.pending_ready_head;
+    for (last != NO_CONNECTION && i != NO_CONNECTION) {
         val pending: *PendingInitial = pending_at(runtime, i);
-        val next:    usize           = pending.next_live;
+        var next:    usize           = pending.ready_next;
+        if (i == last) { next = NO_CONNECTION; }
+        unmark_pending_ready(runtime, i);
         if (pending.pump >= MAX_PUMPS
             || pending.admission_bank >= ADMISSION_BANKS) {
-            if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
             i = next;
             cnt;
         }
@@ -3096,13 +3201,19 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         val bank: *AdmissionGeneration =
             ?pump.admissions[pending.admission_bank];
         if (pending.cleanup_only) {
-            if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
             i = next;
             cnt;
         }
         if (!pump.live || pump.generation != pending.pump_generation
             || pump.draining || pump.cancelling || !bank.live) {
-            if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
             i = next;
             cnt;
         }
@@ -3116,7 +3227,10 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             if (!pending.budget_charge.live) {
                 pending.budget_charge_live = false;
             }
-            if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
             i = next;
             cnt;
         }
@@ -3125,7 +3239,10 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         var config_snapshot: ConnectionConfig;
         if (!materialize_pending_config(?pending.config,
             ?config_snapshot)) {
-            if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
             i = next;
             cnt;
         }
@@ -3135,7 +3252,10 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         val connection_index: usize                   = acquire_connection(controls, runtime,
             pump_index, bank_index, lease);
         if (connection_index == NO_CONNECTION) {
-            if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
             i = next;
             cnt;
         }
@@ -3147,7 +3267,10 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             value.lease      = process_admission.no_lease();
             value.state      = CONNECTION_CLEANUP;
             cleanup_accepting(controls, runtime, connection_index);
-            if (!release_pending_initial(controls, runtime, i)) { status = FAILED; }
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
             i = next;
             cnt;
         }
@@ -3172,6 +3295,12 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
     ret status;
 }
 
+# an initial whose release waits on nothing that wakes it is tried every turn
+# until #182 gives teardown a wake of its own
+fun retry_release(runtime: *Runtime, index: usize) {
+    mark_pending_ready(runtime, index);
+}
+
 fun cancel_pending_bank(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize) bool {
     var success: bool  = true;
@@ -3181,7 +3310,10 @@ fun cancel_pending_bank(controls: *ControlView, runtime: *Runtime, pump_index: u
         val next:    usize           = pending.next_live;
         if (pending.pump == pump_index
             && pending.admission_bank == bank_index
-            && !release_pending_initial(controls, runtime, i)) { success = false; }
+            && !release_pending_initial(controls, runtime, i)) {
+            retry_release(runtime, i);
+            success = false;
+        }
         i = next;
     }
     ret success;
@@ -3236,7 +3368,12 @@ fun service_connection(controls: *ControlView, runtime: *Runtime, index: usize,
 # a wheel entry of this runtime came due. the transport's own deadline is
 # handed to it, and either way the connection is looked at this turn
 pub fun fire(controls: *ControlView, runtime: *Runtime, owner: u64, now_ns: u64) {
-    if (runtime == nil || !runtime.initialized || !owns_timer(owner)) { ret; }
+    if (runtime == nil || !runtime.initialized) { ret; }
+    if (owns_pending(owner)) {
+        wake_pending(runtime, owner);
+        ret;
+    }
+    if (!owns_timer(owner)) { ret; }
     val index: usize = (owner & ~TIMER_MASK)::usize;
     if (index >= controls.connections.capacity) { ret; }
     val value: *Connection = connection_at(controls, index);
@@ -3263,8 +3400,19 @@ pub fun fire(controls: *ControlView, runtime: *Runtime, owner: u64, now_ns: u64)
 
 # a wake from the worker's queue for a connection this runtime owns. the owner
 # is the connection's timer owner, so the wake routes the same way a timer does
+fun wake_pending(runtime: *Runtime, owner: u64) {
+    val index: usize = (owner & ~TIMER_MASK)::usize;
+    if (index >= runtime.pending_initials.capacity) { ret; }
+    mark_pending_ready(runtime, index);
+}
+
 pub fun wake(controls: *ControlView, runtime: *Runtime, owner: u64) {
-    if (runtime == nil || !runtime.initialized || !owns_timer(owner)) { ret; }
+    if (runtime == nil || !runtime.initialized) { ret; }
+    if (owns_pending(owner)) {
+        wake_pending(runtime, owner);
+        ret;
+    }
+    if (!owns_timer(owner)) { ret; }
     val index: usize = (owner & ~TIMER_MASK)::usize;
     if (index >= controls.connections.capacity) { ret; }
     mark_ready(controls, runtime, index);
@@ -3302,26 +3450,6 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, wall: time.Time,
 pub fun replay_full(runtime: *Runtime) u64 {
     if (runtime == nil || !runtime.initialized) { ret 0; }
     ret runtime.replay_full;
-}
-
-pub fun next_budget_deadline(runtime: *Runtime,
-    output: *time.Time) Status {
-    if (runtime == nil || !runtime.initialized || output == nil) { ret INVALID; }
-    var found: bool  = false;
-    var i:     usize = runtime.pending_live_head;
-    for (i != NO_CONNECTION) {
-        val pending:  *PendingInitial = pending_at(runtime, i);
-        var deadline: time.Time;
-        if (pending.budget_charge_live
-            && budget.deadline(?pending.budget_charge, ?deadline)
-            && (!found || time.time_before(deadline, @output))) {
-            @output = deadline;
-            found   = true;
-        }
-        i = pending.next_live;
-    }
-    if (found) { ret OK; }
-    ret BLOCKED;
 }
 
 pub fun graceful_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHandle,
@@ -4137,7 +4265,30 @@ test "hedge.protocol.quic.runtime: pending transfer preserves old generation" {
     ret 0;
 }
 
-test "hedge.protocol.quic.runtime: queued initial deadline expires exactly" {
+# queue `waiting` as pending initial 0 the way enqueue_initial does
+fun test_queue_pending(controls: *ControlView, runtime: *Runtime,
+    budgets: *budget.Set, waiting: *budget.Charge) *PendingInitial {
+    val pending: *PendingInitial = test_take_pending(runtime);
+    if (pending == nil || !claim_pending_timer(runtime, 0, waiting)) { ret nil; }
+    runtime.pending_initial_count                   = 1;
+    runtime.live_total                              = 1;
+    controls.pumps[0].live                          = true;
+    controls.pumps[0].generation                    = 2;
+    controls.pumps[0].queued_initials               = 1;
+    controls.pumps[0].admissions[0].live            = true;
+    controls.pumps[0].admissions[0].queued_initials = 1;
+    pending.live                                    = true;
+    link_pending_live(runtime, 0);
+    pending.pump            = 0;
+    pending.pump_generation = 2;
+    pending.admission_bank  = 0;
+    pending.config.budgets  = budgets;
+    take_pending_charge(runtime, 0, budgets, waiting);
+    pending.budget_charge_live = true;
+    ret pending;
+}
+
+test "hedge.protocol.quic.runtime: a queued initial is left alone until its deadline fires" {
     var fixture:  TestControls;
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
@@ -4153,33 +4304,58 @@ test "hedge.protocol.quic.runtime: queued initial deadline expires exactly" {
         || budget.charge(?budgets, allowance, 0,
         time.Time{sec: 0, nsec: 0}, ?waiting, hedge_wake.no_waker()) != budget.QUEUED) { ret 2; }
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    val pending: *PendingInitial = test_take_pending(?runtime);
+    val pending: *PendingInitial = test_queue_pending(controls, ?runtime, ?budgets, ?waiting);
     if (pending == nil) { ret 91; }
-    runtime.pending_initial_count                   = 1;
-    runtime.live_total                              = 1;
-    controls.pumps[0].live                          = true;
-    controls.pumps[0].generation                    = 2;
-    controls.pumps[0].queued_initials               = 1;
-    controls.pumps[0].admissions[0].live            = true;
-    controls.pumps[0].admissions[0].queued_initials = 1;
-    pending.live                                    = true;
-    link_pending_live(?runtime, 0);
-    pending.pump            = 0;
-    pending.pump_generation = 2;
-    pending.admission_bank  = 0;
-    pending.config.budgets  = ?budgets;
-    budget.relocate(?budgets, ?pending.budget_charge, ?waiting);
-    pending.budget_charge_live = true;
-    var deadline: time.Time;
-    if (next_budget_deadline(?runtime, ?deadline) != OK
-        || !time.time_equal(deadline, time.Time{sec: 3, nsec: 0})) { ret 3; }
+    var owners: [4]u64;
+    if (!wheel.armed(?fixture.timers, pending.timer) || has_ready(?runtime)
+        || wheel.advance(?fixture.timers, 2999999999, ?owners[0], 4) != 0) { ret 3; }
+    # nothing woke it, so a turn past its deadline does not look at it
     if (advance_pending_initials(controls, ?runtime,
-        time.Time{sec: 3, nsec: 0}, 1) != OK
+        time.Time{sec: 4, nsec: 0}, 4000000000) != OK
+        || !pending.live || items[0].expired != 0) { ret 4; }
+    if (wheel.advance(?fixture.timers, 4000000000, ?owners[0], 4) != 1
+        || !owns(owners[0])) { ret 5; }
+    fire(controls, ?runtime, owners[0], 4000000000);
+    if (!has_ready(?runtime)) { ret 6; }
+    if (advance_pending_initials(controls, ?runtime,
+        time.Time{sec: 4, nsec: 0}, 4000000000) != OK
         || pending.live || runtime.pending_initial_count != 0
         || runtime.live_total != 0 || items[0].waiting != 0
-        || items[0].expired != 1
-        || next_budget_deadline(?runtime, ?deadline) != BLOCKED) { ret 4; }
-    if (!budget.release(?budgets, ?running)) { ret 5; }
+        || items[0].expired != 1 || has_ready(?runtime)
+        || wheel.armed_count(?fixture.timers) != 0) { ret 7; }
+    if (!budget.release(?budgets, ?running)) { ret 8; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a budget release wakes the initial queued behind it" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    var items:    [1]budget.Budget;
+    var budgets:  budget.Set;
+    if (!budget.make(?budgets, ?items[0], 1)) { ret 1; }
+    val allowance: usize = budget.define(?budgets, "quic", 1, 1, 0, 0);
+    var running:   budget.Charge;
+    var waiting:   budget.Charge;
+    if (budget.charge(?budgets, allowance, 0,
+        time.Time{sec: 0, nsec: 0}, ?running, hedge_wake.no_waker()) != budget.ADMITTED
+        || budget.charge(?budgets, allowance, 0,
+        time.Time{sec: 0, nsec: 0}, ?waiting, hedge_wake.no_waker()) != budget.QUEUED) { ret 2; }
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val pending: *PendingInitial = test_queue_pending(controls, ?runtime, ?budgets, ?waiting);
+    if (pending == nil)                                                 { ret 91; }
+    if (wheel.armed_count(?fixture.timers) != 0 || has_ready(?runtime)) { ret 3; }
+    if (!budget.release(?budgets, ?running)
+        || pending.budget_charge.outcome != budget.ADMITTED) { ret 4; }
+    var owners: [4]u64;
+    if (hedge_wake.take(?fixture.wakes, ?owners[0], 4) != 1 || !owns(owners[0])) { ret 5; }
+    wake(controls, ?runtime, owners[0]);
+    if (!pending.ready || runtime.pending_ready_head != 0) { ret 6; }
+    # the pump went away meanwhile, so the woken initial is released, not admitted
+    controls.pumps[0].live = false;
+    if (advance_pending_initials(controls, ?runtime,
+        time.Time{sec: 1, nsec: 0}, 1000000000) != OK
+        || pending.live || has_ready(?runtime) || items[0].active != 0) { ret 7; }
     ret 0;
 }
 
