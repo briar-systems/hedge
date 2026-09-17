@@ -54,6 +54,10 @@ fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
 
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret sel outcome.ok;
+}
+
 fun runtime_ok(outcome: err[io_error.Error]) bool {
     ret sel outcome.ok;
 }
@@ -96,10 +100,13 @@ rec Pending {
 
 # everything a callback may touch. no secret state is reachable from here.
 pub rec Channel {
-    live:              bool;
-    index:             usize;
-    state:             State;
-    current:           Kind;
+    live:    bool;
+    index:   usize;
+    state:   State;
+    current: Kind;
+    # the running read was cancelled here so a write could start, and is not
+    # the engine's to hear about
+    preempted:         bool;
     generation:        u32;
     read:              Pending;
     write:             Pending;
@@ -157,6 +164,7 @@ fun reset_channel(value: *Channel, index: usize) {
     value.index             = index;
     value.state             = IDLE;
     value.current           = KIND_NONE;
+    value.preempted         = false;
     value.generation        = 0;
     value.ready             = false;
     value.handshake_settled = false;
@@ -528,11 +536,24 @@ fun settle(index: usize) bool {
     val snapshot: tls_transport.Snapshot = tls_transport.snapshot(
         ?session_at(index).stream.operation);
     if (snapshot.state != tls_transport.OPERATION_TERMINAL) { ret false; }
-    val kind: Kind = value.current;
-    value.current = KIND_NONE;
+    val kind:      Kind = value.current;
+    val preempted: bool = value.preempted;
+    value.current   = KIND_NONE;
+    value.preempted = false;
     observe(index);
     tls_stream.destroy_operation(?session_at(index).stream);
     release_operation_scope(index);
+    if (preempted && snapshot.terminal_error == tls_error.CANCELLED
+        && ended_by_owner(?value.read) == tls_error.OK) {
+        # the engine's read stays queued behind the writes and starts again with
+        # the same buffer and token. mach-tls keeps every byte a cancelled read
+        # settled, and whatever it already delivered is the engine's now
+        if (snapshot.application_bytes == 0) { ret false; }
+        var delivered: tls_transport.Snapshot = snapshot;
+        delivered.terminal_error = tls_error.OK;
+        publish(index, kind, delivered);
+        ret value.ready;
+    }
     if (kind == KIND_HANDSHAKE) {
         value.handshake_settled = true;
         value.handshake_error   = snapshot.terminal_error;
@@ -554,11 +575,23 @@ fun ended_by_owner(slot: *Pending) tls_error.Error {
     ret tls_error.OK;
 }
 
+fun writes_waiting(value: *Channel) bool {
+    ret value.write.active || value.shutdown.active || value.close.active;
+}
+
 # start whatever should run next
+#
+# a write never waits behind a read. a response can become ready at any time,
+# long after a read was started for the next request, and the peer that would
+# satisfy that read may be waiting for the response. so a read in flight when a
+# write is queued is cancelled through its own operation scope, the queued
+# writes run, and the read then starts again once, unseen by the engine. a
+# write is never cancelled this way, because a write cancelled with a record
+# partly on the wire fails the stream.
 #
 # `reads` says whether a read may be started. the connection plane passes false
 # while it is still driving its engines and true once they have quiesced, so a
-# read is never in flight at a moment when a response could still appear.
+# read does not start ahead of work those engines are about to queue.
 pub fun drive(index: usize, reads: bool) bool {
     prepare();
     if (!claimed_index(index) || !channel_at(index).live) { ret false; }
@@ -566,6 +599,13 @@ pub fun drive(index: usize, reads: bool) bool {
     if (value.ready) { ret true; }
     if (value.state == FAILED || value.state == CLOSED) {
         ret fail_next(value, tls_error.INTERNAL_ERROR);
+    }
+    if (value.current == KIND_READ && value.state == OPEN && writes_waiting(value)) {
+        if (!value.preempted
+            && transition_ok(cancel.cancel(?session_at(index).operation_scope))) {
+            value.preempted = true;
+        }
+        ret settle(index);
     }
     if (value.current != KIND_NONE || value.state != OPEN) { ret false; }
     val wanted: Kind = next_kind(value);
