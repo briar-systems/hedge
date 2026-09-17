@@ -64,9 +64,9 @@ use hedge.listener;
 use h3_session:    hedge.protocol.h3.session;
 use quic_capacity: hedge.protocol.quic.capacity;
 use hedge.protocol.quic.routing;
-use hedge.protocol.quic.timers;
 use hedge_tls:     hedge.protocol.tls;
 use hedge_storage: hedge.storage;
+use wheel:         hedge.timer;
 use A:             std.allocator;
 use std.allocator.page;
 use allocator_testing: std.allocator.testing;
@@ -140,7 +140,16 @@ pub rec RuntimeConfig {
     backing: *A.Allocator;
     # request memory for every h3 exchange is claimed from here
     chunks: *hedge_storage.Chunks;
+    # the worker's timer, which holds every connection deadline. the worker
+    # advances it and hands each QUIC entry back through `fire`
+    timers: *wheel.Wheel;
 }
+
+# a wheel owner is tagged as QUIC so a worker sharing one wheel can route it
+val TIMER_TAG:  u64 = 0x5155000000000000;
+val TIMER_MASK: u64 = 0xffff000000000000;
+# how long a forced release that is still waiting sleeps before it looks again
+val BROKEN_RETRY_NS: u64 = 10000000;
 
 pub rec PumpConfig {
     admission_generation: u64;
@@ -287,7 +296,11 @@ rec CompletionContext {
     token_source:          u64;
     token_index:           u32;
     token_generation:      u64;
-    completion_pending:    bool;
+    # a settled completion waits on its runtime's list until advance takes it
+    runtime:            *Runtime;
+    next_pending:       *CompletionContext;
+    prev_pending:       *CompletionContext;
+    completion_pending: bool;
 }
 
 rec SendOperation {
@@ -351,32 +364,43 @@ pub rec Connection {
     max_requests:         usize;
     call_memory_bytes:    usize;
     request_timeout_ns:   u64;
-    timer_pass:           u64;
-    generation:           u64;
-    source:               u64;
-    next_free:            usize;
-    next_live:            usize;
-    prev_live:            usize;
-    pump:                 usize;
-    pump_generation:      u64;
-    admission_bank:       usize;
-    state:                ConnectionState;
-    scope_live:           bool;
-    charge_live:          bool;
-    budget_charge_live:   bool;
-    lease_live:           bool;
-    h3_started:           bool;
-    h3_abandoning:        bool;
-    h3_cancelled:         bool;
-    close_started:        bool;
-    close_deadline_ns:    u64;
-    transport_finished:   bool;
-    timer_disarmed:       bool;
-    routes_removed:       bool;
-    tls_live:             bool;
-    assembly_attempted:   bool;
-    assembly_released:    bool;
-    live:                 bool;
+    # the connection's wheel entry, armed at the earlier of the transport's
+    # next deadline and the drain deadline once closing
+    timer:           wheel.Handle;
+    transport_timer: qt.Timer;
+    # the connections with work, in arrival order, and those an h3 service
+    # holds waiting, which are tried every turn until #181 gives services wakers
+    ready_next:         usize;
+    ready_prev:         usize;
+    waiting_next:       usize;
+    waiting_prev:       usize;
+    ready:              bool;
+    waiting:            bool;
+    generation:         u64;
+    source:             u64;
+    next_free:          usize;
+    next_live:          usize;
+    prev_live:          usize;
+    pump:               usize;
+    pump_generation:    u64;
+    admission_bank:     usize;
+    state:              ConnectionState;
+    scope_live:         bool;
+    charge_live:        bool;
+    budget_charge_live: bool;
+    lease_live:         bool;
+    h3_started:         bool;
+    h3_abandoning:      bool;
+    h3_cancelled:       bool;
+    close_started:      bool;
+    close_deadline_ns:  u64;
+    transport_finished: bool;
+    timer_disarmed:     bool;
+    routes_removed:     bool;
+    tls_live:           bool;
+    assembly_attempted: bool;
+    assembly_released:  bool;
+    live:               bool;
 }
 
 pub rec Pump {
@@ -444,7 +468,7 @@ pub rec Runtime {
     connection_storages: hedge_storage.Recycler[ConnectionStorage];
     pending_initials:    hedge_storage.Table[PendingInitial];
     routes:              routing.Table;
-    timer_queue:         timers.Queue;
+    timers:              *wheel.Wheel;
     sessions:            h3_session.Pool;
     chunks:              *hedge_storage.Chunks;
     backing:             *A.Allocator;
@@ -452,6 +476,11 @@ pub rec Runtime {
     # the live connections, so every sweep costs what is live rather than what
     # was configured. an idle QUIC listener sweeps nothing.
     live_head:           usize;
+    ready_head:          usize;
+    ready_tail:          usize;
+    waiting_head:        usize;
+    completions_head:    *CompletionContext;
+    completions_tail:    *CompletionContext;
     admission:           *process_admission.Manager;
     live_connections:    usize;
     live_total:          usize;
@@ -467,7 +496,6 @@ pub rec Runtime {
     pending_initial_count: usize;
     pump_count:            usize;
     next_source:           u64;
-    advance_pass:          u64;
     generation:            u64;
     # calendar time of the current advance, read only to verify certificates.
     # everything that schedules uses the monotonic clock
@@ -591,7 +619,13 @@ fun reset_connection(value: *Connection) {
     value.close_deadline_ns    = 0;
     value.transport_finished   = false;
     value.timer_disarmed       = false;
-    value.timer_pass           = 0;
+    value.timer                = wheel.no_handle();
+    value.ready                = false;
+    value.waiting              = false;
+    value.ready_next           = NO_CONNECTION;
+    value.ready_prev           = NO_CONNECTION;
+    value.waiting_next         = NO_CONNECTION;
+    value.waiting_prev         = NO_CONNECTION;
     value.routes_removed       = false;
     value.tls_live             = false;
     value.assembly_attempted   = false;
@@ -666,6 +700,8 @@ fun arm_connection_storage(value: *Connection) {
     for (i < assembly.SEND_CAPACITY) {
         value.storage.sends[i].pending                    = false;
         value.storage.sends[i].context.completion_pending = false;
+        value.storage.sends[i].context.next_pending       = nil;
+        value.storage.sends[i].context.prev_pending       = nil;
         i                                                 = i + 1;
     }
     i = 0;
@@ -742,13 +778,13 @@ fun unlink_live(controls: *ControlView, runtime: *Runtime, index: usize) {
 # hold, from an earlier runtime, are threaded back onto the free lists.
 pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) bool {
     if (runtime == nil || runtime.initialized || config.chunks == nil
-        || config.backing == nil || !view_valid(controls)) { ret false; }
+        || config.backing == nil || config.timers == nil
+        || !view_valid(controls)) { ret false; }
     if (!hedge_storage.make[ConnectionStorage](?runtime.connection_storages,
         config.backing, 1)) { ret false; }
     if (!hedge_storage.make_table[PendingInitial](?runtime.pending_initials,
         config.backing)
         || !routing.make(?runtime.routes, config.backing)
-        || !timers.make(?runtime.timer_queue, config.backing)
         || !h3_session.make_pool(?runtime.sessions, config.backing,
         controls.sessions)) {
         hedge_storage.destroy[ConnectionStorage](?runtime.connection_storages);
@@ -756,6 +792,12 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     }
     runtime.chunks                = config.chunks;
     runtime.backing               = config.backing;
+    runtime.timers                = config.timers;
+    runtime.ready_head            = NO_CONNECTION;
+    runtime.ready_tail            = NO_CONNECTION;
+    runtime.waiting_head          = NO_CONNECTION;
+    runtime.completions_head      = nil;
+    runtime.completions_tail      = nil;
     runtime.admission             = nil;
     runtime.free_head             = NO_CONNECTION;
     runtime.live_head             = NO_CONNECTION;
@@ -770,7 +812,6 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.pending_initial_count = 0;
     runtime.pump_count            = 0;
     runtime.next_source           = 1;
-    runtime.advance_pass          = 0;
     runtime.generation            = next_generation(runtime.generation);
     runtime.wall                  = time.Time{sec: 0, nsec: 0};
     runtime.stopping              = false;
@@ -798,12 +839,39 @@ fun pump_for(controls: *ControlView, runtime: *Runtime, handle: PumpHandle) *Pum
 fun queue_completion(owner: ptr, token_context: usize,
     completion: io_runtime.Completion) {
     val context: *CompletionContext = owner::*CompletionContext;
-    if (context == nil || context.completion_pending) { ret; }
+    if (context == nil || context.completion_pending || context.runtime == nil) { ret; }
+    val runtime: *Runtime = context.runtime;
     context.completion         = completion;
     context.completion_pending = true;
+    context.next_pending       = nil;
+    context.prev_pending       = runtime.completions_tail;
+    if (runtime.completions_tail != nil) {
+        runtime.completions_tail.next_pending = context;
+    }
+    or {
+        runtime.completions_head = context;
+    }
+    runtime.completions_tail = context;
 }
 
-fun make_context(context: *CompletionContext, kind: CompletionKind,
+# a context leaves the list when advance takes it, or before its storage goes
+# away when its owner is freed first
+fun unqueue_completion(runtime: *Runtime, context: *CompletionContext) {
+    if (!context.completion_pending) { ret; }
+    context.completion_pending = false;
+    if (context.prev_pending != nil) {
+        context.prev_pending.next_pending = context.next_pending;
+    }
+    or { runtime.completions_head = context.next_pending; }
+    if (context.next_pending != nil) {
+        context.next_pending.prev_pending = context.prev_pending;
+    }
+    or { runtime.completions_tail = context.prev_pending; }
+    context.next_pending = nil;
+    context.prev_pending = nil;
+}
+
+fun make_context(context: *CompletionContext, runtime: *Runtime, kind: CompletionKind,
     pump: usize, pump_generation: u64, connection: usize,
     connection_generation: u64, operation: usize,
     operation_generation: u64, value: qt.Token) bool {
@@ -818,6 +886,9 @@ fun make_context(context: *CompletionContext, kind: CompletionKind,
     context.token_source          = value.source;
     context.token_index           = value.index;
     context.token_generation      = value.generation;
+    context.runtime               = runtime;
+    context.next_pending          = nil;
+    context.prev_pending          = nil;
     context.completion_pending    = false;
     ret hedge_connection.bind_operation(?context.operation_owner,
         ?context.route, (context)::ptr, queue_completion, 0);
@@ -1060,7 +1131,7 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
         reset_receive_packet(pump, i);
         i = i + 1;
     }
-    if (!make_context(?pump.storage.receive_context, COMPLETION_RECEIVE, index,
+    if (!make_context(?pump.storage.receive_context, runtime, COMPLETION_RECEIVE, index,
         pump.generation, NO_CONNECTION, 0, 0, 0, no_token())) {
         abandon_attached_pump(pump);
         ret FAILED;
@@ -1205,10 +1276,12 @@ fun connection_superseded(controls: *ControlView, runtime: *Runtime, value: *Con
 }
 
 fun mark_connection_superseded(controls: *ControlView, runtime: *Runtime,
-    value: *Connection) {
+    index: usize) {
+    val value: *Connection = connection_at(controls, index);
     if (value.state == CONNECTION_LIVE
         && connection_superseded(controls, runtime, value)) {
         value.state = CONNECTION_GRACEFUL;
+        mark_ready(controls, runtime, index);
     }
 }
 
@@ -1216,7 +1289,7 @@ fun mark_superseded_graceful(controls: *ControlView, runtime: *Runtime) {
     var i: usize = runtime.live_head;
     for (i != NO_CONNECTION) {
         val next: usize = connection_at(controls, i).next_live;
-        mark_connection_superseded(controls, runtime, connection_at(controls, i));
+        mark_connection_superseded(controls, runtime, i);
         i = next;
     }
 }
@@ -1359,12 +1432,20 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
         && !grow_connections(controls, runtime))) {
         ret NO_CONNECTION;
     }
+    val index:  usize        = runtime.free_head;
+    val handle: wheel.Handle = wheel.claim(runtime.timers, timer_owner(index));
+    if (handle.index == wheel.NONE) { ret NO_CONNECTION; }
     val storage: *ConnectionStorage =
         hedge_storage.claim[ConnectionStorage](?runtime.connection_storages);
-    if (storage == nil) { ret NO_CONNECTION; }
-    val index: usize       = runtime.free_head;
+    if (storage == nil) {
+        wheel.release(runtime.timers, handle);
+        ret NO_CONNECTION;
+    }
     val value: *Connection = connection_at(controls, index);
+    var idle:  qt.Timer;
     runtime.free_head        = value.next_free;
+    value.timer              = handle;
+    value.transport_timer    = idle;
     value.storage            = storage;
     value.next_free          = NO_CONNECTION;
     value.generation         = next_generation(value.generation);
@@ -1444,7 +1525,16 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     value.listener_name_length     = 0;
     value.peer                     = ip.endpoint(0, 0, 0, 0, 0);
     value.local                    = ip.endpoint(0, 0, 0, 0, 0);
-    value.live                     = false;
+    unmark_ready(controls, runtime, index);
+    set_waiting(controls, runtime, index, false);
+    wheel.release(runtime.timers, value.timer);
+    value.timer = wheel.no_handle();
+    var send: usize = 0;
+    for (send < assembly.SEND_CAPACITY) {
+        unqueue_completion(runtime, ?value.storage.sends[send].context);
+        send = send + 1;
+    }
+    value.live = false;
     unlink_live(controls, runtime, index);
     # the scope is destroyed by now, so nothing io holds points into the storage
     hedge_storage.release[ConnectionStorage](?runtime.connection_storages,
@@ -1570,11 +1660,103 @@ fun remove_routes(runtime: *Runtime, value: *Connection) bool {
     ret true;
 }
 
+pub fun timer_owner(index: usize) u64 {
+    ret TIMER_TAG | index::u64;
+}
+
+pub fun owns_timer(owner: u64) bool {
+    ret (owner & TIMER_MASK) == TIMER_TAG;
+}
+
+# the wheel entry follows the earliest thing this connection is waiting for in
+# time: the transport's deadline, the drain deadline once closing, and a short
+# retry while a forced release is still blocked
+fun arm_timer(runtime: *Runtime, value: *Connection, now_ns: u64) bool {
+    if (value.state == CONNECTION_BROKEN) {
+        ret wheel.arm(runtime.timers, value.timer,
+            saturated_add(now_ns, BROKEN_RETRY_NS)) == wheel.OK;
+    }
+    var armed:    bool = false;
+    var deadline: u64  = 0;
+    if (!value.timer_disarmed && value.transport_timer.armed) {
+        armed    = true;
+        deadline = value.transport_timer.deadline_ns;
+    }
+    if (value.close_started && value.close_deadline_ns != 0
+        && (!armed || value.close_deadline_ns < deadline)) {
+        armed    = true;
+        deadline = value.close_deadline_ns;
+    }
+    if (!armed) { ret wheel.disarm(runtime.timers, value.timer) == wheel.OK; }
+    ret wheel.arm(runtime.timers, value.timer, deadline) == wheel.OK;
+}
+
 fun refresh_timer(controls: *ControlView, runtime: *Runtime, index: usize) bool {
     val value: *Connection = connection_at(controls, index);
     if (!value.live || !value.assembly.initialized) { ret false; }
-    ret timers.refresh(?runtime.timer_queue, index, value.generation,
-        qt.timer[binding.Binding](?value.assembly.driver)) == timers.TIMER_OK;
+    value.transport_timer = qt.timer[binding.Binding](?value.assembly.driver);
+    ret arm_timer(runtime, value, 0);
+}
+
+fun mark_ready(controls: *ControlView, runtime: *Runtime, index: usize) {
+    val value: *Connection = connection_at(controls, index);
+    if (value == nil || !value.live || value.ready) { ret; }
+    value.ready      = true;
+    value.ready_next = NO_CONNECTION;
+    value.ready_prev = runtime.ready_tail;
+    if (runtime.ready_tail != NO_CONNECTION) {
+        connection_at(controls, runtime.ready_tail).ready_next = index;
+    }
+    or {
+        runtime.ready_head = index;
+    }
+    runtime.ready_tail = index;
+}
+
+fun unmark_ready(controls: *ControlView, runtime: *Runtime, index: usize) {
+    val value: *Connection = connection_at(controls, index);
+    if (!value.ready) { ret; }
+    if (value.ready_prev != NO_CONNECTION) {
+        connection_at(controls, value.ready_prev).ready_next = value.ready_next;
+    }
+    or { runtime.ready_head = value.ready_next; }
+    if (value.ready_next != NO_CONNECTION) {
+        connection_at(controls, value.ready_next).ready_prev = value.ready_prev;
+    }
+    or { runtime.ready_tail = value.ready_prev; }
+    value.ready      = false;
+    value.ready_next = NO_CONNECTION;
+    value.ready_prev = NO_CONNECTION;
+}
+
+fun set_waiting(controls: *ControlView, runtime: *Runtime, index: usize, waiting: bool) {
+    val value: *Connection = connection_at(controls, index);
+    if (value.waiting == waiting) { ret; }
+    if (waiting) {
+        value.waiting      = true;
+        value.waiting_prev = NO_CONNECTION;
+        value.waiting_next = runtime.waiting_head;
+        if (runtime.waiting_head != NO_CONNECTION) {
+            connection_at(controls, runtime.waiting_head).waiting_prev = index;
+        }
+        runtime.waiting_head = index;
+        ret;
+    }
+    if (value.waiting_prev != NO_CONNECTION) {
+        connection_at(controls, value.waiting_prev).waiting_next = value.waiting_next;
+    }
+    or { runtime.waiting_head = value.waiting_next; }
+    if (value.waiting_next != NO_CONNECTION) {
+        connection_at(controls, value.waiting_next).waiting_prev = value.waiting_prev;
+    }
+    value.waiting      = false;
+    value.waiting_next = NO_CONNECTION;
+    value.waiting_prev = NO_CONNECTION;
+}
+
+pub fun has_ready(runtime: *Runtime) bool {
+    ret runtime != nil && runtime.initialized
+        && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil);
 }
 
 fun copy_listener_name(value: *Connection, name: str) bool {
@@ -1623,9 +1805,11 @@ fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize) b
     val value: *Connection          = connection_at(controls, index);
     val pump:  *Pump                = ?controls.pumps[value.pump];
     val bank:  *AdmissionGeneration = ?pump.admissions[value.admission_bank];
-    if (value.state != CONNECTION_CLEANUP
-        || (value.assembly_attempted
-        && !assembly.reusable(?value.assembly))) { ret false; }
+    if (value.state != CONNECTION_CLEANUP) { ret false; }
+    if (value.assembly_attempted && !assembly.reusable(?value.assembly)) {
+        set_waiting(controls, runtime, index, true);
+        ret false;
+    }
     if (value.tls_live && server.destroy(?value.tls)) {
         value.tls_live = false;
     }
@@ -1643,9 +1827,13 @@ fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize) b
     if (value.scope_live) {
         if (operation_ok(cancel.destroy(?value.storage.scope))) { value.scope_live = false; }
     }
+    # a cleanup that cannot finish now is tried again every turn
     if (value.tls_live || value.charge_live || value.budget_charge_live
-        || value.scope_live) { ret false; }
-    ret return_connection(controls, runtime, index);
+        || value.scope_live || !return_connection(controls, runtime, index)) {
+        set_waiting(controls, runtime, index, true);
+        ret false;
+    }
+    ret true;
 }
 
 fun own_connection_admission(value: *Connection,
@@ -1819,7 +2007,7 @@ fun submit_stateless(controls: *ControlView, runtime: *Runtime, pump_index: usiz
     operation.packet.has_local_destination = received.has_local_destination;
     operation.packet.truncated             = false;
     operation.packet.zero_length           = false;
-    if (!make_context(?operation.context, COMPLETION_STATELESS,
+    if (!make_context(?operation.context, runtime, COMPLETION_STATELESS,
         pump_index, pump.generation, NO_CONNECTION, 0, index,
         operation.generation, no_token())) {
         release_stateless(pump, index);
@@ -2312,6 +2500,7 @@ fun fail_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     or {
         value.state = CONNECTION_BROKEN;
     }
+    mark_ready(controls, runtime, index);
 }
 
 # the abortive counterpart of release_connection. each step either completes
@@ -2322,11 +2511,9 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
     index: usize, now: time.Time, now_ns: u64) Status {
     val value: *Connection = connection_at(controls, index);
     if (!value.live) { ret OK; }
-    value.state = CONNECTION_BROKEN;
-    if (!value.timer_disarmed) {
-        timers.disarm(?runtime.timer_queue, index, value.generation);
-        value.timer_disarmed = true;
-    }
+    value.state          = CONNECTION_BROKEN;
+    value.timer_disarmed = true;
+    arm_timer(runtime, value, now_ns);
     if (!value.routes_removed) {
         reconcile_routes(controls, runtime, index);
         if (!remove_routes(runtime, value)) { ret FAILED; }
@@ -2538,7 +2725,7 @@ fun generate_sends(controls: *ControlView, runtime: *Runtime, index: usize,
         if (generated.status != qt.STATUS_OK) { ret false; }
         operation.token = generated.token;
         fill_send_packet(operation, generated);
-        if (!make_context(?operation.context, COMPLETION_SEND,
+        if (!make_context(?operation.context, runtime, COMPLETION_SEND,
             value.pump, value.pump_generation, index, value.generation,
             operation_index, operation.generation, generated.token)) {
             qt.complete_send[binding.Binding](?value.assembly.driver,
@@ -2584,10 +2771,10 @@ fun deliver_known(controls: *ControlView, runtime: *Runtime, received: *net_type
         ?value.assembly.driver, received, value.local, now_ns, 0);
     if (delivered.status == qt.STATUS_ERROR
         || !reconcile_routes(controls, runtime, index)
-        || !refresh_timer(controls, runtime, index)
-        || !progress_connection(controls, runtime, index, now, now_ns)) {
+        || !refresh_timer(controls, runtime, index)) {
         fail_connection(controls, runtime, index, now_ns);
     }
+    mark_ready(controls, runtime, index);
     ret OK;
 }
 
@@ -2696,10 +2883,10 @@ fun settle_send(controls: *ControlView, runtime: *Runtime, context: *CompletionC
     operation.pending = false;
     if (settled.status == qt.STATUS_ERROR
         || !reconcile_routes(controls, runtime, context.connection)
-        || !refresh_timer(controls, runtime, context.connection)
-        || !progress_connection(controls, runtime, context.connection, now, now_ns)) {
+        || !refresh_timer(controls, runtime, context.connection)) {
         fail_connection(controls, runtime, context.connection, now_ns);
     }
+    mark_ready(controls, runtime, context.connection);
     ret OK;
 }
 
@@ -2742,54 +2929,19 @@ pub fun bind_admission(runtime: *Runtime,
     ret true;
 }
 
+# only what settled before this call is taken, so a completion that settles
+# while these are handled waits for the next turn instead of starving it
 fun drain_completions(controls: *ControlView, runtime: *Runtime, now: time.Time,
     now_ns: u64) Status {
-    var status:     Status = OK;
-    var pump_index: usize  = 0;
-    for (pump_index < MAX_PUMPS) {
-        val pump: *Pump = ?controls.pumps[pump_index];
-        if (pump.live
-            && pump.storage.receive_context.completion_pending) {
-            val completion: io_runtime.Completion =
-                pump.storage.receive_context.completion;
-            pump.storage.receive_context.completion_pending = false;
-            if (complete_at(controls, runtime, ?pump.storage.receive_context, completion,
-                now, now_ns) == FAILED) { status = FAILED; }
-        }
-        # settling a send releases it from the list, so the next is read first
-        var stateless: usize = NO_CONNECTION;
-        if (pump.live) { stateless = pump.stateless_pending; }
-        for (stateless != NO_CONNECTION) {
-            val operation: *StatelessSend     = stateless_at(pump, stateless);
-            val context:   *CompletionContext = ?operation.context;
-            val next:      usize              = operation.next_pending;
-            if (context.completion_pending) {
-                val completion: io_runtime.Completion = context.completion;
-                context.completion_pending = false;
-                if (complete_at(controls, runtime, context, completion,
-                    now, now_ns) == FAILED) { status = FAILED; }
-            }
-            stateless = next;
-        }
-        pump_index = pump_index + 1;
-    }
-    var index: usize = runtime.live_head;
-    for (index != NO_CONNECTION) {
-        val value:      *Connection = connection_at(controls, index);
-        val next_index: usize       = value.next_live;
-        var send:       usize       = 0;
-        for (send < assembly.SEND_CAPACITY) {
-            val context: *CompletionContext =
-                ?value.storage.sends[send].context;
-            if (context.completion_pending) {
-                val completion: io_runtime.Completion = context.completion;
-                context.completion_pending = false;
-                if (complete_at(controls, runtime, context, completion,
-                    now, now_ns) == FAILED) { status = FAILED; }
-            }
-            send = send + 1;
-        }
-        index = next_index;
+    var status: Status             = OK;
+    val last:   *CompletionContext = runtime.completions_tail;
+    for (last != nil && runtime.completions_head != nil) {
+        val context:    *CompletionContext    = runtime.completions_head;
+        val completion: io_runtime.Completion = context.completion;
+        unqueue_completion(runtime, context);
+        if (complete_at(controls, runtime, context, completion,
+            now, now_ns) == FAILED) { status = FAILED; }
+        if (context == last) { brk; }
     }
     ret status;
 }
@@ -2863,11 +3015,8 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
             value.state = CONNECTION_BROKEN;
             ret force_release_connection(controls, runtime, index, now, now_ns);
         }
-        if (!value.timer_disarmed) {
-            if (timers.disarm(?runtime.timer_queue, index,
-                value.generation) != timers.TIMER_OK) { ret FAILED; }
-            value.timer_disarmed = true;
-        }
+        value.timer_disarmed = true;
+        if (!arm_timer(runtime, value, now_ns)) { ret FAILED; }
         value.transport_finished = true;
     }
     if (qt.snapshot[binding.Binding](?value.assembly.driver).state !=
@@ -2986,7 +3135,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         if (initialized) {
             delivered = deliver_initial(controls, runtime, connection_index,
                 ?packet_value, now_ns);
-            mark_connection_superseded(controls, runtime, value);
+            mark_connection_superseded(controls, runtime, connection_index);
             if (delivered
                 && !progress_connection(controls, runtime, connection_index,
                 now, now_ns)) {
@@ -3018,74 +3167,100 @@ fun connection_failed(runtime: *Runtime) {
     runtime.connection_failures = runtime.connection_failures + 1;
 }
 
+# a connection an h3 service holds, or one whose teardown waits on nothing that
+# wakes it, is tried every turn until #181 gives those a wake of their own
+fun needs_polling(controls: *ControlView, runtime: *Runtime, value: *Connection) bool {
+    if (value.state == CONNECTION_CLEANUP || value.state == CONNECTION_FINALIZING
+        || value.h3_abandoning) { ret true; }
+    if (value.h3_session == h3_session.NO_SESSION) { ret false; }
+    if (value.close_started)                       { ret true; }
+    val session: *h3_session.Session = h3_session.session_at(
+        ?runtime.sessions, controls.sessions, value.h3_session);
+    ret session == nil || h3_session.awaiting_service(session);
+}
+
+fun service_connection(controls: *ControlView, runtime: *Runtime, index: usize,
+    now: time.Time, now_ns: u64) {
+    val value: *Connection = connection_at(controls, index);
+    if (!value.live) { ret; }
+    if (value.state == CONNECTION_CLEANUP) {
+        if (!cleanup_accepting(controls, runtime, index)) { connection_failed(runtime); }
+    }
+    or (value.state == CONNECTION_FINALIZING) {
+        if (finalize_connection(controls, runtime, index) == FAILED) { connection_failed(runtime); }
+    }
+    or (value.state == CONNECTION_BROKEN) {
+        if (release_connection(controls, runtime, index, now, now_ns) == FAILED) {
+            connection_failed(runtime);
+        }
+    }
+    or {
+        if (!progress_connection(controls, runtime, index, now, now_ns)) {
+            fail_connection(controls, runtime, index, now_ns);
+        }
+        val released: Status = release_connection(controls, runtime, index, now, now_ns);
+        if (released == FAILED) {
+            connection_failed(runtime);
+            fail_connection(controls, runtime, index, now_ns);
+        }
+    }
+    if (!value.live) { ret; }
+    if (!arm_timer(runtime, value, now_ns)) {
+        connection_failed(runtime);
+        fail_connection(controls, runtime, index, now_ns);
+    }
+    set_waiting(controls, runtime, index, needs_polling(controls, runtime, value));
+}
+
+# a wheel entry of this runtime came due. the transport's own deadline is
+# handed to it, and either way the connection is looked at this turn
+pub fun fire(controls: *ControlView, runtime: *Runtime, owner: u64, now_ns: u64) {
+    if (runtime == nil || !runtime.initialized || !owns_timer(owner)) { ret; }
+    val index: usize = (owner & ~TIMER_MASK)::usize;
+    if (index >= controls.connections.capacity) { ret; }
+    val value: *Connection = connection_at(controls, index);
+    if (!value.live) { ret; }
+    if (!value.timer_disarmed && value.assembly.initialized
+        && value.transport_timer.armed
+        && value.transport_timer.deadline_ns <= now_ns) {
+        val timed: qt.OperationResult = qt.on_timeout[binding.Binding](
+            ?value.assembly.driver, value.transport_timer, now_ns);
+        value.transport_timer.armed = false;
+        if (timed.status != qt.STATUS_STALE
+            && timed.status != qt.STATUS_CLOSED
+            && timed.status != qt.STATUS_CANCELLED
+            && timed.status != qt.STATUS_OK) {
+            fail_connection(controls, runtime, index, now_ns);
+        }
+        if (!reconcile_routes(controls, runtime, index)
+            || !refresh_timer(controls, runtime, index)) {
+            fail_connection(controls, runtime, index, now_ns);
+        }
+    }
+    mark_ready(controls, runtime, index);
+}
+
 # wall is calendar time, used only to verify certificates. every deadline and
-# budget is scheduled on now_ns, the monotonic clock
+# budget is scheduled on now_ns, the monotonic clock. only connections something
+# happened to are visited: settled io, a fired timer, or a state change
 pub fun advance(controls: *ControlView, runtime: *Runtime, wall: time.Time,
     now_ns: u64) Status {
     if (runtime == nil || !runtime.initialized || now_ns == 0) { ret INVALID; }
     runtime.wall = wall;
-    val now: time.Time = clock.from_ns(now_ns);
-    runtime.advance_pass = runtime.advance_pass + 1;
-    var status: Status        = drain_completions(controls, runtime, now, now_ns);
-    var due:    timers.Result = timers.take_due(?runtime.timer_queue, now_ns);
-    for (due.status == timers.TIMER_OK) {
-        val index: usize       = due.node.connection_slot;
-        val value: *Connection = connection_for(controls, runtime, index,
-            due.node.connection_generation);
-        # a timer that comes due again inside the same pass belongs to a
-        # connection waiting on io this call cannot deliver. re-arm it and
-        # yield, or the loop starves the completions it is waiting for.
-        if (value != nil && value.timer_pass == runtime.advance_pass) {
-            if (!refresh_timer(controls, runtime, index)) {
-                connection_failed(runtime);
-                fail_connection(controls, runtime, index, now_ns);
-            }
-            brk;
-        }
-        if (value != nil) {
-            value.timer_pass = runtime.advance_pass;
-            val timed: qt.OperationResult = qt.on_timeout[binding.Binding](
-                ?value.assembly.driver, due.node.timer, now_ns);
-            if (timed.status != qt.STATUS_STALE
-                && timed.status != qt.STATUS_CLOSED
-                && timed.status != qt.STATUS_CANCELLED
-                && timed.status != qt.STATUS_OK) {
-                fail_connection(controls, runtime, index, now_ns);
-            }
-            if (!reconcile_routes(controls, runtime, index)
-                || !refresh_timer(controls, runtime, index)
-                || !progress_connection(controls, runtime, index, now, now_ns)) {
-                fail_connection(controls, runtime, index, now_ns);
-            }
-        }
-        due = timers.take_due(?runtime.timer_queue, now_ns);
-    }
-    var i: usize = runtime.live_head;
+    val now:    time.Time = clock.from_ns(now_ns);
+    val status: Status    = drain_completions(controls, runtime, now, now_ns);
+    var i:      usize     = runtime.waiting_head;
     for (i != NO_CONNECTION) {
-        val value: *Connection = connection_at(controls, i);
-        val next:  usize       = value.next_live;
-        if (value.state == CONNECTION_CLEANUP) {
-            if (!cleanup_accepting(controls, runtime, i)) { connection_failed(runtime); }
-        }
-        or (value.state == CONNECTION_FINALIZING) {
-            if (finalize_connection(controls, runtime, i) == FAILED) { connection_failed(runtime); }
-        }
-        or (value.state == CONNECTION_BROKEN) {
-            if (release_connection(controls, runtime, i, now, now_ns) == FAILED) {
-                connection_failed(runtime);
-            }
-        }
-        or {
-            if (!progress_connection(controls, runtime, i, now, now_ns)) {
-                fail_connection(controls, runtime, i, now_ns);
-            }
-            val released: Status = release_connection(controls, runtime, i, now, now_ns);
-            if (released == FAILED) {
-                connection_failed(runtime);
-                fail_connection(controls, runtime, i, now_ns);
-            }
-        }
-        i = next;
+        mark_ready(controls, runtime, i);
+        i = connection_at(controls, i).waiting_next;
+    }
+    # a connection marked while these are serviced waits for the next turn
+    val last: usize = runtime.ready_tail;
+    for (last != NO_CONNECTION && runtime.ready_head != NO_CONNECTION) {
+        val index: usize = runtime.ready_head;
+        unmark_ready(controls, runtime, index);
+        service_connection(controls, runtime, index, now, now_ns);
+        if (index == last) { brk; }
     }
     if (advance_pending_initials(controls, runtime, now, now_ns) == FAILED) {
         connection_failed(runtime);
@@ -3097,15 +3272,6 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, wall: time.Time,
 pub fun replay_full(runtime: *Runtime) u64 {
     if (runtime == nil || !runtime.initialized) { ret 0; }
     ret runtime.replay_full;
-}
-
-pub fun next_deadline(runtime: *Runtime, output: *u64) Status {
-    if (runtime == nil || !runtime.initialized || output == nil) { ret INVALID; }
-    val status: timers.Status = timers.next_deadline(?runtime.timer_queue,
-        output);
-    if (status == timers.TIMER_OK)    { ret OK; }
-    if (status == timers.TIMER_EMPTY) { ret BLOCKED; }
-    ret FAILED;
 }
 
 pub fun next_budget_deadline(runtime: *Runtime,
@@ -3145,6 +3311,7 @@ pub fun graceful_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHan
             && value.pump_generation == handle.generation
             && value.state == CONNECTION_LIVE) {
             value.state = CONNECTION_GRACEFUL;
+            mark_ready(controls, runtime, i);
             if (value.h3_session == h3_session.NO_SESSION
                 && !begin_transport_close(value, h3.H3_NO_ERROR, now_ns)) {
                 ret FAILED;
@@ -3243,6 +3410,7 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
         if (!operation_ok(cancel.destroy(?pump.storage.scope))) { ret BLOCKED; }
         pump.scope_live = false;
     }
+    unqueue_completion(runtime, ?pump.storage.receive_context);
     ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
     pump.driver        = nil;
     pump.socket        = nil;
@@ -3266,8 +3434,7 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
 pub fun release(controls: *ControlView, runtime: *Runtime) Status {
     if (runtime == nil || !runtime.initialized) { ret INVALID; }
     if (runtime.live_total != 0 || runtime.live_connections != 0
-        || runtime.pending_initial_count != 0 || runtime.routes.len != 0
-        || runtime.timer_queue.len != 0) { ret BLOCKED; }
+        || runtime.pending_initial_count != 0 || runtime.routes.len != 0) { ret BLOCKED; }
     var i: usize = 0;
     for (i < MAX_PUMPS) {
         if (controls.pumps[i].live) {
@@ -3284,7 +3451,6 @@ pub fun release(controls: *ControlView, runtime: *Runtime) Status {
         && !hedge_storage.destroy[ConnectionStorage](?runtime.connection_storages))
         || !hedge_storage.destroy_table[PendingInitial](?runtime.pending_initials)
         || (runtime.routes.initialized && !routing.destroy(?runtime.routes))
-        || (runtime.timer_queue.initialized && !timers.destroy(?runtime.timer_queue))
         || (runtime.sessions.storages.live && !h3_session.destroy_pool(?runtime.sessions))) {
         ret FAILED;
     }
@@ -3351,7 +3517,7 @@ pub fun snapshot(controls: *ControlView, runtime: *Runtime) Snapshot {
     value.live                = runtime.live_total;
     value.superseded          = superseded(controls, runtime);
     value.routes              = runtime.routes.len;
-    value.timers              = runtime.timer_queue.len;
+    value.timers              = wheel.armed_count(runtime.timers);
     value.datagram_failures   = runtime.datagram_failures;
     value.connection_failures = runtime.connection_failures;
     value.stateless_dropped   = runtime.stateless_dropped;
@@ -3409,6 +3575,7 @@ rec TestControls {
     sessions:        hedge_storage.SecretTable[h3_session.Session];
     view:            ControlView;
     chunks:          hedge_storage.Chunks;
+    timers:          wheel.Wheel;
 }
 
 fun test_controls(fixture: *TestControls) *ControlView {
@@ -3416,6 +3583,7 @@ fun test_controls(fixture: *TestControls) *ControlView {
     hedge_storage.make_secret_table[assembly.SecretStorage](?fixture.secret_storages);
     hedge_storage.make_secret_table[h3_session.Session](?fixture.sessions);
     hedge_storage.make_chunks(?fixture.chunks, test_allocator());
+    wheel.make(?fixture.timers, test_allocator(), 1);
     fixture.view = ControlView{pumps: ?fixture.pumps[0],
         connections:     ?fixture.connections,
         secret_storages: ?fixture.secret_storages, sessions: ?fixture.sessions};
@@ -3433,7 +3601,8 @@ fun test_take_pending(runtime: *Runtime) *PendingInitial {
 
 fun test_make(fixture: *TestControls, runtime: *Runtime, backing: *A.Allocator) bool {
     ret make(?fixture.view, runtime,
-        RuntimeConfig{backing: backing, chunks: ?fixture.chunks});
+        RuntimeConfig{backing: backing, chunks: ?fixture.chunks,
+        timers: ?fixture.timers});
 }
 
 var test_backing:      A.Allocator;
@@ -3922,7 +4091,7 @@ test "hedge.protocol.quic.runtime: pending transfer preserves old generation" {
     value.plan = pending.config.plan;
     if (index != 0 || !transfer_pending_ownership(pending, value)) { ret 1; }
     value.state = CONNECTION_LIVE;
-    mark_connection_superseded(controls, ?runtime, value);
+    mark_connection_superseded(controls, ?runtime, index);
     take_pending_initial(controls, ?runtime, 0);
     if (pending.live || pending.config.plan != nil
         || pending.config.budgets != nil || runtime.pending_initial_count != 0
@@ -4224,7 +4393,7 @@ test "hedge.protocol.quic.runtime: an idle runtime holds no connection storage" 
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 1; }
     if (controls.connections.capacity != 0 || controls.sessions.capacity != 0
         || runtime.pending_initials.capacity != 0 || runtime.routes.capacity != 0
-        || runtime.timer_queue.node_capacity != 0
+        || fixture.timers.entries.capacity != 0
         || hedge_storage.held[ConnectionStorage](?runtime.connection_storages) != 0) {
         ret 2;
     }
@@ -4526,6 +4695,7 @@ test "hedge.protocol.quic.runtime: a connection that cannot finish cleanup does 
     connection.state = CONNECTION_CLEANUP;
     # the lease cannot be returned, so the cleanup cannot finish this pass
     runtime.admission = nil;
+    if (cleanup_accepting(controls, ?runtime, index) || !connection.waiting) { ret 5; }
     if (advance(controls, ?runtime, time.Time{sec: 1, nsec: 0}, 1) != OK
         || !connection.live
         || snapshot(controls, ?runtime).connection_failures != 1) { ret 3; }
