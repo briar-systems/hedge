@@ -14,7 +14,16 @@ cd "$root" || exit 1
 binary="${HEDGE_BINARY:-out/linux-x86_64/debug/bin/hedge}"
 fixtures="test/interop/fixtures"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"; stop_server' EXIT
+origin_pid=""
+trap 'rm -rf "$work"; stop_server; stop_origin' EXIT
+
+stop_origin() {
+    if [ -n "$origin_pid" ] && kill -0 "$origin_pid" 2>/dev/null; then
+        kill "$origin_pid" 2>/dev/null
+        wait "$origin_pid" 2>/dev/null
+    fi
+    origin_pid=""
+}
 
 passed=0
 failed=0
@@ -106,6 +115,9 @@ echo
 
 # --- the main configuration --------------------------------------------------
 
+python3 -m http.server 9090 --bind 127.0.0.1 --directory test/interop \
+    > "$work/origin.log" 2>&1 &
+origin_pid=$!
 start_server test/interop/hedge.toml || exit 1
 
 large="test/interop/public/files/large.txt"
@@ -176,6 +188,26 @@ if cmp -s "$large" "$work/h3-large"; then
     check "HTTP/3 multi-frame response is byte-identical" ok ok
 else
     check "HTTP/3 multi-frame response is byte-identical" ok differs
+fi
+
+for version in http1.1 http2; do
+    timeout 30 curl -sS --$version --cacert $fixtures/root.pem \
+        --resolve api.example.com:9443:127.0.0.1 -o "$work/$version-proxied" \
+        https://api.example.com:9443/public/files/large.txt >/dev/null 2>&1
+    if cmp -s "$large" "$work/$version-proxied"; then
+        check "$version over TLS proxies a body while the client is read" ok ok
+    else
+        check "$version over TLS proxies a body while the client is read" ok differs
+    fi
+done
+
+timeout 30 curl -sS --http3-only --cacert $fixtures/root.pem \
+    --resolve api.example.com:9443:127.0.0.1 -o "$work/h3-proxied" \
+    https://api.example.com:9443/public/files/large.txt >/dev/null 2>&1
+if cmp -s "$large" "$work/h3-proxied"; then
+    check "HTTP/3 request waiting on an upstream is woken and completes" ok ok
+else
+    check "HTTP/3 request waiting on an upstream is woken and completes" ok differs
 fi
 
 timeout 30 curl -sS --http2 --cacert $fixtures/root.pem \
