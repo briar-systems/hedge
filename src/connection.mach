@@ -9,11 +9,13 @@
 use crypto.contracts;
 use hedge.budget;
 use hedge.clock;
+use hedge.config.lanes;
 use hedge.config.schema;
 use hedge.dispatch;
 use hedge.dispatch.call;
 use hedge.dispatch.plan;
 use hedge.listener;
+use hedge.memory;
 use hedge.protocol.h2;
 use hedge.protocol.prologue;
 use hedge.protocol.proxy_protocol;
@@ -45,7 +47,8 @@ use io_error:     std.io.error;
 use io_handle:    std.io.handle;
 use io_lifecycle: std.io.lifecycle;
 use io_runtime:   std.io.runtime;
-use net_async:    std.net.async;
+use std.memory.buffers;
+use net_async: std.net.async;
 use std.net.ip;
 use std.net.tcp;
 use std.sync.cancel;
@@ -54,6 +57,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -71,13 +75,7 @@ fun runtime_ok(outcome: err[io_error.Error]) bool {
 
 pub val PIPELINE_DEPTH:         usize = schema.MAX_PIPELINE_DEPTH;
 pub val TRANSPORT_SLOTS:        usize = 4;
-pub val LINE_BYTES:             usize = 4096;
-pub val STORAGE_BYTES:          usize = 8192;
-pub val FIELD_SLOTS:            usize = 64;
-pub val TRAILER_SLOTS:          usize = 16;
-pub val SCRATCH_BYTES:          usize = 4096;
 pub val READ_BYTES:             usize = 8192;
-pub val WRITE_BYTES:            usize = 8192;
 pub val RESPONSE_FIELD_SLOTS:   usize = 32;
 pub val RESPONSE_TRAILER_SLOTS: usize = 8;
 pub val INFORMATIONAL_SLOTS:    usize = 4;
@@ -169,6 +167,9 @@ pub rec Config {
     # bounds the prologue and, on a TLS listener, the handshake behind it
     prologue_timeout_ns: u64;
     call_memory_bytes:   usize;
+    memory_budgets:      memory.Budgets;
+    # how long a connection may wait on memory before it is shed
+    memory_wait_ns: u64;
 }
 
 pub fun config_from(graph: *schema.Graph) Config {
@@ -179,24 +180,23 @@ pub fun config_from(graph: *schema.Graph) Config {
     }
     var max_streams: usize = graph.limits.max_pipeline_depth;
     if (max_streams > h2.MAX_STREAMS) { max_streams = h2.MAX_STREAMS; }
-    engine.parser.max_header_bytes = graph.limits.max_header_bytes;
-    engine.parser.max_headers      = graph.limits.max_header_count;
-    engine.parser.max_body_bytes   = graph.limits.max_body_bytes::u64;
-    engine.header_timeout_ns       = graph.timeouts.header_ms * 1000000;
-    engine.request_timeout_ns      = graph.timeouts.request_ms * 1000000;
-    engine.idle_timeout_ns         = graph.timeouts.keep_alive_ms * 1000000;
-    engine.write_timeout_ns        = graph.timeouts.write_ms * 1000000;
-    if (engine.parser.max_header_bytes > STORAGE_BYTES)  { engine.parser.max_header_bytes = STORAGE_BYTES; }
-    if (engine.parser.max_headers > FIELD_SLOTS)         { engine.parser.max_headers = FIELD_SLOTS; }
-    if (engine.parser.max_start_line > LINE_BYTES)       { engine.parser.max_start_line = LINE_BYTES; }
-    if (engine.parser.max_header_line > LINE_BYTES)      { engine.parser.max_header_line = LINE_BYTES; }
-    if (engine.parser.max_trailer_bytes > STORAGE_BYTES) { engine.parser.max_trailer_bytes = STORAGE_BYTES; }
-    if (engine.parser.max_trailers > TRAILER_SLOTS)      { engine.parser.max_trailers = TRAILER_SLOTS; }
-    if (engine.parser.max_chunk_line > LINE_BYTES)       { engine.parser.max_chunk_line = LINE_BYTES; }
+    engine.parser             = lanes.h1_limits(?graph.limits);
+    engine.read_bytes         = READ_BYTES;
+    engine.write_bytes        = READ_BYTES;
+    engine.slot_storage_bytes = lanes.h1_storage_bytes(engine.parser);
+    engine.slot_scratch_bytes = lanes.SCRATCH_BYTES;
+    engine.slot_lane          = memory.LANE_REQUEST;
+    engine.connection_lane    = memory.LANE_IO;
+    engine.header_timeout_ns  = graph.timeouts.header_ms * 1000000;
+    engine.request_timeout_ns = graph.timeouts.request_ms * 1000000;
+    engine.idle_timeout_ns    = graph.timeouts.keep_alive_ms * 1000000;
+    engine.write_timeout_ns   = graph.timeouts.write_ms * 1000000;
     ret Config{engine: engine, max_streams: max_streams,
         request_timeout_ns:  graph.timeouts.request_ms * 1000000,
         prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000,
-        call_memory_bytes:   graph.limits.call_memory_bytes};
+        call_memory_bytes:   graph.limits.call_memory_bytes,
+        memory_budgets:      lanes.budgets(?graph.limits),
+        memory_wait_ns:      graph.timeouts.header_ms * 1000000};
 }
 
 # the exchange limits a service sees must admit everything the parser will accept,
@@ -231,44 +231,45 @@ rec RequestBody {
 }
 
 pub rec Connection {
-    state:               State;
-    id:                  u64;
-    generation:          u64;
-    token:               listener.ConnectionToken;
-    stream:              tcp.Stream;
-    peer:                ip.Endpoint;
-    peer_text:           [PEER_BYTES]u8;
-    peer_len:            usize;
-    peer_port:           u16;
-    peer_kind:           message.EndpointKind;
-    local_text:          [PEER_BYTES]u8;
-    local_len:           usize;
-    local_port:          u16;
-    local_kind:          message.EndpointKind;
-    secure:              bool;
-    listener_name:       str;
-    driver:              *net_async.Driver;
-    runtime_stream:      transport.RuntimeStream;
-    adapter:             transport.Adapter;
-    channel:             transport.Transport;
-    channel_slots:       [TRANSPORT_SLOTS]transport.Slot;
-    contexts:            [TRANSPORT_SLOTS]listener.ConnectionContext;
-    operations:          [TRANSPORT_SLOTS]Operation;
-    operation_root:      cancel.Scope;
-    control_scope:       cancel.Scope;
-    engine_scope:        cancel.Scope;
-    request_scope:       cancel.Scope;
-    request_scope_live:  bool;
-    engine:              connection.Engine;
-    engine_slots:        [PIPELINE_DEPTH]connection.Slot;
-    engine_memories:     [PIPELINE_DEPTH]connection.SlotMemory;
-    lines:               [PIPELINE_DEPTH][LINE_BYTES]u8;
-    storages:            [PIPELINE_DEPTH][STORAGE_BYTES]u8;
-    slot_fields:         [PIPELINE_DEPTH][FIELD_SLOTS]field.Field;
-    slot_trailers:       [PIPELINE_DEPTH][TRAILER_SLOTS]field.Field;
-    scratches:           [PIPELINE_DEPTH][SCRATCH_BYTES]u8;
-    read_buffer:         [READ_BYTES]u8;
-    write_buffer:        [WRITE_BYTES]u8;
+    state:              State;
+    id:                 u64;
+    generation:         u64;
+    token:              listener.ConnectionToken;
+    stream:             tcp.Stream;
+    peer:               ip.Endpoint;
+    peer_text:          [PEER_BYTES]u8;
+    peer_len:           usize;
+    peer_port:          u16;
+    peer_kind:          message.EndpointKind;
+    local_text:         [PEER_BYTES]u8;
+    local_len:          usize;
+    local_port:         u16;
+    local_kind:         message.EndpointKind;
+    secure:             bool;
+    listener_name:      str;
+    driver:             *net_async.Driver;
+    runtime_stream:     transport.RuntimeStream;
+    adapter:            transport.Adapter;
+    channel:            transport.Transport;
+    channel_slots:      [TRANSPORT_SLOTS]transport.Slot;
+    contexts:           [TRANSPORT_SLOTS]listener.ConnectionContext;
+    operations:         [TRANSPORT_SLOTS]Operation;
+    operation_root:     cancel.Scope;
+    control_scope:      cancel.Scope;
+    engine_scope:       cancel.Scope;
+    request_scope:      cancel.Scope;
+    request_scope_live: bool;
+    engine:             connection.Engine;
+    engine_slots:       [PIPELINE_DEPTH]connection.Slot;
+    # every engine on this connection borrows from the worker's pool through
+    # this account, which stays open until close has released them all
+    borrower:            memory.Borrower;
+    account:             buffers.Account;
+    source:              buffers.Source;
+    account_live:        bool;
+    refused_memory:      bool;
+    memory_deadline_ns:  u64;
+    memory_expired:      bool;
     stage:               [READ_BYTES]u8;
     stage_length:        usize;
     stage_offset:        usize;
@@ -396,6 +397,36 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
         (?owner.contexts[index])::usize);
 }
 
+# staged bytes are already readable, so the wait they answer settles at once
+fun ready_staged(owner: *Connection, scope: *cancel.Scope,
+    index: usize) res[io_runtime.Token, io_error.Error] {
+    val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
+        owner.driver.runtime, scope,
+        io_runtime.Operation{kind: io_runtime.READABLE, resource: owner.stream.handle.value,
+        buffer: nil, length: 0, offset: 0, context: (?owner.contexts[index])::usize});
+    if (sel submitted.err) { ret submitted; }
+    val published: err[io_error.Error] = io_runtime.complete(owner.driver.runtime,
+        submitted.ok, 0, owner.stream.handle.value, false);
+    if (sel published.err) {
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
+    }
+    ret submitted;
+}
+
+fun submit_readable(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val owner: *Connection = context::*Connection;
+    val index: usize       = operation_for(owner, token_context);
+    if (index >= TRANSPORT_SLOTS) {
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
+    }
+    if (owner.session == secure.NO_SESSION && owner.prologue_read < owner.prologue_len) {
+        ret ready_staged(owner, scope, index);
+    }
+    ret net_async.submit_readable(owner.driver, scope, ?owner.stream,
+        (?owner.contexts[index])::usize);
+}
+
 fun submit_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val owner: *Connection = context::*Connection;
@@ -431,6 +462,7 @@ fun submit_close(context: ptr, scope: *cancel.Scope,
 
 pub fun logical_kind(kind: io_runtime.Kind) transport.Kind {
     if (kind == io_runtime.READ)     { ret transport.READ; }
+    if (kind == io_runtime.READABLE) { ret transport.READABLE; }
     if (kind == io_runtime.WRITE)    { ret transport.WRITE; }
     if (kind == io_runtime.SHUTDOWN) { ret transport.SHUTDOWN_WRITE; }
     if (kind == io_runtime.CLOSE)    { ret transport.CLOSE; }
@@ -453,7 +485,7 @@ pub fun translate(settled: *transport.Completion, source: io_runtime.Completion,
         ret true;
     }
     if (source.end_of_stream) {
-        if (kind == transport.READ) {
+        if (kind == transport.READ || kind == transport.READABLE) {
             @settled = transport.end(token, source.bytes);
             ret true;
         }
@@ -472,7 +504,7 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
     fin { notify(owner); }
     var settled: transport.Completion;
     if (!translate(?settled, completion, token_context)) { ret; }
-    val now: time.Time = clock.instant();
+    val now: time.Instant = clock.instant();
     if (owner.h2_session != nil) {
         val stepped: Step = from_h2(h2.complete_io(owner.h2_session, ?settled, now));
         if (stepped == STEP_DONE || stepped == STEP_ERROR) {
@@ -634,11 +666,16 @@ pub fun make(
     owned: *listener.OwnedListener,
     policy: usize,
     shared: *Storage,
+    pool: *memory.Memory,
     waker: hedge_wake.Waker,
-    now: time.Time,
+    now: time.Instant,
 ) bool {
-    if (owner == nil || source == nil || net_driver == nil || active_plan == nil
-        || owned == nil || shared == nil || id == 0 || generation == 0
+    if (owner == nil) { ret false; }
+    owner.initialized    = false;
+    owner.account_live   = false;
+    owner.refused_memory = false;
+    if (source == nil || net_driver == nil || active_plan == nil
+        || owned == nil || shared == nil || pool == nil || id == 0 || generation == 0
         || !hedge_wake.valid(?waker)) { ret false; }
     owner.waker                = waker;
     owner.wake_failed          = false;
@@ -695,9 +732,9 @@ pub fun make(
     owner.initialized            = false;
     # every connection is a cancel root of its own. mach-http's transport requires
     # it, and it means no two connections, let alone two workers, share a lock
-    if (!operation_ok(cancel.make_root(?owner.operation_root, false, time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_root(?owner.control_scope, false, time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_child(?owner.engine_scope, ?owner.operation_root, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?owner.operation_root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_root(?owner.control_scope, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_child(?owner.engine_scope, ?owner.operation_root, opt[time.Instant].none{}))) {
         ret false;
     }
     # a peer that opens a connection and then says nothing must not hold a slot
@@ -708,13 +745,13 @@ pub fun make(
         owner.prologue_deadline_ns = clock.after_ns(clock.to_ns(now),
             configured.prologue_timeout_ns);
     }
-    if (!operation_ok(cancel.make_child(?owner.prologue_scope, ?owner.operation_root, false,
-        time.Time{sec: 0, nsec: 0}))) { ret false; }
+    if (!operation_ok(cancel.make_child(?owner.prologue_scope, ?owner.operation_root, opt[time.Instant].none{}))) { ret false; }
     owner.prologue_scope_live = true;
     owner.runtime_stream      = transport.RuntimeStream{
         runtime: net_driver.runtime,
         context: (owner)::ptr,
         submit_read:           submit_read,
+        submit_readable:       submit_readable,
         submit_write:          submit_write,
         submit_shutdown_write: submit_shutdown,
         submit_close:          submit_close,
@@ -723,26 +760,21 @@ pub fun make(
         ret false;
     }
     owner.channel.initialized = false;
-    var i: usize = 0;
-    for (i < PIPELINE_DEPTH) {
-        owner.engine_memories[i] = connection.SlotMemory{
-            line:             ?owner.lines[i][0],
-            line_capacity:    LINE_BYTES,
-            storage:          ?owner.storages[i][0],
-            storage_capacity: STORAGE_BYTES,
-            fields:           ?owner.slot_fields[i][0],
-            field_capacity:   FIELD_SLOTS,
-            trailers:         ?owner.slot_trailers[i][0],
-            trailer_capacity: TRAILER_SLOTS,
-            scratch:          ?owner.scratches[i][0],
-            scratch_capacity: SCRATCH_BYTES,
-        };
-        i = i + 1;
-    }
-    owner.engine.initialized = false;
+    owner.engine.initialized  = false;
     if (!call.make_memory(?owner.memory, ?shared.chunks, configured.call_memory_bytes)) {
         ret false;
     }
+    # the account is opened last, so a connection refused for anything else
+    # never holds one. a refusal here is admission turning the connection away
+    owner.memory_deadline_ns = 0;
+    owner.memory_expired     = false;
+    memory.borrower(?owner.borrower, pool, waker.owner, 0, configured.memory_budgets);
+    if (!memory.open(?owner.borrower, ?owner.account)) {
+        owner.refused_memory = true;
+        ret false;
+    }
+    owner.source       = memory.borrowed_source(?owner.borrower);
+    owner.account_live = true;
     # the engine is not started here: which engine to start is what the prologue
     # decides, and starting one first would mean guessing
     owner.initialized = true;
@@ -768,6 +800,9 @@ pub fun next_deadline(owner: *Connection, output: *u64) bool {
     }
     if (owner.request_scope_live && owner.exchange_live && owner.request_deadline_ns != 0) {
         found = earliest(found, owner.request_deadline_ns, output);
+    }
+    if (owner.memory_deadline_ns != 0) {
+        found = earliest(found, owner.memory_deadline_ns, output);
     }
     var engine_at: u64 = 0;
     if (owner.exchange_live && owner.service_pending
@@ -803,6 +838,35 @@ pub fun expire(owner: *Connection, now_ns: u64) {
     if (owner.request_scope_live && owner.exchange_live) {
         cancel.expire(?owner.request_scope, clock.from_ns(now_ns));
     }
+    # shedding a connection that cannot get memory is deliberate: under
+    # pressure the pool is kept for the connections that can still finish
+    if (owner.memory_deadline_ns != 0 && now_ns >= owner.memory_deadline_ns
+        && memory.waiting(?owner.account) && !owner.memory_expired) {
+        memory.timed_out(?owner.borrower);
+        owner.memory_expired = true;
+        owner.state          = FAILED;
+    }
+}
+
+# a connection's memory wait is bounded from the first step that ends blocked
+# on the pool, and the bound clears once a step ends without waiting
+fun track_memory(owner: *Connection, now: time.Instant) {
+    if (!owner.account_live || !memory.waiting(?owner.account)) {
+        owner.memory_deadline_ns = 0;
+        ret;
+    }
+    if (owner.memory_deadline_ns == 0 && owner.configured.memory_wait_ns != 0) {
+        owner.memory_deadline_ns = clock.after_ns(clock.to_ns(now),
+            owner.configured.memory_wait_ns);
+    }
+}
+
+pub fun memory_expired(owner: *Connection) bool {
+    ret owner != nil && owner.memory_expired;
+}
+
+pub fun refused_memory(owner: *Connection) bool {
+    ret owner != nil && owner.refused_memory;
 }
 
 pub fun wake_failed(owner: *Connection) bool {
@@ -821,7 +885,7 @@ fun refuse(owner: *Connection, reason: prologue.Refusal) Step {
     ret STEP_ERROR;
 }
 
-fun start_engine(owner: *Connection, now: time.Time) Step {
+fun start_engine(owner: *Connection, now: time.Instant) Step {
     var adapter: transport.Adapter = owner.adapter;
     if (owner.session != secure.NO_SESSION) { adapter = secure.adapter(owner.session); }
     if (!transport.adapter_valid(?adapter)) {
@@ -835,9 +899,8 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
     if (owner.protocol == selection.HTTP1) {
         owner.engine.initialized = false;
         if (!connection.init(?owner.engine, connection.SERVER, ?owner.channel,
-            ?owner.engine_scope, ?owner.engine_slots[0], ?owner.engine_memories[0],
-            PIPELINE_DEPTH, ?owner.read_buffer[0], READ_BYTES,
-            ?owner.write_buffer[0], WRITE_BYTES, owner.configured.engine, now)) {
+            ?owner.engine_scope, ?owner.engine_slots[0], PIPELINE_DEPTH, ?owner.source,
+            ?owner.account, owner.configured.engine, now)) {
             ret refuse(owner, prologue.REFUSED_UNBOUND);
         }
         owner.engine_live = true;
@@ -858,7 +921,8 @@ fun start_engine(owner: *Connection, now: time.Time) Step {
             owner.peer_port),
             endpoint_metadata(owner.local_kind, ?owner.local_text[0],
             owner.local_len, owner.local_port),
-            owner.configured.request_timeout_ns, ?owner.shared.chunks,
+            owner.configured.request_timeout_ns, owner.source, ?owner.account,
+            ?owner.shared.chunks,
             owner.configured.call_memory_bytes,
             h2.Timeouts{header_ns: owner.configured.engine.header_timeout_ns,
             idle_ns:  owner.configured.engine.idle_timeout_ns,
@@ -885,10 +949,12 @@ fun from_h2(progress: h2.Step) Step {
 # record layer must see them before the socket is read again
 fun staged_bytes(context: ptr, buffer: *u8, length: usize) usize {
     val owner: *Connection = context::*Connection;
-    if (owner == nil || buffer == nil || length == 0) { ret 0; }
+    if (owner == nil) { ret 0; }
     var count: usize = owner.prologue_len - owner.prologue_read;
-    if (count == 0)     { ret 0; }
-    if (count > length) { count = length; }
+    # a nil buffer asks how many staged bytes are left
+    if (buffer == nil)             { ret count; }
+    if (count == 0 || length == 0) { ret 0; }
+    if (count > length)            { count = length; }
     var i: usize = 0;
     for (i < count) {
         buffer[i] = owner.prologue_buffer[owner.prologue_read + i];
@@ -910,11 +976,9 @@ fun settle_secure(context: ptr, token_context: usize,
     advance(owner, clock.instant());
 }
 
-# `now` is monotonic and only schedules. TLS compares its time against
-# certificate validity and ticket times, so it gets the wall clock (#190)
-fun begin_secure(owner: *Connection, now: time.Time) Step {
-    val tls_time: i64 = clock.wall_seconds();
-    if (!hedge_tls.prepare(owner.tls_policy, tls_time)) {
+# TLS reads the wall clock through its policy, never `now` (#190)
+fun begin_secure(owner: *Connection, now: time.Instant) Step {
+    if (!hedge_tls.prepare(owner.tls_policy)) {
         ret refuse(owner, prologue.REFUSED_TLS);
     }
     owner.session = secure.acquire();
@@ -924,11 +988,11 @@ fun begin_secure(owner: *Connection, now: time.Time) Step {
     val channel: *secure.Channel = secure.channel(owner.session);
     if (channel == nil
         || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
-        staged_bytes)
+        staged_bytes, ?owner.borrower, ?owner.account)
         || !bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
         settle_secure, 0)
         || !secure.begin(owner.session, hedge_tls.policy_at(owner.tls_policy),
-        tls_time, ?owner.operation_root, ?owner.prologue_scope)) {
+        ?owner.operation_root, ?owner.prologue_scope)) {
         ret refuse(owner, prologue.REFUSED_TLS);
     }
     owner.handshaking = true;
@@ -959,8 +1023,8 @@ fun refuse_handshake(owner: *Connection) Step {
     ret refuse(owner, prologue.REFUSED_TLS);
 }
 
-fun advance_handshake(owner: *Connection, now: time.Time) Step {
-    secure.drive(owner.session, true);
+fun advance_handshake(owner: *Connection, now: time.Instant) Step {
+    secure.drive(owner.session);
     if (!secure.handshake_settled(owner.session)) { ret STEP_BLOCKED; }
     owner.handshaking = false;
     if (!secure.open(owner.session)) { ret refuse_handshake(owner); }
@@ -994,7 +1058,7 @@ fun submit_prologue_read(owner: *Connection) Step {
 }
 
 # read the prefix until policy can decide what this connection is
-fun advance_prologue(owner: *Connection, now: time.Time) Step {
+fun advance_prologue(owner: *Connection, now: time.Instant) Step {
     if (owner.prologue_pending) { ret STEP_BLOCKED; }
     val decided: prologue.Result = prologue.evaluate(owner.prologue_policy,
         ?owner.prologue_buffer[0], owner.prologue_len, owner.prologue_ended,
@@ -1116,7 +1180,7 @@ fun body_release(context: ptr) {}
 
 # --- exchange construction from one parsed request head ---
 
-fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
+fun make_exchange(owner: *Connection, slot: usize, now: time.Instant) u8 {
     val parsed: *parser.Parsed = connection.parsed(?owner.engine, slot);
     if (parsed == nil) { ret SETUP_PARSED; }
     owner.requests            = owner.requests + 1;
@@ -1131,7 +1195,7 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
     # mach-http requires the exchange scope to carry the request's deadline. the
     # wheel entry is what enforces it on a service that submits no io
     if (!operation_ok(cancel.make_child(?owner.request_scope, ?owner.engine_scope,
-        owner.request_deadline_ns != 0, clock.from_ns(owner.request_deadline_ns)))) {
+        clock.deadline(owner.request_deadline_ns)))) {
         ret SETUP_SCOPE;
     }
     owner.request_scope_live            = true;
@@ -1171,8 +1235,7 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Time) u8 {
             owner.local_len, owner.local_port),
         # calendar time: telemetry and caching measure from it
         received_at:   clock.wall(),
-        has_deadline:  owner.request_deadline_ns != 0,
-        deadline:      clock.from_ns(owner.request_deadline_ns),
+        deadline:      clock.deadline(owner.request_deadline_ns),
         request_index: owner.request_generation,
     };
     if (!message.init_request(?owner.request, parsed.method, parsed.target, metadata,
@@ -1260,7 +1323,7 @@ fun reason_for(code: status.Status) view.View {
     ret view.view(nil, 0);
 }
 
-fun begin_response(owner: *Connection, now: time.Time) bool {
+fun begin_response(owner: *Connection, now: time.Instant) bool {
     if (owner.response_started)    { ret true; }
     if (!owner.response.committed) { ret false; }
     var trailers: *field.Fields = nil;
@@ -1301,7 +1364,7 @@ fun response_body_progress(reader: *body.Reader, output: *u8,
 # the serializer consumes only what fits in the write buffer, so the unconsumed
 # remainder of a staged chunk is offered again before the body is read further.
 # dropping it would silently corrupt every response larger than one buffer.
-fun advance_response(owner: *Connection, now: time.Time) Step {
+fun advance_response(owner: *Connection, now: time.Instant) Step {
     if (!owner.response_started || response_complete(owner))          { ret STEP_IDLE; }
     if (owner.engine.write_pending || owner.engine.write_length != 0) { ret STEP_BLOCKED; }
     if (owner.stage_offset >= owner.stage_length) {
@@ -1342,7 +1405,7 @@ fun advance_response(owner: *Connection, now: time.Time) Step {
     ret STEP_PROGRESS;
 }
 
-fun settle_exchange(owner: *Connection, now: time.Time) bool {
+fun settle_exchange(owner: *Connection, now: time.Instant) bool {
     if (!owner.exchange_live)                                   { ret true; }
     if (exchange.finish(?owner.exchange) != exchange.FINISH_OK) { ret false; }
     val finalized: bool = call.release(?owner.active_call);
@@ -1353,7 +1416,7 @@ fun settle_exchange(owner: *Connection, now: time.Time) bool {
     ret finalized;
 }
 
-fun fail_exchange(owner: *Connection, code: status.Status, now: time.Time) bool {
+fun fail_exchange(owner: *Connection, code: status.Status, now: time.Instant) bool {
     if (owner.response.committed)                                         { ret false; }
     if (!call.reset_response_for_failure(?owner.active_call))             { ret false; }
     if (message.set_status(?owner.response, code) != message.RESPONSE_OK) { ret false; }
@@ -1365,7 +1428,7 @@ fun fail_exchange(owner: *Connection, code: status.Status, now: time.Time) bool 
 
 # response progress is the connection's own work: it owns the serializer and the
 # write buffer, and the service supplies only the body reader
-fun pump_response(owner: *Connection, now: time.Time) Step {
+fun pump_response(owner: *Connection, now: time.Instant) Step {
     if (!owner.response_started) { ret STEP_IDLE; }
     if (!response_complete(owner)) {
         val advanced: Step = advance_response(owner, now);
@@ -1412,7 +1475,7 @@ fun runnable(owner: *Connection) bool {
 # build one exchange and cross the dispatch boundary with it exactly once
 # a service that is waiting on something of its own gets another turn without the
 # boundary being crossed again
-fun resume_service(owner: *Connection, now: time.Time) Step {
+fun resume_service(owner: *Connection, now: time.Instant) Step {
     val served: dispatch.Result = dispatch.resume(owner.plan, ?owner.active_call,
         owner.budgets, ?owner.charge, now);
     if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
@@ -1433,7 +1496,7 @@ fun resume_service(owner: *Connection, now: time.Time) Step {
     ret STEP_PROGRESS;
 }
 
-fun start_exchange(owner: *Connection, slot: usize, now: time.Time) Step {
+fun start_exchange(owner: *Connection, slot: usize, now: time.Instant) Step {
     owner.setup_failure = make_exchange(owner, slot, now);
     if (owner.setup_failure != SETUP_OK) {
         owner.state = FAILED;
@@ -1467,13 +1530,16 @@ fun start_exchange(owner: *Connection, slot: usize, now: time.Time) Step {
 # this is the only place a connection event becomes a service call. a pipelined
 # request that arrives while an exchange is live is held, not started, so
 # responses stay wire-ordered and one exchange owns the arena at a time.
-fun apply(owner: *Connection, event: connection.Event, now: time.Time) Step {
+fun apply(owner: *Connection, event: connection.Event, now: time.Instant) Step {
     owner.last_event = event.kind;
     if (event.kind == connection.EVENT_NEED_READ) {
         connection.submit_read(?owner.engine);
         ret STEP_BLOCKED;
     }
-    if (event.kind == connection.EVENT_NONE || event.kind == connection.EVENT_SATURATED) {
+    # a memory-blocked engine is woken through the account when the pool can
+    # fund it again
+    if (event.kind == connection.EVENT_NONE || event.kind == connection.EVENT_SATURATED
+        || event.kind == connection.EVENT_MEMORY_BLOCKED) {
         ret STEP_BLOCKED;
     }
     if (event.kind == connection.EVENT_CLOSED || event.kind == connection.EVENT_PEER_CLOSED
@@ -1505,13 +1571,13 @@ fun apply(owner: *Connection, event: connection.Event, now: time.Time) Step {
 
 # advancing the engine is how a request body reaches its terminal state, so the
 # inbound side keeps moving even while a response is still being written
-fun pump_inbound(owner: *Connection, now: time.Time) Step {
+fun pump_inbound(owner: *Connection, now: time.Instant) Step {
     if (owner.has_pending) { ret STEP_BLOCKED; }
     ret apply(owner, connection.process(?owner.engine, now), now);
 }
 
 # one step: response work first, then whatever the protocol has next
-pub fun step(owner: *Connection, now: time.Time) Step {
+pub fun step(owner: *Connection, now: time.Instant) Step {
     if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
     if (owner.state == NEW) {
         var opened: Step = STEP_BLOCKED;
@@ -1537,7 +1603,7 @@ pub fun step(owner: *Connection, now: time.Time) Step {
                     ?settled, now);
                 if (runnable(owner)) { apply(owner, event, now); }
             }
-            secure.drive(owner.session, false);
+            secure.drive(owner.session);
             owner.last_step = STEP_PROGRESS;
             ret STEP_PROGRESS;
         }
@@ -1548,12 +1614,12 @@ pub fun step(owner: *Connection, now: time.Time) Step {
         # whatever the engine queued in this step has to start now. leaving it
         # for the next completion strands the last frame of a response behind a
         # read the peer will never satisfy, because the peer is waiting for it.
-        if (owner.session != secure.NO_SESSION) { secure.drive(owner.session, false); }
+        if (owner.session != secure.NO_SESSION) { secure.drive(owner.session); }
         owner.last_step = stepped;
         if (stepped == STEP_DONE || stepped == STEP_ERROR) { owner.state = CLOSING; }
         ret stepped;
     }
-    if (owner.session != secure.NO_SESSION) { secure.drive(owner.session, false); }
+    if (owner.session != secure.NO_SESSION) { secure.drive(owner.session); }
     if (owner.engine.state == connection.CLOSED || owner.engine.state == connection.FAILED) {
         owner.state = CLOSING;
         ret STEP_DONE;
@@ -1594,8 +1660,11 @@ pub fun step(owner: *Connection, now: time.Time) Step {
 }
 
 # drive until the connection blocks on I/O or finishes
-pub fun advance(owner: *Connection, now: time.Time) Step {
+pub fun advance(owner: *Connection, now: time.Instant) Step {
     if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
+    fin { track_memory(owner, now); }
+    # a wake may be the pool funding what TLS was blocked on
+    if (owner.session != secure.NO_SESSION) { secure.resume(owner.session); }
     var steps: usize = 0;
     # a connection still moving when its step bound runs out has more to do
     var settled: Step = STEP_PROGRESS;
@@ -1610,7 +1679,7 @@ pub fun advance(owner: *Connection, now: time.Time) Step {
     # the engines have nothing more to send, so a read may start without a
     # response ever having to wait behind it
     if (owner.session != secure.NO_SESSION && owner.engine_live
-        && owner.state == ACTIVE && secure.drive(owner.session, true)) {
+        && owner.state == ACTIVE && secure.drive(owner.session)) {
         ret STEP_PROGRESS;
     }
     ret settled;
@@ -1705,7 +1774,7 @@ fun pump_secure_close(owner: *Connection) {
     if (secure.take(owner.session, ?settled)) {
         connection.complete_io(?owner.engine, ?settled, clock.instant());
     }
-    secure.drive(owner.session, false);
+    secure.drive(owner.session);
 }
 
 pub fun close(owner: *Connection) bool {
@@ -1761,6 +1830,10 @@ pub fun close(owner: *Connection) bool {
         owner.session = secure.NO_SESSION;
     }
     owner.handshaking = false;
+    if (owner.account_live) {
+        if (!memory.close(owner.borrower.memory, ?owner.account)) { owner.close_failed = true; }
+        owner.account_live = false;
+    }
     release_prologue_scope(owner);
     if (owner.request_scope_live) {
         cancel.destroy(?owner.request_scope);
@@ -1879,7 +1952,7 @@ fun pending_response_release(context: ptr) {}
 
 test "connection: a pending response read completes into the retained stage" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var state: PendingResponseTest;
     state.output   = nil;
     state.capacity = 0;
@@ -1914,7 +1987,7 @@ test "connection: a pending response read completes into the retained stage" {
 
 test "connection: a pending request body read completes into the retained buffer" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var owner: Connection;
     owner.engine.initialized               = true;
     owner.engine.capacity                  = PIPELINE_DEPTH;
@@ -2021,9 +2094,8 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
     var heap:       A.Allocator;
     page.make(?heap);
     var chunks: storage.Chunks;
-    if (!storage.make_chunks(?chunks, ?heap)) { ret 1; }
-    if (!operation_ok(cancel.make_root(?owner.request_scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!storage.make_chunks(?chunks, ?heap))                                            { ret 1; }
+    if (!operation_ok(cancel.make_root(?owner.request_scope, opt[time.Instant].none{}))) { ret 1; }
     var request_body:   body.Reader  = body.empty_reader(generation);
     var request_fields: field.Fields = field.init(nil, 0,
         field.limits(0, 0, 0, 0));
@@ -2036,8 +2108,7 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
         peer:          message.unspecified_endpoint(),
         local:         message.unspecified_endpoint(),
         received_at:   time.Time{sec: 0, nsec: 0},
-        has_deadline:  false,
-        deadline:      time.Time{sec: 0, nsec: 0},
+        deadline:      opt[time.Instant].none{},
         request_index: generation,
     };
     if (!message.init_request(?owner.request, method.from_kind(method.GET),
@@ -2087,7 +2158,7 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
     val index: usize = budget.define(?budgets, "requests", 1, 0, 0, 0);
     owner.budgets = ?budgets;
     if (index == budget.NO_BUDGET
-        || budget.charge(?budgets, index, 0, time.Time{sec: 0, nsec: 0},
+        || budget.charge(?budgets, index, 0, time.Instant{sec: 0, nsec: 0},
         ?owner.charge, hedge_wake.no_waker()) != budget.ADMITTED) {
         cancel.destroy(?owner.request_scope);
         ret 5;
@@ -2123,7 +2194,7 @@ test "connection: pending H1 response cancellation retains exchange and budget" 
     owner.exchange_cancelling    = false;
     owner.exchange_call_released = false;
     owner.close_failed           = false;
-    if (budget.charge(?budgets, index, 0, time.Time{sec: 0, nsec: 0},
+    if (budget.charge(?budgets, index, 0, time.Instant{sec: 0, nsec: 0},
         ?owner.charge, hedge_wake.no_waker()) != budget.ADMITTED
         || settle_exchange_close(?owner) != exchange.FINISH_INVALID) {
         cancel.destroy(?owner.request_scope);
