@@ -6,6 +6,7 @@ use hedge.dispatch.middleware;
 use hedge.dispatch.plan;
 use hedge.listener;
 use quic_runtime: hedge.protocol.quic.runtime;
+use hedge_tls:    hedge.protocol.tls;
 use hedge.proxy.upstream;
 use hedge.serve;
 use hedge.service;
@@ -13,6 +14,7 @@ use hedge.service.proxy;
 use observability:    hedge.telemetry;
 use telemetry_admin:  hedge.telemetry.admin;
 use telemetry_health: hedge.telemetry.health;
+use hedge.test.runtime.tlswire;
 use hedge.test.runtime.wire;
 use engine_h1: http.h1.connection;
 use http.router.router;
@@ -323,6 +325,8 @@ rec Edge {
     binding_storage: [MAX_SERVICES]proxy.Binding;
     telemetry:       observability.Runtime;
     checks:          [1]telemetry_health.Check;
+    # the listener speaks TLS with the interop fixture identity
+    secure: bool;
 }
 
 fun quiesce_proxy(context: ptr, now: time.Time) serve.PlaneQuiesceStatus {
@@ -333,6 +337,22 @@ fun quiesce_proxy(context: ptr, now: time.Time) serve.PlaneQuiesceStatus {
     ret serve.PLANE_FAILED;
 }
 
+fun secure_listener(graph: *schema.Graph) {
+    schema.set_text(?graph.listeners[0].tls_policy, "public");
+    schema.set_text(?graph.hosts[0].server_names[0], "api.example.com");
+    graph.tls_policy_count = 1;
+    val policy: *schema.TlsPolicy = ?graph.tls_policies[0];
+    schema.set_text(?policy.name, "public");
+    policy.identity_count = 1;
+    schema.set_text(?policy.identities[0].server_name, "api.example.com");
+    schema.set_text(?policy.identities[0].certificate, "test/interop/fixtures/api.pem");
+    schema.set_text(?policy.identities[0].key, "test/interop/fixtures/api.key");
+    schema.set_text(?policy.default_name, "api.example.com");
+    policy.has_default = true;
+    policy.client_auth = false;
+    schema.clear_text(?policy.client_trust);
+}
+
 fun start_edge(edge: *Edge, generation: u64, upstream_address: str,
     traces: bool) bool {
     listener_graph(?edge.site.graph, "edge", "127.0.0.1:0");
@@ -340,6 +360,7 @@ fun start_edge(edge: *Edge, generation: u64, upstream_address: str,
     edge.site.graph.telemetry.traces = traces;
     add_service(?edge.site.graph, "backend", schema.SERVICE_PROXY, upstream_address);
     add_route(?edge.site.graph, "all", "/**", "backend");
+    if (edge.secure) { secure_listener(?edge.site.graph); }
     service.make_applications(?edge.site.applications, ?edge.site.application_slots[0], 2);
     if (!proxy.make_runtime(?edge.proxy_runtime, nil, "hedge-test",
         engine_h1.config_default(), upstream.default_limits())) { ret false; }
@@ -364,7 +385,12 @@ fun start_edge(edge: *Edge, generation: u64, upstream_address: str,
         edge.site.resolver.observer = observability.observer(telemetry);
     }
     if (!compile_site(?edge.site, generation, ?edge.site.resolver)) { ret false; }
-    if (!start_site(?edge.site, generation, telemetry))             { ret false; }
+    if (edge.secure) {
+        hedge_tls.reset();
+        if (hedge_tls.publish("public", ?edge.site.graph.tls_policies[0],
+            schema.PROTOCOL_HTTP1) != hedge_tls.OK) { ret false; }
+    }
+    if (!start_site(?edge.site, generation, telemetry)) { ret false; }
     proxy.attach_driver(?edge.proxy_runtime, ?edge.site.runtime.owner.network);
     serve.attach_plane_lifecycle(?edge.site.runtime,
         (?edge.proxy_runtime)::ptr, proxy.poll, quiesce_proxy);
@@ -374,6 +400,7 @@ fun start_edge(edge: *Edge, generation: u64, upstream_address: str,
 fun shutdown_edge(edge: *Edge, origin: *Origin) {
     var quic_controls: quic_runtime.ControlView;
     serve.stop(?quic_controls, ?edge.site.runtime);
+    if (edge.secure) { hedge_tls.destroy(); }
     proxy.close_runtime(?edge.proxy_runtime);
     proxy.close_registry(?edge.proxy_runtime, ?edge.proxy_registry);
     stop_origin(origin);
@@ -637,6 +664,86 @@ test "proxy: a delayed upstream read completes into the retained body buffer" {
     if (length == 0 || !wire.contains(?response[0], length,
         "delayed-response")) { ret 7; }
     ret 0;
+}
+
+fun tls_send(client: *tlswire.Client, text: str) bool {
+    ret tlswire.send(client, text::*u8, str_len(text));
+}
+
+fun secure_finish(edge: *Edge, origin: *Origin, client: *tlswire.Client, result: i32) i32 {
+    if (client != nil) { tlswire.release(client); }
+    shutdown_edge(edge, origin);
+    ret result;
+}
+
+# #196: over TLS the connection's next read is already in flight when a late
+# response is queued. the response must still go out, in every piece the
+# upstream sends, and the read must survive it to carry the next request
+test "proxy: a late response over TLS is written while the client's next read waits" {
+    var quic_controls: quic_runtime.ControlView;
+    var origin:        Origin;
+    if (!start_origin(?origin, "late-response-over-tls")) { ret 1; }
+    origin.declared_length = str_len(origin.body);
+    origin.sent_length     = 4;
+    var edge: Edge;
+    edge.secure = true;
+    if (!start_edge(?edge, 49, (?origin.address[0])::str, false)) {
+        ret secure_finish(?edge, ?origin, nil, 2);
+    }
+    val client: *tlswire.Client = tlswire.allocate(?edge.site.heap);
+    if (client == nil) { ret secure_finish(?edge, ?origin, nil, 3); }
+    if (!tlswire.make(client, ?edge.site.runtime, "api.example.com", "http/1.1")
+        || !tlswire.handshake(client, edge.site.endpoint)) {
+        ret secure_finish(?edge, ?origin, client, 4);
+    }
+    if (!tls_send(client, "GET /late HTTP/1.1\r\nHost: api.example.com\r\n\r\n")) {
+        ret secure_finish(?edge, ?origin, client, 5);
+    }
+    if (!drive_origin_request(?edge, ?origin)) { ret secure_finish(?edge, ?origin, client, 6); }
+    var pending: proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+    var rounds:  usize          = 0;
+    for (rounds < 64 && !pending.body_read_pending) {
+        serve.poll(?quic_controls, ?edge.site.runtime, 1);
+        pending = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+        rounds  = rounds + 1;
+    }
+    if (!pending.body_read_pending) { ret secure_finish(?edge, ?origin, client, 7); }
+    # the rest arrives in two pieces, each its own write while the client is silent
+    val rest:  usize = origin.declared_length - origin.sent_length;
+    val first: usize = rest / 2;
+    if (!write_all(?origin.peer, ?origin.body[origin.sent_length], first)) {
+        ret secure_finish(?edge, ?origin, client, 8);
+    }
+    rounds = 0;
+    for (rounds < 16) {
+        serve.poll(?quic_controls, ?edge.site.runtime, 1);
+        rounds = rounds + 1;
+    }
+    if (!write_all(?origin.peer, ?origin.body[origin.sent_length + first], rest - first)) {
+        ret secure_finish(?edge, ?origin, client, 9);
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length:   usize = tlswire.receive(client, ?response[0], RESPONSE_BYTES,
+        "late-response-over-tls");
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")
+        || !wire.contains(?response[0], length, "late-response-over-tls")) {
+        ret secure_finish(?edge, ?origin, client, 10);
+    }
+    # the read that waited out the response carries the next request
+    origin.declared_length = 0;
+    origin.sent_length     = 0;
+    if (!tls_send(client, "GET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n")) {
+        ret secure_finish(?edge, ?origin, client, 11);
+    }
+    if (!drive_origin_request(?edge, ?origin)) { ret secure_finish(?edge, ?origin, client, 12); }
+    val second: usize = tlswire.receive(client, ?response[0], RESPONSE_BYTES,
+        "late-response-over-tls");
+    if (second == 0 || !wire.starts_with(?response[0], second, "HTTP/1.1 200 OK\r\n")) {
+        ret secure_finish(?edge, ?origin, client, 13);
+    }
+    val requests: u64 = connection.snapshot(serve.slot_connection(?edge.site.runtime, 0)).requests;
+    if (requests != 2) { ret secure_finish(?edge, ?origin, client, 14); }
+    ret secure_finish(?edge, ?origin, client, 0);
 }
 
 test "proxy: repeated bodyless upstream responses release more than one attempt pool" {

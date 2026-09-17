@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-17
+
+### Fixed
+
+- A proxied response body only reached the client over cleartext HTTP/1.1 (#196). Two causes.
+  - Over TLS the connection had already started a read for its next request when a late response became ready, and the TLS channel runs one operation at a time, so the response waited behind a read that only the client could end. HTTP/1.1 stopped after its first 8192 bytes and HTTP/2 never sent the body. A write queued behind a read now cancels that read through its own operation scope, the writes run, and the read starts again unseen by the engine, keeping every byte it had already received. A write is never cancelled this way.
+  - HTTP/2 and HTTP/3 carry field names in lowercase only, and the engines refuse anything else. An upstream's `Content-Type` or `Last-Modified` was passed through as written, so the response was refused and the request logged as `cancelled`. hedge now lowers every name it sends on those protocols, headers and trailers alike, and refuses a list it cannot lower rather than truncating it.
+- The interop lane now proxies a 156000-byte body over TLS HTTP/1.1, HTTP/2 and HTTP/3 and compares it byte for byte.
+
 ## [0.5.2] - 2026-09-17
 
 ### Security
