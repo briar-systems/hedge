@@ -96,11 +96,11 @@ fun monotonic_ns() u64 {
     ret 0;
 }
 
-pub val MAX_PUMPS:           usize = quic_capacity.MAX_PUMPS;
-pub val ADMISSION_BANKS:     usize = quic_capacity.ADMISSION_BANKS;
-pub val RECEIVE_BATCH:       usize = 16;
-pub val STATELESS_SENDS:     usize = quic_capacity.STATELESS_SENDS;
-pub val CONNECTION_ID_BYTES: usize = 20;
+pub val MAX_PUMPS:             usize = quic_capacity.MAX_PUMPS;
+pub val ADMISSION_BANKS:       usize = quic_capacity.ADMISSION_BANKS;
+pub val RECEIVE_BATCH:         usize = 16;
+pub val MAX_STATELESS_PENDING: usize = quic_capacity.MAX_STATELESS_PENDING;
+pub val CONNECTION_ID_BYTES:   usize = 20;
 # how long one closed connection may linger before the transport abandons it.
 # this is a per-connection RFC 9000 close period, not the process drain budget:
 # sourcing it from the shutdown budget held every finished connection open for
@@ -182,7 +182,6 @@ pub rec PumpStorage {
     scope:            cancel.Scope;
     receive_buffers:  [RECEIVE_BATCH][assembly.MAX_UDP_PAYLOAD]u8;
     receive_packets:  [RECEIVE_BATCH]net_types.Packet;
-    stateless:        [STATELESS_SENDS]StatelessSend;
     preflight_output: [assembly.MAX_UDP_PAYLOAD]u8;
     versions:         [2]u32;
     receive_context:  CompletionContext;
@@ -297,12 +296,16 @@ rec SendOperation {
     pending:    bool;
 }
 
+# pinned while pending, because the io completion context lives inside it
 rec StatelessSend {
-    buffer:     [assembly.MAX_UDP_PAYLOAD]u8;
-    packet:     net_types.Packet;
-    context:    CompletionContext;
-    generation: u64;
-    pending:    bool;
+    buffer:       [assembly.MAX_UDP_PAYLOAD]u8;
+    packet:       net_types.Packet;
+    context:      CompletionContext;
+    generation:   u64;
+    next_free:    usize;
+    next_pending: usize;
+    prev_pending: usize;
+    pending:      bool;
 }
 
 rec PublishedRoute {
@@ -400,12 +403,19 @@ pub rec Pump {
     generation:               u64;
     active_admission:         usize;
     token_generation:         u64;
-    receive_pending:          bool;
-    scope_live:               bool;
-    started:                  bool;
-    draining:                 bool;
-    cancelling:               bool;
-    live:                     bool;
+    # stateless sends grow on demand up to MAX_STATELESS_PENDING. the pending
+    # list is what the completion sweep walks, so it costs what is in flight
+    stateless:         hedge_storage.Table[StatelessSend];
+    stateless_claimed: usize;
+    stateless_free:    usize;
+    stateless_pending: usize;
+    stateless_live:    usize;
+    receive_pending:   bool;
+    scope_live:        bool;
+    started:           bool;
+    draining:          bool;
+    cancelling:        bool;
+    live:              bool;
 }
 
 pub rec Snapshot {
@@ -418,8 +428,10 @@ pub rec Snapshot {
     # datagrams dropped and connection steps that failed, since make
     datagram_failures:   u64;
     connection_failures: u64;
-    stopping:            bool;
-    initialized:         bool;
+    # Retries dropped because a pump held its ceiling of pending sends
+    stateless_dropped: u64;
+    stopping:          bool;
+    initialized:       bool;
 }
 
 pub rec Runtime {
@@ -440,6 +452,7 @@ pub rec Runtime {
     live_total:          usize;
     datagram_failures:   u64;
     connection_failures: u64;
+    stateless_dropped:   u64;
     pending_free_head:   usize;
     # the queued initials, so a sweep costs what is queued rather than what
     # the configured connection limit reserved
@@ -737,6 +750,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.live_head             = NO_CONNECTION;
     runtime.live_connections      = 0;
     runtime.live_total            = 0;
+    runtime.stateless_dropped     = 0;
     runtime.datagram_failures     = 0;
     runtime.connection_failures   = 0;
     runtime.pending_free_head     = NO_CONNECTION;
@@ -941,6 +955,9 @@ fun abandon_attached_pump(pump: *Pump) bool {
         }
     }
     ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+    if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) {
+        success = false;
+    }
     if (!success) { ret false; }
     pump.driver        = nil;
     pump.socket        = nil;
@@ -989,6 +1006,13 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     pump.started          = false;
     pump.draining         = false;
     pump.cancelling       = false;
+    if (!hedge_storage.make_table[StatelessSend](?pump.stateless, pump.backing)) {
+        ret FAILED;
+    }
+    pump.stateless_claimed = 0;
+    pump.stateless_free    = NO_CONNECTION;
+    pump.stateless_pending = NO_CONNECTION;
+    pump.stateless_live    = 0;
     var i: usize = 0;
     for (i < ADMISSION_BANKS) {
         pump.admissions[i].live     = false;
@@ -1021,11 +1045,6 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     for (i < RECEIVE_BATCH) {
         reset_receive_packet(pump, i);
         i = i + 1;
-    }
-    i = 0;
-    for (i < STATELESS_SENDS) {
-        pump.storage.stateless[i].pending = false;
-        i                                 = i + 1;
     }
     if (!make_context(?pump.storage.receive_context, COMPLETION_RECEIVE, index,
         pump.generation, NO_CONNECTION, 0, 0, 0, no_token())) {
@@ -1714,22 +1733,67 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     ret true;
 }
 
-fun stateless_slot(pump: *Pump) usize {
-    var i: usize = 0;
-    for (i < STATELESS_SENDS) {
-        if (!pump.storage.stateless[i].pending) { ret i; }
-        i = i + 1;
+fun stateless_at(pump: *Pump, index: usize) *StatelessSend {
+    ret hedge_storage.table_at[StatelessSend](?pump.stateless, index);
+}
+
+# NO_CONNECTION when the pump already holds its ceiling of pending sends or the
+# allocator refuses to grow
+fun claim_stateless(pump: *Pump) usize {
+    if (pump.stateless_live >= MAX_STATELESS_PENDING) { ret NO_CONNECTION; }
+    var index: usize = pump.stateless_free;
+    if (index != NO_CONNECTION) {
+        pump.stateless_free = stateless_at(pump, index).next_free;
     }
-    ret STATELESS_SENDS;
+    or {
+        if (pump.stateless_claimed == pump.stateless.capacity
+            && !hedge_storage.grow_table[StatelessSend](?pump.stateless)) {
+            ret NO_CONNECTION;
+        }
+        index                  = pump.stateless_claimed;
+        pump.stateless_claimed = pump.stateless_claimed + 1;
+    }
+    val operation: *StatelessSend = stateless_at(pump, index);
+    operation.next_free    = NO_CONNECTION;
+    operation.prev_pending = NO_CONNECTION;
+    operation.next_pending = pump.stateless_pending;
+    if (pump.stateless_pending != NO_CONNECTION) {
+        stateless_at(pump, pump.stateless_pending).prev_pending = index;
+    }
+    pump.stateless_pending = index;
+    pump.stateless_live    = pump.stateless_live + 1;
+    ret index;
+}
+
+fun release_stateless(pump: *Pump, index: usize) {
+    val operation: *StatelessSend = stateless_at(pump, index);
+    if (operation.prev_pending != NO_CONNECTION) {
+        stateless_at(pump, operation.prev_pending).next_pending = operation.next_pending;
+    }
+    or {
+        pump.stateless_pending = operation.next_pending;
+    }
+    if (operation.next_pending != NO_CONNECTION) {
+        stateless_at(pump, operation.next_pending).prev_pending = operation.prev_pending;
+    }
+    operation.pending      = false;
+    operation.next_pending = NO_CONNECTION;
+    operation.prev_pending = NO_CONNECTION;
+    operation.next_free    = pump.stateless_free;
+    pump.stateless_free    = index;
+    pump.stateless_live    = pump.stateless_live - 1;
 }
 
 fun submit_stateless(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     received: *net_types.Packet, data: *u8, length: usize) Status {
-    val pump:  *Pump = ?controls.pumps[pump_index];
-    val index: usize = stateless_slot(pump);
-    if (index == STATELESS_SENDS || data == nil || length == 0
-        || length > assembly.MAX_UDP_PAYLOAD) { ret BLOCKED; }
-    val operation: *StatelessSend = ?pump.storage.stateless[index];
+    val pump: *Pump = ?controls.pumps[pump_index];
+    if (data == nil || length == 0 || length > assembly.MAX_UDP_PAYLOAD) { ret FAILED; }
+    val index: usize = claim_stateless(pump);
+    if (index == NO_CONNECTION) {
+        runtime.stateless_dropped = runtime.stateless_dropped + 1;
+        ret BLOCKED;
+    }
+    val operation: *StatelessSend = stateless_at(pump, index);
     operation.generation = next_generation(operation.generation);
     memory.raw_copy(?operation.buffer[0], data, length);
     operation.packet.buffer                = ?operation.buffer[0];
@@ -1743,11 +1807,17 @@ fun submit_stateless(controls: *ControlView, runtime: *Runtime, pump_index: usiz
     operation.packet.zero_length           = false;
     if (!make_context(?operation.context, COMPLETION_STATELESS,
         pump_index, pump.generation, NO_CONNECTION, 0, index,
-        operation.generation, no_token())) { ret FAILED; }
+        operation.generation, no_token())) {
+        release_stateless(pump, index);
+        ret FAILED;
+    }
     val submitted: res[io_runtime.Token, io_error.Error] =
         net_async.submit_send_batch(pump.driver, ?pump.storage.scope, pump.socket,
         ?operation.packet, 1, (?operation.context.route)::usize);
-    if (sel submitted.err) { ret FAILED; }
+    if (sel submitted.err) {
+        release_stateless(pump, index);
+        ret FAILED;
+    }
     operation.pending = true;
     ret OK;
 }
@@ -2603,13 +2673,12 @@ fun settle_send(controls: *ControlView, runtime: *Runtime, context: *CompletionC
 
 fun settle_stateless(controls: *ControlView, runtime: *Runtime, context: *CompletionContext,
     completion: io_runtime.Completion) Status {
-    if (context.operation >= STATELESS_SENDS) { ret STALE; }
-    val pump:      *Pump          = ?controls.pumps[context.pump];
-    val operation: *StatelessSend =
-        ?pump.storage.stateless[context.operation];
+    val pump: *Pump = ?controls.pumps[context.pump];
+    if (context.operation >= pump.stateless_claimed) { ret STALE; }
+    val operation: *StatelessSend = stateless_at(pump, context.operation);
     if (!operation.pending
         || operation.generation != context.operation_generation) { ret STALE; }
-    operation.pending = false;
+    release_stateless(pump, context.operation);
     ret OK;
 }
 
@@ -2655,17 +2724,20 @@ fun drain_completions(controls: *ControlView, runtime: *Runtime, now: time.Time,
             if (complete_at(controls, runtime, ?pump.storage.receive_context, completion,
                 now, now_ns) == FAILED) { status = FAILED; }
         }
-        var stateless: usize = 0;
-        for (stateless < STATELESS_SENDS) {
-            val context: *CompletionContext =
-                ?pump.storage.stateless[stateless].context;
-            if (pump.live && context.completion_pending) {
+        # settling a send releases it from the list, so the next is read first
+        var stateless: usize = NO_CONNECTION;
+        if (pump.live) { stateless = pump.stateless_pending; }
+        for (stateless != NO_CONNECTION) {
+            val operation: *StatelessSend     = stateless_at(pump, stateless);
+            val context:   *CompletionContext = ?operation.context;
+            val next:      usize              = operation.next_pending;
+            if (context.completion_pending) {
                 val completion: io_runtime.Completion = context.completion;
                 context.completion_pending = false;
                 if (complete_at(controls, runtime, context, completion,
                     now, now_ns) == FAILED) { status = FAILED; }
             }
-            stateless = stateless + 1;
+            stateless = next;
         }
         pump_index = pump_index + 1;
     }
@@ -3104,12 +3176,7 @@ pub fun stop(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
 }
 
 fun stateless_pending(pump: *Pump) bool {
-    var i: usize = 0;
-    for (i < STATELESS_SENDS) {
-        if (pump.storage.stateless[i].pending) { ret true; }
-        i = i + 1;
-    }
-    ret false;
+    ret pump.stateless_live != 0;
 }
 
 pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHandle) Status {
@@ -3143,9 +3210,13 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
     pump.budgets       = nil;
     pump.listener_name = nil;
     clear_pump_config(pump);
-    pump.storage = nil;
-    pump.started = false;
-    pump.live    = false;
+    if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) { ret FAILED; }
+    pump.stateless_claimed = 0;
+    pump.stateless_free    = NO_CONNECTION;
+    pump.stateless_pending = NO_CONNECTION;
+    pump.storage           = nil;
+    pump.started           = false;
+    pump.live              = false;
     if (runtime.pump_count != 0) { runtime.pump_count = runtime.pump_count - 1; }
     ret OK;
 }
@@ -3241,6 +3312,7 @@ pub fun snapshot(controls: *ControlView, runtime: *Runtime) Snapshot {
     value.timers              = runtime.timer_queue.len;
     value.datagram_failures   = runtime.datagram_failures;
     value.connection_failures = runtime.connection_failures;
+    value.stateless_dropped   = runtime.stateless_dropped;
     value.stopping            = runtime.stopping;
     value.initialized         = true;
     var i: usize = runtime.live_head;
@@ -4444,5 +4516,75 @@ test "hedge.protocol.quic.runtime: a forced release keeps a slot whose assembly 
     val other: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (other == index || other == NO_CONNECTION) { ret 3; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a pump holds more pending stateless sends than a fixed pool" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    val pump:     *Pump        = ?controls.pumps[0];
+    if (!hedge_storage.make_table[StatelessSend](?pump.stateless, test_allocator())) { ret 90; }
+    pump.stateless_free    = NO_CONNECTION;
+    pump.stateless_pending = NO_CONNECTION;
+    var claimed: [64]usize;
+    var i:       usize = 0;
+    for (i < 64) {
+        claimed[i] = claim_stateless(pump);
+        if (claimed[i] != i) { ret 1; }
+        stateless_at(pump, claimed[i]).pending = true;
+        i                                      = i + 1;
+    }
+    if (pump.stateless_live != 64 || pump.stateless_claimed != 64) { ret 2; }
+    # settle out of order, then every pending send is still reachable
+    release_stateless(pump, 0);
+    release_stateless(pump, 63);
+    release_stateless(pump, 17);
+    var seen: usize = 0;
+    var at:   usize = pump.stateless_pending;
+    for (at != NO_CONNECTION) {
+        if (at == 0 || at == 63 || at == 17 || !stateless_at(pump, at).pending) { ret 3; }
+        seen = seen + 1;
+        at   = stateless_at(pump, at).next_pending;
+    }
+    if (seen != 61 || pump.stateless_live != 61) { ret 4; }
+    # released slots are reused before the table grows
+    val reused: usize = claim_stateless(pump);
+    if (reused != 17 || pump.stateless_claimed != 64) { ret 5; }
+    release_stateless(pump, reused);
+    i = 1;
+    for (i < 63) {
+        if (i != 17) { release_stateless(pump, i); }
+        i = i + 1;
+    }
+    if (pump.stateless_live != 0 || pump.stateless_pending != NO_CONNECTION
+        || stateless_pending(pump)) { ret 6; }
+    if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) { ret 7; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a pump at its stateless ceiling drops and counts" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val pump: *Pump = ?controls.pumps[0];
+    if (!hedge_storage.make_table[StatelessSend](?pump.stateless, test_allocator())) { ret 91; }
+    pump.stateless_free    = NO_CONNECTION;
+    pump.stateless_pending = NO_CONNECTION;
+    var i: usize = 0;
+    for (i < MAX_STATELESS_PENDING) {
+        if (claim_stateless(pump) != i) { ret 1; }
+        i = i + 1;
+    }
+    var received: net_types.Packet;
+    var data:     [16]u8;
+    if (submit_stateless(controls, ?runtime, 0, ?received, ?data[0], 16) != BLOCKED
+        || runtime.stateless_dropped != 1
+        || snapshot(controls, ?runtime).stateless_dropped != 1
+        || pump.stateless_live != MAX_STATELESS_PENDING) { ret 2; }
+    # one settled send makes room again without growing
+    release_stateless(pump, 9);
+    if (claim_stateless(pump) != 9)                                   { ret 3; }
+    if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) { ret 4; }
     ret 0;
 }
