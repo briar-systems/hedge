@@ -17,6 +17,7 @@ use hedge.clock;
 use hedge.dispatch;
 use hedge.dispatch.call;
 use hedge.dispatch.plan;
+use hedge.protocol.names;
 use hedge.service;
 use hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
@@ -170,31 +171,34 @@ pub rec Timeouts {
 }
 
 pub rec Session {
-    timeouts:           Timeouts;
-    idle:               bool;
-    idle_since:         time.Time;
-    writing:            bool;
-    writing_since:      time.Time;
-    live:               bool;
-    state:              State;
-    engine:             engine_h2.Engine;
-    streams:            [STREAM_CAPACITY]engine_h2.Stream;
-    memories:           [STREAM_CAPACITY]engine_h2.StreamMemory;
-    encoded:            [STREAM_CAPACITY][STREAM_ENCODED_BYTES]u8;
-    header_fields:      [STREAM_CAPACITY][STREAM_FIELD_SLOTS]field.Field;
-    strings:            [STREAM_CAPACITY][STREAM_STRING_BYTES]u8;
-    pending:            [STREAM_CAPACITY][STREAM_PENDING_ENTRIES]hpack.Entry;
-    read_buffer:        [READ_BYTES]u8;
-    write_buffer:       [WRITE_BYTES]u8;
-    frame_payload:      [FRAME_PAYLOAD_BYTES]u8;
-    header_output:      [HEADER_OUTPUT_BYTES]u8;
-    controls:           [CONTROL_SLOTS]engine_h2.Control;
-    inbound_entries:    [TABLE_ENTRIES]hpack.Entry;
-    inbound_storage:    [TABLE_STORAGE_BYTES]u8;
-    outbound_entries:   [TABLE_ENTRIES]hpack.Entry;
-    outbound_storage:   [TABLE_STORAGE_BYTES]u8;
-    encoder_pending:    [TABLE_ENTRIES]hpack.Entry;
-    slots:              [MAX_STREAMS]Slot;
+    timeouts:         Timeouts;
+    idle:             bool;
+    idle_since:       time.Time;
+    writing:          bool;
+    writing_since:    time.Time;
+    live:             bool;
+    state:            State;
+    engine:           engine_h2.Engine;
+    streams:          [STREAM_CAPACITY]engine_h2.Stream;
+    memories:         [STREAM_CAPACITY]engine_h2.StreamMemory;
+    encoded:          [STREAM_CAPACITY][STREAM_ENCODED_BYTES]u8;
+    header_fields:    [STREAM_CAPACITY][STREAM_FIELD_SLOTS]field.Field;
+    strings:          [STREAM_CAPACITY][STREAM_STRING_BYTES]u8;
+    pending:          [STREAM_CAPACITY][STREAM_PENDING_ENTRIES]hpack.Entry;
+    read_buffer:      [READ_BYTES]u8;
+    write_buffer:     [WRITE_BYTES]u8;
+    frame_payload:    [FRAME_PAYLOAD_BYTES]u8;
+    header_output:    [HEADER_OUTPUT_BYTES]u8;
+    controls:         [CONTROL_SLOTS]engine_h2.Control;
+    inbound_entries:  [TABLE_ENTRIES]hpack.Entry;
+    inbound_storage:  [TABLE_STORAGE_BYTES]u8;
+    outbound_entries: [TABLE_ENTRIES]hpack.Entry;
+    outbound_storage: [TABLE_STORAGE_BYTES]u8;
+    encoder_pending:  [TABLE_ENTRIES]hpack.Entry;
+    slots:            [MAX_STREAMS]Slot;
+    # lowered field names and trailers for the one header list being offered
+    names:              names.Scratch;
+    trailer_items:      [RESPONSE_TRAILER_SLOTS]field.Field;
     held_stream:        u32;
     held_data:          *u8;
     held_length:        usize;
@@ -803,12 +807,15 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
 
 # --- response emission ---
 
-fun response_headers(slot: *Slot) usize {
+# false when the list cannot be sent as HTTP/2 requires, rather than sending
+# part of it
+fun response_headers(scratch: *names.Scratch, slot: *Slot, count: *usize) bool {
+    names.reset(scratch);
     slot.header_items[0] = field.Field{name: view.view(":status", 7),
         value: write_status(slot, slot.response.status), sensitive: false};
-    var count: usize = 1;
-    var i:     usize = 0;
-    for (i < slot.response.fields.len && count < HEADER_ITEM_SLOTS) {
+    @count = 1;
+    var i: usize = 0;
+    for (i < slot.response.fields.len) {
         val item: *field.Field = ?slot.response.fields.items[i];
         # HTTP/2 carries no connection-specific header fields, and a message
         # that keeps one is malformed rather than merely untidy
@@ -817,12 +824,27 @@ fun response_headers(slot: *Slot) usize {
             && !field.name_equal(item.name, view.view("keep-alive", 10))
             && !field.name_equal(item.name, view.view("upgrade", 7))
             && !field.name_equal(item.name, view.view("proxy-connection", 16))) {
-            slot.header_items[count] = @item;
-            count                    = count + 1;
+            if (@count >= HEADER_ITEM_SLOTS
+                || !names.lower(scratch, item, ?slot.header_items[@count])) {
+                ret false;
+            }
+            @count = @count + 1;
         }
         i = i + 1;
     }
-    ret count;
+    ret true;
+}
+
+fun response_trailers(session: *Session, slot: *Slot) bool {
+    names.reset(?session.names);
+    if (slot.response.trailers.len > RESPONSE_TRAILER_SLOTS) { ret false; }
+    var i: usize = 0;
+    for (i < slot.response.trailers.len) {
+        if (!names.lower(?session.names, ?slot.response.trailers.items[i],
+            ?session.trailer_items[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 fun has_body(slot: *Slot) bool {
@@ -832,7 +854,8 @@ fun has_body(slot: *Slot) bool {
 fun begin_response(session: *Session, slot: *Slot) Step {
     if (slot.headers_sent)        { ret STEP_IDLE; }
     if (!slot.response.committed) { ret STEP_IDLE; }
-    val count:   usize           = response_headers(slot);
+    var count: usize = 0;
+    if (!response_headers(?session.names, slot, ?count)) { ret STEP_ERROR; }
     val final:   bool            = !has_body(slot) && slot.response.trailers.len == 0;
     val offered: engine_h2.Offer = engine_h2.send_headers(?session.engine, slot.id,
         ?slot.header_items[0], count, final, true);
@@ -846,8 +869,9 @@ fun begin_response(session: *Session, slot: *Slot) Step {
 
 fun send_trailers(session: *Session, slot: *Slot) Step {
     if (slot.trailers_sent || slot.response.trailers.len == 0) { ret STEP_IDLE; }
+    if (!response_trailers(session, slot))                     { ret STEP_ERROR; }
     val offered: engine_h2.Offer = engine_h2.send_headers(?session.engine, slot.id,
-        slot.response.trailers.items, slot.response.trailers.len, true, true);
+        ?session.trailer_items[0], slot.response.trailers.len, true, true);
     if (offered.status == engine_h2.OFFER_BLOCKED) { ret STEP_BLOCKED; }
     if (offered.status == engine_h2.OFFER_ERROR)   { ret STEP_ERROR; }
     slot.trailers_sent     = true;
@@ -1731,19 +1755,22 @@ test "h2: connection-specific header fields never reach the wire" {
     if (message.set_status(?slot.response, status.OK) != message.RESPONSE_OK) {
         ret 2;
     }
-    if (message.add_field(?slot.response, field.Field{name: view.view("server", 6),
+    if (message.add_field(?slot.response, field.Field{name: view.view("Server", 6),
         value: view.view("hedge", 5), sensitive: false}) != field.ADD_OK) { ret 3; }
     if (message.add_field(?slot.response, field.Field{
         name:      view.view("connection", 10), value: view.view("close", 5),
         sensitive: false
     }) != field.ADD_OK) { ret 4; }
-    val count: usize = response_headers(?slot);
+    var scratch: names.Scratch;
+    var count:   usize = 0;
+    if (!response_headers(?scratch, ?slot, ?count)) { ret 8; }
     # :status, server. the hop-by-hop field is dropped rather than framed.
     if (count != 2) { ret 5; }
     if (slot.header_items[0].name.len != 7
         || slot.header_items[0].value.len != 3
         || slot.header_items[0].value.data[0] != '2'::u8) { ret 6; }
-    if (!field.name_equal(slot.header_items[1].name, view.view("server", 6))) {
+    # HTTP/2 sends the name in lowercase whatever case the service used
+    if (slot.header_items[1].name.len != 6 || slot.header_items[1].name.data[0] != 's') {
         ret 7;
     }
     ret 0;
