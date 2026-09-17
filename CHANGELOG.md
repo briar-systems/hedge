@@ -16,6 +16,7 @@
 
 ### Added
 
+- `hedge.timer`, a hierarchical timing wheel that will hold every deadline hedge decides (#179, part of #172). It has four levels of 256 one-millisecond slots, covering about 49 days. Entries are intrusive, live in a chunked table and never move, and each level keeps an occupancy bitmap, so arming, disarming and finding the next deadline are constant time. Deadlines are monotonic and round up to the next tick, so nothing fires early. With 100,000 armed entries a re-arm costs 70–100 ns, or about 25 ns when the deadline stays in its slot, against about 2,000 ns for a std io timer's cancel and resubmit.
 - `max_retry_replay` on a QUIC `[[listener]]` bounds the Retry nonces its replay store remembers, 65536 by default (#171). mach-quic 0.11 requires the bound. A Retry-token Initial that arrives while the store is full is dropped. Those drops count in `hedge_quic_retry_replay_full_total` and in `quic_runtime.Snapshot.replay_full`.
 - QUIC listeners size their UDP socket buffers (#153). `receive_buffer_bytes` and `send_buffer_bytes` on a `[[listener]]` set them, and an absent value asks for 4 MiB to receive and 1 MiB to send rather than the kernel default that a handshake burst overflowed. The size the kernel granted is read back and logged at startup next to the request, since Linux doubles and caps it. The keys are refused on TCP and local listeners, and changing them needs a restart.
 

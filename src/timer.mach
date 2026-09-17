@@ -1,0 +1,600 @@
+# a per-worker hierarchical timing wheel, where every deadline hedge decides lives
+#
+# the ownership rule recorded on #172: a deadline hedge decides is an entry here,
+# never a std scope deadline, and a scope it guards is timed out when the entry
+# fires. deadlines are monotonic nanoseconds (hedge.clock), rounded up to the
+# next millisecond tick so an entry never fires early.
+#
+# four levels of 256 slots cover about 49 days. a later deadline waits in the top
+# level and is placed again when that slot cascades. arm, re-arm, disarm and
+# release are constant time. a bitmap per level finds the next occupied slot, so
+# neither advancing across a long idle gap nor asking for the next deadline
+# visits empty slots one by one. entries live in a chunked table and never move.
+
+use hedge_storage: hedge.storage;
+use A:             std.allocator;
+use std.allocator.page;
+use std.math.bits;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub def Status: u8;
+pub val OK:      Status = 1;
+pub val INVALID: Status = 2;
+# the handle names an entry that was released or never claimed
+pub val STALE: Status = 3;
+
+pub val LEVELS:  usize = 4;
+pub val SLOTS:   usize = 256;
+pub val TICK_NS: u64   = 1000000;
+pub val NONE:    usize = (-1)::usize;
+
+# the widest distance, in ticks, the levels can place directly
+val SPAN:  u64   = 0xffffffff;
+val LISTS: usize = LEVELS * SLOTS + 1;
+# an entry already due waits here until the next advance
+val DUE: usize = LEVELS * SLOTS;
+
+val STATE_FREE:  u8 = 0;
+val STATE_IDLE:  u8 = 1;
+val STATE_ARMED: u8 = 2;
+
+pub rec Handle {
+    index:      usize;
+    generation: u64;
+}
+
+pub fun no_handle() Handle {
+    ret Handle{index: NONE, generation: 0};
+}
+
+rec Entry {
+    owner:      u64;
+    deadline:   u64;
+    generation: u64;
+    next:       usize;
+    prev:       usize;
+    list:       usize;
+    next_free:  usize;
+    state:      u8;
+}
+
+pub rec Wheel {
+    entries:  hedge_storage.Table[Entry];
+    heads:    [LISTS]usize;
+    tails:    [LISTS]usize;
+    occupied: [LEVELS][4]u64;
+    # the tick every entry at or before has been fired
+    now:       u64;
+    claimed:   usize;
+    free_head: usize;
+    armed:     usize;
+    live:      usize;
+    # loop turns advance has taken, which a long idle gap must keep small
+    steps:       u64;
+    initialized: bool;
+}
+
+fun floor_ticks(ns: u64) u64 {
+    ret ns / TICK_NS;
+}
+
+fun ceil_ticks(ns: u64) u64 {
+    val whole: u64 = ns / TICK_NS;
+    if (ns % TICK_NS != 0) { ret whole + 1; }
+    ret whole;
+}
+
+fun entry_at(wheel: *Wheel, index: usize) *Entry {
+    ret hedge_storage.table_at[Entry](?wheel.entries, index);
+}
+
+fun entry_for(wheel: *Wheel, handle: Handle) *Entry {
+    if (wheel == nil || !wheel.initialized || handle.index >= wheel.claimed) { ret nil; }
+    val found: *Entry = entry_at(wheel, handle.index);
+    if (found == nil || found.state == STATE_FREE
+        || found.generation != handle.generation) { ret nil; }
+    ret found;
+}
+
+fun mark(wheel: *Wheel, list: usize, set: bool) {
+    if (list == DUE) { ret; }
+    val level: usize = list / SLOTS;
+    val slot:  usize = list % SLOTS;
+    val bit:   u64   = 1::u64 << (slot % 64)::u64;
+    if (set) {
+        wheel.occupied[level][slot / 64] = wheel.occupied[level][slot / 64] | bit;
+    }
+    or {
+        wheel.occupied[level][slot / 64] = wheel.occupied[level][slot / 64] & ~bit;
+    }
+}
+
+fun link(wheel: *Wheel, index: usize, value: *Entry, list: usize) {
+    value.list  = list;
+    value.next  = NONE;
+    value.prev  = wheel.tails[list];
+    value.state = STATE_ARMED;
+    if (wheel.tails[list] != NONE) {
+        entry_at(wheel, wheel.tails[list]).next = index;
+    }
+    or {
+        wheel.heads[list] = index;
+        mark(wheel, list, true);
+    }
+    wheel.tails[list] = index;
+    wheel.armed       = wheel.armed + 1;
+}
+
+fun unlink(wheel: *Wheel, value: *Entry) {
+    val list: usize = value.list;
+    if (value.prev != NONE)        { entry_at(wheel, value.prev).next = value.next; }
+    or                             { wheel.heads[list] = value.next; }
+    if (value.next != NONE)        { entry_at(wheel, value.next).prev = value.prev; }
+    or                             { wheel.tails[list] = value.prev; }
+    if (wheel.heads[list] == NONE) { mark(wheel, list, false); }
+    value.list  = NONE;
+    value.next  = NONE;
+    value.prev  = NONE;
+    value.state = STATE_IDLE;
+    wheel.armed = wheel.armed - 1;
+}
+
+# the list a deadline belongs in, measured from the wheel's current tick
+fun list_for(wheel: *Wheel, deadline: u64) usize {
+    if (deadline <= wheel.now) { ret DUE; }
+    var distance: u64 = deadline - wheel.now;
+    var target:   u64 = deadline;
+    if (distance > SPAN) {
+        distance = SPAN;
+        target   = wheel.now + SPAN;
+    }
+    var level: usize = 3;
+    if (distance < 0x100)     { level = 0; }
+    or (distance < 0x10000)   { level = 1; }
+    or (distance < 0x1000000) { level = 2; }
+    val slot: usize = ((target >> (8 * level)::u64) & 0xff)::usize;
+    ret level * SLOTS + slot;
+}
+
+# the lowest occupied slot at a level whose index is above `after`, or at or
+# below it when `wrapped`, or NONE
+fun occupied_slot(wheel: *Wheel, level: usize, after: usize, wrapped: bool) usize {
+    var word: usize = 0;
+    for (word < 4) {
+        var bits_here: u64   = wheel.occupied[level][word];
+        val base:      usize = word * 64;
+        if (!wrapped) {
+            # keep only slots above `after`
+            if (after >= base + 63) { bits_here = 0; }
+            or (after >= base) {
+                bits_here = bits_here & ~((2::u64 << (after - base)::u64) - 1);
+            }
+        }
+        or {
+            # keep only slots at or below `after`
+            if (base > after) { bits_here = 0; }
+            or (after < base + 63) {
+                bits_here = bits_here & ((2::u64 << (after - base)::u64) - 1);
+            }
+        }
+        if (bits_here != 0) { ret base + bits.ctz(bits_here)::usize; }
+        word = word + 1;
+    }
+    ret NONE;
+}
+
+fun earlier(current: u64, found: bool, candidate: u64) u64 {
+    if (!found || candidate < current) { ret candidate; }
+    ret current;
+}
+
+# the next tick after `now` at which a level-0 slot fires or an occupied slot
+# cascades. false when nothing is armed outside the due list
+fun next_event(wheel: *Wheel, output: *u64) bool {
+    var found: bool  = false;
+    var best:  u64   = 0;
+    var level: usize = 0;
+    for (level < LEVELS) {
+        val shift:    u64   = (8 * level)::u64;
+        val position: usize = ((wheel.now >> shift) & 0xff)::usize;
+        val period:   u64   = shift + 8;
+        # the start of the current rotation of this level
+        val base:  u64   = (wheel.now >> period) << period;
+        val ahead: usize = occupied_slot(wheel, level, position, false);
+        if (ahead != NONE) {
+            best  = earlier(best, found, base + (ahead::u64 << shift));
+            found = true;
+        }
+        val behind: usize = occupied_slot(wheel, level, position, true);
+        if (behind != NONE) {
+            # a slot at or behind the position belongs to the next rotation
+            best  = earlier(best, found, base + (1::u64 << period) + (behind::u64 << shift));
+            found = true;
+        }
+        level = level + 1;
+    }
+    if (found) { @output = best; }
+    ret found;
+}
+
+# fire a list into the caller's buffer. what does not fit is due, and waits on
+# the due list in order
+fun drain(wheel: *Wheel, list: usize, output: *u64, capacity: usize, fired: usize) usize {
+    var count: usize = fired;
+    for (count < capacity && wheel.heads[list] != NONE) {
+        val index: usize  = wheel.heads[list];
+        val value: *Entry = entry_at(wheel, index);
+        unlink(wheel, value);
+        output[count] = value.owner;
+        count         = count + 1;
+    }
+    if (list != DUE) {
+        for (wheel.heads[list] != NONE) {
+            val index: usize  = wheel.heads[list];
+            val value: *Entry = entry_at(wheel, index);
+            unlink(wheel, value);
+            link(wheel, index, value, DUE);
+        }
+    }
+    ret count;
+}
+
+# move every entry of a higher-level slot to where it now belongs
+fun cascade(wheel: *Wheel, level: usize, slot: usize) {
+    val list:  usize = level * SLOTS + slot;
+    var index: usize = wheel.heads[list];
+    for (index != NONE) {
+        val value: *Entry = entry_at(wheel, index);
+        val next:  usize  = value.next;
+        unlink(wheel, value);
+        link(wheel, index, value, list_for(wheel, value.deadline));
+        index = next;
+    }
+}
+
+pub fun make(wheel: *Wheel, a: *A.Allocator, now_ns: u64) bool {
+    if (wheel == nil || a == nil)                            { ret false; }
+    if (!hedge_storage.make_table[Entry](?wheel.entries, a)) { ret false; }
+    var i: usize = 0;
+    for (i < LISTS) {
+        wheel.heads[i] = NONE;
+        wheel.tails[i] = NONE;
+        i              = i + 1;
+    }
+    var level: usize = 0;
+    for (level < LEVELS) {
+        var word: usize = 0;
+        for (word < 4) {
+            wheel.occupied[level][word] = 0;
+            word                        = word + 1;
+        }
+        level = level + 1;
+    }
+    wheel.now         = floor_ticks(now_ns);
+    wheel.claimed     = 0;
+    wheel.free_head   = NONE;
+    wheel.armed       = 0;
+    wheel.live        = 0;
+    wheel.steps       = 0;
+    wheel.initialized = true;
+    ret true;
+}
+
+pub fun destroy(wheel: *Wheel) bool {
+    if (wheel == nil || !wheel.initialized) { ret false; }
+    wheel.initialized = false;
+    ret hedge_storage.destroy_table[Entry](?wheel.entries);
+}
+
+# an idle entry that reports `owner` when it fires, or no_handle when the
+# allocator refuses to grow the table
+pub fun claim(wheel: *Wheel, owner: u64) Handle {
+    if (wheel == nil || !wheel.initialized) { ret no_handle(); }
+    var index: usize = wheel.free_head;
+    if (index != NONE) {
+        wheel.free_head = entry_at(wheel, index).next_free;
+    }
+    or {
+        if (wheel.claimed == wheel.entries.capacity
+            && !hedge_storage.grow_table[Entry](?wheel.entries)) {
+            ret no_handle();
+        }
+        index         = wheel.claimed;
+        wheel.claimed = wheel.claimed + 1;
+    }
+    val value: *Entry = entry_at(wheel, index);
+    value.generation = value.generation + 1;
+    if (value.generation == 0) { value.generation = 1; }
+    value.owner     = owner;
+    value.deadline  = 0;
+    value.next      = NONE;
+    value.prev      = NONE;
+    value.list      = NONE;
+    value.next_free = NONE;
+    value.state     = STATE_IDLE;
+    wheel.live      = wheel.live + 1;
+    ret Handle{index: index, generation: value.generation};
+}
+
+pub fun release(wheel: *Wheel, handle: Handle) Status {
+    if (wheel == nil || !wheel.initialized) { ret INVALID; }
+    val value: *Entry = entry_for(wheel, handle);
+    if (value == nil)               { ret STALE; }
+    if (value.state == STATE_ARMED) { unlink(wheel, value); }
+    value.state      = STATE_FREE;
+    value.generation = value.generation + 1;
+    value.next_free  = wheel.free_head;
+    wheel.free_head  = handle.index;
+    wheel.live       = wheel.live - 1;
+    ret OK;
+}
+
+# fire at or after deadline_ns. arming again moves the entry, and a move within
+# the slot it already occupies costs nothing
+pub fun arm(wheel: *Wheel, handle: Handle, deadline_ns: u64) Status {
+    if (wheel == nil || !wheel.initialized) { ret INVALID; }
+    val value: *Entry = entry_for(wheel, handle);
+    if (value == nil) { ret STALE; }
+    val deadline: u64   = ceil_ticks(deadline_ns);
+    val list:     usize = list_for(wheel, deadline);
+    if (value.state == STATE_ARMED) {
+        if (value.list == list) {
+            value.deadline = deadline;
+            ret OK;
+        }
+        unlink(wheel, value);
+    }
+    value.deadline = deadline;
+    link(wheel, handle.index, value, list);
+    ret OK;
+}
+
+pub fun disarm(wheel: *Wheel, handle: Handle) Status {
+    if (wheel == nil || !wheel.initialized) { ret INVALID; }
+    val value: *Entry = entry_for(wheel, handle);
+    if (value == nil)               { ret STALE; }
+    if (value.state == STATE_ARMED) { unlink(wheel, value); }
+    ret OK;
+}
+
+pub fun armed(wheel: *Wheel, handle: Handle) bool {
+    val value: *Entry = entry_for(wheel, handle);
+    ret value != nil && value.state == STATE_ARMED;
+}
+
+pub fun armed_count(wheel: *Wheel) usize {
+    if (wheel == nil || !wheel.initialized) { ret 0; }
+    ret wheel.armed;
+}
+
+# fire every entry due at now_ns, writing each owner into output. an entry that
+# does not fit is fired by the next call before anything later, so a caller that
+# stops early loses nothing. a fired entry is idle and still claimed
+pub fun advance(wheel: *Wheel, now_ns: u64, output: *u64, capacity: usize) usize {
+    if (wheel == nil || !wheel.initialized || output == nil || capacity == 0) { ret 0; }
+    val target: u64   = floor_ticks(now_ns);
+    var fired:  usize = drain(wheel, DUE, output, capacity, 0);
+    if (fired == capacity) { ret fired; }
+    for (wheel.now < target) {
+        wheel.steps = wheel.steps + 1;
+        var tick: u64 = 0;
+        if (!next_event(wheel, ?tick) || tick > target) {
+            wheel.now = target;
+            brk;
+        }
+        wheel.now = tick;
+        # higher levels first, so an entry can fall through every level at once
+        var level: usize = LEVELS - 1;
+        for (level > 0) {
+            val low: u64 = (1::u64 << (8 * level)::u64) - 1;
+            if ((tick & low) == 0) {
+                cascade(wheel, level, ((tick >> (8 * level)::u64) & 0xff)::usize);
+            }
+            level = level - 1;
+        }
+        fired = drain(wheel, DUE, output, capacity, fired);
+        fired = drain(wheel, (tick & 0xff)::usize, output, capacity, fired);
+        if (fired == capacity) { ret fired; }
+    }
+    ret fired;
+}
+
+# the next time the wheel needs advancing, in monotonic nanoseconds. it may be
+# earlier than any deadline, where an occupied slot cascades, but never later.
+# false when nothing is armed
+pub fun next_deadline(wheel: *Wheel, output: *u64) bool {
+    if (wheel == nil || !wheel.initialized || output == nil || wheel.armed == 0) { ret false; }
+    if (wheel.heads[DUE] != NONE) {
+        @output = wheel.now * TICK_NS;
+        ret true;
+    }
+    var tick: u64 = 0;
+    if (!next_event(wheel, ?tick)) { ret false; }
+    @output = tick * TICK_NS;
+    ret true;
+}
+
+fun test_wheel(wheel: *Wheel, pages: *A.Allocator) bool {
+    page.make(pages);
+    ret make(wheel, pages, 0);
+}
+
+fun ms(value: u64) u64 {
+    ret value * TICK_NS;
+}
+
+test "timer: an entry fires at its deadline and not before" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var out:    [8]u64;
+    val handle: Handle = claim(?wheel, 7);
+    if (arm(?wheel, handle, ms(5)) != OK)                       { ret 2; }
+    if (advance(?wheel, ms(5) - 1, ?out[0], 8) != 0)            { ret 3; }
+    if (advance(?wheel, ms(5), ?out[0], 8) != 1 || out[0] != 7) { ret 4; }
+    if (armed(?wheel, handle))                                  { ret 5; }
+    # a deadline between ticks rounds up rather than firing early
+    if (arm(?wheel, handle, ms(9) + 1) != OK)     { ret 6; }
+    if (advance(?wheel, ms(9), ?out[0], 8) != 0)  { ret 7; }
+    if (advance(?wheel, ms(10), ?out[0], 8) != 1) { ret 8; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: a deadline already due fires on the next advance" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var out: [8]u64;
+    advance(?wheel, ms(100), ?out[0], 8);
+    val handle: Handle = claim(?wheel, 3);
+    arm(?wheel, handle, ms(40));
+    if (advance(?wheel, ms(100), ?out[0], 8) != 1 || out[0] != 3) { ret 2; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: re-arm moves, disarm cancels, and a released handle is stale" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var out:   [8]u64;
+    val first: Handle = claim(?wheel, 1);
+    arm(?wheel, first, ms(10));
+    arm(?wheel, first, ms(20));
+    if (advance(?wheel, ms(15), ?out[0], 8) != 0) { ret 2; }
+    if (advance(?wheel, ms(20), ?out[0], 8) != 1) { ret 3; }
+    arm(?wheel, first, ms(30));
+    disarm(?wheel, first);
+    if (advance(?wheel, ms(40), ?out[0], 8) != 0) { ret 4; }
+    if (release(?wheel, first) != OK)             { ret 5; }
+    if (arm(?wheel, first, ms(50)) != STALE)      { ret 6; }
+    # the slot is reused under a new generation, and the old handle stays stale
+    val second: Handle = claim(?wheel, 2);
+    if (second.index != first.index || second.generation == first.generation) { ret 7; }
+    if (disarm(?wheel, first) != STALE)                                       { ret 8; }
+    if (armed_count(?wheel) != 0 || wheel.live != 1)                          { ret 9; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: entries fire in deadline order and a tick fires first come first" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var out: [8]u64;
+    arm(?wheel, claim(?wheel, 30), ms(3));
+    arm(?wheel, claim(?wheel, 10), ms(1));
+    arm(?wheel, claim(?wheel, 21), ms(2));
+    arm(?wheel, claim(?wheel, 22), ms(2));
+    if (advance(?wheel, ms(3), ?out[0], 8) != 4)                      { ret 2; }
+    if (out[0] != 10 || out[1] != 21 || out[2] != 22 || out[3] != 30) { ret 3; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: deadlines on every level cascade down and fire exactly" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var out: [8]u64;
+    # one deadline per level, and one past the widest span
+    var deadlines: [5]u64 = [5]u64{300, 70000, 17000000, 3000000000, 9000000000};
+    var i:         usize  = 0;
+    for (i < 5) {
+        arm(?wheel, claim(?wheel, i::u64), ms(deadlines[i]));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 5) {
+        if (advance(?wheel, ms(deadlines[i]) - 1, ?out[0], 8) != 0) { ret (10 + i)::i32; }
+        if (advance(?wheel, ms(deadlines[i]), ?out[0], 8) != 1
+            || out[0] != i::u64) { ret (20 + i)::i32; }
+        i = i + 1;
+    }
+    if (armed_count(?wheel) != 0) { ret 30; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: a long idle gap is crossed in a few steps" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var out: [8]u64;
+    # ten days is 864 million ticks
+    arm(?wheel, claim(?wheel, 1), ms(864000000));
+    arm(?wheel, claim(?wheel, 2), ms(864000000 + 700));
+    if (advance(?wheel, ms(864000000), ?out[0], 8) != 1)                      { ret 2; }
+    if (wheel.steps > 16)                                                     { ret (100 + wheel.steps)::i32; }
+    if (advance(?wheel, ms(864000000 + 700), ?out[0], 8) != 1 || out[0] != 2) { ret 3; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: a full buffer defers the rest to the next advance in order" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var out: [2]u64;
+    var i:   usize = 0;
+    for (i < 5) {
+        arm(?wheel, claim(?wheel, i::u64), ms(4));
+        i = i + 1;
+    }
+    arm(?wheel, claim(?wheel, 9), ms(6));
+    if (advance(?wheel, ms(6), ?out[0], 2) != 2 || out[0] != 0 || out[1] != 1) { ret 2; }
+    if (advance(?wheel, ms(6), ?out[0], 2) != 2 || out[0] != 2 || out[1] != 3) { ret 3; }
+    if (advance(?wheel, ms(6), ?out[0], 2) != 2 || out[0] != 4 || out[1] != 9) { ret 4; }
+    if (advance(?wheel, ms(6), ?out[0], 2) != 0)                               { ret 5; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: the next deadline is never later than the earliest entry" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    var next: u64 = 0;
+    if (next_deadline(?wheel, ?next)) { ret 2; }
+    val far: Handle = claim(?wheel, 1);
+    arm(?wheel, far, ms(90000));
+    if (!next_deadline(?wheel, ?next) || next > ms(90000) || next == 0) { ret 3; }
+    val near: Handle = claim(?wheel, 2);
+    arm(?wheel, near, ms(12));
+    if (!next_deadline(?wheel, ?next) || next != ms(12)) { ret 4; }
+    disarm(?wheel, near);
+    disarm(?wheel, far);
+    if (next_deadline(?wheel, ?next)) { ret 5; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: growth keeps every entry where it was" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    val first:  Handle = claim(?wheel, 0);
+    val before: *Entry = entry_at(?wheel, first.index);
+    var i:      usize  = 1;
+    for (i < 2000) {
+        val handle: Handle = claim(?wheel, i::u64);
+        if (handle.index == NONE) { ret 2; }
+        arm(?wheel, handle, ms(i::u64 % 3000));
+        i = i + 1;
+    }
+    if (entry_at(?wheel, first.index) != before) { ret 3; }
+    var out:   [64]u64;
+    var total: usize = 0;
+    var round: usize = 0;
+    for (round < 200 && total < 1999) {
+        total = total + advance(?wheel, ms(3000), ?out[0], 64);
+        round = round + 1;
+    }
+    if (total != 1999 || armed_count(?wheel) != 0) { ret 4; }
+    destroy(?wheel);
+    ret 0;
+}
