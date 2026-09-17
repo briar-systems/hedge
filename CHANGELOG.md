@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-16
+
 ### Fixed
 
 - A burst of concurrent HTTP/3 connections no longer leaves the QUIC listener deaf (#145). A connection force-released at its drain deadline skipped the transport's `finish_close` and ignored a refused `assembly.release_closed`, so its slot was reused over a live TLS server and refused every later connection it was given. Each refusal was reported as a runtime failure, which released every QUIC pump and cancelled the pending receive, so the socket was never read again. The forced release now releases the h3 session, finishes the transport's close, destroys the scope and releases the assembly, retrying on later passes until each step completes, and never frees the slot before then.
@@ -18,6 +20,12 @@
 
 - **Breaking.** `quic_runtime.STATELESS_SENDS` and `quic_capacity.STATELESS_SENDS` are replaced by `MAX_STATELESS_PENDING`, a ceiling rather than a pool size, and `operation_capacity_required` counts one operation per pump (#159).
 - Dependencies: mach-quic v0.9.2, mach-crypto v0.10.3, mach-tls v0.4.1, mach-http v0.9.0, mach-acme v0.3.0 and laurel v0.12.0, and mach-std v3.3.0, so every dependency in hedge's graph builds on one mach-std (std and crypto also in `test/acme/mach.toml`). mach-quic no longer enforces the TLS handshake deadline once the handshake is complete, so an HTTP/3 connection that outlives `handshake_ms` (a slow reader, or any long transfer) is no longer failed at that moment (#145). mach-quic v0.9.2 no longer fails a connection whose MTU probe is acknowledged after its congestion window has grown past ten datagrams, and a connection that fails while settling acknowledgements can still finish closing, so hedge's shutdown completes after a burst of handshakes (#161). mach-acme v0.3.0 keeps its store owner-only on Windows (#149).
+
+### Known issues
+
+- A burst of QUIC handshakes larger than the server can complete within its clients' timeouts collapses (#164). With 1100 clients dialling at once, about half connect. The same 1100 arriving at 40 per second almost all connect. Bursts of 200 connect in under 5 seconds.
+- Under 200 concurrent HTTP/3 connections, an occasional response stops just short of its end and does not complete (#163). It affects one or two transfers in roughly one run in ten. Sequential and moderately concurrent HTTP/3 is served in full.
+- hedge builds for `windows-x86_64` but is not supported at runtime on Windows (#149). The CI leg for Windows is build-only until that is fixed.
 
 ## [0.5.0] - 2026-09-16
 
