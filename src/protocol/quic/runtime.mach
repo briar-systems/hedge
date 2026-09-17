@@ -67,6 +67,7 @@ use hedge.protocol.quic.routing;
 use hedge_tls:     hedge.protocol.tls;
 use hedge_storage: hedge.storage;
 use wheel:         hedge.timer;
+use hedge_wake:    hedge.wake;
 use A:             std.allocator;
 use std.allocator.page;
 use allocator_testing: std.allocator.testing;
@@ -143,6 +144,9 @@ pub rec RuntimeConfig {
     # the worker's timer, which holds every connection deadline. the worker
     # advances it and hands each QUIC entry back through `fire`
     timers: *wheel.Wheel;
+    # the worker's wake queue. a service waiting on something wakes its
+    # connection through it, and the worker hands the wake back through `wake`
+    wakes: *hedge_wake.Queue;
 }
 
 # a wheel owner is tagged as QUIC so a worker sharing one wheel can route it
@@ -469,6 +473,7 @@ pub rec Runtime {
     pending_initials:    hedge_storage.Table[PendingInitial];
     routes:              routing.Table;
     timers:              *wheel.Wheel;
+    wakes:               *hedge_wake.Queue;
     sessions:            h3_session.Pool;
     chunks:              *hedge_storage.Chunks;
     backing:             *A.Allocator;
@@ -793,6 +798,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.chunks                = config.chunks;
     runtime.backing               = config.backing;
     runtime.timers                = config.timers;
+    runtime.wakes                 = config.wakes;
     runtime.ready_head            = NO_CONNECTION;
     runtime.ready_tail            = NO_CONNECTION;
     runtime.waiting_head          = NO_CONNECTION;
@@ -1838,11 +1844,11 @@ fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize) b
 
 fun own_connection_admission(value: *Connection,
     accepted: *quic_listener.Accepted,
-    named_charge: budget.Charge) {
-    value.charge             = accepted.charge;
-    value.charge_live        = true;
-    value.budget_charge      = named_charge;
-    value.budget_charge_live = named_charge.live;
+    budgets: *budget.Set, named_charge: *budget.Charge) {
+    value.charge      = accepted.charge;
+    value.charge_live = true;
+    budget.relocate(budgets, ?value.budget_charge, named_charge);
+    value.budget_charge_live = value.budget_charge.live;
 }
 
 # the client addresses this connection by the id the server chose in its Retry,
@@ -2132,7 +2138,7 @@ fun copy_pending_packet(pending: *PendingInitial,
 fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize, accepted: quic_listener.Accepted,
     received: *net_types.Packet, config_snapshot: PumpConfig,
-    named_charge: budget.Charge, lease: process_admission.Lease) bool {
+    named_charge: *budget.Charge, lease: process_admission.Lease) bool {
     val index: usize = free_pending_initial(runtime);
     if (index == NO_CONNECTION) { ret false; }
     val pending: *PendingInitial = pending_at(runtime, index);
@@ -2143,15 +2149,15 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
         runtime.pending_free_head = index;
         ret false;
     }
-    pending.accepted           = accepted;
-    pending.budget_charge      = named_charge;
+    pending.accepted = accepted;
+    budget.relocate(config_snapshot.budgets, ?pending.budget_charge, named_charge);
     pending.lease              = lease;
     pending.pump               = pump_index;
     pending.pump_generation    = controls.pumps[pump_index].generation;
     pending.admission_bank     = bank_index;
     pending.next_free          = NO_CONNECTION;
     pending.q_charge_live      = true;
-    pending.budget_charge_live = named_charge.live;
+    pending.budget_charge_live = pending.budget_charge.live;
     pending.lease_live         = true;
     pending.cleanup_only       = false;
     pending.live               = true;
@@ -2168,7 +2174,7 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
 fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize, accepted: quic_listener.Accepted,
     q_charge_live: bool, config_snapshot: PumpConfig,
-    named_charge: budget.Charge, lease: process_admission.Lease,
+    named_charge: *budget.Charge, lease: process_admission.Lease,
     lease_live: bool) bool {
     val index: usize = free_pending_initial(runtime);
     if (index == NO_CONNECTION) { ret false; }
@@ -2179,8 +2185,8 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
         runtime.pending_free_head = index;
         ret false;
     }
-    pending.accepted           = accepted;
-    pending.budget_charge      = named_charge;
+    pending.accepted = accepted;
+    budget.relocate(config_snapshot.budgets, ?pending.budget_charge, named_charge);
     pending.lease              = lease;
     pending.length             = 0;
     pending.pump               = pump_index;
@@ -2188,7 +2194,7 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
     pending.admission_bank     = bank_index;
     pending.next_free          = NO_CONNECTION;
     pending.q_charge_live      = q_charge_live;
-    pending.budget_charge_live = named_charge.live;
+    pending.budget_charge_live = pending.budget_charge.live;
     pending.lease_live         = lease_live;
     pending.cleanup_only       = true;
     pending.live               = true;
@@ -2291,9 +2297,9 @@ fun transfer_pending_ownership(pending: *PendingInitial,
     if (pending == nil || value == nil || !pending.live
         || !value.live || !pending.q_charge_live
         || !pending.lease_live) { ret false; }
-    value.charge               = pending.accepted.charge;
-    value.charge_live          = true;
-    value.budget_charge        = pending.budget_charge;
+    value.charge      = pending.accepted.charge;
+    value.charge_live = true;
+    budget.relocate(pending.config.budgets, ?value.budget_charge, ?pending.budget_charge);
     value.budget_charge_live   = pending.budget_charge_live;
     pending.lease_live         = false;
     pending.q_charge_live      = false;
@@ -2369,7 +2375,7 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     var named_charge: budget.Charge;
     val outcome:      budget.Outcome = budget.charge(pump.budgets,
         pump.config.listener_budget, $size_of(Connection), now,
-        ?named_charge);
+        ?named_charge, hedge_wake.no_waker());
     if (outcome != budget.ADMITTED && outcome != budget.QUEUED) {
         val lease_released: bool =
             process_admission.release(runtime.admission, lease);
@@ -2377,7 +2383,7 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
         if (!lease_released) {
             var none: quic_listener.Accepted;
             if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-                none, false, pump.config, named_charge, lease,
+                none, false, pump.config, ?named_charge, lease,
                 true)) { ret FAILED; }
         }
         if (!cancelled) { ret FAILED; }
@@ -2387,15 +2393,15 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
         quic_listener.commit(?bank.listener, result.acceptance);
     if (accepted.action != quic_listener.ACTION_ACCEPT) {
         if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-            accepted, false, pump.config, named_charge, lease,
+            accepted, false, pump.config, ?named_charge, lease,
             true)) { ret FAILED; }
         ret FAILED;
     }
     if (outcome == budget.QUEUED) {
         if (!enqueue_initial(controls, runtime, pump_index, bank_index, accepted,
-            received, pump.config, named_charge, lease)) {
+            received, pump.config, ?named_charge, lease)) {
             if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-                accepted, true, pump.config, named_charge, lease,
+                accepted, true, pump.config, ?named_charge, lease,
                 true)) { ret FAILED; }
             ret FAILED;
         }
@@ -2405,7 +2411,7 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
         lease);
     if (index == NO_CONNECTION) {
         if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-            accepted, true, pump.config, named_charge, lease,
+            accepted, true, pump.config, ?named_charge, lease,
             true)) { ret FAILED; }
         ret BLOCKED;
     }
@@ -2413,7 +2419,7 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     if (!active_connection_config(?pump.config,
         ?connection_config)) { ret FAILED; }
     own_connection_admission(connection_at(controls, index),
-        ?accepted, named_charge);
+        ?accepted, pump.config.budgets, ?named_charge);
     if (!initialize_connection(controls, runtime, pump_index, bank_index, index,
         ?accepted, received, ?connection_config, now_ns)) { ret FAILED; }
     if (!deliver_initial(controls, runtime, index, received, now_ns)) { ret FAILED; }
@@ -2607,7 +2613,8 @@ fun start_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
         || !h3_session.begin(session, ?value.assembly.driver, ?value.storage.scope,
         value.plan, value.budgets, value.limits, value.max_requests,
         (?value.storage.listener_name[0])::str, peer, local,
-        value.request_timeout_ns, now_ns, runtime.chunks, value.call_memory_bytes)) {
+        value.request_timeout_ns, now_ns, runtime.chunks, value.call_memory_bytes,
+        hedge_wake.waker(runtime.wakes, timer_owner(index)))) {
         if (!h3_session.abandon(?runtime.sessions,
             controls.sessions, index)) {
             value.h3_session    = index;
@@ -3585,6 +3592,7 @@ rec TestControls {
     view:            ControlView;
     chunks:          hedge_storage.Chunks;
     timers:          wheel.Wheel;
+    wakes:           hedge_wake.Queue;
 }
 
 fun test_controls(fixture: *TestControls) *ControlView {
@@ -3593,6 +3601,7 @@ fun test_controls(fixture: *TestControls) *ControlView {
     hedge_storage.make_secret_table[h3_session.Session](?fixture.sessions);
     hedge_storage.make_chunks(?fixture.chunks, test_allocator());
     wheel.make(?fixture.timers, test_allocator(), 1);
+    hedge_wake.make(?fixture.wakes, test_allocator());
     fixture.view = ControlView{pumps: ?fixture.pumps[0],
         connections:     ?fixture.connections,
         secret_storages: ?fixture.secret_storages, sessions: ?fixture.sessions};
@@ -3611,7 +3620,7 @@ fun test_take_pending(runtime: *Runtime) *PendingInitial {
 fun test_make(fixture: *TestControls, runtime: *Runtime, backing: *A.Allocator) bool {
     ret make(?fixture.view, runtime,
         RuntimeConfig{backing: backing, chunks: ?fixture.chunks,
-        timers: ?fixture.timers});
+        timers: ?fixture.timers, wakes: ?fixture.wakes});
 }
 
 var test_backing:      A.Allocator;
@@ -4126,9 +4135,9 @@ test "hedge.protocol.quic.runtime: queued initial deadline expires exactly" {
     var running: budget.Charge;
     var waiting: budget.Charge;
     if (budget.charge(?budgets, allowance, 0,
-        time.Time{sec: 0, nsec: 0}, ?running) != budget.ADMITTED
+        time.Time{sec: 0, nsec: 0}, ?running, hedge_wake.no_waker()) != budget.ADMITTED
         || budget.charge(?budgets, allowance, 0,
-        time.Time{sec: 0, nsec: 0}, ?waiting) != budget.QUEUED) { ret 2; }
+        time.Time{sec: 0, nsec: 0}, ?waiting, hedge_wake.no_waker()) != budget.QUEUED) { ret 2; }
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
     val pending: *PendingInitial = test_take_pending(?runtime);
     if (pending == nil) { ret 91; }
@@ -4141,11 +4150,11 @@ test "hedge.protocol.quic.runtime: queued initial deadline expires exactly" {
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live                                    = true;
     link_pending_live(?runtime, 0);
-    pending.pump               = 0;
-    pending.pump_generation    = 2;
-    pending.admission_bank     = 0;
-    pending.config.budgets     = ?budgets;
-    pending.budget_charge      = waiting;
+    pending.pump            = 0;
+    pending.pump_generation = 2;
+    pending.admission_bank  = 0;
+    pending.config.budgets  = ?budgets;
+    budget.relocate(?budgets, ?pending.budget_charge, ?waiting);
     pending.budget_charge_live = true;
     var deadline: time.Time;
     if (next_budget_deadline(?runtime, ?deadline) != OK
@@ -4205,9 +4214,9 @@ test "hedge.protocol.quic.runtime: pending cleanup retries each lease once" {
     var running: budget.Charge;
     var waiting: budget.Charge;
     budget.charge(?budgets, allowance, 0,
-        time.Time{sec: 0, nsec: 0}, ?running);
+        time.Time{sec: 0, nsec: 0}, ?running, hedge_wake.no_waker());
     budget.charge(?budgets, allowance, 0,
-        time.Time{sec: 0, nsec: 0}, ?waiting);
+        time.Time{sec: 0, nsec: 0}, ?waiting, hedge_wake.no_waker());
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
     val pending: *PendingInitial = test_take_pending(?runtime);
     if (pending == nil) { ret 91; }
@@ -4219,10 +4228,10 @@ test "hedge.protocol.quic.runtime: pending cleanup retries each lease once" {
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live                                    = true;
     link_pending_live(?runtime, 0);
-    pending.pump               = 0;
-    pending.admission_bank     = 0;
-    pending.config.budgets     = ?budgets;
-    pending.budget_charge      = waiting;
+    pending.pump           = 0;
+    pending.admission_bank = 0;
+    pending.config.budgets = ?budgets;
+    budget.relocate(?budgets, ?pending.budget_charge, ?waiting);
     pending.budget_charge_live = true;
     pending.lease              = lease;
     pending.lease_live         = true;
@@ -4258,9 +4267,9 @@ test "hedge.protocol.quic.runtime: shutdown cancels queued ownership" {
     var running: budget.Charge;
     var waiting: budget.Charge;
     budget.charge(?budgets, allowance, 0,
-        time.Time{sec: 0, nsec: 0}, ?running);
+        time.Time{sec: 0, nsec: 0}, ?running, hedge_wake.no_waker());
     budget.charge(?budgets, allowance, 0,
-        time.Time{sec: 0, nsec: 0}, ?waiting);
+        time.Time{sec: 0, nsec: 0}, ?waiting, hedge_wake.no_waker());
     var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
     var protocols:      [1]tls_config.ProtocolName;
     var policy:         hedge_tls.Policy;
@@ -4282,11 +4291,11 @@ test "hedge.protocol.quic.runtime: shutdown cancels queued ownership" {
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live                                    = true;
     link_pending_live(?runtime, 0);
-    pending.pump               = 0;
-    pending.pump_generation    = 1;
-    pending.admission_bank     = 0;
-    pending.config.budgets     = ?budgets;
-    pending.budget_charge      = waiting;
+    pending.pump            = 0;
+    pending.pump_generation = 1;
+    pending.admission_bank  = 0;
+    pending.config.budgets  = ?budgets;
+    budget.relocate(?budgets, ?pending.budget_charge, ?waiting);
     pending.budget_charge_live = true;
     pending.lease              = lease;
     pending.lease_live         = true;

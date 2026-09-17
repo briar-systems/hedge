@@ -157,17 +157,7 @@ fun earlier_deadline(found: bool, candidate: time.Time,
 fun next_budget_deadline(runtime: *Runtime,
     output: *time.Time) bool {
     if (runtime == nil || output == nil) { ret false; }
-    var found: bool  = false;
-    var i:     usize = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot:     *Slot = slot_at(runtime, i);
-        var deadline: time.Time;
-        if (slot.live && slot.waiting
-            && budget.deadline(?slot.charge, ?deadline)) {
-            found = earlier_deadline(found, deadline, output);
-        }
-        i = slot.next_live;
-    }
+    var found: bool = false;
     if (runtime.quic != nil && !runtime.quic_released) {
         var deadline: time.Time;
         if (quic_runtime.next_budget_deadline(runtime.quic, ?deadline)
@@ -698,10 +688,12 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
         # driven, which is the last point at which refusing it costs nothing
         val allowance: usize          = listener_budget(runtime, source.listener_index);
         val outcome:   budget.Outcome = budget.charge(slot.budgets, allowance,
-            $size_of(connection.Connection), now, ?slot.charge);
+            $size_of(connection.Connection), now, ?slot.charge,
+            hedge_wake.waker(?runtime.wakes, tcp_owner(index)));
         if (outcome == budget.QUEUED) {
             slot.waiting   = true;
             runtime.queued = runtime.queued + 1;
+            arm_waiting(runtime, index);
         }
         or (outcome != budget.ADMITTED) {
             runtime.rejected = runtime.rejected + 1;
@@ -721,30 +713,40 @@ fun listener_budget(runtime: *Runtime, index: usize) usize {
     ret budget.find(runtime.active_budgets, schema.text(?configured.budget));
 }
 
-# a connection holding a place in its budget's queue tries again, and is closed
-# when it has waited longer than the budget allows
-fun admit_waiting(runtime: *Runtime, now: time.Time) usize {
-    var admitted: usize = 0;
-    var i:        usize = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot: *Slot = slot_at(runtime, i);
-        val next: usize = slot.next_live;
-        if (slot.live && slot.waiting) {
-            val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge,
-                now);
-            if (outcome == budget.ADMITTED) {
-                slot.waiting = false;
-                admitted     = admitted + 1;
-                mark_ready(runtime, i);
-            }
-            or (outcome != budget.QUEUED) {
-                runtime.expired = runtime.expired + 1;
-                retire(runtime, i);
-            }
-        }
-        i = next;
+# a connection holding a place in its budget's queue learns where it stands.
+# a release admits it and wakes it, and its wheel entry ends the wait when the
+# budget's timeout passes
+fun admit_waiting(runtime: *Runtime, index: usize, now: time.Time) bool {
+    val slot:    *Slot          = slot_at(runtime, index);
+    val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge, now);
+    if (outcome == budget.ADMITTED) {
+        slot.waiting = false;
+        ret true;
     }
-    ret admitted;
+    if (outcome == budget.QUEUED) {
+        arm_waiting(runtime, index);
+        ret false;
+    }
+    runtime.expired = runtime.expired + 1;
+    retire(runtime, index);
+    ret false;
+}
+
+fun arm_waiting(runtime: *Runtime, index: usize) {
+    val slot: *Slot = slot_at(runtime, index);
+    if (!slot.timer_live) {
+        runtime.teardown_failures = runtime.teardown_failures + 1;
+        ret;
+    }
+    var deadline: time.Time;
+    var armed:    hedge_timer.Status = hedge_timer.OK;
+    if (budget.deadline(?slot.charge, ?deadline)) {
+        armed = hedge_timer.arm(?runtime.timers, slot.timer, clock.to_ns(deadline));
+    }
+    or { armed = hedge_timer.disarm(?runtime.timers, slot.timer); }
+    if (armed != hedge_timer.OK) {
+        runtime.teardown_failures = runtime.teardown_failures + 1;
+    }
 }
 
 fun retire(runtime: *Runtime, index: usize) {
@@ -887,9 +889,9 @@ fun run_ready(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.
         val slot: *Slot = slot_at(runtime, index);
         # a connection still waiting for its budget is not driven, which is what
         # makes the queue a queue rather than a label
-        if (slot.live && !slot.waiting) {
-            if (slot.retiring) { retire(runtime, index); }
-            or                 { drive(runtime, index, now); }
+        if (slot.live && slot.retiring) { retire(runtime, index); }
+        or (slot.live && (!slot.waiting || admit_waiting(runtime, index, now))) {
+            drive(runtime, index, now);
         }
         if (index == tail) { brk; }
     }
@@ -961,8 +963,7 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     # refuses an arrival for a slot that this turn already freed
     run_ready(controls, runtime, now);
     if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
-    admit_waiting(runtime, now);
-    if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
+    if (runtime.plane::usize != 0)            { runtime.plane(runtime.plane_ctx, now); }
     run_ready(controls, runtime, now);
     # plane and tcp progress can release shared budget capacity for quic
     val settled: time.Time = clock.monotonic();
@@ -975,8 +976,7 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
         telemetry.quic_replay_full(runtime.observability,
             quic_runtime.replay_full(runtime.quic));
     }
-    val promoted: usize = admit_waiting(runtime, settled);
-    if (promoted != 0) { run_ready(controls, runtime, settled); }
+    run_ready(controls, runtime, settled);
     if (lifecycle.serving(?runtime.shutdown)) {
         listener.resume_admission(?runtime.owner);
     }

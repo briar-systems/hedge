@@ -13,6 +13,7 @@ use hedge.dispatch.plan;
 use hedge.service;
 use hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
+use hedge_wake:      hedge.wake;
 use http.core.body;
 use http.core.exchange;
 use http.core.field;
@@ -111,6 +112,25 @@ fun refusal_status(outcome: Outcome) status.Status {
     ret status.BAD_REQUEST;
 }
 
+# a queued request runs again when a release admits it, or at its queue deadline
+fun park_budget(active: *call.Call, held: *budget.Charge) exchange.ServiceStatus {
+    var deadline: time.Time;
+    var at:       u64 = 0;
+    if (budget.deadline(held, ?deadline)) { at = clock.to_ns(deadline); }
+    ret call.park(active, call.WAIT_WAKE, at);
+}
+
+# give a handler its turn. a handler that reports itself pending without naming
+# what it waits on would never be given another, so that is a failure
+fun enter_handler(handler: service.Handler, active: *call.Call) exchange.ServiceStatus {
+    call.unpark(active);
+    val served: exchange.ServiceStatus = handler.serve(handler.ctx, active);
+    if (served == exchange.SERVICE_PENDING && !call.parked(active)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret served;
+}
+
 fun serve_listener(active: *call.Call,
     selected: *service.ListenerService) Result {
     if (selected == nil || !service.has_handler(selected.handler)) {
@@ -122,8 +142,7 @@ fun serve_listener(active: *call.Call,
     })) {
         ret result(FAILED, plan.NO_INDEX, exchange.SERVICE_FAILED);
     }
-    val served: exchange.ServiceStatus = selected.handler.serve(
-        selected.handler.ctx, active);
+    val served: exchange.ServiceStatus = enter_handler(selected.handler, active);
     if (served == exchange.SERVICE_FAILED) {
         ret result(FAILED, plan.NO_INDEX, served);
     }
@@ -145,14 +164,14 @@ fun serve_listener(active: *call.Call,
 # resumes; one with neither refuses it as unavailable rather than running work
 # the operator said there was no room for.
 fun admit(budgets: *budget.Set, selected: *plan.Entry, held: *budget.Charge,
-    memory_bytes: usize, now: time.Time) budget.Outcome {
+    memory_bytes: usize, now: time.Time, waker: hedge_wake.Waker) budget.Outcome {
     if (budgets == nil || held == nil) { ret budget.ADMITTED; }
     var index: usize = budget.NO_BUDGET;
     if (selected.budget_index != plan.NO_INDEX
         && selected.budget_index != schema.NO_BUDGET_INDEX) {
         index = selected.budget_index;
     }
-    ret budget.charge(budgets, index, memory_bytes, now, held);
+    ret budget.charge(budgets, index, memory_bytes, now, held, waker);
 }
 
 pub fun serve(active_plan: *plan.Plan, active: *call.Call, captures: *router.Capture,
@@ -201,9 +220,10 @@ pub fun serve(active_plan: *plan.Plan, active: *call.Call, captures: *router.Cap
     # charged before the handler, which is the last point at which refusing the
     # request costs nothing
     val admitted: budget.Outcome = admit(budgets, selected, held,
-        call.memory_capacity(active), now);
+        call.memory_capacity(active), now, call.waker(active));
     if (admitted == budget.QUEUED) {
-        ret result(PENDING, matched.source_index, exchange.SERVICE_PENDING);
+        call.unpark(active);
+        ret result(PENDING, matched.source_index, park_budget(active, held));
     }
     if (admitted != budget.ADMITTED) {
         ret refuse(active, refusal_status(OVER_BUDGET), OVER_BUDGET);
@@ -219,7 +239,7 @@ pub fun serve(active_plan: *plan.Plan, active: *call.Call, captures: *router.Cap
         middleware.run_error(active_plan.storage.middleware, selected.middleware_start, ran, active, exchange.SERVICE_FAILED);
         ret result(FAILED, matched.source_index, exchange.SERVICE_FAILED);
     }
-    val served: exchange.ServiceStatus = handler.serve(handler.ctx, active);
+    val served: exchange.ServiceStatus = enter_handler(handler, active);
     if (served == exchange.SERVICE_FAILED) {
         middleware.run_error(active_plan.storage.middleware, selected.middleware_start, ran, active, served);
         ret result(FAILED, matched.source_index, served);
@@ -253,7 +273,8 @@ pub fun resume(active_plan: *plan.Plan, active: *call.Call, budgets: *budget.Set
     if (held != nil && held.live && held.outcome == budget.QUEUED) {
         val waited: budget.Outcome = budget.retry(budgets, held, now);
         if (waited == budget.QUEUED) {
-            ret result(PENDING, active.route.index, exchange.SERVICE_PENDING);
+            call.unpark(active);
+            ret result(PENDING, active.route.index, park_budget(active, held));
         }
         if (waited != budget.ADMITTED) {
             ret refuse(active, refusal_status(OVER_BUDGET), OVER_BUDGET);
@@ -263,7 +284,7 @@ pub fun resume(active_plan: *plan.Plan, active: *call.Call, budgets: *budget.Set
     if (!service.has_handler(handler)) {
         ret result(FAILED, active.route.index, exchange.SERVICE_FAILED);
     }
-    val served: exchange.ServiceStatus = handler.serve(handler.ctx, active);
+    val served: exchange.ServiceStatus = enter_handler(handler, active);
     if (served == exchange.SERVICE_FAILED) {
         middleware.run_error(active_plan.storage.middleware, selected.middleware_start,
             selected.middleware_count, active, served);
@@ -291,6 +312,7 @@ rec Fixture {
     informationals:    [2]message.Informational;
     exchange:          exchange.Exchange;
     heap:              A.Allocator;
+    wakes:             hedge_wake.Queue;
     chunks:            storage.Chunks;
     memory:            call.Memory;
     trace:             telemetry_trace.Context;
@@ -367,7 +389,9 @@ fun make_fixture(fixture: *Fixture, generation: u64, path: str, host: str) bool 
     if (!storage.make_chunks(?fixture.chunks, ?fixture.heap)
         || !call.make_memory(?fixture.memory, ?fixture.chunks, storage.MIN_CHUNK)) { ret false; }
     if (!telemetry_trace.make_root(?fixture.trace, false)) { ret false; }
-    ret call.bind(?fixture.call, ?fixture.exchange, ?fixture.memory, ?fixture.trace, generation, "test");
+    if (!hedge_wake.make(?fixture.wakes, ?fixture.heap))   { ret false; }
+    ret call.bind(?fixture.call, ?fixture.exchange, ?fixture.memory, ?fixture.trace, generation, "test",
+        hedge_wake.waker(?fixture.wakes, 1));
 }
 
 rec PlanFixture {
