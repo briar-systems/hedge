@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-17
+
+### Security
+
+- A client that opened a TCP connection and then sent nothing was never disconnected (#168). The deadline meant to close it after `timeouts.handshake_ms`, which also bounds the TLS handshake, was computed from the wall clock, but hedge's I/O layer enforces deadlines against the monotonic clock, so the deadline was always decades away. Any client could hold connection slots, admission leases and descriptors open indefinitely by connecting and staying silent, on cleartext and TLS listeners alike. Every deadline hedge builds now comes from the monotonic clock. Wall time is used only for calendar purposes: `Date` headers, certificate validity, cache freshness and request timestamps.
+
+### Fixed
+
+- An HTTP/2 request whose handler never completes is reset when `timeouts.request_ms` passes (#168). The stream's deadline was never checked, because a handler that submits no I/O gives the I/O layer nothing to time out.
+
 ## [0.5.0] - 2026-09-16
 
 ### Changed
