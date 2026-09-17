@@ -21,6 +21,7 @@
 
 ### Changed
 
+- hedge is copyright Briar Systems LLC (#184). The MIT license terms are unchanged.
 - **Breaking.** Dependencies move to the mach-std 4 stack (#171): mach-std v4.1.0, mach-crypto v0.12.0, mach-tls v0.5.1, mach-quic v0.11.0, mach-http v0.11.0, mach-acme v0.4.1 and laurel v0.13.2. Both `mach.toml` and `test/acme/mach.toml` carry the std, crypto and http pins. `test/acme` declares http because laurel v0.13.2 and mach-acme v0.4.1 still select mach-http v0.10.0, and hedge is not the root of that graph. Errors hedge raises itself now name their kind (`io_error.make`), as std 4 requires. `listener.apply_stream_policy` takes a socket handle rather than a raw descriptor. `connection.stream_released` reports whether the driver has taken a connection's socket. `quic_runtime.PumpConfig.max_replay` is required.
 - **Breaking.** `telemetry.metric_series` must now cover seven built-in series, up from six, for `hedge_quic_retry_replay_full_total`.
 - **Breaking.** `quic_runtime.STATELESS_SENDS` and `quic_capacity.STATELESS_SENDS` are replaced by `MAX_STATELESS_PENDING`, a ceiling rather than a pool size, and `operation_capacity_required` counts one operation per pump (#159).
