@@ -19,6 +19,7 @@ use hedge_storage: hedge.storage;
 use hedge.telemetry;
 use telemetry_health: hedge.telemetry.health;
 use hedge_timer:      hedge.timer;
+use hedge_wake:       hedge.wake;
 use http.core.message;
 use A: std.allocator;
 use std.allocator.page;
@@ -50,6 +51,13 @@ pub val NO_SLOT: usize = (-1)::usize;
 pub rec Slot {
     live:     bool;
     retiring: bool;
+    # queued to be driven or retired on this worker's next pass
+    ready:      bool;
+    ready_next: usize;
+    # the wheel entry for the connection's earliest deadline, claimed once for
+    # the slot and reused by every connection that holds it
+    timer:      hedge_timer.Handle;
+    timer_live: bool;
     # accepted and holding a place in its budget's queue, not yet being served
     waiting:   bool;
     token:     listener.ConnectionToken;
@@ -88,7 +96,12 @@ val FIRE_BATCH: usize = 64;
 pub rec Runtime {
     storage: connection.Storage;
     # every deadline this worker decides, whichever protocol owns it
-    timers:        hedge_timer.Wheel;
+    timers: hedge_timer.Wheel;
+    # every owner something outside its own io has made runnable again
+    wakes: hedge_wake.Queue;
+    # the TCP slots with work, in the order they got it
+    ready_head:    usize;
+    ready_tail:    usize;
     state:         State;
     plane_ctx:     ptr;
     plane:         PlaneFun;
@@ -213,6 +226,7 @@ pub fun make(
         || active_plan == nil || !plan.sealed(active_plan) || graph == nil
         || !connection.make_storage(?runtime.storage, a)
         || !hedge_timer.make(?runtime.timers, a, clock.monotonic_ns())
+        || !hedge_wake.make(?runtime.wakes, a)
         || !hedge_storage.make_table[Slot](?runtime.slots, a)
         || !hedge_storage.make[connection.Connection](?runtime.connections, a, 1)) {
         ret false;
@@ -248,6 +262,8 @@ pub fun make(
     runtime.active_budgets = ?runtime.budget_generations[0].set;
     runtime.live_head      = NO_SLOT;
     runtime.free_head      = NO_SLOT;
+    runtime.ready_head     = NO_SLOT;
+    runtime.ready_tail     = NO_SLOT;
     var i: usize = 0;
     for (i < schema.MAX_LISTENERS) {
         runtime.quic_handle_live[i] = false;
@@ -574,10 +590,14 @@ fun free_slot(runtime: *Runtime) usize {
         index                 = runtime.claimed_slots;
         runtime.claimed_slots = runtime.claimed_slots + 1;
         val fresh: *Slot = slot_at(runtime, index);
-        fresh.prev_live = NO_SLOT;
-        fresh.next_live = NO_SLOT;
-        fresh.next_free = NO_SLOT;
-        fresh.charge    = budget.no_charge();
+        fresh.prev_live  = NO_SLOT;
+        fresh.next_live  = NO_SLOT;
+        fresh.next_free  = NO_SLOT;
+        fresh.charge     = budget.no_charge();
+        fresh.ready      = false;
+        fresh.ready_next = NO_SLOT;
+        fresh.timer      = hedge_timer.claim(?runtime.timers, tcp_owner(index));
+        fresh.timer_live = fresh.timer.index != hedge_timer.NONE;
     }
     val slot: *Slot = slot_at(runtime, index);
     slot.handle =
@@ -656,7 +676,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
         if (owned == nil || !connection.make(slot.handle, runtime.next_id, runtime.generation,
             token, source, ?runtime.owner.network, runtime.plan, runtime.active_budgets,
             runtime.configured, runtime.limits, owned, policy,
-            ?runtime.storage, now)) {
+            ?runtime.storage, hedge_wake.waker(?runtime.wakes, tcp_owner(index)), now)) {
             runtime.rejected = runtime.rejected + 1;
             if (!listener.close_connection(?runtime.owner, token)) {
                 runtime.teardown_failures = runtime.teardown_failures + 1;
@@ -687,6 +707,7 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
             runtime.rejected = runtime.rejected + 1;
             retire(runtime, index);
         }
+        or { mark_ready(runtime, index); }
     }
     ret admitted;
 }
@@ -714,6 +735,7 @@ fun admit_waiting(runtime: *Runtime, now: time.Time) usize {
             if (outcome == budget.ADMITTED) {
                 slot.waiting = false;
                 admitted     = admitted + 1;
+                mark_ready(runtime, i);
             }
             or (outcome != budget.QUEUED) {
                 runtime.expired = runtime.expired + 1;
@@ -755,35 +777,121 @@ fun retire(runtime: *Runtime, index: usize) {
     }
     slot.live     = false;
     slot.retiring = false;
+    if (slot.timer_live) { hedge_timer.disarm(?runtime.timers, slot.timer); }
     unlink_live(runtime, index);
     return_slot(runtime, index);
     if (runtime.live > 0) { runtime.live = runtime.live - 1; }
 }
 
-# drive one connection until it blocks on I/O or finishes
+val TCP_TAG:  u64 = 0x5443000000000000;
+val TAG_MASK: u64 = 0xffff000000000000;
+# how many woken owners one routing pass takes at a time
+val WAKE_BATCH: usize = 64;
+
+fun tcp_owner(index: usize) u64 {
+    ret TCP_TAG | index::u64;
+}
+
+fun owns_tcp(owner: u64) bool {
+    ret (owner & TAG_MASK) == TCP_TAG;
+}
+
+fun mark_ready(runtime: *Runtime, index: usize) {
+    if (index >= runtime.claimed_slots) { ret; }
+    val slot: *Slot = slot_at(runtime, index);
+    if (!slot.live || slot.ready) { ret; }
+    slot.ready      = true;
+    slot.ready_next = NO_SLOT;
+    if (runtime.ready_tail != NO_SLOT) {
+        slot_at(runtime, runtime.ready_tail).ready_next = index;
+    }
+    or { runtime.ready_head = index; }
+    runtime.ready_tail = index;
+}
+
+fun take_ready(runtime: *Runtime) usize {
+    val index: usize = runtime.ready_head;
+    if (index == NO_SLOT) { ret NO_SLOT; }
+    val slot: *Slot = slot_at(runtime, index);
+    runtime.ready_head = slot.ready_next;
+    if (runtime.ready_head == NO_SLOT) { runtime.ready_tail = NO_SLOT; }
+    slot.ready      = false;
+    slot.ready_next = NO_SLOT;
+    ret index;
+}
+
+fun has_ready(runtime: *Runtime) bool {
+    ret runtime.ready_head != NO_SLOT || hedge_wake.pending(?runtime.wakes);
+}
+
+# hand every woken owner to the protocol that owns it
+fun route_wakes(controls: *quic_runtime.ControlView, runtime: *Runtime) {
+    var owners: [WAKE_BATCH]u64;
+    for {
+        val taken: usize = hedge_wake.take(?runtime.wakes, ?owners[0], WAKE_BATCH);
+        var i:     usize = 0;
+        for (i < taken) {
+            if (owns_tcp(owners[i])) {
+                mark_ready(runtime, (owners[i] & ~TAG_MASK)::usize);
+            }
+            or (quic_runtime.owns_timer(owners[i]) && runtime.quic != nil
+                && !runtime.quic_released) {
+                quic_runtime.wake(controls, runtime.quic, owners[i]);
+            }
+            i = i + 1;
+        }
+        if (taken < WAKE_BATCH) { brk; }
+    }
+}
+
+# the slot's wheel entry follows its connection's earliest deadline
+fun arm_slot(runtime: *Runtime, index: usize) {
+    val slot: *Slot = slot_at(runtime, index);
+    if (!slot.timer_live) {
+        runtime.teardown_failures = runtime.teardown_failures + 1;
+        ret;
+    }
+    var deadline: u64                = 0;
+    var armed:    hedge_timer.Status = hedge_timer.OK;
+    if (connection.next_deadline(slot.handle, ?deadline)) {
+        armed = hedge_timer.arm(?runtime.timers, slot.timer, deadline);
+    }
+    or { armed = hedge_timer.disarm(?runtime.timers, slot.timer); }
+    if (armed != hedge_timer.OK) {
+        runtime.teardown_failures = runtime.teardown_failures + 1;
+    }
+}
+
+# drive one connection until it blocks on I/O or finishes, then wait on its
+# earliest deadline
 fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
-    val slot:     *Slot           = slot_at(runtime, index);
+    val slot: *Slot = slot_at(runtime, index);
+    connection.expire(slot.handle, clock.to_ns(now));
     val progress: connection.Step = connection.advance(slot.handle, now);
     if (progress == connection.STEP_DONE || progress == connection.STEP_ERROR) {
         retire(runtime, index);
         ret true;
     }
+    arm_slot(runtime, index);
     ret false;
 }
 
-# retire what has finished and drive what has not
-fun sweep(runtime: *Runtime, now: time.Time) {
-    var i: usize = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot: *Slot = slot_at(runtime, i);
-        val next: usize = slot.next_live;
+# drive or retire the connections that have work. what they queue while this
+# runs waits for the next pass, which then does not wait on the network
+fun run_ready(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Time) {
+    route_wakes(controls, runtime);
+    var tail: usize = runtime.ready_tail;
+    for (tail != NO_SLOT) {
+        val index: usize = take_ready(runtime);
+        if (index == NO_SLOT) { brk; }
+        val slot: *Slot = slot_at(runtime, index);
         # a connection still waiting for its budget is not driven, which is what
         # makes the queue a queue rather than a label
         if (slot.live && !slot.waiting) {
-            if (slot.retiring) { retire(runtime, i); }
-            or                 { drive(runtime, i, now); }
+            if (slot.retiring) { retire(runtime, index); }
+            or                 { drive(runtime, index, now); }
         }
-        i = next;
+        if (index == tail) { brk; }
     }
 }
 
@@ -795,7 +903,10 @@ fun fire_timers(controls: *quic_runtime.ControlView, runtime: *Runtime, now_ns: 
             ?owners[0], FIRE_BATCH);
         var i: usize = 0;
         for (i < fired) {
-            if (quic_runtime.owns_timer(owners[i]) && runtime.quic != nil
+            if (owns_tcp(owners[i])) {
+                mark_ready(runtime, (owners[i] & ~TAG_MASK)::usize);
+            }
+            or (quic_runtime.owns_timer(owners[i]) && runtime.quic != nil
                 && !runtime.quic_released) {
                 quic_runtime.fire(controls, runtime.quic, owners[i], now_ns);
             }
@@ -824,8 +935,8 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
         }
     }
     # work a previous turn left marked is done now rather than after a wait
-    if (runtime.quic != nil && !runtime.quic_released
-        && quic_runtime.has_ready(runtime.quic)) {
+    if (has_ready(runtime) || (runtime.quic != nil && !runtime.quic_released
+        && quic_runtime.has_ready(runtime.quic))) {
         bounded_timeout = 0;
     }
     var budget_deadline: time.Time;
@@ -848,11 +959,11 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     # the completions just settled may have finished a connection, and a finished
     # connection holds its pool slot until it is retired. admitting before that
     # refuses an arrival for a slot that this turn already freed
-    sweep(runtime, now);
+    run_ready(controls, runtime, now);
     if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
     admit_waiting(runtime, now);
     if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
-    sweep(runtime, now);
+    run_ready(controls, runtime, now);
     # plane and tcp progress can release shared budget capacity for quic
     val settled: time.Time = clock.monotonic();
     if (runtime.quic != nil && !runtime.quic_released
@@ -865,7 +976,7 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
             quic_runtime.replay_full(runtime.quic));
     }
     val promoted: usize = admit_waiting(runtime, settled);
-    if (promoted != 0) { sweep(runtime, settled); }
+    if (promoted != 0) { run_ready(controls, runtime, settled); }
     if (lifecycle.serving(?runtime.shutdown)) {
         listener.resume_admission(?runtime.owner);
     }
@@ -903,8 +1014,10 @@ fun run_signal(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
         val slot: *Slot = slot_at(runtime, i);
         # HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
         # reading. the engine decides which; the runtime only asks.
-        if (slot.live
-            && !connection.begin_graceful(slot.handle)) { ok = false; }
+        if (slot.live) {
+            if (!connection.begin_graceful(slot.handle)) { ok = false; }
+            mark_ready(runtime, i);
+        }
         i = slot.next_live;
     }
     ret ok;
@@ -1072,6 +1185,7 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
             if (!connection.begin_graceful(slot.handle)) {
                 signalled = false;
             }
+            mark_ready(runtime, i);
         }
         i = slot.next_live;
     }
@@ -1198,7 +1312,8 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
                     runtime.state = STOPPED;
                     if (!connection.destroy_storage(?runtime.storage)
                         || !release_pool(runtime)
-                        || !hedge_timer.destroy(?runtime.timers)) {
+                        || !hedge_timer.destroy(?runtime.timers)
+                        || !hedge_wake.destroy(?runtime.wakes)) {
                         runtime.teardown_failures = runtime.teardown_failures + 1;
                     }
                 }
