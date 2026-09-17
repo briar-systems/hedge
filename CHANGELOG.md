@@ -35,8 +35,10 @@
 
 ### Changed
 
-- **Breaking.** Dependencies move to the mach-std 5 stack (#202): mach-std v5.3.0, mach-crypto v0.13.2, mach-tls v0.8.1, mach-quic v0.13.0, mach-http v0.12.0, mach-acme v0.5.0 and laurel v0.14.0, with `mach = "^5.3"`.
+- **Breaking.** Dependencies move to the mach-std 5 stack (#202): mach-std v5.4.0, mach-crypto v0.13.2, mach-tls v0.8.1, mach-quic v0.13.1, mach-http v0.13.0, mach-acme v0.5.0 and laurel v0.14.0, with `mach = "^5.3"`. Both `mach.toml` and `test/acme/mach.toml` pin mach-std v5.4.0.
 - Every deadline hedge schedules is a monotonic `time.Instant` (#202). Cancel scopes take an optional deadline, and budgets, the drain sequence, dispatch waits, request deadlines, proxy attempts and upstream breakers all run on the monotonic clock. Calendar time is read only for dates, cache freshness and certificate validity. TLS reads both clocks through its policy's clock source, so hedge hands TLS and QUIC no verification time.
+- HTTP/2 connection deadlines are the engine's own on mach-http 0.13 (#202). The adapter's stopgap from #189 is gone. `header_ms`, `request_ms`, `keep_alive_ms` and `write_ms` reach the HTTP/2 engine, which also closes every HTTP/2 connection at its total timeout (300 s), as HTTP/1.1 already did. A stalled HTTP/2 stream is reset on its own, and a failed HTTP/2 connection releases every stream's memory when it closes, including streams hedge never saw.
+- An HTTP/1.1 connection that has no request in hand and nothing read closes at `header_ms`, following mach-http 0.13 (#202). That covers a client that goes quiet after its TLS handshake, and a connection blocked on memory, which counts as a memory timeout. A quiet keep-alive connection is still bounded by `keep_alive_ms`.
 - TLS reads and writes run concurrently on mach-tls 0.8 (#202). The read preemption from 0.5.3 (#196) is removed. A queued write no longer waits behind a read.
 - **Breaking.** `telemetry.metric_series` must cover 23 built-in series, up from six, for `hedge_quic_retry_replay_full_total` and the per-lane memory series.
 - **Breaking.** `connection.make` takes the worker's `hedge.memory.Memory`, `proxy.attach_driver` takes the pool and the connection budgets, `quic_runtime.RuntimeConfig` takes `memory`, and `quic_runtime.advance` no longer takes a wall time. `serve.PlaneFun` and `serve.PlaneQuiesceFun` take a monotonic `time.Instant`. A laurel test site takes `handler_timeout` as an optional duration, following laurel 0.14.
@@ -54,7 +56,7 @@
 
 - A burst of QUIC handshakes larger than the server can complete within its clients' timeouts collapses (#164). With 1100 clients dialling at once, about half connect. The same 1100 arriving at 40 per second almost all connect. Bursts of 200 connect in under 5 seconds.
 - hedge builds for `windows-x86_64` but is not supported at runtime on Windows (#149). The CI leg for Windows is build-only until that is fixed.
-- The TLS stall fix merged from 0.5.2 (#189) is bounded by the timing wheel, not by a deadline carried on std's cancel scope. A TLS operation runs under the scope of the protocol engine that asked for it, and that engine's own deadline (keep-alive, header, request or write) is an entry in the worker's wheel, which times the scope out when it passes. The HTTP/2 adapter's connection deadlines are temporary until briar-systems/mach-http#110.
+- The TLS stall fix merged from 0.5.2 (#189) is bounded by the timing wheel, not by a deadline carried on std's cancel scope. A TLS operation runs under the scope of the protocol engine that asked for it, and that engine's own deadline (keep-alive, header, request or write) is an entry in the worker's wheel, which times the scope out when it passes.
 
 ## [0.5.3] - 2026-09-17
 
