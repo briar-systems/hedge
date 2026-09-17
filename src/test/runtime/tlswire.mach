@@ -10,10 +10,12 @@ use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
 use hedge.clock;
+use pool:         hedge.memory;
 use quic_runtime: hedge.protocol.quic.runtime;
 use hedge.serve;
 use hedge.storage;
 use A: std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use std.crypto.ct;
 use std.filesystem;
@@ -21,6 +23,7 @@ use io_error: std.io.error;
 use std.io.file;
 use io_runtime: std.io.runtime;
 use std.memory;
+use std.memory.buffers;
 use std.net.ip;
 use std.net.tcp;
 use std.sync.cancel;
@@ -34,14 +37,15 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use tls_buffer: tls.buffer;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
 use tls_client: tls.client;
+use tls_clock:  tls.clock;
 use tls.config;
 use tls_error: tls.error;
 use tls.memory_range;
-use tls.record;
 use tls.stream;
 use tls.tls13;
 use tls.transport;
@@ -49,10 +53,11 @@ use tls.transport;
 val ROOT_PATH:       str   = "test/interop/fixtures/root.pem";
 val PEM_BYTES:       usize = 8192;
 val HANDSHAKE_BYTES: usize = 16384;
-val WIRE_BYTES:      usize = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
 val CAPTURE_BYTES:   usize = 4096;
+# what the session's TLS lane may hold: both record buffers and the handshake
+val SESSION_BYTES: usize = 262144;
 # how long one wait for the server may take before the client gives up
-val WAIT_NS: i64 = 5000000000;
+val WAIT_NS: u64 = 5000000000;
 
 rec Lower {
     runtime:   *io_runtime.Runtime;
@@ -75,32 +80,39 @@ rec Session {
     groups:        [1]tls13.NamedGroup;
     signatures:    [1]tls13.SignatureScheme;
     entropy:       secret.Entropy;
-    core:          tls_client.Client;
+    clock:         tls_clock.Source;
+    core:          tls_client.Handshake;
     secure:        stream.Stream;
-    input:         [HANDSHAKE_BYTES]u8;
-    output:        [HANDSHAKE_BYTES]u8;
-    hello:         [HANDSHAKE_BYTES]u8;
-    certificates:  [4]cert.Certificate;
+    heap:          A.Allocator;
+    lender:        pool.Memory;
+    borrower:      pool.Borrower;
+    account:       buffers.Account;
+    source:        buffers.Source;
+    secrets:       buffers.SecretSource;
     owner:         secret.Allocator;
     identity:      credentials.Identity;
     client_key:    keys.PrivateKey;
     client_der:    [PEM_BYTES]u8;
     client_cert:   [1]cert.Certificate;
     key_pem:       [PEM_BYTES]^u8;
-    wire_input:    [WIRE_BYTES]u8;
-    wire_output:   [WIRE_BYTES]u8;
 }
 
 pub rec Client {
-    runtime:        io_runtime.Runtime;
-    runtime_live:   bool;
-    socket:         tcp.Stream;
-    socket_live:    bool;
-    lower_state:    Lower;
-    lower:          transport.Transport;
-    index:          usize;
-    core_live:      bool;
-    secure_live:    bool;
+    runtime:      io_runtime.Runtime;
+    runtime_live: bool;
+    socket:       tcp.Stream;
+    socket_live:  bool;
+    lower_state:  Lower;
+    lower:        transport.Transport;
+    index:        usize;
+    memory_live:  bool;
+    account_open: bool;
+    core_live:    bool;
+    secure_live:  bool;
+    # the operation in flight and the lane it runs on, or none
+    current:        transport.Token;
+    reading:        bool;
+    operating:      bool;
     scope:          cancel.Scope;
     scope_live:     bool;
     key_live:       bool;
@@ -167,7 +179,7 @@ fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.READ, buffer, length, token_context);
     if (sel submitted.err) { ret submitted; }
-    val started: time.Time = clock.instant();
+    val started: time.Instant = clock.instant();
     for {
         pump(state.serving);
         val received: res[usize, io_error.Error] = tcp.stream_read(state.socket,
@@ -178,7 +190,7 @@ fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
             ret submitted;
         }
         if (!io_error.retryable(received.err)
-            || time.time_sub(clock.instant(), started) > WAIT_NS) {
+            || clock.between_ns(started, clock.instant()) > WAIT_NS) {
             io_runtime.fail(state.runtime, submitted.ok, received.err);
             ret submitted;
         }
@@ -304,6 +316,7 @@ pub fun make(client: *Client, serving: *serve.Runtime, server_name: str, alpn: s
     value.groups[0]                 = tls13.X25519;
     value.signatures[0]             = tls13.ED25519;
     value.entropy                   = secret.system_entropy();
+    value.clock                     = tls_clock.system();
     value.configuration             = config.no_client_config();
     value.configuration.server_name = contracts.Bytes{data: server_name::*u8,
         len: str_len(server_name)};
@@ -320,6 +333,7 @@ pub fun make(client: *Client, serving: *serve.Runtime, server_name: str, alpn: s
     value.configuration.signature_len                   = 1;
     value.configuration.client_identity                 = nil;
     value.configuration.entropy                         = ?value.entropy;
+    value.configuration.clock                           = ?value.clock;
     value.configuration.sessions                        = nil;
     value.configuration.limits                          = config.production_limits();
     value.configuration.limits.max_peer_handshake_bytes = HANDSHAKE_BYTES;
@@ -352,38 +366,91 @@ fun start(client: *Client, endpoint: ip.Endpoint, capture: bool) bool {
         aliases_state:                                     lower_aliases, submit_read: lower_read, submit_write: lower_write,
         submit_shutdown:                                   lower_shutdown, submit_close: lower_close,
         submit_abort:                                      lower_close};
-    val storage: tls_client.Storage = tls_client.Storage{
-        input:           ?session(client).input[0], input_capacity: HANDSHAKE_BYTES,
-        output:          ?session(client).output[0], output_capacity: HANDSHAKE_BYTES,
-        hello:           ?session(client).hello[0], hello_capacity: HANDSHAKE_BYTES,
-        certificates:    ?session(client).certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0
-    };
-    var wire: stream.Storage;
-    wire.wire_input           = ?session(client).wire_input[0];
-    wire.wire_input_capacity  = WIRE_BYTES;
-    wire.wire_output          = ?session(client).wire_output[0];
-    wire.wire_output_capacity = WIRE_BYTES;
+    if (!open_memory(client)) { ret false; }
     var extra: tls_client.ExtraExtension;
     extra.kind      = 0;
     extra.data.data = nil;
     extra.data.len  = 0;
-    if (!tls_client.init(?session(client).core, ?session(client).configuration, storage, extra, 0)) { ret false; }
+    if (!tls_client.init(?session(client).core, ?session(client).configuration, lease(client),
+        extra, 0)) { ret false; }
     client.core_live = true;
     if (!operation_ok(cancel.make_root(?client.scope, opt[time.Instant].none{}))) {
         ret false;
     }
     client.scope_live = true;
     client.token      = 1;
-    if (!stream.connect(?session(client).secure, ?session(client).core, wire, ?client.lower, ?client.scope,
-        transport.Token{index: 1, generation: 1}, time.time_unix_sec(clock.wall()), 1)) { ret false; }
+    val token: transport.Token = transport.Token{index: 1, generation: 1};
+    if (!stream.connect(?session(client).secure, ?session(client).core, lease(client),
+        secret_lease(client), ?client.lower, ?client.scope, token, 1)) { ret false; }
     client.secure_live = true;
+    began(client, token, false);
     ret true;
 }
 
+fun lease(client: *Client) tls_buffer.Lease {
+    ret tls_buffer.Lease{source: ?session(client).source,
+        account: ?session(client).account, lane: pool.LANE_TLS};
+}
+
+fun secret_lease(client: *Client) tls_buffer.SecretLease {
+    ret tls_buffer.SecretLease{source: ?session(client).secrets,
+        account: ?session(client).account, lane: pool.LANE_TLS};
+}
+
+# the session's own pool and its one account. the pool holds
+# twice the lane budget, so an oversized exchange fails on its budget rather
+# than waiting on a pool nobody else releases into
+fun open_memory(client: *Client) bool {
+    val value: *Session = session(client);
+    page.make(?value.heap);
+    if (!pool.make(?value.lender, SESSION_BYTES * 2, ?value.heap)) { ret false; }
+    client.memory_live = true;
+    var budgets: pool.Budgets = pool.no_budgets();
+    budgets.lanes[pool.LANE_TLS::usize] = SESSION_BYTES;
+    pool.borrower(?value.borrower, ?value.lender, client.index::u64 + 1, 0, budgets);
+    value.source  = pool.borrowed_source(?value.borrower);
+    value.secrets = pool.borrowed_secret_source(?value.borrower);
+    if (!pool.open(?value.borrower, ?value.account)) { ret false; }
+    client.account_open = true;
+    ret true;
+}
+
+fun close_memory(client: *Client) {
+    val value: *Session = session(client);
+    if (client.account_open && pool.close(?value.lender, ?value.account)) {
+        client.account_open = false;
+    }
+    if (!client.account_open && client.memory_live && pool.destroy(?value.lender)) {
+        client.memory_live = false;
+    }
+}
+
+fun began(client: *Client, token: transport.Token, reading: bool) {
+    client.current   = token;
+    client.reading   = reading;
+    client.operating = true;
+}
+
+# the handshake and writes run on the write lane, reads on the read lane
+fun current(client: *Client) transport.Snapshot {
+    val lanes: stream.Snapshot = stream.snapshot(?session(client).secure);
+    if (client.reading) { ret lanes.read; }
+    ret lanes.write;
+}
+
+# a woken account resumes whatever the stream parked for memory, and each
+# retry arrives as a completion
+fun resume_woken(client: *Client) {
+    val value: *Session = session(client);
+    if (!client.memory_live || !pool.has_woken(?value.lender)) { ret; }
+    var woken: [4]u64;
+    for (pool.woken(?value.lender, ?woken[0], 4) != 0) {}
+    stream.resume(?value.secure);
+}
+
 fun settle(client: *Client) bool {
-    for (transport.snapshot(?session(client).secure.operation).state
-        != transport.OPERATION_TERMINAL) {
+    for (current(client).state != transport.OPERATION_TERMINAL) {
+        resume_woken(client);
         var completion: io_runtime.Completion;
         val polled:     res[usize, io_error.Error] = io_runtime.poll(?client.runtime,
             ?completion, 1);
@@ -393,14 +460,25 @@ fun settle(client: *Client) bool {
     ret true;
 }
 
-fun finish_operation(client: *Client) bool {
-    val finished: transport.Snapshot = transport.snapshot(?session(client).secure.operation);
-    ret stream.destroy_operation(?session(client).secure) && finished.terminal_error == tls_error.OK;
+# release the settled operation, reporting what it ended with
+fun finish_operation(client: *Client) transport.Snapshot {
+    val finished: transport.Snapshot = current(client);
+    if (!stream.destroy_operation(?session(client).secure, client.current)) {
+        var failed: transport.Snapshot = finished;
+        failed.terminal_error = tls_error.INTERNAL_ERROR;
+        ret failed;
+    }
+    client.operating = false;
+    ret finished;
+}
+
+fun finished_ok(client: *Client) bool {
+    ret finish_operation(client).terminal_error == tls_error.OK;
 }
 
 # complete a handshake with the server at `endpoint`
 pub fun handshake(client: *Client, endpoint: ip.Endpoint) bool {
-    ret start(client, endpoint, false) && settle(client) && finish_operation(client);
+    ret start(client, endpoint, false) && settle(client) && finished_ok(client);
 }
 
 # the ClientHello this client would send, without sending any of it
@@ -429,18 +507,24 @@ fun next_token(client: *Client) transport.Token {
 
 # send application bytes through the session
 pub fun send(client: *Client, data: *u8, length: usize) bool {
-    ret stream.write(?session(client).secure, ?client.scope, next_token(client), data, length, 2)
-        && settle(client) && finish_operation(client);
+    val token: transport.Token = next_token(client);
+    if (!stream.write(?session(client).secure, ?client.scope, token, data, length, 2)) {
+        ret false;
+    }
+    began(client, token, false);
+    ret settle(client) && finished_ok(client);
 }
 
 # read application bytes until `needle` has arrived, pumping the server
 pub fun receive(client: *Client, output: *u8, capacity: usize, needle: str) usize {
     var total: usize = 0;
     for (total < capacity) {
-        if (!stream.read(?session(client).secure, ?client.scope, next_token(client),
-            ?output[total], capacity - total, 3) || !settle(client)) { ret total; }
-        val got: transport.Snapshot = transport.snapshot(?session(client).secure.operation);
-        stream.destroy_operation(?session(client).secure);
+        val token: transport.Token = next_token(client);
+        if (!stream.read(?session(client).secure, ?client.scope, token, ?output[total],
+            capacity - total, 3)) { ret total; }
+        began(client, token, true);
+        if (!settle(client)) { ret total; }
+        val got: transport.Snapshot = finish_operation(client);
         if (got.terminal_error != tls_error.OK || got.application_bytes == 0) { ret total; }
         total = total + got.application_bytes;
         if (needle == nil || contains(output, total, needle)) { ret total; }
@@ -461,18 +545,22 @@ fun contains(buffer: *u8, length: usize, needle: str) bool {
 
 pub fun release(client: *Client) {
     if (client.secure_live) {
-        stream.destroy_operation(?session(client).secure);
-        stream.destroy(?session(client).secure);
-        client.secure_live = false;
+        # an operation still in flight, such as a captured hello, is cancelled
+        # and settled so the stream can let go of its buffers
+        if (client.operating) {
+            if (client.scope_live) { cancel.cancel(?client.scope); }
+            if (settle(client))    { finish_operation(client); }
+        }
+        if (stream.destroy(?session(client).secure)) { client.secure_live = false; }
     }
-    if (client.core_live) {
-        tls_client.destroy(?session(client).core);
+    if (client.core_live && tls_client.destroy(?session(client).core)) {
         client.core_live = false;
     }
     if (client.scope_live) {
         cancel.destroy(?client.scope);
         client.scope_live = false;
     }
+    if (!client.secure_live && !client.core_live) { close_memory(client); }
     if (client.key_live) {
         keys.destroy_private(?session(client).client_key);
         client.key_live = false;
