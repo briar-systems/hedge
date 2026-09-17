@@ -148,6 +148,8 @@ Each listener configures a native `backlog` and a pre-submitted `accept_depth`. 
 
 A QUIC listener sizes its UDP socket's buffers with `receive_buffer_bytes` and `send_buffer_bytes`. When they are absent it asks for 4 MiB to receive and 1 MiB to send, because the kernel default (212 KiB on Linux, about 166 full-size datagrams) overflows under a burst of handshakes, and every dropped Initial costs a client a retransmission timeout. The kernel decides what it grants: Linux doubles the request and caps it at `net.core.rmem_max` and `net.core.wmem_max`. So hedge reads the size back and logs both at startup, as `hedge: socket buffers <listener> receive <granted> (asked <requested>) send <granted> (asked <requested>)`. If the granted size is well below the request, raise those sysctls. Either key on a TCP or local listener is a configuration error, as are zero and sizes past the native signed 32-bit range. Changing either needs a restart, like `backlog`, because the size is applied when the socket is bound.
 
+A QUIC listener remembers the nonce of every Retry token it accepts until the token's age passes, so that a replayed token is refused. `max_retry_replay` bounds how many it remembers, 65536 by default. Each remembered nonce costs roughly 120 to 150 bytes in the listener's replay store, so the default bounds the store near 10 MiB. A reload briefly holds two stores, one for the outgoing generation and one for the new. While the store is full, an Initial carrying a Retry token is dropped rather than refused, and the client's retransmission is admitted once older nonces expire. Each such drop counts in `hedge_quic_retry_replay_full_total`. The key is refused on TCP and local listeners, and so is zero. A reload applies a changed value to the connections that arrive afterwards.
+
 `server.limits.max_connections` is optional and absent by default. For TCP and
 local listeners, connection storage grows with what is actually connected, so
 leaving it out does not mean an unbounded server: it means the ceiling is the
@@ -422,7 +424,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the six built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the seven built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
