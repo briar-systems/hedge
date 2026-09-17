@@ -13,6 +13,7 @@ use hedge.proxy.link;
 use hedge.proxy.upstream;
 use hedge.service;
 use hedge.telemetry.trace;
+use hedge_wake: hedge.wake;
 use http.core.body;
 use http.core.exchange;
 use http.core.field;
@@ -90,6 +91,8 @@ pub rec Attempt {
     registry:         *Registry;
     owner_call:       *call.Call;
     owner_generation: u64;
+    # the downstream connection, woken whenever this attempt's link moves
+    waker: hedge_wake.Waker;
 }
 
 # a response body reader that pulls from the upstream link
@@ -258,13 +261,17 @@ pub fun poll(context: ptr, now: time.Time) bool {
             i = i + 1;
             cnt;
         }
-        var steps: usize = 0;
+        val before: link.State = current.state;
+        var steps:  usize      = 0;
+        var moved:  bool       = false;
         for (steps < 16) {
             val progress: link.Step = link.step(current, now);
+            if (progress != link.STEP_BLOCKED && progress != link.STEP_IDLE)     { moved = true; }
             if (progress != link.STEP_PROGRESS && progress != link.STEP_HEADERS) { brk; }
             progressed = true;
             steps      = steps + 1;
         }
+        if (moved || current.state != before) { wake_owner(runtime, current); }
         i = i + 1;
     }
     # a terminal body releases its link immediately. the attempt remains owned by
@@ -282,6 +289,25 @@ pub fun poll(context: ptr, now: time.Time) bool {
         i = i + 1;
     }
     ret progressed;
+}
+
+# the attempt waiting on a link learns that the link moved
+fun wake_owner(runtime: *Runtime, moved: *link.Link) {
+    var i: usize = 0;
+    for (i < MAX_LINKS) {
+        val attempt: *Attempt = ?runtime.attempts[i];
+        if (attempt.live && attempt.link == moved && hedge_wake.valid(?attempt.waker)) {
+            hedge_wake.wake(?attempt.waker);
+        }
+        i = i + 1;
+    }
+}
+
+# a pending attempt waits for its link to move, and for its deadline
+fun park_attempt(attempt: *Attempt, active: *call.Call) exchange.ServiceStatus {
+    var deadline_ns: u64 = 0;
+    if (attempt.has_deadline) { deadline_ns = clock.to_ns(attempt.attempt_deadline); }
+    ret call.park(active, call.WAIT_WAKE, deadline_ns);
 }
 
 fun free_attempt(runtime: *Runtime) *Attempt {
@@ -572,7 +598,7 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
         ret bad_gateway(active, status.BAD_GATEWAY);
     }
     attempt.phase = PHASE_CONNECT;
-    ret exchange.SERVICE_PENDING;
+    ret park_attempt(attempt, active);
 }
 
 fun settle_attempt(attempt: *Attempt, outcome: upstream.Outcome, now: time.Time) {
@@ -709,6 +735,7 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
             call.request(active).metadata.deadline, ?attempt.attempt_deadline);
         attempt.owner_call        = active;
         attempt.owner_generation  = active.exchange.generation;
+        attempt.waker             = call.waker(active);
         attempt.body.reader.valid = false;
         if (!call.attach_finalizer(active, call.Finalizer{
             ctx: (attempt)::ptr,
@@ -778,10 +805,11 @@ fun advance(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
             attempt.phase = PHASE_SEND;
         }
         val progress: link.Step = link.step(attempt.link, now);
-        if (progress == link.STEP_BLOCKED) { ret exchange.SERVICE_PENDING; }
+        if (progress == link.STEP_BLOCKED) { ret park_attempt(attempt, active); }
         steps = steps + 1;
     }
-    ret exchange.SERVICE_PENDING;
+    # the step bound ran out with work left, so ask for another turn at once
+    ret call.yield_turn(active);
 }
 
 fun outbound_target(active: *call.Call) target.Target {

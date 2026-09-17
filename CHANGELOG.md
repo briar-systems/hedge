@@ -14,6 +14,10 @@
 - A QUIC connection whose peer left with a response still unacknowledged no longer holds shutdown open (#161). Past its drain deadline the forced release waited for the HTTP/3 session before cancelling the transport, but a request stream only closes once the transport settles it, and with the peer gone and the connection timer off nothing did. The transport is now cancelled first.
 - An HTTP/3 response under many concurrent connections no longer stops short of its last bytes (#163). mach-quic v0.9.3 publishes a send range that crosses a lap of its stream buffer under the right offset, where a range published under the old offset left the next lap unsent and later counted as delivered.
 
+- A budget queue whose head expires now admits the waiters that head was holding back (#181). They used to wait for an unrelated release.
+- A connection still making progress at the end of its turn runs again on the next turn (#181). Without this, an HTTP/2 upload over TLS larger than its flow-control window could stall until the request timeout.
+- The interop matrix's telemetry leg configures the seven built-in metric series. It was refused at startup, which stopped the matrix before its remaining legs ran.
+
 ### Added
 
 - `hedge.timer`, a hierarchical timing wheel that will hold every deadline hedge decides (#179, part of #172). It has four levels of 256 one-millisecond slots, covering about 49 days. Entries are intrusive, live in a chunked table and never move, and each level keeps an occupancy bitmap, so arming, disarming and finding the next deadline are constant time. Deadlines are monotonic and round up to the next tick, so nothing fires early. With 100,000 armed entries a re-arm costs 70–100 ns, or about 25 ns when the deadline stays in its slot, against about 2,000 ns for a std io timer's cancel and resubmit.
@@ -22,7 +26,10 @@
 
 ### Changed
 
-- The QUIC runtime runs only the connections that have work (#180, part of #172). A settled completion, a fired timer or a state change marks its connection ready, and `advance` services only the ready list, in arrival order. QUIC transport and drain deadlines live in the serving runtime's timing wheel, which also sets the poll timeout, and `hedge.protocol.quic.timers` is removed. 100 held idle HTTP/3 connections cost about 2% CPU, down from 66%. Until #181 gives them wakes of their own, a connection with a request in service, or with a teardown step that waits on nothing that wakes it, is still visited every turn.
+- The QUIC runtime runs only the connections that have work (#180, part of #172). A settled completion, a fired timer or a state change marks its connection ready, and `advance` services only the ready list, in arrival order. QUIC transport and drain deadlines live in the serving runtime's timing wheel, which also sets the poll timeout, and `hedge.protocol.quic.timers` is removed. 100 held idle HTTP/3 connections cost about 2% CPU, down from 66%. A connection with a teardown step that waits on nothing that wakes it is still visited every turn until #182.
+- TCP connections run only when something happened to them (#181, part of #172). Each worker has a wake queue of tagged owners (`hedge.wake`) and a ready queue, and every connection deadline (prologue, request, HTTP/1.1 and HTTP/2 timeouts, a service's wait) is an entry in the worker's timing wheel. The per-turn sweep over every connection is gone. With release builds, 4000 idle HTTP/1.1 keep-alive connections cost 0.2% CPU, down from 2.1%. 2000 idle TLS connections cost 0.2%, down from 1.6%. Measured as the server process's CPU over 10 s after every connection was held.
+- A service that reports `SERVICE_PENDING` must say what it waits on with `call.park` (a body, a wake, a deadline) or ask for another turn with `call.yield_turn`, and dispatch fails a pending service that does neither (#181). Budget waiters form a FIFO queue on their budget, and a release wakes the waiter it admits. The proxy wakes the request waiting on an upstream link when that link moves. An HTTP/3 connection with a request in service waits for that request's wake or deadline instead of running every turn, and a queued QUIC initial waits for its budget's wake or its queue deadline. A pending service is still re-entered on any event its connection has (#131).
+- **Breaking.** `call.bind`, `budget.charge`, `dispatch.admit`, `connection.make`, `h2.begin` and the HTTP/3 `session.begin` take a `hedge.wake.Waker`. `quic_runtime.RuntimeConfig` takes the worker's `wakes`. `quic_runtime.next_budget_deadline` is removed, `quic_runtime.wake` and `owns` are new, and `budget.relocate` is the only way to move a queued charge.
 - **Breaking.** `quic_runtime.RuntimeConfig` takes the worker's `timers`, `quic_runtime.next_deadline` is removed in favour of the wheel's, and `quic_runtime.fire`, `owns_timer` and `has_ready` are new. `quic_runtime.Snapshot.timers` counts armed wheel entries.
 - hedge is copyright Briar Systems LLC (#184). The MIT license terms are unchanged.
 - **Breaking.** Dependencies move to the mach-std 4 stack (#171): mach-std v4.2.0, mach-crypto v0.12.0, mach-tls v0.5.1, mach-quic v0.11.0, mach-http v0.11.0, mach-acme v0.4.2 and laurel v0.13.3. Both `mach.toml` and `test/acme/mach.toml` carry the std and crypto pins (#171, #186). Errors hedge raises itself now name their kind (`io_error.make`), as std 4 requires. `listener.apply_stream_policy` takes a socket handle rather than a raw descriptor. `connection.stream_released` reports whether the driver has taken a connection's socket. `quic_runtime.PumpConfig.max_replay` is required.
@@ -32,9 +39,10 @@
 
 ### Known issues
 
+- A proxied response body only reaches the client over cleartext HTTP/1.1 (#196). Over TLS it stops after 8192 bytes, and over HTTP/2 and HTTP/3 the request is cancelled after its headers.
 - A burst of QUIC handshakes larger than the server can complete within its clients' timeouts collapses (#164). With 1100 clients dialling at once, about half connect. The same 1100 arriving at 40 per second almost all connect. Bursts of 200 connect in under 5 seconds.
 - hedge builds for `windows-x86_64` but is not supported at runtime on Windows (#149). The CI leg for Windows is build-only until that is fixed.
-- The TLS stall fix merged from 0.5.2 (#189) bounds a TLS operation through the deadline std's cancel scope carries. That is temporary: stage 3c (#181) moves connection deadlines into hedge's timing wheel, and the scope deadline goes with it. The HTTP/2 adapter's connection deadlines are likewise temporary until briar-systems/mach-http#110.
+- The TLS stall fix merged from 0.5.2 (#189) bounds a TLS operation through the deadline std's cancel scope carries. That is temporary: stage 3c-2 (#195) runs TLS channels by events, and the scope deadline goes with it. The HTTP/2 adapter's connection deadlines are likewise temporary until briar-systems/mach-http#110.
 
 ## [0.5.2] - 2026-09-17
 

@@ -20,6 +20,7 @@ use hedge.dispatch.plan;
 use hedge.service;
 use hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
+use hedge_wake:      hedge.wake;
 use http.core.body;
 use http.core.exchange;
 use http.core.field;
@@ -111,11 +112,14 @@ rec Body {
 }
 
 rec Slot {
-    live:              bool;
-    id:                u32;
-    generation:        u64;
-    scope:             cancel.Scope;
-    scope_live:        bool;
+    live:       bool;
+    id:         u32;
+    generation: u64;
+    scope:      cancel.Scope;
+    scope_live: bool;
+    # the request deadline in monotonic nanoseconds, zero for none. the worker's
+    # wheel wakes the connection for it and pump_slot enforces it
+    deadline_ns:       u64;
     body:              Body;
     request:           message.Request;
     response:          message.Response;
@@ -206,15 +210,17 @@ pub rec Session {
     peer:               message.Endpoint;
     local:              message.Endpoint;
     request_timeout_ns: u64;
-    chunks:             *storage.Chunks;
-    call_memory_bytes:  usize;
-    engine_scope:       *cancel.Scope;
-    requests:           u64;
-    last_event:         engine_h2.EventKind;
-    last_step:          Step;
-    engine_started:     bool;
-    final_goaway_sent:  bool;
-    release_failed:     bool;
+    # the connection's waker, which every stream's call wakes
+    waker:             hedge_wake.Waker;
+    chunks:            *storage.Chunks;
+    call_memory_bytes: usize;
+    engine_scope:      *cancel.Scope;
+    requests:          u64;
+    last_event:        engine_h2.EventKind;
+    last_step:         Step;
+    engine_started:    bool;
+    final_goaway_sent: bool;
+    release_failed:    bool;
 }
 
 fun reset_slot(slot: *Slot) {
@@ -447,9 +453,10 @@ pub fun begin(session: *Session, channel: *transport.Transport, scope: *cancel.S
     listener_name: str,
     secure: bool, peer: message.Endpoint, local: message.Endpoint,
     request_timeout_ns: u64, chunks: *storage.Chunks, call_memory_bytes: usize,
-    timeouts: Timeouts, now: time.Time) bool {
+    timeouts: Timeouts, waker: hedge_wake.Waker, now: time.Time) bool {
     if (session == nil || !session.live || channel == nil
         || scope == nil || active_plan == nil || chunks == nil) { ret false; }
+    session.waker              = waker;
     session.timeouts           = timeouts;
     session.idle               = true;
     session.idle_since         = now;
@@ -720,15 +727,16 @@ fun write_status(slot: *Slot, code: status.Status) view.View {
 fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     now: time.Time) bool {
     session.requests = session.requests + 1;
-    val has_deadline: bool      = session.request_timeout_ns != 0;
-    var deadline:     time.Time = now;
-    if (has_deadline) {
-        deadline = clock.after(now, session.request_timeout_ns);
+    slot.deadline_ns = 0;
+    if (session.request_timeout_ns != 0) {
+        slot.deadline_ns = clock.after_ns(clock.to_ns(now), session.request_timeout_ns);
     }
     if (slot.scope_live) { operation_ok(cancel.destroy(?slot.scope)); }
     slot.scope_live = false;
-    if (!operation_ok(cancel.make_child(?slot.scope, session.engine_scope, has_deadline,
-        deadline))) { ret false; }
+    # mach-http requires the exchange scope to carry the request's deadline. the
+    # wheel entry is what enforces it on a service that submits no io
+    if (!operation_ok(cancel.make_child(?slot.scope, session.engine_scope,
+        slot.deadline_ns != 0, clock.from_ns(slot.deadline_ns)))) { ret false; }
     slot.scope_live            = true;
     slot.body.session          = session;
     slot.body.slot             = (slot)::usize - (?session.slots[0])::usize;
@@ -771,8 +779,8 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     metadata.local      = session.local;
     # calendar time: telemetry and caching measure from it
     metadata.received_at  = clock.wall();
-    metadata.has_deadline = has_deadline;
-    metadata.deadline     = deadline;
+    metadata.has_deadline = slot.deadline_ns != 0;
+    metadata.deadline     = clock.from_ns(slot.deadline_ns);
     # the engine binds an exchange only when its request index is the stream id
     metadata.request_index = event.stream_id::u64;
     if (!message.init_request(?slot.request, method_of(event.headers.method),
@@ -796,7 +804,7 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     }
     if (!telemetry_trace.make_root(?slot.trace, false)) { ret false; }
     if (!call.bind(?slot.active_call, ?slot.exchange, ?slot.memory, ?slot.trace,
-        session.plan.generation, session.listener_name)) { ret false; }
+        session.plan.generation, session.listener_name, session.waker)) { ret false; }
     slot.exchange_live = true;
     ret true;
 }
@@ -1235,6 +1243,43 @@ fun deadline_passed(session: *Session, now: time.Time) bool {
     if (session.requests == 0) { idle_limit = session.timeouts.header_ns; }
     ret (session.idle && elapsed(session.idle_since, now, idle_limit))
         || (session.writing && elapsed(session.writing_since, now, session.timeouts.write_ns));
+}
+
+fun earlier(found: bool, candidate: u64, output: *u64) bool {
+    if (!found || candidate < @output) { @output = candidate; }
+    ret true;
+}
+
+# the earliest instant this session has to be stepped for a deadline alone, in
+# monotonic nanoseconds. it reflects the state left by the last step, so the
+# connection asks again after every one
+pub fun next_deadline(session: *Session, output: *u64) bool {
+    if (session == nil || output == nil || !runnable(session)) { ret false; }
+    var found: bool  = false;
+    var i:     usize = 0;
+    for (i < MAX_STREAMS) {
+        val slot: *Slot = ?session.slots[i];
+        if (slot.live && slot.exchange_live && slot.deadline_ns != 0) {
+            found = earlier(found, slot.deadline_ns, output);
+        }
+        var waited: u64 = 0;
+        if (slot.live && slot.exchange_live && slot.service_pending
+            && call.wait_deadline(?slot.active_call, ?waited)) {
+            found = earlier(found, waited, output);
+        }
+        i = i + 1;
+    }
+    var idle_limit: u64 = session.timeouts.idle_ns;
+    if (session.requests == 0) { idle_limit = session.timeouts.header_ns; }
+    if (session.idle && idle_limit != 0) {
+        found = earlier(found, clock.after_ns(clock.to_ns(session.idle_since), idle_limit),
+            output);
+    }
+    if (session.writing && session.timeouts.write_ns != 0) {
+        found = earlier(found, clock.after_ns(clock.to_ns(session.writing_since),
+            session.timeouts.write_ns), output);
+    }
+    ret found;
 }
 
 pub fun step(session: *Session, now: time.Time) Step {
