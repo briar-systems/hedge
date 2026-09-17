@@ -13,6 +13,7 @@
 # connection that never negotiates HTTP/2 must not pay for that.
 
 use hedge.budget;
+use hedge.clock;
 use hedge.dispatch;
 use hedge.dispatch.call;
 use hedge.dispatch.plan;
@@ -40,12 +41,6 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-
-fun wall_now() time.Time {
-    val sampled: time.Clock = time.now();
-    if (sel sampled.ok) { ret sampled.ok; }
-    ret time.Time{sec: 0, nsec: 0};
-}
 
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
@@ -677,24 +672,13 @@ fun write_status(slot: *Slot, code: status.Status) view.View {
     ret view.view(?slot.status_text[0], 3);
 }
 
-fun deadline_from(now: time.Time, timeout_ns: u64) time.Time {
-    var deadline: time.Time = now;
-    deadline.sec  = now.sec + (timeout_ns / 1000000000)::i64;
-    deadline.nsec = now.nsec + (timeout_ns % 1000000000)::i64;
-    if (deadline.nsec >= 1000000000) {
-        deadline.nsec = deadline.nsec - 1000000000;
-        deadline.sec  = deadline.sec + 1;
-    }
-    ret deadline;
-}
-
 fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     now: time.Time) bool {
     session.requests = session.requests + 1;
     val has_deadline: bool      = session.request_timeout_ns != 0;
     var deadline:     time.Time = now;
     if (has_deadline) {
-        deadline = deadline_from(now, session.request_timeout_ns);
+        deadline = clock.after(now, session.request_timeout_ns);
     }
     if (slot.scope_live) { operation_ok(cancel.destroy(?slot.scope)); }
     slot.scope_live = false;
@@ -735,12 +719,13 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     }
     slot.request_trailers = field.init(nil, 0, session.limits.request_trailers);
     var metadata: message.Metadata;
-    metadata.version      = message.version_h2();
-    metadata.secure       = session.secure;
-    metadata.early_data   = false;
-    metadata.peer         = session.peer;
-    metadata.local        = session.local;
-    metadata.received_at  = now;
+    metadata.version    = message.version_h2();
+    metadata.secure     = session.secure;
+    metadata.early_data = false;
+    metadata.peer       = session.peer;
+    metadata.local      = session.local;
+    # calendar time: telemetry and caching measure from it
+    metadata.received_at  = clock.wall();
     metadata.has_deadline = has_deadline;
     metadata.deadline     = deadline;
     # the engine binds an exchange only when its request index is the stream id
@@ -986,7 +971,7 @@ fun fail_exchange(session: *Session, slot: *Slot, code: status.Status) Step {
 fun start_exchange(session: *Session, slot: *Slot) Step {
     val served: dispatch.Result = dispatch.serve(session.plan, ?slot.active_call,
         ?slot.captures[0], CAPTURE_SLOTS, session.budgets, ?slot.charge,
-        wall_now());
+        clock.monotonic());
     if (served.outcome == dispatch.FAILED) {
         ret fail_exchange(session, slot, status.INTERNAL_SERVER_ERROR);
     }
@@ -999,7 +984,7 @@ fun start_exchange(session: *Session, slot: *Slot) Step {
 
 fun resume_exchange(session: *Session, slot: *Slot) Step {
     val served: dispatch.Result = dispatch.resume(session.plan, ?slot.active_call,
-        session.budgets, ?slot.charge, wall_now());
+        session.budgets, ?slot.charge, clock.monotonic());
     if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
     slot.service_pending = false;
     if (served.outcome == dispatch.FAILED) {
@@ -1127,6 +1112,17 @@ fun return_event(session: *Session, event: engine_h2.Event) {
 
 fun pump_slot(session: *Session, slot: *Slot, now: time.Time) Step {
     if (!slot.live || !slot.exchange_live) { ret STEP_IDLE; }
+    # a handler that never completes submits no io under the stream scope, so
+    # its request deadline is enforced here or not at all
+    cancel.expire(?slot.scope, now);
+    if (!slot.cancelling && !scope_active(?slot.scope)) {
+        val stream: *engine_h2.Stream = engine_h2.stream_for(?session.engine,
+            slot.id);
+        if (stream != nil && stream.state != engine_h2.STREAM_CLOSED
+            && !engine_h2.cancel_stream(?session.engine, slot.id,
+            engine_h2.H2_CANCEL)) { ret STEP_ERROR; }
+        ret retire_closed_stream(session, slot);
+    }
     if (slot.cancelling) {
         ret retire_closed_stream(session, slot);
     }

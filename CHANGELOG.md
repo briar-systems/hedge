@@ -2,8 +2,6 @@
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-09-16
-
 ### Fixed
 
 - A burst of concurrent HTTP/3 connections no longer leaves the QUIC listener deaf (#145). A connection force-released at its drain deadline skipped the transport's `finish_close` and ignored a refused `assembly.release_closed`, so its slot was reused over a live TLS server and refused every later connection it was given. Each refusal was reported as a runtime failure, which released every QUIC pump and cancelled the pending receive, so the socket was never read again. The forced release now releases the h3 session, finishes the transport's close, destroys the scope and releases the assembly, retrying on later passes until each step completes, and never frees the slot before then.
@@ -26,6 +24,16 @@
 
 - A burst of QUIC handshakes larger than the server can complete within its clients' timeouts collapses (#164). With 1100 clients dialling at once, about half connect. The same 1100 arriving at 40 per second almost all connect. Bursts of 200 connect in under 5 seconds.
 - hedge builds for `windows-x86_64` but is not supported at runtime on Windows (#149). The CI leg for Windows is build-only until that is fixed.
+
+## [0.5.1] - 2026-09-17
+
+### Security
+
+- A client that opened a TCP connection and then sent nothing was never disconnected (#168). The deadline meant to close it after `timeouts.handshake_ms`, which also bounds the TLS handshake, was computed from the wall clock, but hedge's I/O layer enforces deadlines against the monotonic clock, so the deadline was always decades away. Any client could hold connection slots, admission leases and descriptors open indefinitely by connecting and staying silent, on cleartext and TLS listeners alike. Every deadline hedge builds now comes from the monotonic clock. Wall time is used only for calendar purposes: `Date` headers, certificate validity, cache freshness and request timestamps.
+
+### Fixed
+
+- An HTTP/2 request whose handler never completes is reset when `timeouts.request_ms` passes (#168). The stream's deadline was never checked, because a handler that submits no I/O gives the I/O layer nothing to time out.
 
 ## [0.5.0] - 2026-09-16
 
