@@ -270,7 +270,8 @@ pub rec Connection {
     refused_memory:      bool;
     memory_deadline_ns:  u64;
     memory_expired:      bool;
-    stage:               [READ_BYTES]u8;
+    stage_chunk:         buffers.Chunk;
+    stage_held:          bool;
     stage_length:        usize;
     stage_offset:        usize;
     body_done:           bool;
@@ -1365,6 +1366,29 @@ fun response_body_progress(reader: *body.Reader, output: *u8,
         body.REUSE_FORBIDDEN);
 }
 
+# the response staging buffer is borrowed from the connection's own account
+# only while a response body is being serialized, so an idle connection holds
+# none of it. a refusal registers the account for a wake, which the memory
+# deadline already bounds
+fun ensure_stage(owner: *Connection) bool {
+    if (owner.stage_held) { ret true; }
+    val got: buffers.Acquired = buffers.source_acquire(?owner.source, ?owner.account,
+        buffers.Request{bytes: READ_BYTES, align: 0, lane: memory.LANE_IO, secret: false},
+        true);
+    if (!(sel got.status.ok)) { ret false; }
+    owner.stage_chunk = got.chunk;
+    owner.stage_held  = true;
+    ret true;
+}
+
+fun release_stage(owner: *Connection) {
+    if (!owner.stage_held) { ret; }
+    buffers.source_release(?owner.source, ?owner.account, owner.stage_chunk);
+    owner.stage_held   = false;
+    owner.stage_length = 0;
+    owner.stage_offset = 0;
+}
+
 # pull from the response body into the staging buffer and hand it to the
 # serializer
 #
@@ -1379,13 +1403,14 @@ fun advance_response(owner: *Connection, now: time.Instant) Step {
         owner.stage_length = 0;
         if (!owner.body_done) {
             if (owner.response.body_kind == message.BODY_READER) {
+                if (!ensure_stage(owner)) { ret STEP_BLOCKED; }
                 val reader:   *body.Reader  = owner.response.body_reader;
                 val progress: body.Progress = response_body_progress(reader,
-                    ?owner.stage[0], READ_BYTES);
+                    owner.stage_chunk.data, READ_BYTES);
                 if (progress.status == body.DATA) {
                     owner.stage_length = progress.count;
                     owner.body_chunks  = owner.body_chunks + 1;
-                    call.record_body(?owner.active_call, ?owner.stage[0], progress.count);
+                    call.record_body(?owner.active_call, owner.stage_chunk.data, progress.count);
                 }
                 or (progress.status == body.PENDING)  { ret STEP_BLOCKED; }
                 or (progress.status == body.COMPLETE) { owner.body_done = true; }
@@ -1399,7 +1424,7 @@ fun advance_response(owner: *Connection, now: time.Instant) Step {
     var payload: *u8   = nil;
     var length:  usize = 0;
     if (owner.stage_offset < owner.stage_length) {
-        payload = ?owner.stage[owner.stage_offset];
+        payload = ?owner.stage_chunk.data[owner.stage_offset];
         length  = owner.stage_length - owner.stage_offset;
     }
     val final:   bool             = owner.body_done && length == 0;
@@ -1415,6 +1440,7 @@ fun advance_response(owner: *Connection, now: time.Instant) Step {
 fun settle_exchange(owner: *Connection, now: time.Instant) bool {
     if (!owner.exchange_live)                                   { ret true; }
     if (exchange.finish(?owner.exchange) != exchange.FINISH_OK) { ret false; }
+    release_stage(owner);
     val finalized: bool = call.release(?owner.active_call);
     budget.release(owner.budgets, ?owner.charge);
     connection.release(?owner.engine, owner.active_slot, now);
@@ -1842,6 +1868,9 @@ pub fun close(owner: *Connection) bool {
         owner.session = secure.NO_SESSION;
     }
     owner.handshaking = false;
+    # the account cannot close while it still holds the staging chunk, and a
+    # connection torn down mid-response still holds it
+    release_stage(owner);
     if (owner.account_live) {
         if (!memory.close(owner.borrower.memory, ?owner.account)) { owner.close_failed = true; }
         owner.account_live = false;
@@ -1889,6 +1918,7 @@ pub rec Snapshot {
     response_started: bool;
     service_pending:  bool;
     response_status:  status.Status;
+    stage_held:       bool;
 }
 
 pub fun snapshot(owner: *Connection) Snapshot {
@@ -1898,7 +1928,7 @@ pub fun snapshot(owner: *Connection) Snapshot {
             engine_state:    0, engine_error: 0,
             last_event:      connection.EVENT_NONE, last_step: STEP_IDLE, setup_failure: SETUP_OK, request_failure: 0, body_chunks: 0, requests: 0,
             exchange_live:   false, response_started: false, service_pending: false,
-            response_status: 0};
+            response_status: 0, stage_held: false};
     }
     ret Snapshot{
         state:            owner.state,
@@ -1918,6 +1948,7 @@ pub fun snapshot(owner: *Connection) Snapshot {
         response_started: owner.response_started,
         service_pending:  owner.service_pending,
         response_status:  owner.response.status,
+        stage_held:       owner.stage_held,
     };
 }
 
