@@ -343,7 +343,6 @@ rec StatelessSend {
     packet:       net_types.Packet;
     context:      CompletionContext;
     generation:   u64;
-    next_free:    usize;
     next_pending: usize;
     prev_pending: usize;
     pending:      bool;
@@ -464,17 +463,19 @@ pub rec Pump {
     token_generation:         u64;
     # stateless sends grow on demand up to MAX_STATELESS_PENDING. the pending
     # list is what the completion sweep walks, so it costs what is in flight
-    stateless:         hedge_storage.Table[StatelessSend];
-    stateless_claimed: usize;
-    stateless_free:    usize;
-    stateless_pending: usize;
-    stateless_live:    usize;
-    receive_pending:   bool;
-    scope_live:        bool;
-    started:           bool;
-    draining:          bool;
-    cancelling:        bool;
-    live:              bool;
+    stateless: hedge_storage.Table[StatelessSend];
+    # a per-pump monotonic generation stamped on each send, so a completion for a
+    # slot the table has since released and reused (or compacted away and regrown)
+    # is detected as stale. u64 never wraps in practice
+    stateless_generation: u64;
+    stateless_pending:    usize;
+    stateless_live:       usize;
+    receive_pending:      bool;
+    scope_live:           bool;
+    started:              bool;
+    draining:             bool;
+    cancelling:           bool;
+    live:                 bool;
 }
 
 pub rec Snapshot {
@@ -1221,10 +1222,9 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     if (!hedge_storage.make_table[StatelessSend](?pump.stateless, pump.backing)) {
         ret FAILED;
     }
-    pump.stateless_claimed = 0;
-    pump.stateless_free    = NO_CONNECTION;
-    pump.stateless_pending = NO_CONNECTION;
-    pump.stateless_live    = 0;
+    pump.stateless_generation = 0;
+    pump.stateless_pending    = NO_CONNECTION;
+    pump.stateless_live       = 0;
     var i: usize = 0;
     for (i < ADMISSION_BANKS) {
         pump.admissions[i].live     = false;
@@ -2114,20 +2114,9 @@ fun stateless_at(pump: *Pump, index: usize) *StatelessSend {
 # allocator refuses to grow
 fun claim_stateless(pump: *Pump) usize {
     if (pump.stateless_live >= MAX_STATELESS_PENDING) { ret NO_CONNECTION; }
-    var index: usize = pump.stateless_free;
-    if (index != NO_CONNECTION) {
-        pump.stateless_free = stateless_at(pump, index).next_free;
-    }
-    or {
-        if (pump.stateless_claimed == hedge_storage.table_capacity[StatelessSend](?pump.stateless)
-            && !hedge_storage.grow_table[StatelessSend](?pump.stateless)) {
-            ret NO_CONNECTION;
-        }
-        index                  = pump.stateless_claimed;
-        pump.stateless_claimed = pump.stateless_claimed + 1;
-    }
+    val index: usize = hedge_storage.table_claim[StatelessSend](?pump.stateless);
+    if (index == hedge_storage.NO_INDEX) { ret NO_CONNECTION; }
     val operation: *StatelessSend = stateless_at(pump, index);
-    operation.next_free    = NO_CONNECTION;
     operation.prev_pending = NO_CONNECTION;
     operation.next_pending = pump.stateless_pending;
     if (pump.stateless_pending != NO_CONNECTION) {
@@ -2152,9 +2141,8 @@ fun release_stateless(pump: *Pump, index: usize) {
     operation.pending      = false;
     operation.next_pending = NO_CONNECTION;
     operation.prev_pending = NO_CONNECTION;
-    operation.next_free    = pump.stateless_free;
-    pump.stateless_free    = index;
     pump.stateless_live    = pump.stateless_live - 1;
+    hedge_storage.table_release[StatelessSend](?pump.stateless, index);
 }
 
 fun submit_stateless(controls: *ControlView, runtime: *Runtime, pump_index: usize,
@@ -2167,7 +2155,8 @@ fun submit_stateless(controls: *ControlView, runtime: *Runtime, pump_index: usiz
         ret BLOCKED;
     }
     val operation: *StatelessSend = stateless_at(pump, index);
-    operation.generation = next_generation(operation.generation);
+    pump.stateless_generation = next_generation(pump.stateless_generation);
+    operation.generation      = pump.stateless_generation;
     std_memory.raw_copy(?operation.buffer[0], data, length);
     operation.packet.buffer                = ?operation.buffer[0];
     operation.packet.capacity              = length;
@@ -3120,7 +3109,7 @@ fun settle_send(controls: *ControlView, runtime: *Runtime, context: *CompletionC
 fun settle_stateless(controls: *ControlView, runtime: *Runtime, context: *CompletionContext,
     completion: io_runtime.Completion) Status {
     val pump: *Pump = ?controls.pumps[context.pump];
-    if (context.operation >= pump.stateless_claimed) { ret STALE; }
+    if (context.operation >= hedge_storage.table_capacity[StatelessSend](?pump.stateless)) { ret STALE; }
     val operation: *StatelessSend = stateless_at(pump, context.operation);
     if (!operation.pending
         || operation.generation != context.operation_generation) { ret STALE; }
@@ -3696,12 +3685,11 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
     pump.listener_name = nil;
     clear_pump_config(pump);
     if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) { ret FAILED; }
-    pump.stateless_claimed = 0;
-    pump.stateless_free    = NO_CONNECTION;
-    pump.stateless_pending = NO_CONNECTION;
-    pump.storage           = nil;
-    pump.started           = false;
-    pump.live              = false;
+    pump.stateless_generation = 0;
+    pump.stateless_pending    = NO_CONNECTION;
+    pump.storage              = nil;
+    pump.started              = false;
+    pump.live                 = false;
     if (runtime.pump_count != 0) { runtime.pump_count = runtime.pump_count - 1; }
     ret OK;
 }
@@ -5068,8 +5056,8 @@ test "hedge.protocol.quic.runtime: a pump holds more pending stateless sends tha
     val controls: *ControlView = test_controls(?fixture);
     val pump:     *Pump        = ?controls.pumps[0];
     if (!hedge_storage.make_table[StatelessSend](?pump.stateless, test_allocator())) { ret 90; }
-    pump.stateless_free    = NO_CONNECTION;
-    pump.stateless_pending = NO_CONNECTION;
+    pump.stateless_generation = 0;
+    pump.stateless_pending    = NO_CONNECTION;
     var claimed: [64]usize;
     var i:       usize = 0;
     for (i < 64) {
@@ -5078,7 +5066,8 @@ test "hedge.protocol.quic.runtime: a pump holds more pending stateless sends tha
         stateless_at(pump, claimed[i]).pending = true;
         i                                      = i + 1;
     }
-    if (pump.stateless_live != 64 || pump.stateless_claimed != 64) { ret 2; }
+    if (pump.stateless_live != 64
+        || hedge_storage.table_live[StatelessSend](?pump.stateless) != 64) { ret 2; }
     # settle out of order, then every pending send is still reachable
     release_stateless(pump, 0);
     release_stateless(pump, 63);
@@ -5091,9 +5080,9 @@ test "hedge.protocol.quic.runtime: a pump holds more pending stateless sends tha
         at   = stateless_at(pump, at).next_pending;
     }
     if (seen != 61 || pump.stateless_live != 61) { ret 4; }
-    # released slots are reused before the table grows
+    # the lowest released slot is reused before the table grows
     val reused: usize = claim_stateless(pump);
-    if (reused != 17 || pump.stateless_claimed != 64) { ret 5; }
+    if (reused != 0 || hedge_storage.table_count[StatelessSend](?pump.stateless) != 3) { ret 5; }
     release_stateless(pump, reused);
     i = 1;
     for (i < 63) {
@@ -5113,8 +5102,8 @@ test "hedge.protocol.quic.runtime: a pump at its stateless ceiling drops and cou
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
     val pump: *Pump = ?controls.pumps[0];
     if (!hedge_storage.make_table[StatelessSend](?pump.stateless, test_allocator())) { ret 91; }
-    pump.stateless_free    = NO_CONNECTION;
-    pump.stateless_pending = NO_CONNECTION;
+    pump.stateless_generation = 0;
+    pump.stateless_pending    = NO_CONNECTION;
     var i: usize = 0;
     for (i < MAX_STATELESS_PENDING) {
         if (claim_stateless(pump) != i) { ret 1; }
