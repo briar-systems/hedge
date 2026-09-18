@@ -486,27 +486,29 @@ fun handle_connect(transport: *Transport, completion: io_runtime.Completion) {
 }
 
 # advances a secured exchange whenever its outstanding tls operation settles
+# mach-tls keeps on a cancelled operation the bytes that settled before the
+# cancel, and reports them through `transferred`, so a secured exchange
+# accounts them before it weighs the terminal error, the same order the
+# cleartext handlers use. a handshake carries no application bytes, so it fails
+# on any error.
 fun settle_secure(transport: *Transport) Status {
     val progress: origination.Status = origination.poll(transport.tls);
     if (progress == origination.PENDING) { ret PENDING; }
     transport.pending = false;
-    if (progress != origination.OK) {
-        if (transport.stage == HANDSHAKING) {
-            ret fail(transport, CAUSE_HANDSHAKE);
-        }
-        if (transport.stage == WRITING) { ret fail(transport, CAUSE_WRITE); }
-        ret fail(transport, CAUSE_READ);
-    }
     if (transport.stage == HANDSHAKING) {
-        if (!submit_write(transport)) { ret fail(transport, CAUSE_WRITE); }
+        if (progress != origination.OK) { ret fail(transport, CAUSE_HANDSHAKE); }
+        if (!submit_write(transport))   { ret fail(transport, CAUSE_WRITE); }
         transport.stage = WRITING;
         ret PENDING;
     }
     if (transport.stage == WRITING) {
         val written: usize = origination.transferred(transport.tls);
-        if (written == 0) { ret fail(transport, CAUSE_WRITE); }
         transport.request_sent = transport.request_sent + written;
         if (transport.request_sent < transport.request_len) {
+            # more of the request is still unsent, so an error ends the exchange
+            if (progress != origination.OK || written == 0) {
+                ret fail(transport, CAUSE_WRITE);
+            }
             if (!submit_write(transport)) { ret fail(transport, CAUSE_WRITE); }
             ret PENDING;
         }
@@ -525,8 +527,9 @@ fun settle_secure(transport: *Transport) Status {
         transport.stage = COMPLETE;
         ret OK;
     }
-    if (parsed != PENDING) { ret parsed; }
-    if (transport.eof)     { ret fail(transport, CAUSE_PROTOCOL); }
+    if (parsed != PENDING)          { ret parsed; }
+    if (progress != origination.OK) { ret fail(transport, CAUSE_READ); }
+    if (transport.eof)              { ret fail(transport, CAUSE_PROTOCOL); }
     if (transport.response_len >= transport.max_body) {
         ret fail(transport, CAUSE_LIMIT);
     }
@@ -534,13 +537,17 @@ fun settle_secure(transport: *Transport) Status {
     ret PENDING;
 }
 
+# std 5.3.0 reports on a cancelled completion the bytes that left before the
+# cancel took effect, so what was sent is accounted before the error is
+# weighed: a request fully written and then cancelled counts as sent.
 fun handle_write(transport: *Transport, completion: io_runtime.Completion) {
-    if (completion.has_error || completion.bytes == 0) {
-        fail(transport, CAUSE_WRITE);
-        ret;
-    }
     transport.request_sent = transport.request_sent + completion.bytes;
     if (transport.request_sent < transport.request_len) {
+        # more of the request is still unsent, so an error ends the exchange
+        if (completion.has_error || completion.bytes == 0) {
+            fail(transport, CAUSE_WRITE);
+            ret;
+        }
         if (!submit_write(transport)) { fail(transport, CAUSE_WRITE); }
         ret;
     }
@@ -551,11 +558,11 @@ fun handle_write(transport: *Transport, completion: io_runtime.Completion) {
     transport.stage = READING;
 }
 
+# a response that fully arrived and was then cancelled is still a response, so
+# the bytes std reports on the completion are accounted and parsed before the
+# error is weighed. an error completion ends the exchange only when what it
+# carried is not a whole response.
 fun handle_read(transport: *Transport, completion: io_runtime.Completion) {
-    if (completion.has_error) {
-        fail(transport, CAUSE_READ);
-        ret;
-    }
     transport.response_len = transport.response_len + completion.bytes;
     if (completion.bytes == 0 || completion.end_of_stream) { transport.eof = true; }
     val parsed: Status = parse_available(transport);
@@ -564,6 +571,10 @@ fun handle_read(transport: *Transport, completion: io_runtime.Completion) {
         ret;
     }
     if (parsed != PENDING) { ret; }
+    if (completion.has_error) {
+        fail(transport, CAUSE_READ);
+        ret;
+    }
     if (transport.eof) {
         fail(transport, CAUSE_PROTOCOL);
         ret;
@@ -623,6 +634,32 @@ fun drain(transport: *Transport, timeout_ms: i32) bool {
     ret true;
 }
 
+# cancels the operation in flight and reaps its completion so a transfer that
+# finished before the cancel took effect is accounted rather than dropped. the
+# cleartext path drains the runtime, which routes the cancelled completion
+# through the read and write handlers; the secured path drains until mach-tls
+# settles the operation, then lets settle_secure surface the bytes it kept.
+fun reap_cancelled(transport: *Transport) {
+    if (transport.secure && origination.operating(transport.tls)) {
+        origination.cancel_operation(transport.tls);
+        var tls_guard: usize = 0;
+        for (origination.operating(transport.tls) && tls_guard < 64) {
+            if (!drain(transport, 50)) { brk; }
+            origination.poll(transport.tls);
+            tls_guard = tls_guard + 1;
+        }
+        settle_secure(transport);
+        ret;
+    }
+    if (!transport.pending) { ret; }
+    transition_ok(cancel.cancel(?transport.scope));
+    var guard: usize = 0;
+    for (transport.pending && guard < 64) {
+        if (!drain(transport, 50)) { brk; }
+        guard = guard + 1;
+    }
+}
+
 # advances the exchange by whatever has completed. never waits.
 pub fun poll(transport: *Transport, now: time.Instant) Status {
     if (transport == nil || !transport.live) { ret INVALID; }
@@ -659,13 +696,14 @@ pub fun poll(transport: *Transport, now: time.Instant) Status {
     }
     if (transport.stage == COMPLETE) { ret OK; }
     if (transport.stage == BROKEN)   { ret FAILED; }
-    # an expired exchange is cancelled, and its outstanding completion is
-    # reaped before anything it owns is released
+    # an expired exchange cancels its outstanding operation and reaps the
+    # completion before giving up. std 5.3.0 delivers on that completion a
+    # transfer that finished before the cancel took effect, so a response that
+    # raced the deadline completes the exchange rather than being lost to a
+    # needless reissue. anything short of a whole response is a timeout.
     if (expired(transport, now)) {
-        if (transport.secure && origination.operating(transport.tls)) {
-            origination.cancel_operation(transport.tls);
-        }
-        or { transition_ok(cancel.cancel(?transport.scope)); }
+        reap_cancelled(transport);
+        if (transport.stage == COMPLETE) { ret OK; }
         ret fail(transport, CAUSE_TIMEOUT);
     }
     ret PENDING;
@@ -988,5 +1026,69 @@ test "acme transport: one exchange completes against a real socket" {
         ret 11;
     }
     if (!destroy(?fixture.engine)) { ret 12; }
+    ret 0;
+}
+
+fun load_response(fixture: *Fixture, text: str) usize {
+    var length: usize = 0;
+    for (text[length] != 0) {
+        fixture.response[length] = text[length];
+        length                   = length + 1;
+    }
+    ret length;
+}
+
+test "acme transport: a read cancelled after a whole response completes the exchange" {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    # std 5.3.0 delivers on a cancelled completion the bytes that landed before
+    # the cancel took effect. a whole response carried by an error completion
+    # must still parse rather than be discarded as a failed read.
+    val length: usize = load_response(?fixture,
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi");
+    fixture.engine.stage = READING;
+    var completion: io_runtime.Completion;
+    completion.context   = CONTEXT_READ;
+    completion.bytes     = length;
+    completion.has_error = true;
+    handle_read(?fixture.engine, completion);
+    if (fixture.engine.stage != COMPLETE) {
+        destroy(?fixture.engine);
+        ret 2;
+    }
+    val answer: ac.Response = response(?fixture.engine);
+    if (answer.status != 200 || !view.view_eq_str(answer.body, "hi")) {
+        destroy(?fixture.engine);
+        ret 3;
+    }
+    if (!destroy(?fixture.engine)) { ret 4; }
+    ret 0;
+}
+
+test "acme transport: a write cancelled after the whole request counts as sent" {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    # a request fully written and then cancelled has been sent: the bytes are
+    # accounted before the error is weighed, so it is not mistaken for a short
+    # write that must be reissued.
+    fixture.engine.stage        = WRITING;
+    fixture.engine.request_len  = 32;
+    fixture.engine.request_sent = 0;
+    var completion: io_runtime.Completion;
+    completion.context   = CONTEXT_WRITE;
+    completion.bytes     = 32;
+    completion.has_error = true;
+    handle_write(?fixture.engine, completion);
+    if (fixture.engine.request_sent != 32) {
+        destroy(?fixture.engine);
+        ret 2;
+    }
+    # the whole request was accounted, so the exchange did not fail as a short
+    # write; with no live stream the follow-on read simply cannot be submitted
+    if (fixture.engine.stage == BROKEN && fixture.engine.cause == CAUSE_WRITE) {
+        destroy(?fixture.engine);
+        ret 3;
+    }
+    if (!destroy(?fixture.engine)) { ret 4; }
     ret 0;
 }
