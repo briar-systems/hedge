@@ -378,14 +378,17 @@ fun retire_closed_stream(session: *Session, slot: *Slot) Step {
     ret STEP_PROGRESS;
 }
 
-# an engine is destroyed only once its close has completed. a connection that is
-# closed under it is no longer stepped, so the close of an engine the
-# cancellation failed is submitted here, and its completion brings the
-# connection back to this call
+# http 0.13 fails the connection on its own deadlines and closes a failed engine
+# itself once its scope has ended: `submit_write` and `tick` drop the abandoned
+# GOAWAY drain and submit the transport close. a failed engine is no longer
+# stepped, so a failure that still holds a stream open, which `destroy` refuses
+# until it closes, is nudged to submit that close here; its completion brings the
+# session back to be destroyed. a failed engine with no live stream, and every
+# other engine, `destroy` settles on its own, so nothing is nudged.
 fun finish_close(session: *Session) {
     val engine: *engine_h2.Engine = ?session.engine;
-    if (engine.state == engine_h2.CLOSED || engine.close_pending
-        || engine.write_pending) { ret; }
+    if (engine.state != engine_h2.FAILED || engine.active_streams == 0
+        || engine.close_pending || engine.write_pending) { ret; }
     if (engine_h2.submit_write(engine, session.now)) { ret; }
     engine_h2.progress_close(engine);
 }
@@ -1108,14 +1111,13 @@ fun apply(session: *Session, event: engine_h2.Event, now: time.Instant) Step {
         || event.kind == engine_h2.EVENT_MEMORY_BLOCKED) { ret STEP_BLOCKED; }
     if (event.kind == engine_h2.EVENT_PENDING) { ret STEP_PROGRESS; }
     if (event.kind == engine_h2.EVENT_CLOSED
-        || event.kind == engine_h2.EVENT_PEER_CLOSED) {
+        || event.kind == engine_h2.EVENT_PEER_CLOSED
+        || event.kind == engine_h2.EVENT_ERROR
+        || event.kind == engine_h2.EVENT_TIMED_OUT
+        || event.kind == engine_h2.EVENT_CANCELLED) {
         session.state = CLOSING;
         ret STEP_DONE;
     }
-    # a failure is the start of the engine's drain, not the end of the session
-    if (event.kind == engine_h2.EVENT_ERROR
-        || event.kind == engine_h2.EVENT_TIMED_OUT
-        || event.kind == engine_h2.EVENT_CANCELLED) { ret STEP_PROGRESS; }
     if (event.kind == engine_h2.EVENT_REQUEST_HEADERS) {
         ret open_stream(session, event, now);
     }
@@ -1226,24 +1228,8 @@ fun pump_streams(session: *Session, now: time.Instant) Step {
 fun runnable(session: *Session) bool {
     if (session == nil || !session.live
         || !session.engine_started) { ret false; }
-    ret session.engine.state != engine_h2.CLOSED;
-}
-
-# a failed engine still owes the peer its GOAWAY and then its close, each
-# bounded by the engine's own write deadline, and only a closed engine can be
-# destroyed: a stream it opened for a header block the host never saw stays
-# live until then
-fun drain(session: *Session, now: time.Instant) Step {
-    val engine: *engine_h2.Engine = ?session.engine;
-    engine_h2.tick(engine, now);
-    if (engine.state == engine_h2.CLOSED) {
-        session.state = CLOSING;
-        ret STEP_DONE;
-    }
-    if (engine.close_pending || engine.write_pending) { ret STEP_BLOCKED; }
-    if (engine_h2.submit_write(engine, now))          { ret STEP_PROGRESS; }
-    if (engine_h2.progress_close(engine))             { ret STEP_PROGRESS; }
-    ret STEP_BLOCKED;
+    ret session.engine.state != engine_h2.CLOSED
+        && session.engine.state != engine_h2.FAILED;
 }
 
 fun earlier(found: bool, candidate: u64, output: *u64) bool {
@@ -1279,8 +1265,6 @@ pub fun step(session: *Session, now: time.Instant) Step {
     if (!runnable(session))                                  { ret STEP_DONE; }
     if (session.state != ACTIVE && session.state != CLOSING) { ret STEP_DONE; }
     session.now = now;
-    if (session.engine.state == engine_h2.FAILED
-        || session.engine.state == engine_h2.CLOSING) { ret drain(session, now); }
     # the engine's own deadlines, one expiry per call
     var ticks: usize = 0;
     for (ticks < MAX_STEPS) {
