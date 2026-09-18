@@ -25,7 +25,6 @@ use static_files:  hedge.service.static;
 use hedge_storage: hedge.storage;
 use hedge.telemetry;
 use telemetry_production: hedge.telemetry.production;
-use engine_h1:            http.h1.connection;
 use http.router.router;
 use quic_admission: quic.connection.admission;
 use quic.connection.assembly;
@@ -40,6 +39,7 @@ use std.types.bool.true;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use tls_server: tls.server;
 
 pub val MAX_ROUTES:       usize = 64;
 pub val MAX_SEGMENTS:     usize = 512;
@@ -151,12 +151,12 @@ pub rec Runtime {
 # is held by main for the process lifetime, never moves, and is never retained
 # by a public record. the tables start empty and the quic runtime grows them.
 pub rec Controls {
-    pump_allocator:  secret.ArrayAllocator[quic_runtime.Pump];
-    pumps:           secret.SecretArray[quic_runtime.Pump];
-    connections:     hedge_storage.SecretTable[quic_runtime.Connection];
-    secret_storages: hedge_storage.SecretTable[assembly.SecretStorage];
-    sessions:        hedge_storage.SecretTable[h3_session.Session];
-    live:            bool;
+    pump_allocator: secret.ArrayAllocator[quic_runtime.Pump];
+    pumps:          secret.SecretArray[quic_runtime.Pump];
+    connections:    hedge_storage.SecretTable[quic_runtime.Connection];
+    handshakes:     hedge_storage.SecretTable[tls_server.Handshake];
+    sessions:       hedge_storage.SecretTable[h3_session.Session];
+    live:           bool;
 }
 
 # the control owner is made only when a quic listener exists to need it
@@ -176,8 +176,8 @@ pub fun make_controls(controls: *Controls) bool {
         secret.system_array_allocator[quic_runtime.Pump]();
     if (!hedge_storage.make_secret_table[quic_runtime.Connection](
         ?controls.connections)
-        || !hedge_storage.make_secret_table[assembly.SecretStorage](
-        ?controls.secret_storages)
+        || !hedge_storage.make_secret_table[tls_server.Handshake](
+        ?controls.handshakes)
         || !hedge_storage.make_secret_table[h3_session.Session](
         ?controls.sessions)) { ret false; }
     if (secret.init_array[quic_runtime.Pump](?controls.pumps,
@@ -196,8 +196,8 @@ pub fun release_controls(controls: *Controls) bool {
     var released: bool = true;
     if (!hedge_storage.destroy_secret_table[h3_session.Session](
         ?controls.sessions)) { released = false; }
-    if (!hedge_storage.destroy_secret_table[assembly.SecretStorage](
-        ?controls.secret_storages)) { released = false; }
+    if (!hedge_storage.destroy_secret_table[tls_server.Handshake](
+        ?controls.handshakes)) { released = false; }
     if (!hedge_storage.destroy_secret_table[quic_runtime.Connection](
         ?controls.connections)) { released = false; }
     if (secret.destroy_array[quic_runtime.Pump](?controls.pumps)
@@ -211,8 +211,8 @@ pub fun controls_cleanup_pending(controls: *Controls) bool {
     ret secret.array_cleanup_pending[quic_runtime.Pump](?controls.pumps)
         || hedge_storage.secret_table_cleanup_pending[quic_runtime.Connection](
         ?controls.connections)
-        || hedge_storage.secret_table_cleanup_pending[assembly.SecretStorage](
-        ?controls.secret_storages)
+        || hedge_storage.secret_table_cleanup_pending[tls_server.Handshake](
+        ?controls.handshakes)
         || hedge_storage.secret_table_cleanup_pending[h3_session.Session](
         ?controls.sessions);
 }
@@ -221,10 +221,10 @@ pub fun controls_cleanup_pending(controls: *Controls) bool {
 pub fun controls_view(controls: *Controls,
     output: *quic_runtime.ControlView) bool {
     if (controls == nil || output == nil || !controls.live) { ret false; }
-    output.pumps           = secret.array_data[quic_runtime.Pump](?controls.pumps);
-    output.connections     = ?controls.connections;
-    output.secret_storages = ?controls.secret_storages;
-    output.sessions        = ?controls.sessions;
+    output.pumps       = secret.array_data[quic_runtime.Pump](?controls.pumps);
+    output.connections = ?controls.connections;
+    output.handshakes  = ?controls.handshakes;
+    output.sessions    = ?controls.sessions;
     ret output.pumps != nil;
 }
 
@@ -260,7 +260,7 @@ pub fun make_storage(storage: *plan.Storage, backing: *PlanStorage) bool {
         ?backing.text[0], PLAN_TEXT_BYTES);
 }
 
-fun drive_planes(context: ptr, now: time.Time) bool {
+fun drive_planes(context: ptr, now: time.Instant) bool {
     val planes: *Planes = context::*Planes;
     if (planes == nil) { ret false; }
     var advanced: bool = true;
@@ -275,7 +275,7 @@ fun drive_planes(context: ptr, now: time.Time) bool {
     ret advanced;
 }
 
-fun quiesce_planes(context: ptr, now: time.Time) serve.PlaneQuiesceStatus {
+fun quiesce_planes(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
     val planes: *Planes = context::*Planes;
     if (planes == nil) { ret serve.PLANE_FAILED; }
     if (planes.proxying != nil) {
@@ -561,8 +561,7 @@ pub fun start(runtime: *Runtime, controls: *Controls,
         generation_slot                                          = generation_slot + 1;
     }
 
-    if (!proxy.make_runtime(?runtime.proxying, nil, options.pseudonym,
-        engine_h1.config_default(), upstream.default_limits())) {
+    if (!proxy.make_runtime(?runtime.proxying, nil, options.pseudonym, upstream.default_limits())) {
         ret fail(runtime, controls, START_RUNTIME, "proxy runtime could not be constructed");
     }
     runtime.proxy_live = true;
@@ -681,6 +680,7 @@ pub fun start(runtime: *Runtime, controls: *Controls,
             || !quic_runtime.make(?quic_controls, ?runtime.quic,
             quic_runtime.RuntimeConfig{backing: heap,
             chunks: ?runtime.serving.storage.chunks,
+            memory: ?runtime.serving.memory,
             timers: ?runtime.serving.timers,
             wakes:  ?runtime.serving.wakes})) {
             ret fail(runtime, controls, START_RUNTIME, "QUIC runtime initialization failed");
@@ -702,7 +702,9 @@ pub fun start(runtime: *Runtime, controls: *Controls,
         ret fail(runtime, controls, START_RUNTIME, "listeners did not become ready");
     }
     runtime.serve_live = true;
-    if (!proxy.attach_driver(?runtime.proxying, ?runtime.serving.owner.network)) {
+    if (!proxy.attach_driver(?runtime.proxying, ?runtime.serving.owner.network,
+        ?runtime.serving.memory, runtime.serving.configured.memory_budgets,
+        runtime.serving.configured.engine)) {
         ret fail(runtime, controls, START_RUNTIME, "proxy driver could not be attached");
     }
     runtime.planes.proxying     = ?runtime.proxying;

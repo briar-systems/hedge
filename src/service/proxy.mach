@@ -8,6 +8,7 @@
 use hedge.clock;
 use hedge.config.schema;
 use hedge.dispatch.call;
+use hedge_memory: hedge.memory;
 use hedge.proxy.forward;
 use hedge.proxy.link;
 use hedge.proxy.upstream;
@@ -31,6 +32,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -72,7 +74,7 @@ pub rec Attempt {
     attempts:         usize;
     replay:           forward.Replay;
     has_deadline:     bool;
-    attempt_deadline: time.Time;
+    attempt_deadline: time.Instant;
     attempt_scope:    cancel.Scope;
     scope_live:       bool;
     outbound:         field.Fields;
@@ -122,7 +124,10 @@ pub rec Registry {
 }
 
 pub rec Runtime {
-    driver:          *net_async.Driver;
+    driver: *net_async.Driver;
+    # the worker's pool and what each upstream link may borrow from it
+    memory:          *hedge_memory.Memory;
+    budgets:         hedge_memory.Budgets;
     pseudonym:       str;
     links:           [MAX_LINKS]link.Link;
     link_registries: [MAX_LINKS]*Registry;
@@ -138,11 +143,12 @@ pub rec Runtime {
 }
 
 pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: str,
-    engine: engine_h1.Config, limits: upstream.Limits) bool {
+    limits: upstream.Limits) bool {
     if (runtime == nil || pseudonym == nil) { ret false; }
     runtime.driver         = driver;
+    runtime.memory         = nil;
     runtime.pseudonym      = pseudonym;
-    runtime.engine         = engine;
+    runtime.engine         = engine_h1.config_default();
     runtime.limits         = limits;
     runtime.total_attempts = 0;
     runtime.total_failures = 0;
@@ -168,15 +174,22 @@ pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: st
 
 # the network driver belongs to the listener plane and only exists once listeners
 # are ready, so it is attached after the plan is sealed rather than during it
-pub fun attach_driver(runtime: *Runtime, driver: *net_async.Driver) bool {
-    if (runtime == nil || driver == nil) { ret false; }
-    runtime.driver = driver;
+# links size and charge their buffers exactly as a served HTTP/1 connection on
+# the same worker does, so `engine` is the served engine configuration
+pub fun attach_driver(runtime: *Runtime, driver: *net_async.Driver,
+    pool: *hedge_memory.Memory, budgets: hedge_memory.Budgets,
+    engine: engine_h1.Config) bool {
+    if (runtime == nil || driver == nil || pool == nil) { ret false; }
+    runtime.driver  = driver;
+    runtime.memory  = pool;
+    runtime.budgets = budgets;
+    runtime.engine  = engine;
     ret true;
 }
 
 pub fun close_runtime(runtime: *Runtime) bool {
-    if (runtime == nil)                                  { ret false; }
-    if (quiesce(runtime, clock.monotonic()) != QUIESCED) { ret false; }
+    if (runtime == nil)                                { ret false; }
+    if (quiesce(runtime, clock.instant()) != QUIESCED) { ret false; }
     var i: usize = 0;
     for (i < MAX_LINKS) {
         runtime.link_registries[i]   = nil;
@@ -187,7 +200,7 @@ pub fun close_runtime(runtime: *Runtime) bool {
     ret true;
 }
 
-pub fun quiesce(runtime: *Runtime, now: time.Time) QuiesceStatus {
+pub fun quiesce(runtime: *Runtime, now: time.Instant) QuiesceStatus {
     if (runtime == nil || !runtime.live) { ret QUIESCE_FAILED; }
     runtime.quiescing = true;
     var pending: bool  = false;
@@ -250,7 +263,7 @@ pub fun route_count(registry: *Registry) usize {
 # the proxy owns its links, so they are driven every round rather than only while
 # a served request happens to be waiting on one. a response body still needs the
 # upstream pumped long after the response head was committed.
-pub fun poll(context: ptr, now: time.Time) bool {
+pub fun poll(context: ptr, now: time.Instant) bool {
     val runtime: *Runtime = context::*Runtime;
     if (runtime == nil || !runtime.live) { ret false; }
     var progressed: bool  = false;
@@ -393,7 +406,7 @@ fun upstream_read(context: ptr, output: *u8, capacity: usize, trailers: *field.F
 # a message whose bytes are already in our buffers needs no further io to
 # finish, only the turns to parse what is there. the downstream exchange can end
 # in the same turn the last of those bytes arrived
-fun settle_link(active: *link.Link, now: time.Time) {
+fun settle_link(active: *link.Link, now: time.Instant) {
     var steps: usize = 0;
     for (steps < LINK_SETTLE_STEPS) {
         if (link.step(active, now) != link.STEP_PROGRESS) { brk; }
@@ -409,7 +422,7 @@ fun upstream_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body
     # even when the client went away in the same turn the last of it arrived
     var reuse: body.Reuse = body.REUSE_FORBIDDEN;
     if (state.attempt != nil && state.attempt.link != nil) {
-        settle_link(state.attempt.link, clock.monotonic());
+        settle_link(state.attempt.link, clock.instant());
         if (link.finished(state.attempt.link)) { reuse = body.REUSE_ALLOWED; }
     }
     if (mode == body.CANCEL)  { ret body.cancelled(reuse); }
@@ -427,7 +440,7 @@ fun upstream_complete(context: ptr, token: u64, trailers: *field.Fields) body.Pr
     ret upstream_read(context, state.pending_output, state.pending_capacity, trailers);
 }
 
-fun release_response_link(attempt: *Attempt, reuse: body.Reuse, now: time.Time) {
+fun release_response_link(attempt: *Attempt, reuse: body.Reuse, now: time.Instant) {
     if (attempt == nil || attempt.link == nil) { ret; }
     if (reuse != body.REUSE_ALLOWED
         || !link.release_idle(attempt.link, now)) { link.close(attempt.link); }
@@ -439,7 +452,7 @@ fun upstream_release(context: ptr) {
     if (state == nil || state.attempt == nil) { ret; }
     val attempt: *Attempt = state.attempt;
     if (!attempt.live || attempt.phase != PHASE_STREAM) { ret; }
-    release_response_link(attempt, state.reader.reuse, clock.monotonic());
+    release_response_link(attempt, state.reader.reuse, clock.instant());
 }
 
 test "proxy: response release retains embedded reader storage until call finalization" {
@@ -455,37 +468,17 @@ test "proxy: response release retains embedded reader storage until call finaliz
 
 # --- deadlines ---
 
-fun add_ns(base: time.Time, nanos: u64) time.Time {
-    var result: time.Time = base;
-    result.sec  = base.sec + (nanos / 1000000000)::i64;
-    result.nsec = base.nsec + (nanos % 1000000000)::i64;
-    if (result.nsec >= 1000000000) {
-        result.nsec = result.nsec - 1000000000;
-        result.sec  = result.sec + 1;
-    }
-    ret result;
-}
-
-fun remaining_ns(now: time.Time, deadline: time.Time) u64 {
-    if (deadline.sec < now.sec || (deadline.sec == now.sec && deadline.nsec <= now.nsec)) {
-        ret 0;
-    }
-    val seconds: i64 = deadline.sec - now.sec;
-    if (seconds > 9223372035) { ret 0xffffffffffffffff; }
-    ret (seconds * 1000000000 + (deadline.nsec - now.nsec))::u64;
-}
-
 # one attempt gets a child of the request deadline, never a fresh full one
-pub fun attempt_deadline(now: time.Time, has_request_deadline: bool,
-    request_deadline: time.Time, output: *time.Time) bool {
-    if (output == nil)         { ret false; }
-    if (!has_request_deadline) { ret false; }
-    val remaining: u64 = remaining_ns(now, request_deadline);
-    if (remaining == 0) { ret false; }
+pub fun attempt_deadline(now: time.Instant, request_deadline: opt[time.Instant],
+    output: *time.Instant) bool {
+    if (output == nil || !(sel request_deadline.some)) { ret false; }
+    var remaining: u64 = 0;
+    if (sel request_deadline.some) { remaining = clock.between_ns(now, request_deadline.some); }
+    if (remaining == 0)            { ret false; }
     var share: u64 = remaining / ATTEMPT_DENOMINATOR * ATTEMPT_NUMERATOR;
     if (share < MIN_ATTEMPT_NS) { share = remaining; }
     if (share > remaining)      { share = remaining; }
-    @output = add_ns(now, share);
+    @output = clock.after(now, share);
     ret true;
 }
 
@@ -567,7 +560,7 @@ fun build_outbound(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
 }
 
 fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
-    now: time.Time) exchange.ServiceStatus {
+    now: time.Instant) exchange.ServiceStatus {
     val selection: upstream.Selection = upstream.select(?attempt.route.pool, now);
     if (selection.admission == upstream.ROUTE_SATURATED) {
         ret bad_gateway(active, status.SERVICE_UNAVAILABLE);
@@ -589,7 +582,8 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
         ret bad_gateway(active, status.BAD_GATEWAY);
     }
     if (attempt.link.state != link.READY
-        && !link.make(attempt.link, runtime.driver, selection.index, chosen.endpoint,
+        && !link.make(attempt.link, runtime.driver, runtime.memory, runtime.budgets,
+        selection.index, chosen.endpoint,
         runtime.engine, now)) {
         link.close(attempt.link);
         attempt.link = nil;
@@ -601,7 +595,7 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
     ret park_attempt(attempt, active);
 }
 
-fun settle_attempt(attempt: *Attempt, outcome: upstream.Outcome, now: time.Time) {
+fun settle_attempt(attempt: *Attempt, outcome: upstream.Outcome, now: time.Instant) {
     if (outcome != upstream.SUCCESS && attempt.owner != nil) {
         attempt.owner.total_failures = attempt.owner.total_failures + 1;
     }
@@ -623,7 +617,7 @@ fun finish_attempt(context: ptr, active: *call.Call) bool {
         && attempt.owner_generation == active.exchange.generation;
     if (attempt.selection.admission == upstream.ADMITTED) {
         upstream.release(?attempt.route.pool, attempt.selection.index,
-            upstream.FAILURE, clock.monotonic());
+            upstream.FAILURE, clock.instant());
         attempt.selection.admission = upstream.NO_UPSTREAM;
     }
     var reuse: body.Reuse = body.REUSE_FORBIDDEN;
@@ -631,7 +625,7 @@ fun finish_attempt(context: ptr, active: *call.Call) bool {
         && body.reader_terminal_state(?attempt.body.reader)) {
         reuse = attempt.body.reader.reuse;
     }
-    release_response_link(attempt, reuse, clock.monotonic());
+    release_response_link(attempt, reuse, clock.instant());
     attempt.phase            = PHASE_SETTLED;
     attempt.owner_call       = nil;
     attempt.owner_generation = 0;
@@ -703,7 +697,7 @@ fun commit_response(attempt: *Attempt, active: *call.Call) exchange.ServiceStatu
 fun may_replay(attempt: *Attempt, active: *call.Call) bool {
     if (attempt.attempts >= attempt.route.max_attempts) { ret false; }
     if (attempt.replay != forward.REPLAY_SAFE)          { ret false; }
-    ret upstream.healthy_count(?attempt.route.pool, clock.monotonic()) != 0;
+    ret upstream.healthy_count(?attempt.route.pool, clock.instant()) != 0;
 }
 
 pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
@@ -714,8 +708,8 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     }
     val runtime: *Runtime = binding.runtime;
     if (runtime.driver == nil) { ret bad_gateway(active, status.INTERNAL_SERVER_ERROR); }
-    val now:     time.Time = clock.monotonic();
-    var attempt: *Attempt  = find_attempt(runtime, active);
+    val now:     time.Instant = clock.instant();
+    var attempt: *Attempt     = find_attempt(runtime, active);
     if (attempt == nil) {
         attempt = free_attempt(runtime);
         if (attempt == nil) { ret bad_gateway(active, status.SERVICE_UNAVAILABLE); }
@@ -731,7 +725,6 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
         };
         attempt.replay       = forward.classify_replay(call.request(active));
         attempt.has_deadline = attempt_deadline(now,
-            call.request(active).metadata.has_deadline,
             call.request(active).metadata.deadline, ?attempt.attempt_deadline);
         attempt.owner_call        = active;
         attempt.owner_generation  = active.exchange.generation;
@@ -757,11 +750,11 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
 # proxy runtime also drives links: an edge-triggered handoff would be consumed by
 # whichever driver happened to run first.
 fun advance(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
-    now: time.Time) exchange.ServiceStatus {
+    now: time.Instant) exchange.ServiceStatus {
     if (attempt.phase == PHASE_STREAM || attempt.phase == PHASE_SETTLED) {
         ret exchange.SERVICE_COMPLETE;
     }
-    if (attempt.has_deadline && remaining_ns(now, attempt.attempt_deadline) == 0) {
+    if (attempt.has_deadline && clock.between_ns(now, attempt.attempt_deadline) == 0) {
         settle_attempt(attempt, upstream.TIMEOUT, now);
         attempt.phase = PHASE_SETTLED;
         ret bad_gateway(active, status.GATEWAY_TIMEOUT);
@@ -1004,8 +997,7 @@ fun configured_proxy(graph: *schema.Graph, target: str) *schema.Service {
 
 test "proxy: route registries are reclaimed only after their generation drains" {
     var runtime: Runtime;
-    if (!make_runtime(?runtime, nil, "hedge-test", engine_h1.config_default(),
-        upstream.default_limits())) { ret 1; }
+    if (!make_runtime(?runtime, nil, "hedge-test", upstream.default_limits())) { ret 1; }
     var first:  Registry;
     var second: Registry;
     if (!make_registry(?first, 1) || !make_registry(?second, 2)) { ret 2; }
@@ -1050,8 +1042,7 @@ test "proxy: route registries are reclaimed only after their generation drains" 
 
 test "proxy: idle upstream links are scoped to their service registry" {
     var runtime: Runtime;
-    if (!make_runtime(?runtime, nil, "hedge-test", engine_h1.config_default(),
-        upstream.default_limits())) { ret 1; }
+    if (!make_runtime(?runtime, nil, "hedge-test", upstream.default_limits())) { ret 1; }
     var first:  Registry;
     var second: Registry;
     if (!make_registry(?first, 1) || !make_registry(?second, 2)) { ret 2; }

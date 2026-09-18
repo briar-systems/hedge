@@ -1,5 +1,6 @@
 # strict toml loading, reference resolution, and graph validation
 
+use hedge.config.lanes;
 use hedge.config.schema;
 use hedge.protocol.trust;
 use std.allocator;
@@ -264,8 +265,8 @@ fun parse_server(graph: *schema.Graph, table: *toml.Table, resolver: *Resolver, 
 
     val limits: *toml.Table = optional_table(table, "limits", diagnostics, source);
     if (limits != nil) {
-        var limit_fields: [7]str = [7]str{"max_connections", "max_connections_per_peer", "max_header_bytes", "max_header_count", "max_body_bytes", "max_pipeline_depth", "call_memory_bytes"};
-        validate_fields(limits, diagnostics, source, ?limit_fields[0], 7);
+        var limit_fields: [9]str = [9]str{"max_connections", "max_connections_per_peer", "max_header_bytes", "max_header_count", "max_body_bytes", "max_pipeline_depth", "call_memory_bytes", "memory_bytes", "connection_memory_bytes"};
+        validate_fields(limits, diagnostics, source, ?limit_fields[0], 9);
         graph.limits.max_connections          = optional_limit(limits, "max_connections", graph.limits.max_connections, diagnostics, source);
         graph.limits.max_connections_per_peer = optional_limit(limits, "max_connections_per_peer", graph.limits.max_connections_per_peer, diagnostics, source);
         graph.limits.max_header_bytes         = optional_usize(limits, "max_header_bytes", graph.limits.max_header_bytes, false, diagnostics, source);
@@ -273,6 +274,16 @@ fun parse_server(graph: *schema.Graph, table: *toml.Table, resolver: *Resolver, 
         graph.limits.max_body_bytes           = optional_usize(limits, "max_body_bytes", graph.limits.max_body_bytes, true, diagnostics, source);
         graph.limits.max_pipeline_depth       = optional_usize(limits, "max_pipeline_depth", graph.limits.max_pipeline_depth, false, diagnostics, source);
         graph.limits.call_memory_bytes        = optional_usize(limits, "call_memory_bytes", graph.limits.call_memory_bytes, false, diagnostics, source);
+        graph.limits.memory_bytes             = optional_usize(limits, "memory_bytes", graph.limits.memory_bytes, false, diagnostics, source);
+        graph.limits.connection_memory_bytes  = optional_usize(limits, "connection_memory_bytes", graph.limits.connection_memory_bytes, false, diagnostics, source);
+    }
+    # the memory keys default from the limits around them, so they are derived
+    # only once every other limit is known
+    if (graph.limits.connection_memory_bytes == 0) {
+        graph.limits.connection_memory_bytes = lanes.default_connection_bytes(?graph.limits);
+    }
+    if (graph.limits.memory_bytes == 0) {
+        graph.limits.memory_bytes = lanes.default_memory_bytes(?graph.limits);
     }
 
     val timeouts: *toml.Table = optional_table(table, "timeouts", diagnostics, source);
@@ -1231,6 +1242,28 @@ fun call_memory_in_range(bytes: usize) bool {
     ret bytes >= schema.MIN_CALL_MEMORY_BYTES && bytes <= schema.MAX_CALL_MEMORY_BYTES;
 }
 
+fun validate_memory(graph: *schema.Graph, diagnostics: *schema.Diagnostics) {
+    val limits:     *schema.Limits = ?graph.limits;
+    val connection: usize          = lanes.connection_bytes(limits);
+    val total:      usize          = lanes.memory_bytes(limits);
+    if (!lanes.funds_request(limits)) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation",
+            "server.limits.connection_memory_bytes",
+            "a connection's memory must fund its TLS and I/O lanes and one request");
+    }
+    if (total < connection) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation",
+            "server.limits.memory_bytes",
+            "the memory budget must fund at least one connection");
+    }
+    if (sel limits.max_connections.some) {
+        if (connection != 0 && limits.max_connections.some > total / connection) {
+            diagnose(diagnostics, schema.CONFLICT, "validation", "server.limits.memory_bytes",
+                "max_connections connections at connection_memory_bytes exceed memory_bytes");
+        }
+    }
+}
+
 pub fun validate(graph: *schema.Graph, capabilities: Capabilities, diagnostics: *schema.Diagnostics) bool {
     duplicate_names(graph, diagnostics);
     validate_acme(graph, diagnostics);
@@ -1260,6 +1293,7 @@ pub fun validate(graph: *schema.Graph, capabilities: Capabilities, diagnostics: 
         }
         service_index = service_index + 1;
     }
+    validate_memory(graph, diagnostics);
     if (graph.limits.max_pipeline_depth > schema.MAX_PIPELINE_DEPTH) {
         diagnose(diagnostics, schema.RESOURCE_LIMIT, "validation",
             "server.limits.max_pipeline_depth",
@@ -2079,5 +2113,31 @@ test "config loader: max_retry_replay is a positive count on QUIC listeners only
     val zero: str = "[server]\nname = \"zero\"\n\n[[listener]]\nname = \"quic\"\naddress = \"127.0.0.1:443\"\ntransport = \"quic\"\nprotocols = [\"h3\"]\ntls = \"public\"\nmax_retry_replay = 0\n\n[tls.public]\ncertificate = \"server.pem\"\nkey = \"server.key\"\n";
     if (build(?graph, ?diagnostics, ?a, "zero.toml", zero, nil, capabilities)
         || !has_diagnostic(?diagnostics, schema.INVALID_VALUE, "max_retry_replay")) { ret 5; }
+    ret 0;
+}
+
+test "config loader: connection memory is derived, bounded and funds the connection limit" {
+    var memory:      [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a:           allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph:        schema.Graph;
+    var diagnostics:  schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true,
+        local_transport: true, environment_secrets: true,
+        file_secrets:    true, os_secrets: true, application_secrets: true};
+    val derived: str = "[server]\nname = \"memory\"\n\n[server.limits]\nmax_connections = 10\nmax_connections_per_peer = 10\n";
+    if (!build(?graph, ?diagnostics, ?a, "derived.toml", derived, nil, capabilities)) { ret 1; }
+    if (graph.limits.connection_memory_bytes != lanes.default_connection_bytes(?graph.limits)
+        || graph.limits.memory_bytes != 10 * graph.limits.connection_memory_bytes) { ret 2; }
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    val starved: str = "[server]\nname = \"memory\"\n\n[server.limits]\nconnection_memory_bytes = 65536\n";
+    if (build(?graph, ?diagnostics, ?a, "starved.toml", starved, nil, capabilities)
+        || !has_diagnostic(?diagnostics, schema.RESOURCE_LIMIT,
+        "server.limits.connection_memory_bytes")) { ret 3; }
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    val over: str = "[server]\nname = \"memory\"\n\n[server.limits]\nmax_connections = 1000\nmemory_bytes = 16777216\n";
+    if (build(?graph, ?diagnostics, ?a, "over.toml", over, nil, capabilities)
+        || !has_diagnostic(?diagnostics, schema.CONFLICT, "server.limits.memory_bytes")) { ret 4; }
     ret 0;
 }

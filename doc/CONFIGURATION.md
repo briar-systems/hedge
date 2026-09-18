@@ -223,6 +223,49 @@ the service answers however it answers a failed allocation. The request is then
 logged as an error with `code = "memory_exhausted"`, naming the route and the
 bound it hit, and `hedge_request_memory_refusals_total` counts it.
 
+## Connection memory
+
+Every buffer a connection uses comes from its worker's buffer pool: TLS records,
+read and write buffers, and each request's parsed head. Nothing is reserved per
+connection up front. Each connection instead opens an account on the pool with
+a budget, and borrows against it as it needs memory.
+
+- `server.limits.memory_bytes` is the pool's total budget. It defaults to
+  `max_connections` connections' worth, or 256 connections' worth when
+  `max_connections` is not set.
+- `server.limits.connection_memory_bytes` is what one connection may hold. It
+  defaults to what its fixed lanes need plus `max_pipeline_depth` requests at the
+  configured header limits.
+
+A connection's budget is split into lanes:
+
+- the TLS lane gets 64 KiB, for record and handshake buffers.
+- the I/O lane gets 64 KiB, for the read and write buffers of whichever protocol
+  engine runs.
+- the request lane gets the rest, for per-request memory such as a parsed HTTP/1
+  head (target, fields and trailers) or an HTTP/2 or HTTP/3 stream.
+- QUIC names its own send and receive lanes, sized by the QUIC engine.
+
+Loading fails when `connection_memory_bytes` cannot fund both fixed lanes and one
+request, when `memory_bytes` is smaller than one connection, or when
+`max_connections` connections at `connection_memory_bytes` would exceed
+`memory_bytes`.
+
+When the pool runs short, hedge sheds load on purpose, so the connections it
+already holds can finish:
+
+- A new connection is admitted only while the pool's reservations stay under
+  seven eighths of `memory_bytes`. The rest is headroom for open connections. A
+  refused TCP connection is closed, and a refused QUIC Initial is dropped.
+- On an open connection, HTTP/2 refuses a new stream with REFUSED_STREAM and
+  HTTP/3 with REQUEST_REJECTED. HTTP/1 and TLS wait for memory.
+- A connection that waits for memory longer than `server.timeouts.header_ms` is
+  closed.
+
+`hedge_memory_held_bytes`, `hedge_memory_refusals_total` and
+`hedge_memory_timeouts_total` report each lane, labelled `lane`.
+`hedge_connections_refused_memory_total` counts refused connections.
+
 ## Budgets
 
 A named `budget` carries four bounds, and a listener that names one is held to
@@ -424,7 +467,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the seven built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 23 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 

@@ -8,6 +8,8 @@
 use hedge.clock;
 use hedge.connection;
 use hedge.listener;
+use hedge.memory;
+use hedge.wake;
 use http.core.body;
 use http.core.field;
 use http.core.message;
@@ -23,7 +25,8 @@ use std.io.handle;
 use io_handle:    std.io.handle;
 use io_lifecycle: std.io.lifecycle;
 use io_runtime:   std.io.runtime;
-use net_async:    std.net.async;
+use std.memory.buffers;
+use net_async: std.net.async;
 use std.net.ip;
 use std.net.tcp;
 use std.sync.cancel;
@@ -31,6 +34,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -46,12 +50,6 @@ fun transition_ok(outcome: cancel.Transition) bool {
 
 pub val LINK_SLOTS:           usize = 1;
 pub val LINK_TRANSPORT_SLOTS: usize = 4;
-pub val LINK_LINE_BYTES:      usize = 4096;
-pub val LINK_STORAGE_BYTES:   usize = 8192;
-pub val LINK_FIELD_SLOTS:     usize = 64;
-pub val LINK_TRAILER_SLOTS:   usize = 16;
-pub val LINK_SCRATCH_BYTES:   usize = 4096;
-pub val LINK_IO_BYTES:        usize = 8192;
 
 pub def State: u8;
 pub val FREE:       State = 0;
@@ -100,16 +98,13 @@ pub rec Link {
     scopes_live:       bool;
     engine:            engine_h1.Engine;
     engine_slots:      [LINK_SLOTS]engine_h1.Slot;
-    engine_memories:   [LINK_SLOTS]engine_h1.SlotMemory;
-    lines:             [LINK_SLOTS][LINK_LINE_BYTES]u8;
-    storages:          [LINK_SLOTS][LINK_STORAGE_BYTES]u8;
-    slot_fields:       [LINK_SLOTS][LINK_FIELD_SLOTS]field.Field;
-    slot_trailers:     [LINK_SLOTS][LINK_TRAILER_SLOTS]field.Field;
-    scratches:         [LINK_SLOTS][LINK_SCRATCH_BYTES]u8;
-    read_buffer:       [LINK_IO_BYTES]u8;
-    write_buffer:      [LINK_IO_BYTES]u8;
-    slot:              usize;
-    have_headers:      bool;
+    # the link borrows from its worker's pool like a served connection does
+    borrower:     memory.Borrower;
+    account:      buffers.Account;
+    source:       buffers.Source;
+    account_live: bool;
+    slot:         usize;
+    have_headers: bool;
     # held response body already reported, since the engine reports what it
     # holds on every turn until it is taken
     reported_held:      usize;
@@ -130,7 +125,7 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
     var settled: transport.Completion;
     if (!connection.translate(?settled, completion, token_context)) { ret; }
     val was_closing: bool            = link.state == CLOSING;
-    val event:       engine_h1.Event = engine_h1.complete_io(?link.engine, ?settled, clock.monotonic());
+    val event:       engine_h1.Event = engine_h1.complete_io(?link.engine, ?settled, clock.instant());
     absorb(link, event);
     if (was_closing) { link.state = CLOSING; }
 }
@@ -155,6 +150,15 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     val index: usize = operation_for(link, token_context);
     if (index >= LINK_TRANSPORT_SLOTS) { ret rejected(); }
     ret net_async.submit_read(link.driver, scope, ?link.stream, buffer, length,
+        (?link.contexts[index])::usize);
+}
+
+fun submit_readable(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val link:  *Link = context::*Link;
+    val index: usize = operation_for(link, token_context);
+    if (index >= LINK_TRANSPORT_SLOTS) { ret rejected(); }
+    ret net_async.submit_readable(link.driver, scope, ?link.stream,
         (?link.contexts[index])::usize);
 }
 
@@ -215,30 +219,6 @@ fun connect_settled(context: ptr, token_context: usize, completion: io_runtime.C
 pub fun link_config(base: engine_h1.Config) engine_h1.Config {
     var configured: engine_h1.Config = base;
     configured.max_pipeline = LINK_SLOTS;
-    if (configured.parser.max_header_bytes > LINK_STORAGE_BYTES) {
-        configured.parser.max_header_bytes = LINK_STORAGE_BYTES;
-    }
-    if (configured.parser.max_trailer_bytes > LINK_STORAGE_BYTES) {
-        configured.parser.max_trailer_bytes = LINK_STORAGE_BYTES;
-    }
-    if (configured.parser.max_headers > LINK_FIELD_SLOTS) {
-        configured.parser.max_headers = LINK_FIELD_SLOTS;
-    }
-    if (configured.parser.max_trailers > LINK_TRAILER_SLOTS) {
-        configured.parser.max_trailers = LINK_TRAILER_SLOTS;
-    }
-    if (configured.parser.max_start_line > LINK_LINE_BYTES) {
-        configured.parser.max_start_line = LINK_LINE_BYTES;
-    }
-    if (configured.parser.max_header_line > LINK_LINE_BYTES) {
-        configured.parser.max_header_line = LINK_LINE_BYTES;
-    }
-    if (configured.parser.max_chunk_line > LINK_LINE_BYTES) {
-        configured.parser.max_chunk_line = LINK_LINE_BYTES;
-    }
-    if (configured.parser.max_target_bytes > LINK_LINE_BYTES) {
-        configured.parser.max_target_bytes = LINK_LINE_BYTES;
-    }
     ret configured;
 }
 
@@ -269,7 +249,7 @@ pub fun lease(link: *Link) bool {
 
 # hand a finished connection back, keeping it only when both sides agreed it may
 # be reused and the engine is still open for another exchange
-pub fun release_idle(link: *Link, now: time.Time) bool {
+pub fun release_idle(link: *Link, now: time.Instant) bool {
     if (link == nil || !link.initialized || !link.reusable
         || link.slot == engine_h1.NO_SLOT
         || link.engine.state != engine_h1.OPEN) { ret false; }
@@ -283,9 +263,13 @@ pub fun release_idle(link: *Link, now: time.Time) bool {
     ret true;
 }
 
-pub fun make(link: *Link, driver: *net_async.Driver, upstream: usize,
-    endpoint: ip.Endpoint, configured: engine_h1.Config, now: time.Time) bool {
-    if (link == nil || driver == nil) { ret false; }
+# the account is opened under an owner no protocol routes: the pool waking it
+# only gives the worker a turn, and every turn drives the links
+pub fun make(link: *Link, driver: *net_async.Driver, pool: *memory.Memory,
+    budgets: memory.Budgets, upstream: usize, endpoint: ip.Endpoint,
+    configured: engine_h1.Config, now: time.Instant) bool {
+    if (link == nil || driver == nil || pool == nil) { ret false; }
+    link.account_live       = false;
     link.state              = CONNECTING;
     link.upstream           = upstream;
     link.generation         = link.generation + 1;
@@ -311,11 +295,14 @@ pub fun make(link: *Link, driver: *net_async.Driver, upstream: usize,
     link.inbound_complete   = false;
     if (!connection.bind_operation(?link.connect_operation, ?link.connect_context,
         (link)::ptr, connect_settled, link.generation::usize)) { ret false; }
-    if (!operation_ok(cancel.make_root(?link.operation_root, false, time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_root(?link.control_scope, false, time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_child(?link.engine_scope, ?link.operation_root, false,
-        time.Time{sec: 0, nsec: 0}))) { ret false; }
+    if (!operation_ok(cancel.make_root(?link.operation_root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_root(?link.control_scope, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_child(?link.engine_scope, ?link.operation_root, opt[time.Instant].none{}))) { ret false; }
     link.scopes_live = true;
+    memory.borrower(?link.borrower, pool, wake.PLANE_OWNER, 0, budgets);
+    if (!memory.open(?link.borrower, ?link.account)) { ret false; }
+    link.source       = memory.borrowed_source(?link.borrower);
+    link.account_live = true;
     val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_connect(
         driver, ?link.operation_root, endpoint, (?link.connect_context)::usize);
     if (sel submitted.err) {
@@ -327,11 +314,12 @@ pub fun make(link: *Link, driver: *net_async.Driver, upstream: usize,
 }
 
 # bind the transport and engine once the socket exists
-fun activate(link: *Link, now: time.Time) bool {
+fun activate(link: *Link, now: time.Instant) bool {
     link.runtime_stream = transport.RuntimeStream{
         runtime: link.driver.runtime,
         context: (link)::ptr,
         submit_read:           submit_read,
+        submit_readable:       submit_readable,
         submit_write:          submit_write,
         submit_shutdown_write: submit_shutdown,
         submit_close:          submit_close,
@@ -342,26 +330,9 @@ fun activate(link: *Link, now: time.Time) bool {
     link.channel.initialized = false;
     if (!transport.init(?link.channel, link.adapter, ?link.operation_root,
         ?link.control_scope, ?link.channel_slots[0], LINK_TRANSPORT_SLOTS)) { ret false; }
-    var i: usize = 0;
-    for (i < LINK_SLOTS) {
-        link.engine_memories[i] = engine_h1.SlotMemory{
-            line:             ?link.lines[i][0],
-            line_capacity:    LINK_LINE_BYTES,
-            storage:          ?link.storages[i][0],
-            storage_capacity: LINK_STORAGE_BYTES,
-            fields:           ?link.slot_fields[i][0],
-            field_capacity:   LINK_FIELD_SLOTS,
-            trailers:         ?link.slot_trailers[i][0],
-            trailer_capacity: LINK_TRAILER_SLOTS,
-            scratch:          ?link.scratches[i][0],
-            scratch_capacity: LINK_SCRATCH_BYTES,
-        };
-        i = i + 1;
-    }
     link.engine.initialized = false;
     if (!engine_h1.init(?link.engine, engine_h1.CLIENT, ?link.channel, ?link.engine_scope,
-        ?link.engine_slots[0], ?link.engine_memories[0], LINK_SLOTS,
-        ?link.read_buffer[0], LINK_IO_BYTES, ?link.write_buffer[0], LINK_IO_BYTES,
+        ?link.engine_slots[0], LINK_SLOTS, ?link.source, ?link.account,
         link.configured, now)) { ret false; }
     link.initialized = true;
     link.state       = READY;
@@ -370,7 +341,7 @@ fun activate(link: *Link, now: time.Time) bool {
 
 # publish the outbound request head; the body follows through `offer_body`
 pub fun send(link: *Link, request_method: method.Method, request_target: target.Target,
-    fields: *field.Fields, now: time.Time) bool {
+    fields: *field.Fields, now: time.Instant) bool {
     if (link == nil || link.state != READY) { ret false; }
     link.slot = engine_h1.enqueue_request(?link.engine, message.version_h1(1, 1),
         request_method, request_target, fields, nil, now);
@@ -416,7 +387,7 @@ pub fun response(link: *Link) *parser.Parsed {
 }
 
 # drive the upstream leg one step
-pub fun step(link: *Link, now: time.Time) Step {
+pub fun step(link: *Link, now: time.Instant) Step {
     if (link == nil) { ret STEP_ERROR; }
     if (link.state == CLOSING) {
         if (close(link))                             { ret STEP_DONE; }
@@ -474,7 +445,8 @@ pub fun step(link: *Link, now: time.Time) Step {
             engine_h1.submit_read(?link.engine);
             ret STEP_BLOCKED;
         }
-        if (event.kind == engine_h1.EVENT_NONE) { ret STEP_BLOCKED; }
+        if (event.kind == engine_h1.EVENT_NONE
+            || event.kind == engine_h1.EVENT_MEMORY_BLOCKED) { ret STEP_BLOCKED; }
         absorb(link, event);
         if (link.state == FAILED) { ret STEP_ERROR; }
         if (event.kind == engine_h1.EVENT_RESPONSE_HEADERS) {
@@ -561,6 +533,10 @@ pub fun close(link: *Link) bool {
         val closed: err[io_error.Error] = tcp.stream_close(?link.stream);
         if (sel closed.err) { link.close_failed = true; }
         link.has_stream = false;
+    }
+    if (link.account_live) {
+        if (!memory.close(link.borrower.memory, ?link.account)) { link.close_failed = true; }
+        link.account_live = false;
     }
     if (link.scopes_live) {
         if (!operation_ok(cancel.destroy(?link.engine_scope))

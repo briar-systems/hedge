@@ -17,7 +17,9 @@ use acme_keys: hedge.acme.keys;
 use acme:      hedge.acme.manager;
 use hedge.clock;
 use hedge.config.schema;
+use hedge.memory;
 use hedge_credentials: hedge.protocol.credentials;
+use std.chrono.time;
 use std.crypto.ct;
 use std.filesystem;
 use io_error: std.io.error;
@@ -35,6 +37,7 @@ use std.types.view;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
+use tls_clock:  tls.clock;
 use tls_config: tls.config;
 use tls_server: tls.server;
 use tls.session;
@@ -71,12 +74,12 @@ pub val EXHAUSTED:   Status = 6;
 # lease, so there is no bank free to build the new one in
 pub val RETIRED_IN_USE: Status = 7;
 
-# the exact storage one server handshake needs, checked against mach-tls at load
-# time so an unusable listener fails before it becomes ready
+# the largest handshake messages a listener takes and sends. their buffers come
+# from the connection's TLS lane, so a configuration whose flight cannot fit
+# that lane fails at load rather than at the first handshake
 pub val HANDSHAKE_INPUT_BYTES:  usize = 16384;
 pub val HANDSHAKE_OUTPUT_BYTES: usize = 16384;
 pub val HELLO_BYTES:            usize = 8192;
-pub val PEER_CERTIFICATES:      usize = 8;
 
 pub fun listener_limits() tls_config.Limits {
     var limits: tls_config.Limits = tls_config.production_limits();
@@ -145,10 +148,11 @@ pub rec Policy {
     groups:                      [2]tls13.NamedGroup;
     signatures:                  [4]tls13.SignatureScheme;
     entropy:                     secret.Entropy;
+    clock:                       tls_clock.Source;
     ticket_ring:                 session.KeyRing;
     replay_window:               session.ReplayWindow;
     ticket_key_lifetime_seconds: u32;
-    ticket_rotate_at:            i64;
+    ticket_rotate_at:            time.Instant;
     ticket_replay_policy:        session.ReplayPolicy;
     tickets_per_connection:      u8;
     tickets_live:                bool;
@@ -191,7 +195,7 @@ pub fun reset() {
         policies[i].name_len           = 0;
         policies[i].tickets_live       = false;
         policies[i].replay_live        = false;
-        policies[i].ticket_rotate_at   = 0;
+        policies[i].ticket_rotate_at   = time.Instant{sec: 0, nsec: 0};
         i                              = i + 1;
     }
     policy_count   = 0;
@@ -207,21 +211,25 @@ pub fun policy_at(index: usize) *Policy {
     ret ?policies[index];
 }
 
-# rotate the ticket key when it is due, before a handshake uses the ring
+# rotate the ticket key when it is due, before a handshake uses the ring. the
+# rotation schedule is an interval, so it runs on the monotonic clock, and the
+# ring takes both readings of one moment
 # ---
-# index:        the policy a connection is about to handshake under
-# wall_seconds: clock.wall_seconds(). the ring keeps key windows in that timebase
-#               and the handshake compares them against its own wall time, so a
-#               deadline clock here leaves every key open forever
-# ret:          false when the policy is gone or a new key cannot be minted
-pub fun prepare(index: usize, wall_seconds: i64) bool {
+# index: the policy a connection is about to handshake under
+# ret:   false when the policy is gone, the clocks cannot be read, or a new key
+#        cannot be minted
+pub fun prepare(index: usize) bool {
     val policy: *Policy = policy_at(index);
-    if (policy == nil)                                                   { ret false; }
-    if (!policy.tickets_live || wall_seconds <= policy.ticket_rotate_at) { ret true; }
-    if (!session.keyring_rotate(?policy.ticket_ring, ?policy.entropy, wall_seconds)) {
+    if (policy == nil)        { ret false; }
+    if (!policy.tickets_live) { ret true; }
+    var moment: tls_clock.Moment;
+    if (!tls_clock.read(?policy.clock, ?moment))                        { ret false; }
+    if (time.instant_before(moment.monotonic, policy.ticket_rotate_at)) { ret true; }
+    if (!session.keyring_rotate(?policy.ticket_ring, ?policy.entropy, moment)) {
         ret false;
     }
-    policy.ticket_rotate_at = wall_seconds + policy.ticket_key_lifetime_seconds::i64;
+    policy.ticket_rotate_at = clock.after(moment.monotonic,
+        policy.ticket_key_lifetime_seconds::u64 * 1000000000);
     ret true;
 }
 
@@ -446,6 +454,7 @@ fun build_configuration(policy: *Policy) Status {
     configuration.signature_len        = 4;
     configuration.entropy              = ?policy.entropy;
     configuration.entropy_context_size = 0;
+    configuration.clock                = ?policy.clock;
     if (policy.tickets_live) {
         configuration.tickets                = ?policy.ticket_ring;
         configuration.tickets_per_connection = policy.tickets_per_connection;
@@ -474,10 +483,9 @@ fun build_configuration(policy: *Policy) Status {
     var flight_required: usize = 0;
     if (!tls_server.storage_requirements(?policy.configuration, extra,
         ?hello_required, ?flight_required)) { ret UNSUPPORTED; }
-    # the per-connection buffers are fixed, so a configuration that needs more
-    # than they hold must fail here rather than at the first handshake
-    if (hello_required > HANDSHAKE_OUTPUT_BYTES
-        || flight_required > HANDSHAKE_OUTPUT_BYTES) { ret UNSUPPORTED; }
+    # the handshake's output comes from the connection's TLS lane, so a
+    # configuration that needs more than the lane holds fails here
+    if (hello_required + flight_required > memory.TLS_BUDGET) { ret UNSUPPORTED; }
     ret OK;
 }
 
@@ -490,29 +498,30 @@ fun destroy_resumption(policy: *Policy) {
         session.keyring_destroy(?policy.ticket_ring);
         policy.tickets_live = false;
     }
-    policy.ticket_rotate_at = 0;
+    policy.ticket_rotate_at = time.Instant{sec: 0, nsec: 0};
 }
 
-# wall_seconds is clock.wall_seconds(), the timebase of every ticket and key time
-fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption,
-    wall_seconds: i64) Status {
+fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Status {
     policy.tickets_live           = false;
     policy.replay_live            = false;
-    policy.ticket_rotate_at       = 0;
+    policy.ticket_rotate_at       = time.Instant{sec: 0, nsec: 0};
     policy.ticket_replay_policy   = session.REPLAY_PERMISSIVE;
     policy.tickets_per_connection = 0;
     if (configured == nil || !configured.enabled) { ret OK; }
     if (configured.retirement_overlap_seconds::usize >
         configured.key_lifetime_seconds::usize *
         (session.MAX_TICKET_KEYS - 1)) { ret INVALID; }
-    if (!session.keyring_init(?policy.ticket_ring, ?policy.entropy, wall_seconds,
+    var moment: tls_clock.Moment;
+    if (!tls_clock.read(?policy.clock, ?moment)) { ret UNSUPPORTED; }
+    if (!session.keyring_init(?policy.ticket_ring, ?policy.entropy, moment,
         configured.key_lifetime_seconds,
         configured.retirement_overlap_seconds,
         configured.ticket_lifetime_seconds)) { ret UNSUPPORTED; }
     policy.tickets_live                = true;
     policy.ticket_key_lifetime_seconds = configured.key_lifetime_seconds;
-    policy.ticket_rotate_at            = wall_seconds + configured.key_lifetime_seconds::i64;
-    policy.tickets_per_connection      = configured.tickets_per_connection;
+    policy.ticket_rotate_at            = clock.after(moment.monotonic,
+        configured.key_lifetime_seconds::u64 * 1000000000);
+    policy.tickets_per_connection = configured.tickets_per_connection;
     if (configured.replay_policy == schema.TLS_REPLAY_SINGLE_USE) {
         if (!session.replay_init(?policy.replay_window)) {
             destroy_resumption(policy);
@@ -583,14 +592,14 @@ fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
     policy.require_client_auth  = configured.client_auth;
     policy.tickets_live         = false;
     policy.replay_live          = false;
-    policy.ticket_rotate_at     = 0;
+    policy.ticket_rotate_at     = time.Instant{sec: 0, nsec: 0};
     policy.client_trust.anchors = nil;
     policy.client_trust.len     = 0;
     if (!copy_name(?policy.name[0], ?policy.name_len, name)) { ret INVALID; }
     if (configured.identity_count == 0)                      { ret INVALID; }
     policy.entropy = secret.system_entropy();
-    val resumable: Status = configure_resumption(policy,
-        ?configured.resumption, clock.wall_seconds());
+    policy.clock   = tls_clock.system();
+    val resumable: Status = configure_resumption(policy, ?configured.resumption);
     if (resumable != OK) { ret resumable; }
     var i: usize = 0;
     for (i < configured.identity_count) {
@@ -1029,6 +1038,7 @@ test "tls: a policy offers the listener's protocols in the listener's order" {
 test "tls: the handshake storage a listener configuration needs is bounded" {
     var policy: Policy;
     policy.entropy  = secret.system_entropy();
+    policy.clock    = tls_clock.system();
     policy.alpn_len = 0;
     # the widest offer this listener can make, which is what sizes the flight
     offer_protocols(?policy, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2);
@@ -1184,17 +1194,23 @@ test "tls: configured session keys rotate and retain their exact overlap" {
         destroy();
         ret 3;
     }
-    val first:    u64 = session.keyring_generation(?policy.ticket_ring);
-    val boundary: i64 = policy.ticket_rotate_at;
-    if (first == 0 || !prepare(index, boundary)
+    # the policy reads a clock the test holds, so the schedule is exact
+    var moment: tls_clock.Moment = tls_clock.at(1000, 0);
+    policy.clock = tls_clock.frozen(?moment);
+    val first:    u64          = session.keyring_generation(?policy.ticket_ring);
+    val boundary: time.Instant = policy.ticket_rotate_at;
+    moment.monotonic = time.instant_add(boundary, -1);
+    if (first == 0 || !prepare(index)
         || session.keyring_generation(?policy.ticket_ring) != first) {
         destroy();
         ret 4;
     }
-    if (!prepare(index, boundary + 1)
+    moment.monotonic = boundary;
+    if (!prepare(index)
         || session.keyring_generation(?policy.ticket_ring) != first + 1
-        || session.keyring_openable(?policy.ticket_ring, boundary + 1) != 2
-        || policy.ticket_rotate_at != boundary + 61) {
+        || session.keyring_openable(?policy.ticket_ring, boundary) != 2
+        || !time.instant_equal(policy.ticket_rotate_at,
+        time.instant_add(boundary, 60000000000))) {
         destroy();
         ret 5;
     }

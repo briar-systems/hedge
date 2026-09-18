@@ -6,12 +6,14 @@
 
 use hedge.budget;
 use hedge.clock;
+use hedge.config.lanes;
 use hedge.config.schema;
 use hedge.connection;
 use hedge.dispatch.plan;
 use hedge.lifecycle;
 use hedge.listener;
-use h3_session: hedge.protocol.h3.session;
+use hedge_memory: hedge.memory;
+use h3_session:   hedge.protocol.h3.session;
 use hedge.protocol.prologue;
 use quic_runtime:  hedge.protocol.quic.runtime;
 use hedge_tls:     hedge.protocol.tls;
@@ -82,19 +84,24 @@ fun timeout_nanoseconds(milliseconds: u64, output: *u64) bool {
 
 # a service plane the serving loop must drive alongside connections. the time it
 # is handed is monotonic, the clock every deadline is scheduled on
-pub def PlaneFun: fun(ptr, time.Time) bool;
+pub def PlaneFun: fun(ptr, time.Instant) bool;
 
 pub def PlaneQuiesceStatus: u8;
 pub val PLANE_QUIESCED: PlaneQuiesceStatus = 1;
 pub val PLANE_PENDING:  PlaneQuiesceStatus = 2;
 pub val PLANE_FAILED:   PlaneQuiesceStatus = 3;
-pub def PlaneQuiesceFun: fun(ptr, time.Time) PlaneQuiesceStatus;
+pub def PlaneQuiesceFun: fun(ptr, time.Instant) PlaneQuiesceStatus;
 
 # how many fired timer owners one wheel advance hands back at a time
 val FIRE_BATCH: usize = 64;
 
 pub rec Runtime {
     storage: connection.Storage;
+    # the worker's buffer pool. every connection this worker serves, over any
+    # transport, opens its account here, and its wakes land in `wakes`
+    memory: hedge_memory.Memory;
+    # connections admission turned away because the pool could not fund them
+    refused_memory: u64;
     # every deadline this worker decides, whichever protocol owns it
     timers: hedge_timer.Wheel;
     # every owner something outside its own io has made runnable again
@@ -148,6 +155,11 @@ pub rec Runtime {
     quic_released:    bool;
 }
 
+pub fun refused_memory(runtime: *Runtime) u64 {
+    if (runtime == nil) { ret 0; }
+    ret runtime.refused_memory;
+}
+
 pub fun drives(runtime: *Runtime) u64 {
     if (runtime == nil) { ret 0; }
     ret runtime.drives;
@@ -192,28 +204,30 @@ pub fun make(
         || !connection.make_storage(?runtime.storage, a)
         || !hedge_timer.make(?runtime.timers, a, clock.monotonic_ns())
         || !hedge_wake.make(?runtime.wakes, a)
+        || !hedge_memory.make(?runtime.memory, lanes.memory_bytes(?graph.limits), a)
         || !hedge_storage.make_table[Slot](?runtime.slots, a)
         || !hedge_storage.make[connection.Connection](?runtime.connections, a, 1)) {
         ret false;
     }
-    runtime.state         = NEW;
-    runtime.generation    = 0;
-    runtime.claimed_slots = 0;
-    runtime.live          = 0;
-    runtime.next_id       = 1;
-    runtime.plan          = active_plan;
-    runtime.graph         = graph;
-    runtime.configured    = connection.config_from(graph);
-    runtime.limits        = connection.message_limits(graph, runtime.configured);
-    runtime.observability = nil;
-    runtime.plane_ctx     = nil;
-    runtime.plane         = (0::usize)::PlaneFun;
-    runtime.plane_quiesce = (0::usize)::PlaneQuiesceFun;
-    runtime.served        = 0;
-    runtime.accepted      = 0;
-    runtime.last_refusal  = prologue.REFUSED_NONE;
-    runtime.rejected      = 0;
-    runtime.shutdown      = lifecycle.make();
+    runtime.state          = NEW;
+    runtime.generation     = 0;
+    runtime.claimed_slots  = 0;
+    runtime.live           = 0;
+    runtime.next_id        = 1;
+    runtime.plan           = active_plan;
+    runtime.graph          = graph;
+    runtime.configured     = connection.config_from(graph);
+    runtime.limits         = connection.message_limits(graph, runtime.configured);
+    runtime.observability  = nil;
+    runtime.plane_ctx      = nil;
+    runtime.plane          = (0::usize)::PlaneFun;
+    runtime.plane_quiesce  = (0::usize)::PlaneQuiesceFun;
+    runtime.served         = 0;
+    runtime.accepted       = 0;
+    runtime.last_refusal   = prologue.REFUSED_NONE;
+    runtime.rejected       = 0;
+    runtime.refused_memory = 0;
+    runtime.shutdown       = lifecycle.make();
     if (!timeout_nanoseconds(graph.timeouts.drain_ms,
         ?runtime.drain_timeout_ns)) { ret false; }
     runtime.queued            = 0;
@@ -347,6 +361,8 @@ fun quic_config(runtime: *Runtime, graph: *schema.Graph, index: usize,
         limits:                   connection.message_limits(graph, connection_config),
         max_requests:             max_requests,
         call_memory_bytes:        connection_config.call_memory_bytes,
+        memory_budgets:           connection_config.memory_budgets,
+        memory_wait_ns:           connection_config.memory_wait_ns,
         listener_name:            schema.text(?configured.name),
         handshake_timeout_ns:     graph.timeouts.handshake_ms * 1000000,
         request_timeout_ns:       graph.timeouts.request_ms * 1000000,
@@ -363,7 +379,7 @@ fun release_quic(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     for (released == quic_runtime.BLOCKED) {
         if (!listener.poll(?runtime.owner, 1)) { ret false; }
         fire_timers(controls, runtime, clock.monotonic_ns());
-        if (quic_runtime.advance(controls, runtime.quic, clock.wall(), clock.monotonic_ns())
+        if (quic_runtime.advance(controls, runtime.quic, clock.monotonic_ns())
             == quic_runtime.FAILED) { ret false; }
         released = quic_runtime.release(controls, runtime.quic);
     }
@@ -600,7 +616,7 @@ fun teardown_pending(runtime: *Runtime) bool {
 }
 
 # admit every queued connection the pool can hold and refuse the rest at once
-fun admit(runtime: *Runtime, now: time.Time) usize {
+fun admit(runtime: *Runtime, now: time.Instant) usize {
     var admitted: usize = 0;
     for (true) {
         val index: usize = free_slot(runtime);
@@ -641,8 +657,12 @@ fun admit(runtime: *Runtime, now: time.Time) usize {
         if (owned == nil || !connection.make(slot.handle, runtime.next_id, runtime.generation,
             token, source, ?runtime.owner.network, runtime.plan, runtime.active_budgets,
             runtime.configured, runtime.limits, owned, policy,
-            ?runtime.storage, hedge_wake.waker(?runtime.wakes, tcp_owner(index)), now)) {
+            ?runtime.storage, ?runtime.memory,
+            hedge_wake.waker(?runtime.wakes, tcp_owner(index)), now)) {
             runtime.rejected = runtime.rejected + 1;
+            if (connection.refused_memory(slot.handle)) {
+                runtime.refused_memory = runtime.refused_memory + 1;
+            }
             if (!listener.close_connection(?runtime.owner, token)) {
                 runtime.teardown_failures = runtime.teardown_failures + 1;
             }
@@ -691,7 +711,7 @@ fun listener_budget(runtime: *Runtime, index: usize) usize {
 # a connection holding a place in its budget's queue learns where it stands.
 # a release admits it and wakes it, and its wheel entry ends the wait when the
 # budget's timeout passes
-fun admit_waiting(runtime: *Runtime, index: usize, now: time.Time) bool {
+fun admit_waiting(runtime: *Runtime, index: usize, now: time.Instant) bool {
     val slot:    *Slot          = slot_at(runtime, index);
     val outcome: budget.Outcome = budget.retry(slot.budgets, ?slot.charge, now);
     if (outcome == budget.ADMITTED) {
@@ -713,7 +733,7 @@ fun arm_waiting(runtime: *Runtime, index: usize) {
         runtime.teardown_failures = runtime.teardown_failures + 1;
         ret;
     }
-    var deadline: time.Time;
+    var deadline: time.Instant;
     var armed:    hedge_timer.Status = hedge_timer.OK;
     if (budget.deadline(?slot.charge, ?deadline)) {
         armed = hedge_timer.arm(?runtime.timers, slot.timer, clock.to_ns(deadline));
@@ -798,23 +818,37 @@ fun take_ready(runtime: *Runtime) usize {
 }
 
 fun has_ready(runtime: *Runtime) bool {
-    ret runtime.ready_head != NO_SLOT || hedge_wake.pending(?runtime.wakes);
+    ret runtime.ready_head != NO_SLOT || hedge_wake.pending(?runtime.wakes)
+        || hedge_memory.has_woken(?runtime.memory);
 }
 
-# hand every woken owner to the protocol that owns it
+fun route_owner(controls: *quic_runtime.ControlView, runtime: *Runtime, owner: u64) {
+    if (owns_tcp(owner)) {
+        mark_ready(runtime, (owner & ~TAG_MASK)::usize);
+    }
+    or (quic_runtime.owns(owner) && runtime.quic != nil && !runtime.quic_released) {
+        quic_runtime.wake(controls, runtime.quic, owner);
+    }
+}
+
+# hand every woken owner to the protocol that owns it, whether a waiter woke it
+# or the buffer pool funded its account again
 fun route_wakes(controls: *quic_runtime.ControlView, runtime: *Runtime) {
     var owners: [WAKE_BATCH]u64;
+    for {
+        val funded: usize = hedge_memory.woken(?runtime.memory, ?owners[0], WAKE_BATCH);
+        var f:      usize = 0;
+        for (f < funded) {
+            route_owner(controls, runtime, owners[f]);
+            f = f + 1;
+        }
+        if (funded < WAKE_BATCH) { brk; }
+    }
     for {
         val taken: usize = hedge_wake.take(?runtime.wakes, ?owners[0], WAKE_BATCH);
         var i:     usize = 0;
         for (i < taken) {
-            if (owns_tcp(owners[i])) {
-                mark_ready(runtime, (owners[i] & ~TAG_MASK)::usize);
-            }
-            or (quic_runtime.owns(owners[i]) && runtime.quic != nil
-                && !runtime.quic_released) {
-                quic_runtime.wake(controls, runtime.quic, owners[i]);
-            }
+            route_owner(controls, runtime, owners[i]);
             i = i + 1;
         }
         if (taken < WAKE_BATCH) { brk; }
@@ -841,7 +875,7 @@ fun arm_slot(runtime: *Runtime, index: usize) {
 
 # drive one connection until it blocks on I/O or finishes, then wait on its
 # earliest deadline. one that is still moving yields and runs again next turn
-fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
+fun drive(runtime: *Runtime, index: usize, now: time.Instant) bool {
     val slot: *Slot = slot_at(runtime, index);
     runtime.drives = runtime.drives + 1;
     connection.expire(slot.handle, clock.to_ns(now));
@@ -857,7 +891,7 @@ fun drive(runtime: *Runtime, index: usize, now: time.Time) bool {
 
 # drive or retire the connections that have work. what they queue while this
 # runs waits for the next pass, which then does not wait on the network
-fun run_ready(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Time) {
+fun run_ready(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Instant) {
     route_wakes(controls, runtime);
     var tail: usize = runtime.ready_tail;
     for (tail != NO_SLOT) {
@@ -897,11 +931,11 @@ fun fire_timers(controls: *quic_runtime.ControlView, runtime: *Runtime, now_ns: 
 
 pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms: i32) bool {
     if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) { ret false; }
-    var bounded_timeout: i32       = timeout_ms;
-    val poll_started_at: time.Time = clock.monotonic();
-    var deadline:        u64       = 0;
+    var bounded_timeout: i32          = timeout_ms;
+    val poll_started_at: time.Instant = clock.instant();
+    var deadline:        u64          = 0;
     if (hedge_timer.next_deadline(?runtime.timers, ?deadline)) {
-        val current: u64 = time.time_unix_nsec(poll_started_at)::u64;
+        val current: u64 = clock.to_ns(poll_started_at);
         var wait_ms: u64 = 0;
         if (deadline > current) {
             val remaining: u64 = deadline - current;
@@ -918,12 +952,12 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
         && quic_runtime.has_ready(runtime.quic))) {
         bounded_timeout = 0;
     }
-    val polled:  bool      = listener.poll(?runtime.owner, bounded_timeout);
-    val now:     time.Time = clock.monotonic();
-    var quic_ok: bool      = true;
+    val polled:  bool         = listener.poll(?runtime.owner, bounded_timeout);
+    val now:     time.Instant = clock.instant();
+    var quic_ok: bool         = true;
     fire_timers(controls, runtime, clock.monotonic_ns());
     if (runtime.quic != nil && !runtime.quic_released
-        && quic_runtime.advance(controls, runtime.quic, clock.wall(), clock.monotonic_ns())
+        && quic_runtime.advance(controls, runtime.quic, clock.monotonic_ns())
         == quic_runtime.FAILED) {
         quic_ok = false;
     }
@@ -935,15 +969,19 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     if (runtime.plane::usize != 0)            { runtime.plane(runtime.plane_ctx, now); }
     run_ready(controls, runtime, now);
     # plane and tcp progress can release shared budget capacity for quic
-    val settled: time.Time = clock.monotonic();
+    val settled: time.Instant = clock.instant();
     if (runtime.quic != nil && !runtime.quic_released
-        && quic_runtime.advance(controls, runtime.quic, clock.wall(), clock.monotonic_ns())
+        && quic_runtime.advance(controls, runtime.quic, clock.monotonic_ns())
         == quic_runtime.FAILED) {
         quic_ok = false;
     }
     if (runtime.quic != nil && runtime.observability != nil) {
         telemetry.quic_replay_full(runtime.observability,
             quic_runtime.replay_full(runtime.quic));
+    }
+    if (runtime.observability != nil) {
+        telemetry.memory(runtime.observability, hedge_memory.snapshot(?runtime.memory),
+            runtime.refused_memory);
     }
     run_ready(controls, runtime, settled);
     if (lifecycle.serving(?runtime.shutdown)) {
@@ -1042,7 +1080,7 @@ fun run_action(controls: *quic_runtime.ControlView, runtime: *Runtime, action: l
 # that same runtime is a use of what it is destroying. releasing resources is
 # the process's last act, so the sequence parks at FLUSHING and the owner
 # performs the close.
-fun advance_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Time, close: bool) {
+fun advance_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Instant, close: bool) {
     var guard: usize = 0;
     for (guard < 8) {
         if (!close && lifecycle.awaiting_close(?runtime.shutdown)) { ret; }
@@ -1055,7 +1093,7 @@ fun advance_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, now
 }
 
 # begin the sequence and let active exchanges finish within the drain deadline
-pub fun begin_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Time) bool {
+pub fun begin_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.Instant) bool {
     if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) {
         ret false;
     }
@@ -1131,7 +1169,7 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
             ?updates[0], update_count);
         if (!quic_result.committed) {
             if (quic_result.rollback_failed) {
-                begin_shutdown(controls, runtime, clock.monotonic());
+                begin_shutdown(controls, runtime, clock.instant());
             }
             ret false;
         }
@@ -1162,7 +1200,7 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     # as a rejected reload. enter the ordered shutdown path and surface it there.
     if (!signalled || (quic_result.committed
         && quic_result.status != quic_runtime.OK)) {
-        begin_shutdown(controls, runtime, clock.monotonic());
+        begin_shutdown(controls, runtime, clock.instant());
     }
     ret true;
 }
@@ -1282,6 +1320,7 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
                     if (!connection.destroy_storage(?runtime.storage)
                         || !release_pool(runtime)
                         || !hedge_timer.destroy(?runtime.timers)
+                        || !hedge_memory.destroy(?runtime.memory)
                         || !hedge_wake.destroy(?runtime.wakes)) {
                         runtime.teardown_failures = runtime.teardown_failures + 1;
                     }
@@ -1295,7 +1334,7 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
             && runtime.teardown_failures == 0
             && lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED;
     }
-    val now: time.Time = clock.monotonic();
+    val now: time.Instant = clock.instant();
     if (lifecycle.serving(?runtime.shutdown)) {
         run_action(controls, runtime, lifecycle.begin(?runtime.shutdown, now, 0));
     }
@@ -1311,13 +1350,13 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     }
     if (runtime.plane_quiesce::usize != 0) {
         var status: PlaneQuiesceStatus = runtime.plane_quiesce(
-            runtime.plane_ctx, clock.monotonic());
+            runtime.plane_ctx, clock.instant());
         for (status == PLANE_PENDING) {
             if (!listener.poll(?runtime.owner, -1)) {
                 lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
                 ret false;
             }
-            val settled: time.Time = clock.monotonic();
+            val settled: time.Instant = clock.instant();
             if (runtime.plane::usize != 0) {
                 runtime.plane(runtime.plane_ctx, settled);
             }
@@ -1328,7 +1367,7 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
             ret false;
         }
     }
-    advance_shutdown(controls, runtime, clock.monotonic(), true);
+    advance_shutdown(controls, runtime, clock.instant(), true);
     ret lifecycle.closed(?runtime.shutdown)
         && lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED
         && runtime.teardown_failures == 0;
