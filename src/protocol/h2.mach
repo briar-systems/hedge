@@ -38,6 +38,7 @@ use http.router.router;
 use A: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
+use std_memory: std.memory;
 use std.memory.buffers;
 use std.sync.cancel;
 use std.types.bool.bool;
@@ -156,6 +157,10 @@ rec Slot {
     close_disposition: bool;
     bound:             bool;
     charge:            budget.Charge;
+    # this slot's index into the session's slot arrays, the identity of its
+    # borrowed storage chunk. set when the chunk is borrowed and never reset, so
+    # the body reader can find its slot without pointer arithmetic
+    index: usize;
 }
 
 # the connection deadlines the engine enforces, from the listener's timeouts
@@ -187,7 +192,12 @@ pub rec Session {
     inbound_storage:  [TABLE_STORAGE_BYTES]u8;
     outbound_entries: [TABLE_ENTRIES]hpack.Entry;
     outbound_storage: [TABLE_STORAGE_BYTES]u8;
-    slots:            [MAX_STREAMS]Slot;
+    # per-stream Slot storage is borrowed on demand: an idle connection holds no
+    # stream state, only these small handles. slot i lives in slot_chunks[i] for
+    # exactly as long as slot_held[i], borrowed when a stream claims the slot and
+    # released when it retires, so a borrowed Slot never moves under the engine
+    slot_chunks: [MAX_STREAMS]buffers.Chunk;
+    slot_held:   [MAX_STREAMS]bool;
     # lowered field names and trailers for the one header list being offered
     names:              names.Scratch;
     trailer_items:      [RESPONSE_TRAILER_SLOTS]field.Field;
@@ -237,6 +247,20 @@ fun reset_slot(slot: *Slot) {
     slot.charge            = budget.no_charge();
 }
 
+# the Slot at index i, or nil when no stream holds that index. a held chunk does
+# not move, so the pointer is stable for the slot's whole active life
+fun slot_at(session: *Session, i: usize) *Slot {
+    if (!session.slot_held[i]) { ret nil; }
+    ret (session.slot_chunks[i].data)::*Slot;
+}
+
+# return a retired slot's storage to the request lane; a no-op when not held
+fun slot_release_storage(session: *Session, i: usize) {
+    if (!session.slot_held[i]) { ret; }
+    buffers.source_release(?session.source, session.account, session.slot_chunks[i]);
+    session.slot_held[i] = false;
+}
+
 pub fun acquire(sessions: *storage.Recycler[Session]) *Session {
     val session: *Session = storage.claim[Session](sessions);
     if (session == nil) { ret nil; }
@@ -251,10 +275,12 @@ pub fun acquire(sessions: *storage.Recycler[Session]) *Session {
     session.last_step         = STEP_IDLE;
     session.final_goaway_sent = false;
     session.release_failed    = false;
+    # an idle session holds no per-stream storage; the slots are borrowed as
+    # streams claim them
     var j: usize = 0;
     for (j < MAX_STREAMS) {
-        reset_slot(?session.slots[j]);
-        j = j + 1;
+        session.slot_held[j] = false;
+        j                    = j + 1;
     }
     ret session;
 }
@@ -312,6 +338,7 @@ fun release_slot_resources(session: *Session, slot: *Slot) bool {
 
 fun finish_retirement(session: *Session, slot: *Slot,
     release_stream: bool) bool {
+    val index: usize = slot.index;
     # finalizer failure is permanent and already recorded on the session. it
     # cannot become progress after a transport completion, so teardown proceeds.
     val finalized: bool = finalize_slot_call(session, slot);
@@ -321,6 +348,10 @@ fun finish_retirement(session: *Session, slot: *Slot,
         slot.stream_released = true;
     }
     if (!release_slot_resources(session, slot)) { ret false; }
+    # every retirement path funnels through here, so this is the one point that
+    # returns the slot's storage to the request lane. after it the slot pointer
+    # is dead; callers test slot_held to see whether teardown settled
+    slot_release_storage(session, index);
     ret finalized;
 }
 
@@ -335,7 +366,11 @@ fun detach_slot_exchange(session: *Session, slot: *Slot) bool {
 }
 
 fun retire_slot(session: *Session, slot: *Slot) bool {
-    if (!slot.live) { ret true; }
+    val index: usize = slot.index;
+    if (!slot.live) {
+        slot_release_storage(session, index);
+        ret true;
+    }
     var cancellation: exchange.FinishStatus = exchange.FINISH_OK;
     if (slot.exchange_live && slot.exchange.state != exchange.COMPLETE_STATE
         && slot.exchange.state != exchange.CANCELLED_STATE
@@ -362,9 +397,10 @@ fun retire_slot(session: *Session, slot: *Slot) bool {
         if (cancellation == exchange.FINISH_BODY_PENDING) { ret false; }
     }
     val finished: bool = finish_retirement(session, slot, slot.bound);
-    # a permanent call finalizer failure is not pending ownership. the slot was
-    # still fully retired and release_status reports the recorded failure.
-    if (!finished && !slot.live) { ret true; }
+    # finish_retirement returns the slot's storage the moment retirement settles,
+    # so a freed chunk means the slot is fully retired whatever the finalizer
+    # reported; a still-held chunk means teardown is pending and must be retried.
+    if (!session.slot_held[index]) { ret true; }
     ret finished;
 }
 
@@ -401,7 +437,9 @@ pub fun release_status(sessions: *storage.Recycler[Session], session: *Session) 
     var pending: bool  = false;
     var j:       usize = 0;
     for (j < MAX_STREAMS) {
-        if (!retire_slot(session, ?session.slots[j])) { pending = true; }
+        if (session.slot_held[j] && !retire_slot(session, slot_at(session, j))) {
+            pending = true;
+        }
         j = j + 1;
     }
     if (pending)                { ret RELEASE_PENDING; }
@@ -510,18 +548,39 @@ pub fun begin(session: *Session, channel: *transport.Transport, scope: *cancel.S
 fun slot_for(session: *Session, id: u32) *Slot {
     var i: usize = 0;
     for (i < MAX_STREAMS) {
-        if (session.slots[i].live && session.slots[i].id == id) {
-            ret ?session.slots[i];
+        if (session.slot_held[i]) {
+            val slot: *Slot = slot_at(session, i);
+            if (slot.live && slot.id == id) { ret slot; }
         }
         i = i + 1;
     }
     ret nil;
 }
 
+# claim a free slot index and borrow its storage from the request lane, or nil
+# when every index is live or the lane cannot fund another slot. a nil return is
+# the connection's back pressure: the caller refuses the stream. the returned
+# slot is reset and carries its index; a held chunk is stable for its whole life
 fun free_slot(session: *Session) *Slot {
     var i: usize = 0;
     for (i < MAX_STREAMS) {
-        if (!session.slots[i].live) { ret ?session.slots[i]; }
+        if (!session.slot_held[i]) {
+            val got: buffers.Acquired = buffers.source_acquire(?session.source,
+                session.account, buffers.Request{bytes: $size_of(Slot),
+                align:  $align_of(Slot), lane: hedge_memory.LANE_REQUEST,
+                secret: false}, true);
+            if (!(sel got.status.ok)) { ret nil; }
+            session.slot_chunks[i] = got.chunk;
+            session.slot_held[i]   = true;
+            val slot: *Slot = (got.chunk.data)::*Slot;
+            # a fresh chunk is uninitialized; zero it so every embedded struct
+            # starts from the same state a first recycler claim used to give an
+            # inline slot, before make_exchange initializes them
+            std_memory.raw_zero((slot)::ptr, $size_of(Slot));
+            reset_slot(slot);
+            slot.index = i;
+            ret slot;
+        }
         i = i + 1;
     }
     ret nil;
@@ -534,7 +593,10 @@ fun body_read(context: ptr, output: *u8, capacity: usize,
         ret body.failed("request body has no owner", body.REUSE_FORBIDDEN);
     }
     val session: *Session = state.session;
-    val slot:    *Slot    = ?session.slots[state.slot];
+    val slot:    *Slot    = slot_at(session, state.slot);
+    if (slot == nil) {
+        ret body.failed("request body outlived its slot", body.REUSE_FORBIDDEN);
+    }
     if (session.held_stream == slot.id && session.held_length != 0) {
         var count: usize = session.held_length;
         if (count > capacity) { count = capacity; }
@@ -579,7 +641,10 @@ fun body_finish(context: ptr, mode: body.Mode,
     if (mode == body.CANCEL)  { ret body.cancelled(body.REUSE_FORBIDDEN); }
     if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
     val session: *Session = state.session;
-    val slot:    *Slot    = ?session.slots[state.slot];
+    val slot:    *Slot    = slot_at(session, state.slot);
+    if (slot == nil) {
+        ret body.failed("request body outlived its slot", body.REUSE_FORBIDDEN);
+    }
     # an unread request body still owes the peer its flow-control window, so it
     # is consumed rather than abandoned
     if (session.held_stream == slot.id && session.held_length != 0) {
@@ -608,7 +673,10 @@ fun body_complete(context: ptr, token: u64,
     val mode: body.Mode      = state.reader.pending_mode;
     state.pending_token = 0;
     val session: *Session = state.session;
-    val slot:    *Slot    = ?session.slots[state.slot];
+    val slot:    *Slot    = slot_at(session, state.slot);
+    if (slot == nil) {
+        ret body.failed("request body outlived its slot", body.REUSE_FORBIDDEN);
+    }
     if (kind == body.OP_FINISH) {
         if (session.held_stream == slot.id && session.held_length != 0) {
             engine_h2.consume_data(?session.engine, slot.id, session.held_length);
@@ -735,8 +803,7 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
         clock.deadline(slot.deadline_ns)))) { ret false; }
     slot.scope_live            = true;
     slot.body.session          = session;
-    slot.body.slot             = (slot)::usize - (?session.slots[0])::usize;
-    slot.body.slot             = slot.body.slot / $size_of(Slot);
+    slot.body.slot             = slot.index;
     slot.body.pending_output   = nil;
     slot.body.pending_capacity = 0;
     slot.body.pending_token    = 0;
@@ -1082,7 +1149,6 @@ fun open_stream(session: *Session, event: engine_h2.Event, now: time.Instant) St
             event.generation, session.now)) { ret STEP_ERROR; }
         ret STEP_PROGRESS;
     }
-    reset_slot(slot);
     slot.live             = true;
     slot.id               = event.stream_id;
     slot.generation       = event.generation;
@@ -1216,9 +1282,11 @@ fun pump_streams(session: *Session, now: time.Instant) Step {
     var progressed: bool  = false;
     var i:          usize = 0;
     for (i < MAX_STREAMS) {
-        val stepped: Step = pump_slot(session, ?session.slots[i], now);
-        if (stepped == STEP_ERROR)    { ret STEP_ERROR; }
-        if (stepped == STEP_PROGRESS) { progressed = true; }
+        if (session.slot_held[i]) {
+            val stepped: Step = pump_slot(session, slot_at(session, i), now);
+            if (stepped == STEP_ERROR)    { ret STEP_ERROR; }
+            if (stepped == STEP_PROGRESS) { progressed = true; }
+        }
         i = i + 1;
     }
     if (progressed) { ret STEP_PROGRESS; }
@@ -1245,14 +1313,16 @@ pub fun next_deadline(session: *Session, output: *u64) bool {
     var found: bool  = false;
     var i:     usize = 0;
     for (i < MAX_STREAMS) {
-        val slot: *Slot = ?session.slots[i];
-        if (slot.live && slot.exchange_live && slot.deadline_ns != 0) {
-            found = earlier(found, slot.deadline_ns, output);
-        }
-        var waited: u64 = 0;
-        if (slot.live && slot.exchange_live && slot.service_pending
-            && call.wait_deadline(?slot.active_call, ?waited)) {
-            found = earlier(found, waited, output);
+        if (session.slot_held[i]) {
+            val slot: *Slot = slot_at(session, i);
+            if (slot.live && slot.exchange_live && slot.deadline_ns != 0) {
+                found = earlier(found, slot.deadline_ns, output);
+            }
+            var waited: u64 = 0;
+            if (slot.live && slot.exchange_live && slot.service_pending
+                && call.wait_deadline(?slot.active_call, ?waited)) {
+                found = earlier(found, waited, output);
+            }
         }
         i = i + 1;
     }
@@ -1387,7 +1457,7 @@ pub fun snapshot(session: *Session) Snapshot {
     var count: usize = 0;
     var i:     usize = 0;
     for (i < MAX_STREAMS) {
-        if (session.slots[i].live) { count = count + 1; }
+        if (session.slot_held[i] && slot_at(session, i).live) { count = count + 1; }
         i = i + 1;
     }
     value.active_streams = count;
