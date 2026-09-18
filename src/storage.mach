@@ -157,6 +157,8 @@ pub fun destroy_chunks(chunks: *Chunks) bool {
 # record never moves once its chunk exists.
 pub val TABLE_CHUNKS: usize = 32;
 pub val FIRST_CHUNK:  usize = 16;
+# no free slot / no cached chunk
+pub val NO_INDEX: usize = (-1)::usize;
 
 fun chunk_size(chunk: usize) usize {
     ret FIRST_CHUNK << chunk;
@@ -172,50 +174,344 @@ fun chunk_of(index: usize) usize {
     ret chunk;
 }
 
+# the record-table index allocator, shared by Table[T] and SecretTable[T].
+#
+# one index space [0, capacity) is drawn on by up to MAX_STORAGES storages that
+# grow and compact in lockstep (the paired channel/session tables are two storages
+# on one slab). chunk k holds FIRST_CHUNK << k slots. the slab owns a per-chunk
+# free stack in its own `links` storage, a per-chunk live count, and the lowest
+# non-full chunk, so a claim pops the lowest free index in O(1) amortized and
+# O(TABLE_CHUNKS) worst, never an O(capacity) scan.
+#
+# releasing the last live record of the trailing chunk releases that chunk and
+# cascades, so chunks [0, count) stay a dense prefix and a record never moves --
+# the invariant the raw record pointers held across a connection depend on. the
+# footprint is therefore proportional to the highest live index, which lowest-index
+# allocation drives down as high slots churn out, converging to proportional to the
+# live count; a record pinned at a high index holds its chunk until it releases,
+# the correct cost of never moving a record.
+pub val MAX_STORAGES: usize = 2;
+
+# a typed storage the slab drives. grow(ctx, k) adds chunk k (allocating or reusing
+# a cached chunk); release(ctx, k) frees the trailing chunk k (a plain dealloc, or
+# zeroize and unweld for secret storage). ctx is the owning table, fixed for the
+# slab's life -- a table must not be relocated after slab_storage.
+pub rec Storage {
+    ctx:     ptr;
+    grow:    fun(ptr, usize) bool;
+    release: fun(ptr, usize) bool;
+}
+
+pub rec Slab {
+    allocator:         *A.Allocator;
+    storages:          [MAX_STORAGES]Storage;
+    storage_count:     usize;
+    links:             [TABLE_CHUNKS]*usize;
+    links_cache:       *usize;
+    links_cache_class: usize;
+    count:             usize;
+    capacity:          usize;
+    live:              usize;
+    chunk_live:        [TABLE_CHUNKS]usize;
+    free_head:         [TABLE_CHUNKS]usize;
+    lowest_free:       usize;
+}
+
+pub fun slab_make(slab: *Slab, a: *A.Allocator) bool {
+    if (slab == nil || a == nil) { ret false; }
+    slab.allocator         = a;
+    slab.storage_count     = 0;
+    slab.links_cache       = nil;
+    slab.links_cache_class = TABLE_CHUNKS;
+    slab.count             = 0;
+    slab.capacity          = 0;
+    slab.live              = 0;
+    slab.lowest_free       = 0;
+    var i: usize = 0;
+    for (i < TABLE_CHUNKS) {
+        slab.links[i]      = nil;
+        slab.chunk_live[i] = 0;
+        slab.free_head[i]  = NO_INDEX;
+        i                  = i + 1;
+    }
+    ret true;
+}
+
+# register a storage before the first claim
+pub fun slab_storage(slab: *Slab, ctx: ptr, grow: fun(ptr, usize) bool,
+    release: fun(ptr, usize) bool) bool {
+    if (slab == nil || slab.storage_count == MAX_STORAGES || slab.count != 0
+        || grow == nil || release == nil) { ret false; }
+    slab.storages[slab.storage_count] = Storage{ctx: ctx, grow: grow, release: release};
+    slab.storage_count                = slab.storage_count + 1;
+    ret true;
+}
+
+# keep exactly one cached link chunk, the one closest to the regrow boundary
+fun cache_links(slab: *Slab, chunk: *usize, class: usize) {
+    if (slab.links_cache == nil) {
+        slab.links_cache       = chunk;
+        slab.links_cache_class = class;
+        ret;
+    }
+    if (class < slab.links_cache_class) {
+        A.deallocate[usize](slab.allocator, slab.links_cache, chunk_size(slab.links_cache_class));
+        slab.links_cache       = chunk;
+        slab.links_cache_class = class;
+        ret;
+    }
+    A.deallocate[usize](slab.allocator, chunk, chunk_size(class));
+}
+
+# add the next chunk to every storage and the slab's own link stack, in lockstep
+fun slab_grow(slab: *Slab) bool {
+    if (slab.count == TABLE_CHUNKS) { ret false; }
+    val k:    usize  = slab.count;
+    val size: usize  = chunk_size(k);
+    var link: *usize = nil;
+    if (slab.links_cache != nil && slab.links_cache_class == k) {
+        link                   = slab.links_cache;
+        slab.links_cache       = nil;
+        slab.links_cache_class = TABLE_CHUNKS;
+    }
+    or {
+        val got: res[*usize, A.Error] = A.allocate[usize](slab.allocator, size);
+        if (sel got.err) { ret false; }
+        link = got.ok;
+    }
+    var i: usize = 0;
+    for (i < slab.storage_count) {
+        if (!slab.storages[i].grow(slab.storages[i].ctx, k)) {
+            var j: usize = 0;
+            for (j < i) {
+                slab.storages[j].release(slab.storages[j].ctx, k);
+                j = j + 1;
+            }
+            cache_links(slab, link, k);
+            ret false;
+        }
+        i = i + 1;
+    }
+    slab.links[k] = link;
+    val base: usize = chunk_start(k);
+    var s:    usize = 0;
+    for (s < size) {
+        if (s + 1 < size) { link[s] = base + s + 1; }
+        or                { link[s] = NO_INDEX; }
+        s = s + 1;
+    }
+    slab.free_head[k]  = base;
+    slab.chunk_live[k] = 0;
+    slab.capacity      = slab.capacity + size;
+    slab.count         = slab.count + 1;
+    ret true;
+}
+
+# claim the lowest free index, growing all storages when the space is full.
+# NO_INDEX only when a storage or a link allocation refuses.
+pub fun slab_claim(slab: *Slab) usize {
+    if (slab == nil) { ret NO_INDEX; }
+    for (slab.lowest_free < slab.count && slab.free_head[slab.lowest_free] == NO_INDEX) {
+        slab.lowest_free = slab.lowest_free + 1;
+    }
+    if (slab.lowest_free == slab.count) {
+        if (!slab_grow(slab)) { ret NO_INDEX; }
+        slab.lowest_free = slab.count - 1;
+    }
+    val k:     usize = slab.lowest_free;
+    val index: usize = slab.free_head[k];
+    slab.free_head[k]  = slab.links[k][index - chunk_start(k)];
+    slab.chunk_live[k] = slab.chunk_live[k] + 1;
+    slab.live          = slab.live + 1;
+    ret index;
+}
+
+fun release_trailing(slab: *Slab) {
+    val k: usize = slab.count - 1;
+    var i: usize = 0;
+    for (i < slab.storage_count) {
+        slab.storages[i].release(slab.storages[i].ctx, k);
+        i = i + 1;
+    }
+    cache_links(slab, slab.links[k], k);
+    slab.links[k]      = nil;
+    slab.free_head[k]  = NO_INDEX;
+    slab.chunk_live[k] = 0;
+    slab.capacity      = slab.capacity - chunk_size(k);
+    slab.count         = k;
+}
+
+# return an index to its chunk's free stack, releasing trailing all-free chunks
+pub fun slab_release(slab: *Slab, index: usize) bool {
+    if (slab == nil || index >= slab.capacity) { ret false; }
+    val k: usize = chunk_of(index);
+    if (slab.chunk_live[k] == 0) { ret false; }
+    slab.links[k][index - chunk_start(k)] = slab.free_head[k];
+    slab.free_head[k]                     = index;
+    slab.chunk_live[k]                    = slab.chunk_live[k] - 1;
+    slab.live                             = slab.live - 1;
+    if (k < slab.lowest_free) { slab.lowest_free = k; }
+    if (slab.chunk_live[k] == 0 && k == slab.count - 1) {
+        for (slab.count > 0 && slab.chunk_live[slab.count - 1] == 0) {
+            release_trailing(slab);
+        }
+        if (slab.lowest_free > slab.count) { slab.lowest_free = slab.count; }
+    }
+    ret true;
+}
+
+# free the slab's own link storage and cache; storages free their own chunks
+pub fun slab_destroy(slab: *Slab) bool {
+    if (slab == nil) { ret false; }
+    var ok: bool  = true;
+    var i:  usize = 0;
+    for (i < slab.count) {
+        if (slab.links[i] != nil) {
+            val freed: err[A.Error] = A.deallocate[usize](slab.allocator, slab.links[i],
+                chunk_size(i));
+            if (sel freed.err) { ok = false; }
+            slab.links[i] = nil;
+        }
+        i = i + 1;
+    }
+    if (slab.links_cache != nil) {
+        val freed: err[A.Error] = A.deallocate[usize](slab.allocator, slab.links_cache,
+            chunk_size(slab.links_cache_class));
+        if (sel freed.err) { ok = false; }
+        slab.links_cache       = nil;
+        slab.links_cache_class = TABLE_CHUNKS;
+    }
+    slab.count       = 0;
+    slab.capacity    = 0;
+    slab.live        = 0;
+    slab.lowest_free = 0;
+    ret ok;
+}
+
+# an index-addressed table of records, one storage on a Slab. records never move;
+# the table commits a record chunk when the slab grows the index space and releases
+# it (to a one-deep cache, then the allocator) when the slab compacts a trailing
+# all-free chunk, so it holds chunks proportional to the highest live index.
 pub rec Table[T] {
-    allocator: *A.Allocator;
-    chunks:    [TABLE_CHUNKS]*T;
-    count:     usize;
-    capacity:  usize;
+    slab:        Slab;
+    chunks:      [TABLE_CHUNKS]*T;
+    cache:       *T;
+    cache_class: usize;
+}
+
+# the slab's grow hook: commit record chunk k, reusing the cache when it fits.
+# zeroed, because a fresh record must read as unused
+fun table_grow_hook[T](ctx: ptr, k: usize) bool {
+    val table: *Table[T] = ctx::*Table[T];
+    var chunk: *T        = nil;
+    if (table.cache != nil && table.cache_class == k) {
+        chunk             = table.cache;
+        table.cache       = nil;
+        table.cache_class = TABLE_CHUNKS;
+    }
+    or {
+        val allocated: res[*T, A.Error] = A.zallocate[T](table.slab.allocator, chunk_size(k));
+        if (sel allocated.err) { ret false; }
+        chunk = allocated.ok;
+    }
+    table.chunks[k] = chunk;
+    ret true;
+}
+
+# the slab's release hook: keep the lowest released chunk cached, free the rest
+fun table_release_hook[T](ctx: ptr, k: usize) bool {
+    val table: *Table[T] = ctx::*Table[T];
+    if (table.cache == nil) {
+        table.cache       = table.chunks[k];
+        table.cache_class = k;
+    }
+    or (k < table.cache_class) {
+        A.deallocate[T](table.slab.allocator, table.cache, chunk_size(table.cache_class));
+        table.cache       = table.chunks[k];
+        table.cache_class = k;
+    }
+    or {
+        A.deallocate[T](table.slab.allocator, table.chunks[k], chunk_size(k));
+    }
+    table.chunks[k] = nil;
+    ret true;
 }
 
 pub fun make_table[T](table: *Table[T], a: *A.Allocator) bool {
     if (table == nil || a == nil) { ret false; }
-    table.allocator = a;
-    table.count     = 0;
-    table.capacity  = 0;
-    ret true;
+    var i: usize = 0;
+    for (i < TABLE_CHUNKS) {
+        table.chunks[i] = nil;
+        i               = i + 1;
+    }
+    table.cache       = nil;
+    table.cache_class = TABLE_CHUNKS;
+    if (!slab_make(?table.slab, a)) { ret false; }
+    ret slab_storage(?table.slab, table::ptr, table_grow_hook[T], table_release_hook[T]);
 }
 
-# adds the next chunk. zeroed, because a fresh record must read as unused
+pub fun table_capacity[T](table: *Table[T]) usize {
+    if (table == nil) { ret 0; }
+    ret table.slab.capacity;
+}
+
+pub fun table_count[T](table: *Table[T]) usize {
+    if (table == nil) { ret 0; }
+    ret table.slab.count;
+}
+
+pub fun table_live[T](table: *Table[T]) usize {
+    if (table == nil) { ret 0; }
+    ret table.slab.live;
+}
+
+# claim the lowest free index, growing the table if the space is full;
+# NO_INDEX only when the allocator refuses
+pub fun table_claim[T](table: *Table[T]) usize {
+    if (table == nil) { ret NO_INDEX; }
+    ret slab_claim(?table.slab);
+}
+
+# release a claimed index, compacting trailing all-free chunks
+pub fun table_release[T](table: *Table[T], index: usize) bool {
+    if (table == nil) { ret false; }
+    ret slab_release(?table.slab, index);
+}
+
+# adds the next chunk without claiming an index (the pre-slab claim path still
+# used by consumers not yet migrated to table_claim)
 pub fun grow_table[T](table: *Table[T]) bool {
-    if (table == nil || table.allocator == nil || table.count == TABLE_CHUNKS) { ret false; }
-    val allocated: res[*T, A.Error] = A.zallocate[T](table.allocator,
-        chunk_size(table.count));
-    if (sel allocated.err) { ret false; }
-    table.chunks[table.count] = allocated.ok;
-    table.capacity            = table.capacity + chunk_size(table.count);
-    table.count               = table.count + 1;
-    ret true;
+    if (table == nil) { ret false; }
+    ret slab_grow(?table.slab);
 }
 
 pub fun table_at[T](table: *Table[T], index: usize) *T {
-    if (table == nil || index >= table.capacity) { ret nil; }
+    if (table == nil || index >= table.slab.capacity) { ret nil; }
     val chunk: usize = chunk_of(index);
     ret ?table.chunks[chunk][index - chunk_start(chunk)];
 }
 
 pub fun destroy_table[T](table: *Table[T]) bool {
     if (table == nil) { ret false; }
-    var ok: bool = true;
-    for (table.count > 0) {
-        table.count = table.count - 1;
-        val returned: err[A.Error] = A.deallocate[T](table.allocator,
-            table.chunks[table.count], chunk_size(table.count));
-        if (sel returned.err) { ok = false; }
-        table.chunks[table.count] = nil;
+    var ok: bool  = true;
+    var i:  usize = 0;
+    for (i < table.slab.count) {
+        if (table.chunks[i] != nil) {
+            val returned: err[A.Error] = A.deallocate[T](table.slab.allocator,
+                table.chunks[i], chunk_size(i));
+            if (sel returned.err) { ok = false; }
+            table.chunks[i] = nil;
+        }
+        i = i + 1;
     }
-    table.capacity = 0;
+    if (table.cache != nil) {
+        val returned: err[A.Error] = A.deallocate[T](table.slab.allocator, table.cache,
+            chunk_size(table.cache_class));
+        if (sel returned.err) { ok = false; }
+        table.cache       = nil;
+        table.cache_class = TABLE_CHUNKS;
+    }
+    if (!slab_destroy(?table.slab)) { ok = false; }
     ret ok;
 }
 
@@ -321,20 +617,20 @@ test "storage: a table grows by chunks and never moves a record" {
     var a: A.Allocator;
     page.make(?a);
     var table: Table[Probe];
-    if (!make_table[Probe](?table, ?a) || table_at[Probe](?table, 0) != nil) { ret 1; }
-    if (!grow_table[Probe](?table) || table.capacity != FIRST_CHUNK)         { ret 2; }
+    if (!make_table[Probe](?table, ?a) || table_at[Probe](?table, 0) != nil)        { ret 1; }
+    if (!grow_table[Probe](?table) || table_capacity[Probe](?table) != FIRST_CHUNK) { ret 2; }
     val first: *Probe = table_at[Probe](?table, 0);
     val last:  *Probe = table_at[Probe](?table, FIRST_CHUNK - 1);
     if (first == nil || last == nil || first.value != 0 || table_at[Probe](?table, FIRST_CHUNK) != nil) { ret 3; }
     first.value = 11;
     last.value  = 12;
     if (!grow_table[Probe](?table) || !grow_table[Probe](?table))                     { ret 4; }
-    if (table.capacity != FIRST_CHUNK * 7)                                            { ret 5; }
+    if (table_capacity[Probe](?table) != FIRST_CHUNK * 7)                             { ret 5; }
     if (table_at[Probe](?table, 0) != first || first.value != 11 || last.value != 12) { ret 6; }
     # the first record of the third chunk sits at the start of its chunk
     if (table_at[Probe](?table, FIRST_CHUNK * 3) != ?table.chunks[2][0]
         || table_at[Probe](?table, FIRST_CHUNK * 7 - 1) != ?table.chunks[2][FIRST_CHUNK * 4 - 1]) { ret 7; }
-    if (!destroy_table[Probe](?table) || table.capacity != 0) { ret 8; }
+    if (!destroy_table[Probe](?table) || table_capacity[Probe](?table) != 0) { ret 8; }
     ret 0;
 }
 
@@ -372,5 +668,140 @@ test "storage: chunks round up to a class and are reused within it" {
     if (destroy_chunks(?chunks))                   { ret 6; }
     if (!release_chunk(?chunks, small, MIN_CHUNK) || !release_chunk(?chunks, large, MIN_CHUNK * 4)
         || !destroy_chunks(?chunks)) { ret 7; }
+    ret 0;
+}
+
+# a pseudo-random sequence for the churn test
+fun lcg(state: *u64) usize {
+    @state = @state * 6364136223846793005 + 1442695040888963407;
+    ret (@state >> 33)::usize;
+}
+
+test "storage: a table releases trailing chunks as records recede" {
+    var a: A.Allocator;
+    page.make(?a);
+    var table: Table[Probe];
+    if (!make_table[Probe](?table, ?a)) { ret 1; }
+    var claimed: [2000]usize;
+    var i:       usize = 0;
+    for (i < 2000) {
+        val idx: usize = table_claim[Probe](?table);
+        if (idx == NO_INDEX) { ret 2; }
+        claimed[i] = idx;
+        i          = i + 1;
+    }
+    if (table_live[Probe](?table) != 2000) { ret 3; }
+    val full_count: usize = table_count[Probe](?table);
+    if (full_count < 7) { ret 4; }
+    # a low, still-live record and its content must survive the recede
+    val kept: *Probe = table_at[Probe](?table, claimed[100]);
+    if (kept == nil) { ret 5; }
+    kept.value = 43981;
+    # release the high 1800, keep the low 200
+    i = 200;
+    for (i < 2000) {
+        if (!table_release[Probe](?table, claimed[i])) { ret 6; }
+        i = i + 1;
+    }
+    if (table_live[Probe](?table) != 200) { ret 7; }
+    # the table now holds chunks proportional to 200 live, not 2000
+    if (table_count[Probe](?table) >= full_count) { ret 8; }
+    if (table_count[Probe](?table) != 4)          { ret 9; }
+    # the surviving low record never moved and kept its content
+    if (table_at[Probe](?table, claimed[100]) != kept || kept.value != 43981) { ret 10; }
+    # claim back to 2000: no still-live pointer was invalidated by the recede
+    i = 0;
+    for (i < 1800) {
+        if (table_claim[Probe](?table) == NO_INDEX) { ret 11; }
+        i = i + 1;
+    }
+    if (table_at[Probe](?table, claimed[100]) != kept || kept.value != 43981) { ret 12; }
+    if (!destroy_table[Probe](?table))                                        { ret 13; }
+    ret 0;
+}
+
+test "storage: a released index in a compacted-away chunk is never handed out" {
+    var a: A.Allocator;
+    page.make(?a);
+    var table: Table[Probe];
+    if (!make_table[Probe](?table, ?a)) { ret 1; }
+    # fill two chunks: chunk 0 is 0..15, chunk 1 is 16..47
+    var i: usize = 0;
+    for (i < 48) {
+        if (table_claim[Probe](?table) == NO_INDEX) { ret 2; }
+        i = i + 1;
+    }
+    if (table_count[Probe](?table) != 2 || table_capacity[Probe](?table) != 48) { ret 3; }
+    # release all of chunk 1, which compacts it away
+    i = 16;
+    for (i < 48) {
+        if (!table_release[Probe](?table, i)) { ret 4; }
+        i = i + 1;
+    }
+    if (table_count[Probe](?table) != 1 || table_capacity[Probe](?table) != 16) { ret 5; }
+    # an index in the gone chunk is out of range, not a live record
+    if (table_at[Probe](?table, 20) != nil) { ret 6; }
+    # claim a batch: every claim is valid and unique, never a dead index popped
+    # from the discarded free stack of the gone chunk
+    if (!table_release[Probe](?table, 3) || !table_release[Probe](?table, 7)) { ret 7; }
+    var seen: [64]bool;
+    i = 0;
+    for (i < 40) {
+        val idx: usize = table_claim[Probe](?table);
+        if (idx == NO_INDEX)                     { ret 8; }
+        if (table_at[Probe](?table, idx) == nil) { ret 9; }
+        if (idx < 64 && seen[idx])               { ret 10; }
+        if (idx < 64)                            { seen[idx] = true; }
+        i = i + 1;
+    }
+    if (!destroy_table[Probe](?table)) { ret 11; }
+    ret 0;
+}
+
+test "storage: churn packs live records low and the table converges to live size" {
+    var a: A.Allocator;
+    page.make(?a);
+    var table: Table[Probe];
+    if (!make_table[Probe](?table, ?a)) { ret 1; }
+    var live_idx: [2000]usize;
+    var live_n:   usize = 0;
+    var i:        usize = 0;
+    for (i < 2000) {
+        val idx: usize = table_claim[Probe](?table);
+        if (idx == NO_INDEX) { ret 2; }
+        live_idx[live_n] = idx;
+        live_n           = live_n + 1;
+        i                = i + 1;
+    }
+    val full_count: usize = table_count[Probe](?table);
+    # release 1800 chosen pseudo-randomly, keeping 200 live
+    var state: u64 = 19088743;
+    for (live_n > 200) {
+        val pick: usize = lcg(?state) % live_n;
+        if (!table_release[Probe](?table, live_idx[pick])) { ret 3; }
+        live_idx[pick] = live_idx[live_n - 1];
+        live_n         = live_n - 1;
+    }
+    if (table_live[Probe](?table) != 200) { ret 4; }
+    # churn one-in one-out uniformly; the table converges to chunks proportional
+    # to 200 live (4 chunks, plus at most one boundary chunk) within bounded cycles
+    var cycles: usize = 0;
+    for (cycles < 100000) {
+        val pick: usize = lcg(?state) % live_n;
+        if (!table_release[Probe](?table, live_idx[pick])) { ret 5; }
+        val idx: usize = table_claim[Probe](?table);
+        if (idx == NO_INDEX) { ret 6; }
+        live_idx[pick] = idx;
+        if (table_count[Probe](?table) <= 5) { brk; }
+        cycles = cycles + 1;
+    }
+    if (table_count[Probe](?table) > 5)           { ret 7; }
+    if (table_count[Probe](?table) >= full_count) { ret 8; }
+    i = 0;
+    for (i < live_n) {
+        table_release[Probe](?table, live_idx[i]);
+        i = i + 1;
+    }
+    if (!destroy_table[Probe](?table)) { ret 9; }
     ret 0;
 }

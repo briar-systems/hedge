@@ -238,13 +238,14 @@ pub rec Owner {
     reload_requested:       bool;
     stop_requested:         bool;
     active_set:             usize;
-    # slots ever handed out, which is what a sweep costs and what bounds a token
-    claimed_connections:      usize;
+    # generation floor after a compaction and the highest generation ever issued,
+    # so a token into a compacted-away chunk never matches its reused index
+    connection_epoch:         u32;
+    connection_max_gen:       u32;
     connection_count:         usize;
     queued_connection_count:  usize;
     max_connections:          opt[usize];
     max_connections_per_peer: opt[usize];
-    free_head:                usize;
     queue_head:               usize;
     queue_tail:               usize;
     next_connection_id:       u64;
@@ -323,7 +324,7 @@ fun connection_at(owner: *Owner, index: usize) *Connection {
 }
 
 fun connection_for(owner: *Owner, token: ConnectionToken) *Connection {
-    if (owner == nil || token.index::usize >= owner.claimed_connections || token.generation == 0) { ret nil; }
+    if (owner == nil || token.index::usize >= hedge_storage.table_capacity[Connection](?owner.connections) || token.generation == 0) { ret nil; }
     val connection: *Connection = connection_at(owner, token.index::usize);
     if (connection == nil)                                                                { ret nil; }
     if (connection.state == CONNECTION_FREE || connection.generation != token.generation) { ret nil; }
@@ -336,30 +337,44 @@ fun initialize_connections(owner: *Owner, max_connections: opt[usize],
     if (!hedge_storage.make_table[Connection](?owner.connections, ?owner.heap)
         || !process_admission.make(?owner.admission, ?owner.heap,
         max_connections, max_connections_per_peer)) { ret false; }
-    owner.claimed_connections     = 0;
+    owner.connection_epoch        = 0;
+    owner.connection_max_gen      = 0;
     owner.connection_count        = 0;
     owner.queued_connection_count = 0;
     owner.queue_head              = NO_INDEX;
     owner.queue_tail              = NO_INDEX;
-    owner.free_head               = NO_INDEX;
     ret true;
 }
 
-# a released slot is reused before the directory grows again. a grown chunk is
-# zeroed, so a fresh slot already reads as free with generation zero
+# the next generation for a reused index: one past the slot's own last value, but
+# never below the epoch floor a compaction raised, so a token into a chunk that
+# was dropped and regrown can never match the index it once named. records track
+# the highest value ever issued so a later compaction can float the floor above it
+fun next_connection_generation(owner: *Owner, previous: u32) u32 {
+    var generation: u32 = previous + 1;
+    if (generation < owner.connection_epoch)   { generation = owner.connection_epoch; }
+    if (generation == 0)                       { generation = 1; }
+    if (generation > owner.connection_max_gen) { owner.connection_max_gen = generation; }
+    ret generation;
+}
+
+# return an index to the slab and, when that drops a trailing chunk, raise the
+# generation floor above every generation issued so a stale token cannot survive
+# the regrow that zeroes the slot
+fun release_connection_index(owner: *Owner, index: usize) bool {
+    val cap_before: usize = hedge_storage.table_capacity[Connection](?owner.connections);
+    if (!hedge_storage.table_release[Connection](?owner.connections, index)) { ret false; }
+    if (hedge_storage.table_capacity[Connection](?owner.connections) < cap_before) {
+        owner.connection_epoch = owner.connection_max_gen + 1;
+    }
+    ret true;
+}
+
+# the slab hands back the lowest free index, growing on demand. a released slot
+# keeps its prior generation so a reuse can step past it; a slot in a freshly
+# grown chunk reads as free with generation zero
 fun claim_connection_slot(owner: *Owner) usize {
-    if (owner.free_head != NO_INDEX) {
-        val index: usize = owner.free_head;
-        owner.free_head = connection_at(owner, index).next;
-        ret index;
-    }
-    if (owner.claimed_connections == owner.connections.capacity
-        && !hedge_storage.grow_table[Connection](?owner.connections)) {
-        ret NO_INDEX;
-    }
-    val index: usize = owner.claimed_connections;
-    owner.claimed_connections = owner.claimed_connections + 1;
-    ret index;
+    ret hedge_storage.table_claim[Connection](?owner.connections);
 }
 
 fun release_connection_slot(owner: *Owner, index: usize) bool {
@@ -385,9 +400,9 @@ fun release_connection_slot(owner: *Owner, index: usize) bool {
     connection.peer          = ip.endpoint(0, 0, 0, 0, 0);
     connection.has_peer      = false;
     connection.close_pending = false;
-    connection.next          = owner.free_head;
-    owner.free_head          = index;
-    if (owner.connection_count > 0) { owner.connection_count = owner.connection_count - 1; }
+    connection.next          = NO_INDEX;
+    if (!release_connection_index(owner, index)) { ret false; }
+    if (owner.connection_count > 0)              { owner.connection_count = owner.connection_count - 1; }
     ret true;
 }
 
@@ -404,9 +419,8 @@ fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, tr
         ret nil;
     }
     val connection: *Connection = connection_at(owner, index);
-    var generation: u32         = connection.generation + 1;
-    if (generation == 0) { generation = 1; }
-    connection.generation    = generation;
+    connection.generation = next_connection_generation(owner, connection.generation);
+    val generation: u32 = connection.generation;
     connection.state         = CONNECTION_QUEUED;
     connection.id            = owner.next_connection_id;
     owner.next_connection_id = owner.next_connection_id + 1;
@@ -615,8 +629,8 @@ fun dispatch_completion(owner: *Owner, completion: io_runtime.Completion) {
         ret;
     }
     if (context.kind == CONTEXT_STREAM_CLOSE) {
-        if (context.connection_index < owner.claimed_connections) {
-            val connection: *Connection = connection_at(owner, context.connection_index);
+        val connection: *Connection = connection_at(owner, context.connection_index);
+        if (connection != nil) {
             connection.close_completion = completion;
             connection.close_pending    = false;
         }
@@ -1063,8 +1077,8 @@ fun release_connection_storage(owner: *Owner) bool {
     if (owner.admission.initialized
         && !process_admission.destroy(?owner.admission)) { ok = false; }
     if (!hedge_storage.destroy_table[Connection](?owner.connections)) { ok = false; }
-    owner.claimed_connections = 0;
-    owner.free_head           = NO_INDEX;
+    owner.connection_epoch   = 0;
+    owner.connection_max_gen = 0;
     ret ok;
 }
 
@@ -1149,7 +1163,8 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
     owner.stop_requested            = false;
     owner.leaked_descriptors        = 0;
     owner.active_set                = NO_INDEX;
-    owner.claimed_connections       = 0;
+    owner.connection_epoch          = 0;
+    owner.connection_max_gen        = 0;
     owner.admission.initialized     = false;
     owner.connection_ctx            = nil;
     owner.connection_completions    = (0::usize)::ConnectionCompletionFun;
@@ -1386,10 +1401,13 @@ pub fun stop(owner: *Owner) bool {
         if (owner.sets[i].scope_initialized && !drain_set(owner, ?owner.sets[i])) { success = false; }
         i = i + 1;
     }
+    # a close can compact the table, so bound the sweep to the record capacity
+    # once and skip indices a compaction has already dropped (table_at is nil)
+    val sweep_bound: usize = hedge_storage.table_capacity[Connection](?owner.connections);
     i = 0;
-    for (i < owner.claimed_connections) {
+    for (i < sweep_bound) {
         val connection: *Connection = connection_at(owner, i);
-        if (connection.state != CONNECTION_FREE) {
+        if (connection != nil && connection.state != CONNECTION_FREE) {
             val token: ConnectionToken = ConnectionToken{index: i::u32, generation: connection.generation};
             if (!close_connection(owner, token)) { success = false; }
         }
@@ -1488,4 +1506,65 @@ test "listener: an accepted stream is adopted with Nagle disabled" {
     tcp.stream_close(?client);
     tcp.listener_close(?server);
     ret failures;
+}
+
+test "listener: a token into a compacted-away connection chunk is refused after regrow" {
+    var owner: Owner;
+    if (!initialize_connections(?owner, opt[usize].none{}, opt[usize].none{})) { ret 1; }
+    # fill chunk 0 and open chunk 1 so a later release can drop a trailing chunk
+    var claimed: usize = 0;
+    for (claimed <= hedge_storage.FIRST_CHUNK) {
+        val idx: usize = claim_connection_slot(?owner);
+        if (idx != claimed) {
+            release_connection_storage(?owner);
+            ret 2;
+        }
+        val c: *Connection = connection_at(?owner, idx);
+        c.state      = CONNECTION_ACTIVE;
+        c.generation = next_connection_generation(?owner, c.generation);
+        claimed      = claimed + 1;
+    }
+    # the high slot sits alone in chunk 1; its token is valid before the release
+    val high:  usize           = hedge_storage.FIRST_CHUNK;
+    val stale: ConnectionToken = ConnectionToken{index: high::u32, generation: connection_at(?owner, high).generation};
+    if (connection_for(?owner, stale) == nil) {
+        release_connection_storage(?owner);
+        ret 3;
+    }
+    val cap_before: usize = hedge_storage.table_capacity[Connection](?owner.connections);
+    if (!release_connection_index(?owner, high)) {
+        release_connection_storage(?owner);
+        ret 4;
+    }
+    # the trailing chunk must actually have been compacted away
+    if (hedge_storage.table_capacity[Connection](?owner.connections) >= cap_before) {
+        release_connection_storage(?owner);
+        ret 5;
+    }
+    # the reused index is the same number but a zeroed slot in a regrown chunk
+    val reused: usize = claim_connection_slot(?owner);
+    if (reused != high) {
+        release_connection_storage(?owner);
+        ret 6;
+    }
+    val c2: *Connection = connection_at(?owner, reused);
+    c2.state      = CONNECTION_ACTIVE;
+    c2.generation = next_connection_generation(?owner, c2.generation);
+    # the stale token must not resolve to the fresh occupant, and the fresh one must
+    if (connection_for(?owner, stale) != nil) {
+        release_connection_storage(?owner);
+        ret 7;
+    }
+    val fresh: ConnectionToken = ConnectionToken{index: reused::u32, generation: c2.generation};
+    if (connection_for(?owner, fresh) == nil) {
+        release_connection_storage(?owner);
+        ret 8;
+    }
+    # the raised floor put the fresh generation strictly above the stale one
+    if (c2.generation <= stale.generation) {
+        release_connection_storage(?owner);
+        ret 9;
+    }
+    release_connection_storage(?owner);
+    ret 0;
 }
