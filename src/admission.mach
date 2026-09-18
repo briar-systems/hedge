@@ -28,15 +28,13 @@ val SLOT_RESERVED:  u8 = 1;
 val SLOT_COMMITTED: u8 = 2;
 
 pub rec PeerSlot {
-    address:   ip.Addr;
-    count:     usize;
-    next_free: usize;
-    live:      bool;
+    address: ip.Addr;
+    count:   usize;
+    live:    bool;
 }
 
 pub rec LeaseSlot {
     peer:       usize;
-    next_free:  usize;
     generation: u64;
     state:      u8;
 }
@@ -55,12 +53,12 @@ pub rec Manager {
     index:                    map.Map[ip.Addr, usize];
     max_connections:          opt[usize];
     max_connections_per_peer: opt[usize];
-    peer_free_head:           usize;
-    lease_free_head:          usize;
-    claimed_peers:            usize;
-    claimed_leases:           usize;
-    live:                     usize;
-    initialized:              bool;
+    # a process-global monotonic lease generation. a compaction zeroes a reused
+    # slot, so a per-slot counter could repeat a value a stale lease still holds;
+    # a counter that never resets and never wraps (u64) keeps every lease distinct
+    lease_generation: u64;
+    live:             usize;
+    initialized:      bool;
 }
 
 pub fun no_lease() Lease {
@@ -177,10 +175,7 @@ pub fun make(manager: *Manager, a: *A.Allocator, max_connections: opt[usize],
         equal_address);
     manager.max_connections          = max_connections;
     manager.max_connections_per_peer = max_connections_per_peer;
-    manager.peer_free_head           = NO_SLOT;
-    manager.lease_free_head          = NO_SLOT;
-    manager.claimed_peers            = 0;
-    manager.claimed_leases           = 0;
+    manager.lease_generation         = 0;
     manager.live                     = 0;
     manager.initialized              = true;
     ret true;
@@ -221,29 +216,11 @@ fun lease_at(manager: *Manager, index: usize) *LeaseSlot {
 # a released slot is reused before the table grows again, and a table that
 # cannot grow refuses rather than overcommitting
 fun claim_peer(manager: *Manager) usize {
-    if (manager.peer_free_head != NO_SLOT) {
-        val index: usize = manager.peer_free_head;
-        manager.peer_free_head = peer_at(manager, index).next_free;
-        ret index;
-    }
-    if (manager.claimed_peers == storage.table_capacity[PeerSlot](?manager.peers)
-        && !storage.grow_table[PeerSlot](?manager.peers)) { ret NO_SLOT; }
-    val index: usize = manager.claimed_peers;
-    manager.claimed_peers = manager.claimed_peers + 1;
-    ret index;
+    ret storage.table_claim[PeerSlot](?manager.peers);
 }
 
 fun claim_lease(manager: *Manager) usize {
-    if (manager.lease_free_head != NO_SLOT) {
-        val index: usize = manager.lease_free_head;
-        manager.lease_free_head = lease_at(manager, index).next_free;
-        ret index;
-    }
-    if (manager.claimed_leases == storage.table_capacity[LeaseSlot](?manager.leases)
-        && !storage.grow_table[LeaseSlot](?manager.leases)) { ret NO_SLOT; }
-    val index: usize = manager.claimed_leases;
-    manager.claimed_leases = manager.claimed_leases + 1;
-    ret index;
+    ret storage.table_claim[LeaseSlot](?manager.leases);
 }
 
 # whether policy still allows a connection. growth may still refuse one, which
@@ -267,10 +244,11 @@ fun release_peer(manager: *Manager, index: usize) {
     val slot: *PeerSlot = peer_at(manager, index);
     var key:  ip.Addr   = slot.address;
     map.remove[ip.Addr, usize](?manager.index, ?key);
-    slot.live              = false;
-    slot.count             = 0;
-    slot.next_free         = manager.peer_free_head;
-    manager.peer_free_head = index;
+    slot.live  = false;
+    slot.count = 0;
+    # the entry is gone from the map before the slot returns, so a compaction of
+    # the trailing chunk can never orphan an address that still resolves
+    storage.table_release[PeerSlot](?manager.peers, index);
 }
 
 fun allocate_lease(manager: *Manager, peer: *ip.Endpoint,
@@ -290,9 +268,7 @@ fun allocate_lease(manager: *Manager, peer: *ip.Endpoint,
             val inserted: res[bool, A.Error] =
                 map.insert[ip.Addr, usize](?manager.index, address, peer_index);
             if (sel inserted.err) {
-                val slot: *PeerSlot = peer_at(manager, peer_index);
-                slot.next_free         = manager.peer_free_head;
-                manager.peer_free_head = peer_index;
+                storage.table_release[PeerSlot](?manager.peers, peer_index);
                 ret false;
             }
             val slot: *PeerSlot = peer_at(manager, peer_index);
@@ -315,11 +291,11 @@ fun allocate_lease(manager: *Manager, peer: *ip.Endpoint,
         ret false;
     }
     val slot: *LeaseSlot = lease_at(manager, index);
-    slot.next_free  = NO_SLOT;
-    slot.generation = next_generation(slot.generation);
-    slot.peer       = peer_index;
-    slot.state      = state;
-    manager.live    = manager.live + 1;
+    manager.lease_generation = next_generation(manager.lease_generation);
+    slot.generation          = manager.lease_generation;
+    slot.peer                = peer_index;
+    slot.state               = state;
+    manager.live             = manager.live + 1;
     if (peer_index != NO_SLOT) {
         val owner: *PeerSlot = peer_at(manager, peer_index);
         owner.count = owner.count + 1;
@@ -340,7 +316,7 @@ pub fun acquire(manager: *Manager, peer: *ip.Endpoint,
 
 fun lease_slot(manager: *Manager, lease: Lease) *LeaseSlot {
     if (manager == nil || !manager.initialized || lease.generation == 0
-        || lease.index >= manager.claimed_leases) { ret nil; }
+        || lease.index >= storage.table_capacity[LeaseSlot](?manager.leases)) { ret nil; }
     val slot: *LeaseSlot = lease_at(manager, lease.index);
     if (slot == nil || slot.state == SLOT_FREE
         || slot.generation != lease.generation) { ret nil; }
@@ -359,7 +335,7 @@ pub fun release(manager: *Manager, lease: Lease) bool {
     if (slot == nil || manager.live == 0) { ret false; }
     var peer: *PeerSlot = nil;
     if (slot.peer != NO_SLOT) {
-        if (slot.peer >= manager.claimed_peers) { ret false; }
+        if (slot.peer >= storage.table_capacity[PeerSlot](?manager.peers)) { ret false; }
         peer = peer_at(manager, slot.peer);
         if (peer == nil || !peer.live || peer.count == 0) { ret false; }
     }
@@ -367,12 +343,10 @@ pub fun release(manager: *Manager, lease: Lease) bool {
         peer.count = peer.count - 1;
         if (peer.count == 0) { release_peer(manager, slot.peer); }
     }
-    manager.live            = manager.live - 1;
-    slot.state              = SLOT_FREE;
-    slot.peer               = NO_SLOT;
-    slot.next_free          = manager.lease_free_head;
-    manager.lease_free_head = lease.index;
-    ret true;
+    manager.live = manager.live - 1;
+    slot.state   = SLOT_FREE;
+    slot.peer    = NO_SLOT;
+    ret storage.table_release[LeaseSlot](?manager.leases, lease.index);
 }
 
 pub fun in_use(manager: *Manager) usize {
@@ -501,13 +475,55 @@ test "hedge.admission: a peer slot is reused once its last lease is released" {
     if (!acquire(?manager, ?endpoint, ?first)
         || !acquire(?manager, ?endpoint, ?second)
         || acquire(?manager, ?endpoint, ?refused)) { ret 2; }
-    if (manager.claimed_peers != 1)                              { ret 3; }
+    if (storage.table_live[PeerSlot](?manager.peers) != 1)       { ret 3; }
     if (!release(?manager, first) || !release(?manager, second)) { ret 4; }
     # the peer is forgotten, so the next claim takes the same slot back
-    if (manager.peer_free_head == NO_SLOT) { ret 5; }
-    if (!acquire(?manager, ?endpoint, ?first) || manager.claimed_peers != 1) {
+    if (storage.table_live[PeerSlot](?manager.peers) != 0) { ret 5; }
+    if (!acquire(?manager, ?endpoint, ?first)
+        || storage.table_live[PeerSlot](?manager.peers) != 1) {
         ret 6;
     }
     if (!release(?manager, first) || !destroy(?manager)) { ret 7; }
+    ret 0;
+}
+
+test "hedge.admission: a lease into a compacted-away chunk is refused after regrow" {
+    var a: A.Allocator;
+    page.make(?a);
+    var manager: Manager;
+    if (!make(?manager, ?a, uncapped(), uncapped())) { ret 1; }
+    # fill lease chunk 0 and open chunk 1 so a release can drop a trailing chunk
+    var leases: [storage.FIRST_CHUNK + 1]Lease;
+    var i:      usize = 0;
+    for (i <= storage.FIRST_CHUNK) {
+        val endpoint: ip.Endpoint = ip.endpoint(10, 0,
+            (i / 256)::u8, (i % 256)::u8, 443);
+        if (!acquire(?manager, ?endpoint, ?leases[i])) { ret 2; }
+        i = i + 1;
+    }
+    val high: usize = storage.FIRST_CHUNK;
+    if (leases[high].index != high) { ret 3; }
+    val stale:      Lease = leases[high];
+    val cap_before: usize = storage.table_capacity[LeaseSlot](?manager.leases);
+    if (!release(?manager, stale))                                        { ret 4; }
+    if (storage.table_capacity[LeaseSlot](?manager.leases) >= cap_before) { ret 5; }
+    # the same index returns as a zeroed slot in a regrown chunk with a fresh, and
+    # strictly greater, generation from the process-global counter
+    var fresh:     Lease;
+    val endpoint2: ip.Endpoint = ip.endpoint(10, 9, 9, 9, 443);
+    if (!acquire(?manager, ?endpoint2, ?fresh)) { ret 6; }
+    if (fresh.index != high)                    { ret 7; }
+    if (fresh.generation <= stale.generation)   { ret 8; }
+    # the stale lease resolves to nothing, so neither commit nor release accepts it
+    if (commit(?manager, stale))  { ret 9; }
+    if (release(?manager, stale)) { ret 10; }
+    # release everything still held so the manager can be destroyed
+    if (!release(?manager, fresh)) { ret 11; }
+    i = 0;
+    for (i < storage.FIRST_CHUNK) {
+        if (!release(?manager, leases[i])) { ret 12; }
+        i = i + 1;
+    }
+    if (!destroy(?manager)) { ret 13; }
     ret 0;
 }
