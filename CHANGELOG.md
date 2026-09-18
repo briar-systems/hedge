@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-18
+
 ### Security
 
 - A QUIC datagram that went out whole before its send was cancelled or timed out is now reported as sent (#202). hedge reported it as failed, which refunded its anti-amplification credit and queued its frames again, so an unvalidated peer could draw more than three times what it sent (the rule mach-quic fixed in briar-systems/mach-quic#174).
