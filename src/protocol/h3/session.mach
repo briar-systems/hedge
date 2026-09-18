@@ -1,6 +1,7 @@
 # bounded http/3 sessions over the production quic transport
 
 use hedge.clock;
+use hedge_memory: hedge.memory;
 use hedge.protocol.h3.adapter;
 use hedge.protocol.names;
 
@@ -25,27 +26,29 @@ use hedge.dispatch.plan;
 use hedge.service;
 use hedge_storage:   hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
+use hedge_wake:      hedge.wake;
 use http.router.router;
 use A: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
 use std.memory;
+use std.memory.buffers;
 use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.view;
 
-# the scope's effective deadline into `output`, false when it has none
-fun scope_deadline(scope: *cancel.Scope, output: *time.Time) bool {
+# the scope's effective deadline, none when it has none
+fun scope_deadline(scope: *cancel.Scope) opt[time.Instant] {
     val query: cancel.DeadlineQuery = cancel.get_deadline(scope);
-    if (sel query.err)     { ret false; }
-    if (sel query.ok.none) { ret false; }
-    @output = query.ok.some.at;
-    ret true;
+    if (sel query.err)     { ret opt[time.Instant].none{}; }
+    if (sel query.ok.none) { ret opt[time.Instant].none{}; }
+    ret opt[time.Instant].some{query.ok.some.at};
 }
 
 fun operation_ok(outcome: cancel.Operation) bool {
@@ -62,9 +65,11 @@ fun scope_timed_out(scope: *cancel.Scope) bool {
     ret sel reason.timed_out;
 }
 
-pub val NO_SESSION:          usize = (-1)::usize;
-pub val MAX_STREAMS:         usize = 8;
-pub val STREAM_SLOTS:        usize = MAX_STREAMS + 3;
+pub val NO_SESSION:  usize = (-1)::usize;
+pub val MAX_STREAMS: usize = 8;
+# stream records the engine takes at init, enough for the six control streams
+# and two requests before it borrows another chunk
+pub val INITIAL_STREAMS:     usize = 8;
 pub val READ_BYTES:          usize = 8192;
 pub val FRAME_PAYLOAD_BYTES: usize = 8192;
 pub val HEADER_BYTES:        usize = 4096;
@@ -192,18 +197,19 @@ rec RequestSlot {
     charge:                        budget.Charge;
 }
 
+# request streams borrow their buffers from the connection's account. the
+# peer's control, QPACK encoder and QPACK decoder streams live as long as the
+# connection and read through these
 pub rec SessionStorage {
     scope:               cancel.Scope;
-    memories:            [STREAM_SLOTS]h3.StreamMemory;
     pending:             [PENDING_RELEASES]h3.StreamHandle;
-    reads:               [STREAM_SLOTS][READ_BYTES]u8;
-    settings:            [STREAM_SLOTS][SETTING_SLOTS]frame.Setting;
-    encoded:             [STREAM_SLOTS][HEADER_BYTES]u8;
-    fields:              [STREAM_SLOTS][FIELD_SLOTS]field.Field;
-    strings:             [STREAM_SLOTS][STRING_BYTES]u8;
-    scratch:             [STREAM_SLOTS][SCRATCH_BYTES]u8;
-    output:              [STREAM_SLOTS][FRAME_PAYLOAD_BYTES]u8;
-    references:          [STREAM_SLOTS][REFERENCE_SLOTS]u64;
+    control_read:        [READ_BYTES]u8;
+    control_settings:    [SETTING_SLOTS]frame.Setting;
+    encoder_read:        [READ_BYTES]u8;
+    encoder_encoded:     [HEADER_BYTES]u8;
+    encoder_scratch:     [SCRATCH_BYTES]u8;
+    decoder_read:        [READ_BYTES]u8;
+    decoder_encoded:     [HEADER_BYTES]u8;
     inbound_entries:     [TABLE_ENTRIES]qpack.Entry;
     inbound_storage:     [TABLE_BYTES]u8;
     inbound_scratch:     [TABLE_BYTES]u8;
@@ -229,15 +235,19 @@ pub rec SessionStorage {
     request_timeout_ns:  u64;
     chunks:              *hedge_storage.Chunks;
     call_memory_bytes:   usize;
+    # the QUIC connection's waker, which every request's call wakes
+    waker: hedge_wake.Waker;
 }
 
 pub rec Session {
-    storage:           *SessionStorage;
-    live:              bool;
-    next_free:         usize;
-    state:             State;
-    io:                adapter.Adapter;
-    streams:           [STREAM_SLOTS]h3.Stream;
+    storage:   *SessionStorage;
+    live:      bool;
+    next_free: usize;
+    state:     State;
+    io:        adapter.Adapter;
+    # the connection's source and account, which outlive the engine
+    source:            buffers.Source;
+    account:           *buffers.Account;
     engine:            h3.Engine[adapter.Adapter];
     scope_live:        bool;
     engine_started:    bool;
@@ -437,11 +447,9 @@ test "hedge.protocol.h3.session: abandon retains a live child scope" {
     var root:    cancel.Scope;
     var child:   cancel.Scope;
     if (session == nil
-        || !operation_ok(cancel.make_root(?root, false, time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_child(?session.storage.scope, ?root, false,
-        time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_child(?child, ?session.storage.scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 2; }
+        || !operation_ok(cancel.make_root(?root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_child(?session.storage.scope, ?root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_child(?child, ?session.storage.scope, opt[time.Instant].none{}))) { ret 2; }
     session.scope_live = true;
     if (abandon(?pool, ?sessions, index) || !session.live
         || !session.scope_live
@@ -464,11 +472,9 @@ test "hedge.protocol.h3.session: retained start scope blocks mutation" {
     var root:    cancel.Scope;
     var child:   cancel.Scope;
     if (session == nil
-        || !operation_ok(cancel.make_root(?root, false, time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_child(?session.storage.scope, ?root, false,
-        time.Time{sec: 0, nsec: 0}))
-        || !operation_ok(cancel.make_child(?child, ?session.storage.scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 2; }
+        || !operation_ok(cancel.make_root(?root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_child(?session.storage.scope, ?root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_child(?child, ?session.storage.scope, opt[time.Instant].none{}))) { ret 2; }
     session.scope_live               = true;
     session.storage.listener_name[0] = 'o';
     session.storage.listener_name[1] = 'l';
@@ -481,11 +487,15 @@ test "hedge.protocol.h3.session: retained start scope blocks mutation" {
     page.make(?heap);
     var chunks: hedge_storage.Chunks;
     if (!hedge_storage.make_chunks(?chunks, ?heap)) { ret 2; }
+    var no_source:  buffers.Source;
+    var no_account: buffers.Account;
+    no_account.open = true;
     # everything begin needs is present, so only the retained scope refuses it
     if (begin(session, ?driver, ?root, ?active_plan, ?budgets,
         message.limits_default(), 1, "new",
         message.unspecified_endpoint(), message.unspecified_endpoint(),
-        0, 1, ?chunks, hedge_storage.MIN_CHUNK)
+        0, 1, no_source, ?no_account, ?chunks, hedge_storage.MIN_CHUNK,
+        hedge_wake.no_waker())
         || session.storage.listener_name[0] != 'o'
         || session.storage.listener_name[1] != 'l'
         || session.storage.listener_name[2] != 'd'
@@ -499,7 +509,6 @@ test "hedge.protocol.h3.session: retained start scope blocks mutation" {
 
 pub rec FixedProfile {
     request_streams:     usize;
-    stream_slots:        usize;
     field_slots:         usize;
     string_bytes:        usize;
     frame_payload_bytes: usize;
@@ -509,7 +518,6 @@ pub rec FixedProfile {
 pub fun fixed_profile() FixedProfile {
     ret FixedProfile{
         request_streams:     MAX_STREAMS,
-        stream_slots:        STREAM_SLOTS,
         field_slots:         FIELD_SLOTS,
         string_bytes:        STRING_BYTES,
         frame_payload_bytes: FRAME_PAYLOAD_BYTES,
@@ -547,7 +555,6 @@ fun profile_valid(configured: h3.Config) bool {
         && configured.outbound_qpack.max_instruction_bytes <= HEADER_BYTES
         && configured.outbound_qpack.max_outstanding_sections <= SECTION_SLOTS
         && configured.outbound_qpack.max_references <= SECTION_REFERENCES
-        && STREAM_SLOTS >= MAX_STREAMS + 3
         && REQUEST_FIELD_SLOTS >= FIELD_SLOTS
         && REQUEST_TRAILER_SLOTS >= FIELD_SLOTS
         && REQUEST_STRING_BYTES >= STRING_BYTES
@@ -581,6 +588,11 @@ pub fun session_config(limits: message.Limits, max_requests: usize) h3.Config {
     configured.inbound_qpack.max_references            = SECTION_REFERENCES;
     configured.outbound_qpack                          = configured.inbound_qpack;
     configured.messages                                = limits;
+    configured.read_bytes                              = READ_BYTES;
+    configured.output_bytes                            = FRAME_PAYLOAD_BYTES;
+    configured.initial_streams                         = INITIAL_STREAMS;
+    configured.stream_lane                             = hedge_memory.LANE_REQUEST;
+    configured.connection_lane                         = hedge_memory.LANE_IO;
     ret configured;
 }
 
@@ -588,23 +600,27 @@ pub fun session_config(limits: message.Limits, max_requests: usize) h3.Config {
 fun start_session(session: *Session,
     driver: *qt.Driver[binding.Binding], clock: *u64,
     role: h3.Role, configured: h3.Config) bool {
-    var i: usize = 0;
-    for (i < STREAM_SLOTS) {
-        session.storage.memories[i] = h3.StreamMemory{
-            read:       ?session.storage.reads[i][0], read_capacity: READ_BYTES,
-            settings:   ?session.storage.settings[i][0], setting_capacity: SETTING_SLOTS,
-            encoded:    ?session.storage.encoded[i][0], encoded_capacity: HEADER_BYTES,
-            fields:     ?session.storage.fields[i][0], field_capacity: FIELD_SLOTS,
-            strings:    ?session.storage.strings[i][0], string_capacity: STRING_BYTES,
-            scratch:    ?session.storage.scratch[i][0], scratch_capacity: SCRATCH_BYTES,
-            output:     ?session.storage.output[i][0], output_capacity: FRAME_PAYLOAD_BYTES,
-            references: ?session.storage.references[i][0], reference_capacity: REFERENCE_SLOTS
-        };
-        i = i + 1;
-    }
+    var control: h3.StreamMemory;
+    control.read             = ?session.storage.control_read[0];
+    control.read_capacity    = READ_BYTES;
+    control.settings         = ?session.storage.control_settings[0];
+    control.setting_capacity = SETTING_SLOTS;
+    var encoder: h3.StreamMemory;
+    encoder.read             = ?session.storage.encoder_read[0];
+    encoder.read_capacity    = READ_BYTES;
+    encoder.encoded          = ?session.storage.encoder_encoded[0];
+    encoder.encoded_capacity = HEADER_BYTES;
+    encoder.scratch          = ?session.storage.encoder_scratch[0];
+    encoder.scratch_capacity = SCRATCH_BYTES;
+    var decoder: h3.StreamMemory;
+    decoder.read             = ?session.storage.decoder_read[0];
+    decoder.read_capacity    = READ_BYTES;
+    decoder.encoded          = ?session.storage.decoder_encoded[0];
+    decoder.encoded_capacity = HEADER_BYTES;
     val storage: h3.Storage = h3.Storage{
-        streams:                     ?session.streams[0], memories: ?session.storage.memories[0],
-        stream_capacity:             STREAM_SLOTS,
+        source:   ?session.source, account: session.account,
+        critical: h3.CriticalMemory{control: control, encoder: encoder,
+            decoder: decoder},
         pending_release:             ?session.storage.pending[0], pending_release_capacity: PENDING_RELEASES,
         inbound_entries:             ?session.storage.inbound_entries[0], inbound_entry_capacity: TABLE_ENTRIES,
         inbound_storage:             ?session.storage.inbound_storage[0], inbound_storage_capacity: TABLE_BYTES,
@@ -715,13 +731,15 @@ pub fun begin(session: *Session, driver: *qt.Driver[binding.Binding],
     parent: *cancel.Scope, active_plan: *plan.Plan, budgets: *budget.Set,
     limits: message.Limits, max_requests: usize, listener_name: str,
     peer: message.Endpoint, local: message.Endpoint,
-    request_timeout_ns: u64, now_ns: u64, chunks: *hedge_storage.Chunks,
-    call_memory_bytes: usize) bool {
+    request_timeout_ns: u64, now_ns: u64, source: buffers.Source,
+    account: *buffers.Account, chunks: *hedge_storage.Chunks,
+    call_memory_bytes: usize, waker: hedge_wake.Waker) bool {
     val configured: h3.Config = session_config(limits, max_requests);
     if (session == nil || session.storage == nil || !session.live
         || session.state != IDLE || session.scope_live
         || session.engine_started || driver == nil
         || parent == nil || active_plan == nil || budgets == nil || chunks == nil
+        || account == nil || !account.open
         || max_requests == 0 || max_requests > MAX_STREAMS
         || !profile_valid(configured)) {
         ret false;
@@ -731,8 +749,7 @@ pub fun begin(session: *Session, driver: *qt.Driver[binding.Binding],
         ENDPOINT_BYTES, ?session.storage.peer)
         || !copy_endpoint_metadata(local, ?session.storage.local_text[0],
         ENDPOINT_BYTES, ?session.storage.local)
-        || !operation_ok(cancel.make_child(?session.storage.scope, parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret false; }
+        || !operation_ok(cancel.make_child(?session.storage.scope, parent, opt[time.Instant].none{}))) { ret false; }
     session.scope_live                 = true;
     session.storage.plan               = active_plan;
     session.storage.budgets            = budgets;
@@ -740,6 +757,9 @@ pub fun begin(session: *Session, driver: *qt.Driver[binding.Binding],
     session.storage.request_timeout_ns = request_timeout_ns;
     session.storage.chunks             = chunks;
     session.storage.call_memory_bytes  = call_memory_bytes;
+    session.storage.waker              = waker;
+    session.source                     = source;
+    session.account                    = account;
     session.now_ns                     = now_ns;
     session.requests                   = 0;
     session.last_event                 = h3.EVENT_NONE;
@@ -1000,14 +1020,15 @@ fun write_status(slot: *RequestSlot, code: status.Status) view.View {
 }
 
 fun make_exchange(session: *Session, slot: *RequestSlot, event: h3.Event,
-    now: time.Time) bool {
+    now: time.Instant) bool {
     slot.phase = REQUEST_BINDING;
-    val has_deadline: bool      = session.storage.request_timeout_ns != 0;
-    var deadline:     time.Time = now;
-    if (has_deadline)    { deadline = clock.after(now, session.storage.request_timeout_ns); }
+    var deadline: opt[time.Instant] = opt[time.Instant].none{};
+    if (session.storage.request_timeout_ns != 0) {
+        deadline = opt[time.Instant].some{clock.after(now, session.storage.request_timeout_ns)};
+    }
     if (slot.scope_live) { operation_ok(cancel.destroy(?slot.storage.scope)); }
     slot.scope_live = false;
-    if (!operation_ok(cancel.make_child(?slot.storage.scope, ?session.storage.scope, has_deadline, deadline))) {
+    if (!operation_ok(cancel.make_child(?slot.storage.scope, ?session.storage.scope, deadline))) {
         ret false;
     }
     slot.scope_live            = true;
@@ -1043,10 +1064,9 @@ fun make_exchange(session: *Session, slot: *RequestSlot, event: h3.Event,
     slot.request_trailers              = field.init(?slot.storage.request_trailer_items[0],
         REQUEST_TRAILER_SLOTS, session.storage.limits.request_trailers);
     val metadata: message.Metadata = message.Metadata{
-        version:       message.version_h3(), secure: true, early_data: false,
-        peer:          session.storage.peer, local: session.storage.local, received_at: clock.wall(),
-        has_deadline:  has_deadline, deadline: deadline,
-        request_index: event.stream_id
+        version:  message.version_h3(), secure: true, early_data: false,
+        peer:     session.storage.peer, local: session.storage.local, received_at: clock.wall(),
+        deadline: deadline, request_index: event.stream_id
     };
     if (!message.init_request(?slot.request, request_method,
         request_target(raw_target, request_method), metadata, slot.request_fields,
@@ -1069,27 +1089,24 @@ fun make_exchange(session: *Session, slot: *RequestSlot, event: h3.Event,
         || !telemetry_trace.make_root(?slot.trace, false)
         || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory, ?slot.trace,
         session.storage.plan.generation,
-        (?session.storage.listener_name[0])::str)) { ret false; }
+        (?session.storage.listener_name[0])::str, session.storage.waker)) { ret false; }
     ret true;
 }
 
 # h3 requires every request-header lease to bind before it can be released
 fun bind_rejected_exchange(session: *Session, slot: *RequestSlot,
-    event: h3.Event, now: time.Time) bool {
+    event: h3.Event, now: time.Instant) bool {
     var owner: *cancel.Scope = ?session.storage.scope;
     if (slot.scope_live) { owner = ?slot.storage.scope; }
-    var deadline:     time.Time = now;
-    val has_deadline: bool      = scope_deadline(owner, ?deadline);
     slot.body.reader    = body.empty_reader(event.generation);
     slot.request_fields = field.init(?slot.storage.request_items[0],
         REQUEST_FIELD_SLOTS, session.storage.limits.request_fields);
     slot.request_trailers = field.init(?slot.storage.request_trailer_items[0],
         REQUEST_TRAILER_SLOTS, session.storage.limits.request_trailers);
     val metadata: message.Metadata = message.Metadata{
-        version:       message.version_h3(), secure: true, early_data: false,
-        peer:          session.storage.peer, local: session.storage.local, received_at: clock.wall(),
-        has_deadline:  has_deadline, deadline: deadline,
-        request_index: event.stream_id
+        version:  message.version_h3(), secure: true, early_data: false,
+        peer:     session.storage.peer, local: session.storage.local, received_at: clock.wall(),
+        deadline: scope_deadline(owner), request_index: event.stream_id
     };
     if (!message.init_request(?slot.request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1),
@@ -1262,7 +1279,7 @@ fun refuse_body_writer(session: *Session, slot: *RequestSlot) Step {
 }
 
 fun start_exchange(session: *Session, slot: *RequestSlot,
-    now: time.Time) Step {
+    now: time.Instant) Step {
     slot.phase = REQUEST_SERVING;
     val served: dispatch.Result = dispatch.serve(session.storage.plan, ?slot.active_call,
         ?slot.storage.captures[0], CAPTURE_SLOTS, session.storage.budgets, ?slot.charge, now);
@@ -1280,7 +1297,7 @@ fun start_exchange(session: *Session, slot: *RequestSlot,
 }
 
 fun resume_exchange(session: *Session, slot: *RequestSlot,
-    now: time.Time) Step {
+    now: time.Instant) Step {
     val served: dispatch.Result = dispatch.resume(session.storage.plan, ?slot.active_call,
         session.storage.budgets, ?slot.charge, now);
     if (served.outcome == dispatch.PENDING) { ret STEP_BLOCKED; }
@@ -1442,7 +1459,7 @@ fun progress_request_body(slot: *RequestSlot) Step {
 }
 
 fun pump_request(session: *Session, slot: *RequestSlot,
-    now: time.Time) Step {
+    now: time.Instant) Step {
     if (!slot.live) { ret STEP_IDLE; }
     cancel.expire(?slot.storage.scope, now);
     var cancellation: Step = STEP_IDLE;
@@ -1521,7 +1538,7 @@ fun pump_request(session: *Session, slot: *RequestSlot,
     ret settle_request(session, slot);
 }
 
-fun pump_requests(session: *Session, now: time.Time) Step {
+fun pump_requests(session: *Session, now: time.Instant) Step {
     var progressed: bool  = false;
     var i:          usize = 0;
     for (i < MAX_STREAMS) {
@@ -1535,7 +1552,7 @@ fun pump_requests(session: *Session, now: time.Time) Step {
 }
 
 fun open_request(session: *Session, event: h3.Event,
-    now: time.Time) Step {
+    now: time.Instant) Step {
     val slot: *RequestSlot = free_request(session);
     if (slot == nil) {
         h3.cancel_connection[adapter.Adapter](?session.engine);
@@ -1627,11 +1644,14 @@ fun finish_inbound(slot: *RequestSlot) bool {
 }
 
 fun apply_event(session: *Session, event: h3.Event,
-    now: time.Time) Step {
+    now: time.Instant) Step {
     session.last_event = event.kind;
-    if (event.kind == h3.EVENT_NONE || event.kind == h3.EVENT_BLOCKED) {
+    # a memory-blocked engine is woken through the connection's account
+    if (event.kind == h3.EVENT_NONE || event.kind == h3.EVENT_BLOCKED
+        || event.kind == h3.EVENT_MEMORY_BLOCKED) {
         ret STEP_BLOCKED;
     }
+    if (event.kind == h3.EVENT_PENDING)  { ret STEP_PROGRESS; }
     if (event.kind == h3.EVENT_SETTINGS) { ret STEP_PROGRESS; }
     if (event.kind == h3.EVENT_REQUEST_HEADERS) {
         ret open_request(session, event, now);
@@ -1694,7 +1714,7 @@ fun apply_event(session: *Session, event: h3.Event,
     ret STEP_ERROR;
 }
 
-pub fun step(session: *Session, now: time.Time,
+pub fun step(session: *Session, now: time.Instant,
     monotonic_ns: u64) Step {
     if (session == nil || !session.live
         || (session.state != ACTIVE && session.state != CLOSING
@@ -1759,7 +1779,7 @@ pub fun step(session: *Session, now: time.Time,
     ret applied;
 }
 
-pub fun advance(session: *Session, now: time.Time,
+pub fun advance(session: *Session, now: time.Instant,
     monotonic_ns: u64) Step {
     if (session == nil || !session.live) { ret STEP_ERROR; }
     var count: usize = 0;
@@ -1803,6 +1823,40 @@ fun active_requests(session: *Session) usize {
         i = i + 1;
     }
     ret count;
+}
+
+# the session has work no transport event announces: a request an exchange is
+# serving, or a finished session waiting to be released
+fun earliest(found: bool, candidate: u64, output: *u64) bool {
+    if (!found || candidate < @output) { @output = candidate; }
+    ret true;
+}
+
+# the earliest monotonic instant a request of this session must be stepped for a
+# deadline alone: its request deadline, or a pending service's wait deadline
+pub fun next_deadline(session: *Session, output: *u64) bool {
+    if (session == nil || output == nil) { ret false; }
+    var found: bool  = false;
+    var i:     usize = 0;
+    for (i < MAX_STREAMS) {
+        val slot: *RequestSlot = ?session.requests_slots[i];
+        if (slot.live && slot.exchange_live && slot.scope_live) {
+            val deadline: opt[time.Instant] = scope_deadline(?slot.storage.scope);
+            if (sel deadline.some) {
+                found = earliest(found, clock.to_ns(deadline.some), output);
+            }
+            var waited: u64 = 0;
+            if (slot.service_pending && call.wait_deadline(?slot.active_call, ?waited)) {
+                found = earliest(found, waited, output);
+            }
+        }
+        i = i + 1;
+    }
+    ret found;
+}
+
+pub fun awaiting_service(session: *Session) bool {
+    ret session.state == CLOSED || active_requests(session) != 0;
 }
 
 pub fun release_status(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
@@ -1877,15 +1931,13 @@ test "hedge.protocol.h3.session: pool ownership grows and reuses what it is give
     storage.requests[0].captures[0].name        = view.view("route", 5);
     storage.requests[0].header_items[0].value   = view.view("stale", 5);
     taken.io.clock                              = ?taken.now_ns;
-    taken.streams[0].exchange                   = ?taken.requests_slots[0].exchange;
     if (!abandon(?pool, ?sessions, first) || pool.live != 0
         || session_at(?pool, ?sessions, first) != nil
         || hedge_storage.held[SessionStorage](?pool.storages) != 0
         || storage.requests[0].response_fields[0].name.data != nil
         || storage.requests[0].captures[0].name.data != nil
         || storage.requests[0].header_items[0].value.data != nil
-        || taken.storage != nil || taken.io.clock != nil
-        || taken.streams[0].exchange != nil) { ret 3; }
+        || taken.storage != nil || taken.io.clock != nil) { ret 3; }
     val second: usize = acquire(?pool, ?sessions);
     if (second != first || taken.storage != storage
         || !abandon(?pool, ?sessions, second)) { ret 4; }
@@ -1969,7 +2021,7 @@ test "hedge.protocol.h3.session: released header events leave owned views" {
 
 test "hedge.protocol.h3.session: pending body completion fills the retained buffer" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var state: Body;
@@ -1998,7 +2050,7 @@ test "hedge.protocol.h3.session: pending body completion fills the retained buff
 
 test "hedge.protocol.h3.session: a pending service completes its own body read" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var storage: RequestStorage;
@@ -2034,7 +2086,7 @@ test "hedge.protocol.h3.session: a pending service completes its own body read" 
 
 test "hedge.protocol.h3.session: cancellation relinquishes buffered request data" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var state: Body;
@@ -2110,7 +2162,7 @@ fun test_response_release(context: ptr) {
 
 test "hedge.protocol.h3.session: response body completion remains consumer-owned" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var source: TestResponseBody;
@@ -2142,13 +2194,11 @@ fun test_exchange_slot(slot: *RequestSlot, scope: *cancel.Scope,
     slot.body.reader      = body.empty_reader(1);
     slot.request_fields   = field.init(nil, 0, limits.request_fields);
     slot.request_trailers = field.init(nil, 0, limits.request_trailers);
-    var deadline:     time.Time        = time.Time{sec: 0, nsec: 0};
-    val has_deadline: bool             = scope_deadline(scope, ?deadline);
-    val metadata:     message.Metadata = message.Metadata{
-        version:     message.version_h3(), secure: true, early_data: false,
-        peer:        message.unspecified_endpoint(), local: message.unspecified_endpoint(),
-        received_at: time.Time{sec: 1, nsec: 0}, has_deadline: has_deadline,
-        deadline:    deadline, request_index: 0
+    val metadata: message.Metadata = message.Metadata{
+        version:       message.version_h3(), secure: true, early_data: false,
+        peer:          message.unspecified_endpoint(), local: message.unspecified_endpoint(),
+        received_at:   time.Time{sec: 1, nsec: 0}, deadline: scope_deadline(scope),
+        request_index: 0
     };
     if (!message.init_request(?slot.request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1),
@@ -2177,7 +2227,7 @@ fun test_exchange_slot(slot: *RequestSlot, scope: *cancel.Scope,
 
 test "hedge.protocol.h3.session: cancellation starts once and retries pending bodies" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var source: TestResponseBody;
@@ -2205,14 +2255,15 @@ test "hedge.protocol.h3.session: cancellation starts once and retries pending bo
 
 test "hedge.protocol.h3.session: expired deadlines settle as timeouts" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, true, time.Time{sec: 1, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope,
+        opt[time.Instant].some{time.Instant{sec: 1, nsec: 0}}))) {
         ret 1;
     }
     var storage: RequestStorage;
     var slot:    RequestSlot;
     test_request_slot(?slot, ?storage);
     if (!test_exchange_slot(?slot, ?scope, nil, true)) { ret 2; }
-    cancel.expire(?scope, time.Time{sec: 2, nsec: 0});
+    cancel.expire(?scope, time.Instant{sec: 2, nsec: 0});
     if (!scope_timed_out(?scope)
         || progress_cancellation(?slot, false) != STEP_PROGRESS
         || slot.exchange.state != exchange.TIMED_OUT_STATE
@@ -2223,8 +2274,7 @@ test "hedge.protocol.h3.session: expired deadlines settle as timeouts" {
 
 test "hedge.protocol.h3.session: every request body disposition is exact" {
     var deliver_scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?deliver_scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!operation_ok(cancel.make_root(?deliver_scope, opt[time.Instant].none{}))) { ret 1; }
     var deliver_storage: RequestStorage;
     var deliver:         RequestSlot;
     test_request_slot(?deliver, ?deliver_storage);
@@ -2245,8 +2295,7 @@ test "hedge.protocol.h3.session: every request body disposition is exact" {
         || !operation_ok(cancel.destroy(?deliver_scope))) { ret 5; }
 
     var reject_scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?reject_scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 6; }
+    if (!operation_ok(cancel.make_root(?reject_scope, opt[time.Instant].none{}))) { ret 6; }
     var reject_storage: RequestStorage;
     var reject:         RequestSlot;
     test_request_slot(?reject, ?reject_storage);
@@ -2262,8 +2311,7 @@ test "hedge.protocol.h3.session: every request body disposition is exact" {
         || !operation_ok(cancel.destroy(?reject_scope))) { ret 7; }
 
     var drain_scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?drain_scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 8; }
+    if (!operation_ok(cancel.make_root(?drain_scope, opt[time.Instant].none{}))) { ret 8; }
     var drain_storage: RequestStorage;
     var drain:         RequestSlot;
     test_request_slot(?drain, ?drain_storage);
@@ -2335,7 +2383,7 @@ fun test_record_end(context: ptr, complete: bool) {
 
 test "hedge.protocol.h3.session: dispatch owns response and call finalization" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var storage: RequestStorage;
@@ -2343,13 +2391,15 @@ test "hedge.protocol.h3.session: dispatch owns response and call finalization" {
     test_request_slot(?slot, ?storage);
     var heap: A.Allocator;
     page.make(?heap);
-    var chunks: hedge_storage.Chunks;
+    var test_wakes: hedge_wake.Queue;
+    var chunks:     hedge_storage.Chunks;
     if (!hedge_storage.make_chunks(?chunks, ?heap)) { ret 1; }
     if (!test_exchange_slot(?slot, ?scope, nil, false)
         || !call.make_memory(?slot.memory, ?chunks, hedge_storage.MIN_CHUNK)
         || !telemetry_trace.make_root(?slot.trace, false)
+        || !hedge_wake.make(?test_wakes, ?heap)
         || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory,
-        ?slot.trace, 1, "test")
+        ?slot.trace, 1, "test", hedge_wake.waker(?test_wakes, 1))
         || !call.resolve_body(?slot.active_call, call.BODY_DRAIN)) { ret 2; }
     var recorder: TestRecorder;
     if (!call.attach_recorder(?slot.active_call, call.Recorder{
@@ -2384,7 +2434,7 @@ test "hedge.protocol.h3.session: dispatch owns response and call finalization" {
 
 test "hedge.protocol.h3.session: finalizer failure survives slot reset" {
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
         ret 1;
     }
     var storage: RequestStorage;
@@ -2392,13 +2442,15 @@ test "hedge.protocol.h3.session: finalizer failure survives slot reset" {
     test_request_slot(?slot, ?storage);
     var heap: A.Allocator;
     page.make(?heap);
-    var chunks: hedge_storage.Chunks;
+    var test_wakes: hedge_wake.Queue;
+    var chunks:     hedge_storage.Chunks;
     if (!hedge_storage.make_chunks(?chunks, ?heap)) { ret 1; }
     if (!test_exchange_slot(?slot, ?scope, nil, true)
         || !call.make_memory(?slot.memory, ?chunks, hedge_storage.MIN_CHUNK)
         || !telemetry_trace.make_root(?slot.trace, false)
+        || !hedge_wake.make(?test_wakes, ?heap)
         || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory,
-        ?slot.trace, 1, "test")
+        ?slot.trace, 1, "test", hedge_wake.waker(?test_wakes, 1))
         || !call.resolve_body(?slot.active_call, call.BODY_DRAIN)) { ret 2; }
     slot.active_call.entered = true;
     var finalizer: TestFinalizer;
@@ -2441,8 +2493,7 @@ test "hedge.protocol.h3.session: connect targets and fixed storage fail closed" 
     val limits:     message.Limits = message.limits_default();
     val profile:    FixedProfile   = fixed_profile();
     var configured: h3.Config      = session_config(limits, MAX_STREAMS);
-    if (!profile_valid(configured)
-        || profile.stream_slots != profile.request_streams + 3) { ret 4; }
+    if (!profile_valid(configured)) { ret 4; }
     configured.inbound_qpack.max_field_count = FIELD_SLOTS + 1;
     if (profile_valid(configured)) { ret 5; }
     ret 0;

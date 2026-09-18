@@ -1,12 +1,20 @@
 # one TLS server session presented to an HTTP engine as an ordered byte transport
 #
-# mach-tls drives one application operation at a time: a read and a write cannot
-# both be outstanding on the same stream. an HTTP engine assumes they can. this
-# module owns the difference. it accepts every operation the engine submits, runs
-# exactly one of them at a time in a priority that never lets a response wait
-# behind a speculative read, and pre-empts an in-flight read when the engine has
-# something to write. the engine sees an ordinary transport; the ordering rules
-# live here and nowhere else.
+# a mach-tls stream carries one read and one write at once, each in its own
+# lane, which is the shape an HTTP engine already assumes. this module maps the
+# engine's operations onto those lanes: its read or readable wait onto the read
+# lane, and its writes, half close and close onto the write lane in the order
+# they were queued. a close needs both lanes free, so a read outstanding when
+# the engine closes is cancelled first. mach-tls keeps every byte a cancelled
+# read had received, so that cancel is control flow and never data loss.
+#
+# every TLS operation runs under a child of the scope the engine submitted it
+# with, one per lane. that parentage is how a cancel or timeout reaching the
+# engine's operation reaches the socket operation serving it. deadlines are
+# timing wheel entries that end those scopes; no scope here carries one.
+#
+# memory comes from the connection's account on the TLS lane. a lane short of
+# memory parks inside mach-tls, and `resume` retries it when the account wakes.
 #
 # a TLS session is secret-welded, so no public pointer may name one and a session
 # cannot be reached through a callback context. sessions are therefore held in a
@@ -19,6 +27,7 @@
 # in either moves once it exists. a cleartext deployment never allocates them.
 
 use hedge.listener;
+use hedge.memory;
 use hedge.protocol.tls;
 use hedge.storage;
 use http_transport: http.core.transport;
@@ -29,23 +38,20 @@ use std.collections.vector;
 use io_error: std.io.error;
 use std.io.lifecycle;
 use io_runtime: std.io.runtime;
-use net_async:  std.net.async;
+use std.memory.buffers;
+use net_async: std.net.async;
 use std.net.tcp;
-use std.print;
 use std.sync.cancel;
-use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.char.char;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
-use tls.cert;
+use tls_buffer:    tls.buffer;
 use tls_engine:    tls.engine;
 use tls_error:     tls.error;
-use tls_record:    tls.record;
 use tls_server:    tls.server;
 use tls_stream:    tls.stream;
 use tls_transport: tls.transport;
@@ -62,11 +68,6 @@ fun runtime_ok(outcome: err[io_error.Error]) bool {
     ret sel outcome.ok;
 }
 
-fun is_err_bool_io_error_error(outcome: res[bool, io_error.Error]) bool {
-    ret sel outcome.err;
-}
-
-pub val WIRE_BYTES: usize = tls_record.HEADER_SIZE + tls_record.MAX_CIPHERTEXT;
 pub val NO_SESSION: usize = (-1)::usize;
 
 pub def State: u8;
@@ -83,9 +84,15 @@ pub val KIND_READ:      Kind = 2;
 pub val KIND_WRITE:     Kind = 3;
 pub val KIND_SHUTDOWN:  Kind = 4;
 pub val KIND_CLOSE:     Kind = 5;
+pub val KIND_READABLE:  Kind = 6;
+
+# tls tokens name the lane an operation runs in
+val READ_LANE_TOKEN:  u32 = 1;
+val WRITE_LANE_TOKEN: u32 = 2;
 
 # bytes the connection prologue already took off the socket, which the TLS
-# record layer must see before the socket is read again
+# record layer must see before the socket is read again. a nil buffer asks how
+# many are left without taking any
 pub def StagedFun: fun(ptr, *u8, usize) usize;
 
 # one operation the HTTP transport handed over. its buffer and scope belong to
@@ -98,22 +105,30 @@ rec Pending {
     length: usize;
 }
 
+# the completions a session has settled and the engine has not yet taken. each
+# lane settles one at a time, so two is always enough
+val DONE_SLOTS: usize = 2;
+
 # everything a callback may touch. no secret state is reachable from here.
 pub rec Channel {
-    live:    bool;
-    index:   usize;
-    state:   State;
-    current: Kind;
-    # the running read was cancelled here so a write could start, and is not
-    # the engine's to hear about
-    preempted:         bool;
-    generation:        u32;
+    live:  bool;
+    index: usize;
+    state: State;
+    # what each lane is running
+    reading: Kind;
+    writing: Kind;
+    # the read lane was cancelled so a close can start
+    read_cancelled:    bool;
+    read_generation:   u32;
+    write_generation:  u32;
     read:              Pending;
+    readable:          Pending;
+    readable_waiting:  bool;
     write:             Pending;
     shutdown:          Pending;
     close:             Pending;
-    ready:             bool;
-    ready_completion:  http_transport.Completion;
+    done:              [2]http_transport.Completion;
+    done_count:        usize;
     handshake_settled: bool;
     handshake_error:   tls_error.Error;
     peer_closed:       bool;
@@ -123,24 +138,23 @@ pub rec Channel {
     context:           listener.ConnectionContext;
     owner:             ptr;
     staged:            StagedFun;
+    account:           *buffers.Account;
 }
 
 rec Session {
-    transport:            tls_transport.Transport;
-    engine:               tls_server.Server;
-    stream:               tls_stream.Stream;
-    handshake_input:      [tls.HANDSHAKE_INPUT_BYTES]u8;
-    handshake_output:     [tls.HANDSHAKE_OUTPUT_BYTES]u8;
-    hello:                [tls.HELLO_BYTES]u8;
-    peer_certificates:    [tls.PEER_CERTIFICATES]cert.Certificate;
-    wire_input:           [WIRE_BYTES]u8;
-    wire_output:          [WIRE_BYTES]u8;
-    root:                 cancel.Scope;
-    root_live:            bool;
-    operation_scope:      cancel.Scope;
-    operation_scope_live: bool;
-    engine_started:       bool;
-    stream_started:       bool;
+    transport:        tls_transport.Transport;
+    engine:           tls_server.Handshake;
+    stream:           tls_stream.Stream;
+    source:           buffers.Source;
+    secrets:          buffers.SecretSource;
+    root:             cancel.Scope;
+    root_live:        bool;
+    read_scope:       cancel.Scope;
+    read_scope_live:  bool;
+    write_scope:      cancel.Scope;
+    write_scope_live: bool;
+    engine_started:   bool;
+    stream_started:   bool;
 }
 
 var sessions: storage.SecretTable[Session];
@@ -163,10 +177,13 @@ fun reset_channel(value: *Channel, index: usize) {
     value.live              = false;
     value.index             = index;
     value.state             = IDLE;
-    value.current           = KIND_NONE;
-    value.preempted         = false;
-    value.generation        = 0;
-    value.ready             = false;
+    value.reading           = KIND_NONE;
+    value.writing           = KIND_NONE;
+    value.read_cancelled    = false;
+    value.read_generation   = 0;
+    value.write_generation  = 0;
+    value.readable_waiting  = false;
+    value.done_count        = 0;
     value.handshake_settled = false;
     value.handshake_error   = tls_error.OK;
     value.peer_closed       = false;
@@ -175,7 +192,9 @@ fun reset_channel(value: *Channel, index: usize) {
     value.socket            = nil;
     value.owner             = nil;
     value.staged            = (0::usize)::StagedFun;
+    value.account           = nil;
     clear_pending(?value.read);
+    clear_pending(?value.readable);
     clear_pending(?value.write);
     clear_pending(?value.shutdown);
     clear_pending(?value.close);
@@ -230,41 +249,69 @@ pub fun acquire() usize {
     reset_channel(value, index);
     value.live = true;
     val record: *Session = session_at(index);
-    record.root_live            = false;
-    record.operation_scope_live = false;
-    record.engine_started       = false;
-    record.stream_started       = false;
-    live_count                  = live_count + 1;
+    record.root_live        = false;
+    record.read_scope_live  = false;
+    record.write_scope_live = false;
+    record.engine_started   = false;
+    record.stream_started   = false;
+    live_count              = live_count + 1;
     ret index;
 }
 
-fun destroy_scopes(index: usize) {
-    if (session_at(index).operation_scope_live) {
-        cancel.destroy(?session_at(index).operation_scope);
-        session_at(index).operation_scope_live = false;
+fun release_read_scope(index: usize) {
+    if (session_at(index).read_scope_live) {
+        cancel.destroy(?session_at(index).read_scope);
+        session_at(index).read_scope_live = false;
     }
+}
+
+fun release_write_scope(index: usize) {
+    if (session_at(index).write_scope_live) {
+        cancel.destroy(?session_at(index).write_scope);
+        session_at(index).write_scope_live = false;
+    }
+}
+
+fun destroy_scopes(index: usize) {
+    release_read_scope(index);
+    release_write_scope(index);
     if (session_at(index).root_live) {
         cancel.destroy(?session_at(index).root);
         session_at(index).root_live = false;
     }
 }
 
+fun lane_token(lane: u32, generation: u32) tls_transport.Token {
+    ret tls_transport.Token{index: lane, generation: generation};
+}
+
+# false while a lane still runs. the connection releases a session only once
+# both lanes have settled, which its close sequence waits for
 pub fun release(index: usize) bool {
     prepare();
     if (!claimed_index(index)) { ret false; }
-    if (session_at(index).stream_started) {
-        tls_stream.destroy_operation(?session_at(index).stream);
-        tls_stream.destroy(?session_at(index).stream);
-        session_at(index).stream_started = false;
+    val value:  *Channel = channel_at(index);
+    val record: *Session = session_at(index);
+    if (record.stream_started) {
+        if (value.reading != KIND_NONE) {
+            tls_stream.destroy_operation(?record.stream,
+                lane_token(READ_LANE_TOKEN, value.read_generation));
+        }
+        if (value.writing != KIND_NONE) {
+            tls_stream.destroy_operation(?record.stream,
+                lane_token(WRITE_LANE_TOKEN, value.write_generation));
+        }
+        tls_stream.destroy(?record.stream);
+        record.stream_started = false;
     }
-    if (session_at(index).engine_started) {
+    if (record.engine_started) {
         # destroying the engine releases the credential lease it took at the
         # ClientHello, which is what lets a retired generation be reclaimed
-        tls_server.destroy(?session_at(index).engine);
-        session_at(index).engine_started = false;
+        tls_server.destroy(?record.engine);
+        record.engine_started = false;
     }
     destroy_scopes(index);
-    reset_channel(channel_at(index), index);
+    reset_channel(value, index);
     if (live_count > 0) { live_count = live_count - 1; }
     # an index the free list cannot take is simply never reused
     vector.push[usize](?released, index);
@@ -278,31 +325,39 @@ fun lower_resource(value: *Channel) usize {
     ret value.socket.handle.value;
 }
 
+fun completion_context(value: *Channel) usize {
+    ret (?value.context)::usize;
+}
+
 fun deliver_staged(value: *Channel, scope: *cancel.Scope, buffer: *u8,
     length: usize) res[io_runtime.Token, io_error.Error] {
     val count: usize = value.staged(value.owner, buffer, length);
     if (count == 0) {
-        ret res[io_runtime.Token, io_error.Error].err{io_error.from_code(os.EAGAIN, io_error.OP_READ)};
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.WOULD_BLOCK, io_error.OP_READ)};
     }
     val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
         value.driver.runtime, scope,
         io_runtime.Operation{kind: io_runtime.READ, resource: lower_resource(value),
-        buffer: buffer, length: length, offset: 0,
-        context: (?value.context)::usize});
+        buffer:  buffer, length: length, offset: 0,
+        context: completion_context(value)});
     if (sel submitted.err) { ret submitted; }
     val token: io_runtime.Token = submitted.ok;
     if (!runtime_ok(io_runtime.complete(value.driver.runtime,
         token, count, lower_resource(value), false))) {
-        ret res[io_runtime.Token, io_error.Error].err{io_error.from_code(os.EIO, io_error.OP_READ)};
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
     }
     ret submitted;
+}
+
+fun staged_left(value: *Channel) bool {
+    ret value.staged::usize != 0 && value.staged(value.owner, nil, 0) != 0;
 }
 
 fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
     if (value == nil || value.driver == nil || value.socket == nil) {
-        ret res[io_runtime.Token, io_error.Error].err{io_error.from_code(os.EINVAL, io_error.OP_READ)};
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
     }
     if (value.staged::usize != 0 && length != 0) {
         val staged: res[io_runtime.Token, io_error.Error] = deliver_staged(
@@ -310,39 +365,39 @@ fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
         if (sel staged.ok) { ret staged; }
     }
     ret net_async.submit_read(value.driver, scope, value.socket, buffer, length,
-        (?value.context)::usize);
+        completion_context(value));
 }
 
 fun lower_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
     if (value == nil || value.driver == nil || value.socket == nil) {
-        ret res[io_runtime.Token, io_error.Error].err{io_error.from_code(os.EINVAL, io_error.OP_WRITE)};
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WRITE)};
     }
     ret net_async.submit_write(value.driver, scope, value.socket, buffer, length,
-        (?value.context)::usize);
+        completion_context(value));
 }
 
 fun lower_shutdown(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
     if (value == nil || value.driver == nil || value.socket == nil) {
-        ret res[io_runtime.Token, io_error.Error].err{io_error.from_code(os.EINVAL, io_error.OP_SHUTDOWN)};
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_SHUTDOWN)};
     }
     ret net_async.submit_shutdown_write(value.driver, scope, value.socket,
-        (?value.context)::usize);
+        completion_context(value));
 }
 
 fun lower_close(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
     if (value == nil || value.driver == nil || value.socket == nil) {
-        ret res[io_runtime.Token, io_error.Error].err{io_error.from_code(os.EINVAL, io_error.OP_CLOSE)};
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)};
     }
     # the argument is the close mode, not a cause: the cause constant selected
     # a graceful shutdown-write whose completion the TLS close never accepts
     ret net_async.submit_stream_close(value.driver, scope, value.socket,
-        lifecycle.ABORTIVE, (?value.context)::usize);
+        lifecycle.ABORTIVE, completion_context(value));
 }
 
 # the state this transport owns is the channel, the socket it submits on, and
@@ -383,6 +438,7 @@ fun lower_transport(value: *Channel) tls_transport.Transport {
 
 fun pending_for(value: *Channel, kind: Kind) *Pending {
     if (kind == KIND_READ)     { ret ?value.read; }
+    if (kind == KIND_READABLE) { ret ?value.readable; }
     if (kind == KIND_WRITE)    { ret ?value.write; }
     if (kind == KIND_SHUTDOWN) { ret ?value.shutdown; }
     if (kind == KIND_CLOSE)    { ret ?value.close; }
@@ -391,121 +447,77 @@ fun pending_for(value: *Channel, kind: Kind) *Pending {
 
 fun logical_kind(kind: Kind) http_transport.Kind {
     if (kind == KIND_READ)     { ret http_transport.READ; }
+    if (kind == KIND_READABLE) { ret http_transport.READABLE; }
     if (kind == KIND_WRITE)    { ret http_transport.WRITE; }
     if (kind == KIND_SHUTDOWN) { ret http_transport.SHUTDOWN_WRITE; }
     ret http_transport.CLOSE;
 }
 
 fun operation_for(kind: Kind) io_error.Operation {
-    if (kind == KIND_READ)     { ret io_error.OP_READ; }
-    if (kind == KIND_WRITE)    { ret io_error.OP_WRITE; }
-    if (kind == KIND_SHUTDOWN) { ret io_error.OP_SHUTDOWN; }
+    if (kind == KIND_READ || kind == KIND_READABLE) { ret io_error.OP_READ; }
+    if (kind == KIND_WRITE)                         { ret io_error.OP_WRITE; }
+    if (kind == KIND_SHUTDOWN)                      { ret io_error.OP_SHUTDOWN; }
     ret io_error.OP_CLOSE;
 }
 
 fun failure_for(kind: Kind, failure: tls_error.Error) io_error.Error {
     if (failure == tls_error.TIMEOUT) {
-        ret io_error.from_code(os.ETIMEDOUT, operation_for(kind));
+        ret io_error.make(io_error.TIMEOUT, operation_for(kind));
     }
     if (failure == tls_error.CANCELLED) {
-        ret io_error.from_code(os.ECANCELED, operation_for(kind));
+        ret io_error.make(io_error.CANCELLED, operation_for(kind));
     }
-    ret io_error.from_code(os.EIO, operation_for(kind));
+    ret io_error.make(io_error.IO, operation_for(kind));
 }
 
-fun next_token(value: *Channel) tls_transport.Token {
-    var generation: u32 = value.generation + 1;
-    if (generation == 0) { generation = 1; }
-    value.generation = generation;
-    ret tls_transport.Token{index: 1, generation: generation};
-}
-
-fun release_operation_scope(index: usize) {
-    if (session_at(index).operation_scope_live) {
-        cancel.destroy(?session_at(index).operation_scope);
-        session_at(index).operation_scope_live = false;
-    }
+fun next_generation(generation: u32) u32 {
+    var value: u32 = generation + 1;
+    if (value == 0) { value = 1; }
+    ret value;
 }
 
 # a TLS operation runs under a child of the scope that asked for it, so the
-# owner's cancel or deadline reaches the socket operation it is waiting on. an
+# owner's cancel or timeout reaches the socket operation it is waiting on. an
 # operation nobody scoped runs under the session root, itself under the
-# connection. the scope lives only while its operation does.
-fun renew_operation_scope(index: usize, owner: *cancel.Scope) bool {
-    release_operation_scope(index);
+# connection. each lane's scope lives only while its operation does.
+fun renew_scope(index: usize, reading: bool, owner: *cancel.Scope) bool {
     var parent: *cancel.Scope = owner;
     if (parent == nil) { parent = ?session_at(index).root; }
-    if (!operation_ok(cancel.make_child(?session_at(index).operation_scope, parent,
-        false, time.Time{sec: 0, nsec: 0}))) { ret false; }
-    session_at(index).operation_scope_live = true;
+    if (reading) {
+        release_read_scope(index);
+        if (!operation_ok(cancel.make_child(?session_at(index).read_scope, parent,
+            opt[time.Instant].none{}))) { ret false; }
+        session_at(index).read_scope_live = true;
+        ret true;
+    }
+    release_write_scope(index);
+    if (!operation_ok(cancel.make_child(?session_at(index).write_scope, parent,
+        opt[time.Instant].none{}))) { ret false; }
+    session_at(index).write_scope_live = true;
     ret true;
 }
 
-fun begin_operation(index: usize, kind: Kind) bool {
-    val value: *Channel = channel_at(index);
-    val slot:  *Pending = pending_for(value, kind);
-    if (slot == nil || !renew_operation_scope(index, slot.scope)) { ret false; }
-    val token:   tls_transport.Token = next_token(value);
-    var started: bool                = false;
-    if (kind == KIND_READ) {
-        started = tls_stream.read(?session_at(index).stream,
-            ?session_at(index).operation_scope, token, slot.buffer, slot.length, 0);
-    }
-    or (kind == KIND_WRITE) {
-        started = tls_stream.write(?session_at(index).stream,
-            ?session_at(index).operation_scope, token, slot.buffer, slot.length, 0);
-    }
-    or (kind == KIND_SHUTDOWN) {
-        started = tls_stream.half_close(?session_at(index).stream,
-            ?session_at(index).operation_scope, token, 0);
-    }
-    or {
-        started = tls_stream.close(?session_at(index).stream,
-            ?session_at(index).operation_scope, token, 0);
-    }
-    if (!started) { ret false; }
-    value.current = kind;
-    ret true;
-}
-
-# writes go first. a queued read must never delay a response, because the peer
-# that would satisfy that read is the same peer waiting for the response.
-pub fun next_kind(value: *Channel) Kind {
-    if (value.close.active)    { ret KIND_CLOSE; }
-    if (value.write.active)    { ret KIND_WRITE; }
-    if (value.shutdown.active) { ret KIND_SHUTDOWN; }
-    if (value.read.active)     { ret KIND_READ; }
-    ret KIND_NONE;
+fun push_done(value: *Channel, settled: http_transport.Completion) {
+    if (value.done_count >= DONE_SLOTS) { ret; }
+    value.done[value.done_count] = settled;
+    value.done_count             = value.done_count + 1;
 }
 
 fun fail_pending(value: *Channel, kind: Kind, failure: tls_error.Error) {
     val slot: *Pending = pending_for(value, kind);
     if (slot == nil || !slot.active) { ret; }
-    slot.active            = false;
-    value.ready            = true;
-    value.ready_completion = http_transport.failed(slot.token,
-        logical_kind(kind), 0, failure_for(kind, failure));
+    slot.active = false;
+    push_done(value, http_transport.failed(slot.token, logical_kind(kind), 0,
+        failure_for(kind, failure)));
 }
 
-# one completion is publishable at a time, so the first queued operation carries
-# the failure and the rest settle as the engine retires them
-fun fail_next(value: *Channel, failure: tls_error.Error) bool {
-    val wanted: Kind = next_kind(value);
-    if (wanted == KIND_NONE) { ret false; }
-    fail_pending(value, wanted, failure);
-    ret value.ready;
-}
-
-fun publish(index: usize, kind: Kind, snapshot: tls_transport.Snapshot) {
-    val value: *Channel = channel_at(index);
-    val slot:  *Pending = pending_for(value, kind);
+fun publish(value: *Channel, kind: Kind, snapshot: tls_transport.Snapshot) {
+    val slot: *Pending = pending_for(value, kind);
     if (slot == nil || !slot.active) { ret; }
     slot.active = false;
-    value.ready = true;
     if (snapshot.terminal_error != tls_error.OK) {
-        value.ready_completion = http_transport.failed(slot.token,
-            logical_kind(kind), snapshot.application_bytes,
-            failure_for(kind, snapshot.terminal_error));
+        push_done(value, http_transport.failed(slot.token, logical_kind(kind),
+            snapshot.application_bytes, failure_for(kind, snapshot.terminal_error)));
         if (snapshot.terminal_error != tls_error.CANCELLED
             && snapshot.terminal_error != tls_error.TIMEOUT) { value.state = FAILED; }
         ret;
@@ -514,11 +526,11 @@ fun publish(index: usize, kind: Kind, snapshot: tls_transport.Snapshot) {
     # what lets a request without a length terminate rather than hang
     if (kind == KIND_READ && snapshot.application_bytes == 0
         && (value.peer_closed || value.lower_eof)) {
-        value.ready_completion = http_transport.end(slot.token, 0);
+        push_done(value, http_transport.end(slot.token, 0));
         ret;
     }
-    value.ready_completion = http_transport.completed(slot.token,
-        logical_kind(kind), snapshot.application_bytes);
+    push_done(value, http_transport.completed(slot.token, logical_kind(kind),
+        snapshot.application_bytes));
 }
 
 fun observe(index: usize) {
@@ -526,43 +538,49 @@ fun observe(index: usize) {
     val view:  tls_stream.Snapshot = tls_stream.snapshot(?session_at(index).stream);
     value.peer_closed = view.peer_closed;
     value.lower_eof   = view.state == tls_stream.CLOSED;
+    if (view.state == tls_stream.FAILED && value.state == OPEN) { value.state = FAILED; }
 }
 
-# resolve the stream operation if it has finished, and publish at most one
-# transport completion for the engine to collect
-fun settle(index: usize) bool {
+fun settle_read(index: usize, snapshot: tls_transport.Snapshot) {
     val value: *Channel = channel_at(index);
-    if (value.current == KIND_NONE) { ret false; }
-    val snapshot: tls_transport.Snapshot = tls_transport.snapshot(
-        ?session_at(index).stream.operation);
-    if (snapshot.state != tls_transport.OPERATION_TERMINAL) { ret false; }
-    val kind:      Kind = value.current;
-    val preempted: bool = value.preempted;
-    value.current   = KIND_NONE;
-    value.preempted = false;
-    observe(index);
-    tls_stream.destroy_operation(?session_at(index).stream);
-    release_operation_scope(index);
-    if (preempted && snapshot.terminal_error == tls_error.CANCELLED
-        && ended_by_owner(?value.read) == tls_error.OK) {
-        # the engine's read stays queued behind the writes and starts again with
-        # the same buffer and token. mach-tls keeps every byte a cancelled read
-        # settled, and whatever it already delivered is the engine's now
-        if (snapshot.application_bytes == 0) { ret false; }
-        var delivered: tls_transport.Snapshot = snapshot;
-        delivered.terminal_error = tls_error.OK;
-        publish(index, kind, delivered);
-        ret value.ready;
+    if (value.reading == KIND_NONE || snapshot.state != tls_transport.OPERATION_TERMINAL) {
+        ret;
     }
+    val kind: Kind = value.reading;
+    value.reading        = KIND_NONE;
+    value.read_cancelled = false;
+    tls_stream.destroy_operation(?session_at(index).stream, snapshot.token);
+    release_read_scope(index);
+    publish(value, kind, snapshot);
+}
+
+fun settle_write(index: usize, snapshot: tls_transport.Snapshot) {
+    val value: *Channel = channel_at(index);
+    if (value.writing == KIND_NONE || snapshot.state != tls_transport.OPERATION_TERMINAL) {
+        ret;
+    }
+    val kind: Kind = value.writing;
+    value.writing = KIND_NONE;
+    tls_stream.destroy_operation(?session_at(index).stream, snapshot.token);
+    release_write_scope(index);
     if (kind == KIND_HANDSHAKE) {
         value.handshake_settled = true;
         value.handshake_error   = snapshot.terminal_error;
         if (snapshot.terminal_error == tls_error.OK) { value.state = OPEN; }
         or                                           { value.state = FAILED; }
-        ret true;
+        ret;
     }
-    publish(index, kind, snapshot);
-    ret value.ready;
+    publish(value, kind, snapshot);
+}
+
+# resolve whichever lanes have finished, publishing their completions
+fun settle(index: usize) {
+    val value: *Channel = channel_at(index);
+    if (value.reading == KIND_NONE && value.writing == KIND_NONE) { ret; }
+    val view: tls_stream.Snapshot = tls_stream.snapshot(?session_at(index).stream);
+    observe(index);
+    settle_read(index, view.read);
+    settle_write(index, view.write);
 }
 
 # the failure a queued operation settles with when its submitting scope has
@@ -575,64 +593,186 @@ fun ended_by_owner(slot: *Pending) tls_error.Error {
     ret tls_error.OK;
 }
 
-fun writes_waiting(value: *Channel) bool {
-    ret value.write.active || value.shutdown.active || value.close.active;
+# whether a read would return something without the socket: plaintext or
+# ciphertext mach-tls already holds, bytes the prologue read, or the end
+fun buffered(index: usize) bool {
+    val value:  *Channel           = channel_at(index);
+    val stream: *tls_stream.Stream = ?session_at(index).stream;
+    ret stream.plaintext_read < stream.plaintext_len
+        || stream.wire_input_read < stream.wire_input_len || stream.holding
+        || stream.peer_closed || stream.lower_eof || staged_left(value);
 }
 
-# start whatever should run next
-#
-# a write never waits behind a read. a response can become ready at any time,
-# long after a read was started for the next request, and the peer that would
-# satisfy that read may be waiting for the response. so a read in flight when a
-# write is queued is cancelled through its own operation scope, the queued
-# writes run, and the read then starts again once, unseen by the engine. a
-# write is never cancelled this way, because a write cancelled with a record
-# partly on the wire fails the stream.
-#
-# `reads` says whether a read may be started. the connection plane passes false
-# while it is still driving its engines and true once they have quiesced, so a
-# read does not start ahead of work those engines are about to queue.
-pub fun drive(index: usize, reads: bool) bool {
-    prepare();
-    if (!claimed_index(index) || !channel_at(index).live) { ret false; }
+fun start_read(index: usize) {
     val value: *Channel = channel_at(index);
-    if (value.ready) { ret true; }
-    if (value.state == FAILED || value.state == CLOSED) {
-        ret fail_next(value, tls_error.INTERNAL_ERROR);
+    val slot:  *Pending = ?value.read;
+    if (!renew_scope(index, true, slot.scope)) {
+        fail_pending(value, KIND_READ, tls_error.INTERNAL_ERROR);
+        ret;
     }
-    if (value.current == KIND_READ && value.state == OPEN && writes_waiting(value)) {
-        if (!value.preempted
-            && transition_ok(cancel.cancel(?session_at(index).operation_scope))) {
-            value.preempted = true;
+    value.read_generation = next_generation(value.read_generation);
+    if (!tls_stream.read(?session_at(index).stream, ?session_at(index).read_scope,
+        lane_token(READ_LANE_TOKEN, value.read_generation), slot.buffer, slot.length,
+        completion_context(value))) {
+        release_read_scope(index);
+        fail_pending(value, KIND_READ, tls_error.INTERNAL_ERROR);
+        ret;
+    }
+    value.reading = KIND_READ;
+}
+
+# a readable wait holds no buffer. it answers at once when mach-tls or the
+# prologue already holds input, and otherwise waits on the socket
+fun start_readable(index: usize) {
+    val value: *Channel = channel_at(index);
+    val slot:  *Pending = ?value.readable;
+    if (buffered(index)) {
+        slot.active = false;
+        if (session_at(index).stream.peer_closed || session_at(index).stream.lower_eof) {
+            push_done(value, http_transport.end_of(slot.token, http_transport.READABLE, 0));
         }
-        ret settle(index);
+        or { push_done(value, http_transport.completed(slot.token, http_transport.READABLE, 0)); }
+        ret;
     }
-    if (value.current != KIND_NONE || value.state != OPEN) { ret false; }
-    val wanted: Kind = next_kind(value);
-    if (wanted == KIND_NONE) { ret false; }
-    # an operation whose owner already ended it settles without starting, or a
-    # closing connection waits forever on a read it will never begin
-    val ended: tls_error.Error = ended_by_owner(pending_for(value, wanted));
-    if (ended != tls_error.OK) {
-        fail_pending(value, wanted, ended);
-        ret value.ready;
+    if (value.readable_waiting) { ret; }
+    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_readable(
+        value.driver, slot.scope, value.socket, completion_context(value));
+    if (sel submitted.err) {
+        fail_pending(value, KIND_READABLE, tls_error.INTERNAL_ERROR);
+        ret;
     }
-    if (wanted == KIND_READ && !reads) { ret false; }
-    if (!begin_operation(index, wanted)) {
-        fail_pending(value, wanted, tls_error.INTERNAL_ERROR);
-        ret value.ready;
+    value.readable_waiting = true;
+}
+
+fun start_write(index: usize, kind: Kind) {
+    val value: *Channel = channel_at(index);
+    val slot:  *Pending = pending_for(value, kind);
+    if (!renew_scope(index, false, slot.scope)) {
+        fail_pending(value, kind, tls_error.INTERNAL_ERROR);
+        ret;
     }
-    ret settle(index);
+    value.write_generation = next_generation(value.write_generation);
+    val token:   tls_transport.Token = lane_token(WRITE_LANE_TOKEN, value.write_generation);
+    val scope:   *cancel.Scope       = ?session_at(index).write_scope;
+    val stream:  *tls_stream.Stream  = ?session_at(index).stream;
+    var started: bool                = false;
+    if (kind == KIND_WRITE) {
+        started = tls_stream.write(stream, scope, token, slot.buffer, slot.length,
+            completion_context(value));
+    }
+    or (kind == KIND_SHUTDOWN) {
+        started = tls_stream.half_close(stream, scope, token, completion_context(value));
+    }
+    or { started = tls_stream.close(stream, scope, token, completion_context(value)); }
+    if (!started) {
+        release_write_scope(index);
+        fail_pending(value, kind, tls_error.INTERNAL_ERROR);
+        ret;
+    }
+    value.writing = kind;
+}
+
+# the write lane runs what was queued: a close waits for any write or half
+# close queued before it, and for the read lane to end
+fun next_write(value: *Channel) Kind {
+    if (value.write.active)    { ret KIND_WRITE; }
+    if (value.shutdown.active) { ret KIND_SHUTDOWN; }
+    if (value.close.active)    { ret KIND_CLOSE; }
+    ret KIND_NONE;
+}
+
+fun settle_ended(value: *Channel, kind: Kind) bool {
+    val ended: tls_error.Error = ended_by_owner(pending_for(value, kind));
+    if (ended == tls_error.OK) { ret false; }
+    fail_pending(value, kind, ended);
+    ret true;
+}
+
+fun drive_read(index: usize) {
+    val value: *Channel = channel_at(index);
+    if (value.reading != KIND_NONE) { ret; }
+    if (value.read.active) {
+        # an operation whose owner already ended it settles without starting,
+        # or a closing connection waits forever on a read it will never begin
+        if (settle_ended(value, KIND_READ)) { ret; }
+        start_read(index);
+        ret;
+    }
+    if (value.readable.active && !value.readable_waiting) {
+        if (settle_ended(value, KIND_READABLE)) { ret; }
+        start_readable(index);
+    }
+}
+
+fun drive_write(index: usize) {
+    val value: *Channel = channel_at(index);
+    if (value.writing != KIND_NONE) { ret; }
+    val wanted: Kind = next_write(value);
+    if (wanted == KIND_NONE)         { ret; }
+    if (settle_ended(value, wanted)) { ret; }
+    if (wanted == KIND_CLOSE && value.reading != KIND_NONE) {
+        # a close needs the read lane free. the read ends as cancelled with every
+        # byte it had received kept, and the close starts once it has settled
+        if (!value.read_cancelled
+            && transition_ok(cancel.cancel(?session_at(index).read_scope))) {
+            value.read_cancelled = true;
+        }
+        ret;
+    }
+    start_write(index, wanted);
+}
+
+fun fail_all(value: *Channel, failure: tls_error.Error) {
+    if (value.reading == KIND_NONE) {
+        fail_pending(value, KIND_READ, failure);
+        if (!value.readable_waiting) { fail_pending(value, KIND_READABLE, failure); }
+    }
+    if (value.writing == KIND_NONE) {
+        fail_pending(value, KIND_WRITE, failure);
+        fail_pending(value, KIND_SHUTDOWN, failure);
+        fail_pending(value, KIND_CLOSE, failure);
+    }
+}
+
+# start whatever each lane should run next, and resolve what has finished.
+# true when a completion is ready to take
+pub fun drive(index: usize) bool {
+    prepare();
+    if (!claimed_index(index)) { ret false; }
+    val value: *Channel = channel_at(index);
+    if (session_at(index).stream_started) { settle(index); }
+    if (value.state == FAILED || value.state == CLOSED) {
+        # a failed stream may still be closed abortively, which ends a read the
+        # engine left outstanding
+        if (value.writing == KIND_NONE && value.close.active
+            && session_at(index).stream_started && !settle_ended(value, KIND_CLOSE)) {
+            start_write(index, KIND_CLOSE);
+            settle(index);
+        }
+        fail_all(value, tls_error.INTERNAL_ERROR);
+        ret value.done_count != 0;
+    }
+    if (value.state == OPEN) {
+        drive_read(index);
+        drive_write(index);
+        settle(index);
+    }
+    ret value.done_count != 0;
 }
 
 fun adapter_submit(value: *Channel, kind: Kind, token: http_transport.Token,
     scope: *cancel.Scope, buffer: *u8, length: usize) res[bool, io_error.Error] {
     if (value == nil || !value.live) {
-        ret res[bool, io_error.Error].err{io_error.from_code(os.EBADF, operation_for(kind))};
+        ret res[bool, io_error.Error].err{io_error.make(io_error.CLOSED, operation_for(kind))};
     }
     val slot: *Pending = pending_for(value, kind);
     if (slot == nil || slot.active) {
-        ret res[bool, io_error.Error].err{io_error.from_code(os.EBUSY, operation_for(kind))};
+        ret res[bool, io_error.Error].err{io_error.make(io_error.BUSY, operation_for(kind))};
+    }
+    # a read and a readable wait share the read direction
+    if ((kind == KIND_READ && value.readable.active)
+        || (kind == KIND_READABLE && value.read.active)) {
+        ret res[bool, io_error.Error].err{io_error.make(io_error.BUSY, operation_for(kind))};
     }
     slot.active = true;
     slot.token  = token;
@@ -647,6 +787,11 @@ fun adapter_submit(value: *Channel, kind: Kind, token: http_transport.Token,
 fun adapter_read(context: ptr, token: http_transport.Token, scope: *cancel.Scope,
     buffer: *u8, length: usize) res[bool, io_error.Error] {
     ret adapter_submit(context::*Channel, KIND_READ, token, scope, buffer, length);
+}
+
+fun adapter_readable(context: ptr, token: http_transport.Token,
+    scope: *cancel.Scope) res[bool, io_error.Error] {
+    ret adapter_submit(context::*Channel, KIND_READABLE, token, scope, nil, 0);
 }
 
 fun adapter_write(context: ptr, token: http_transport.Token, scope: *cancel.Scope,
@@ -672,6 +817,7 @@ pub fun adapter(index: usize) http_transport.Adapter {
     value.context               = nil;
     value.security              = http_transport.SECURED;
     value.submit_read           = adapter_read;
+    value.submit_readable       = adapter_readable;
     value.submit_write          = adapter_write;
     value.submit_shutdown_write = adapter_shutdown;
     value.submit_close          = adapter_close;
@@ -689,63 +835,56 @@ pub fun channel(index: usize) *Channel {
 
 # --- lifecycle ---
 
-fun handshake_storage(index: usize) tls_server.Storage {
-    var value: tls_server.Storage;
-    value.input                    = ?session_at(index).handshake_input[0];
-    value.input_capacity           = tls.HANDSHAKE_INPUT_BYTES;
-    value.output                   = ?session_at(index).handshake_output[0];
-    value.output_capacity          = tls.HANDSHAKE_OUTPUT_BYTES;
-    value.hello                    = ?session_at(index).hello[0];
-    value.hello_capacity           = tls.HELLO_BYTES;
-    value.certificates             = ?session_at(index).peer_certificates[0];
-    value.certificate_capacity     = tls.PEER_CERTIFICATES;
-    value.peer_parameters          = nil;
-    value.peer_parameters_capacity = 0;
-    ret value;
-}
-
-fun wire_storage(index: usize) tls_stream.Storage {
-    var value: tls_stream.Storage;
-    value.wire_input           = ?session_at(index).wire_input[0];
-    value.wire_input_capacity  = WIRE_BYTES;
-    value.wire_output          = ?session_at(index).wire_output[0];
-    value.wire_output_capacity = WIRE_BYTES;
-    ret value;
-}
-
-# bind the socket this session speaks over, and the connection that owns the
-# bytes the prologue already read
+# bind the socket this session speaks over, the connection that owns the bytes
+# the prologue already read, and the memory its buffers come from. `borrower`
+# and `account` are the connection's, and the account must stay open until the
+# session is released
 pub fun attach(index: usize, driver: *net_async.Driver, socket: *tcp.Stream,
-    owner: ptr, staged: StagedFun) bool {
+    owner: ptr, staged: StagedFun, borrower: *memory.Borrower,
+    account: *buffers.Account) bool {
     prepare();
-    if (!claimed_index(index) || !channel_at(index).live || driver == nil
-        || socket == nil) { ret false; }
-    channel_at(index).driver = driver;
-    channel_at(index).socket = socket;
-    channel_at(index).owner  = owner;
-    channel_at(index).staged = staged;
+    if (!claimed_index(index) || driver == nil || socket == nil || borrower == nil
+        || account == nil || !account.open) { ret false; }
+    channel_at(index).driver  = driver;
+    channel_at(index).socket  = socket;
+    channel_at(index).owner   = owner;
+    channel_at(index).staged  = staged;
+    channel_at(index).account = account;
+    session_at(index).source  = memory.borrowed_source(borrower);
+    session_at(index).secrets = memory.borrowed_secret_source(borrower);
     ret true;
+}
+
+fun lease(index: usize) tls_buffer.Lease {
+    ret tls_buffer.Lease{source: ?session_at(index).source,
+        account: channel_at(index).account, lane: memory.LANE_TLS};
+}
+
+fun secret_lease(index: usize) tls_buffer.SecretLease {
+    ret tls_buffer.SecretLease{source: ?session_at(index).secrets,
+        account: channel_at(index).account, lane: memory.LANE_TLS};
 }
 
 # `connection` is the scope every operation of this session descends from, and
 # `handshake` bounds the handshake. both belong to the caller and must outlive
-# the session and its handshake respectively. `verification_time` is wall-clock
-# unix seconds from clock.wall_seconds, never a deadline clock.
-pub fun begin(index: usize, policy: *tls.Policy, verification_time: i64,
-    connection: *cancel.Scope, handshake: *cancel.Scope) bool {
+# the session and its handshake respectively. the policy's clock supplies every
+# time the handshake reads
+pub fun begin(index: usize, policy: *tls.Policy, connection: *cancel.Scope,
+    handshake: *cancel.Scope) bool {
     prepare();
-    if (!claimed_index(index) || !channel_at(index).live || policy == nil
-        || !policy.live || channel_at(index).driver == nil || connection == nil
-        || handshake == nil) { ret false; }
+    if (!claimed_index(index) || policy == nil || !policy.live
+        || channel_at(index).driver == nil || channel_at(index).account == nil
+        || connection == nil || handshake == nil) { ret false; }
     val value: *Channel = channel_at(index);
     value.state                 = IDLE;
-    value.current               = KIND_NONE;
-    value.ready                 = false;
+    value.reading               = KIND_NONE;
+    value.writing               = KIND_NONE;
+    value.done_count            = 0;
     value.handshake_settled     = false;
     value.handshake_error       = tls_error.OK;
     session_at(index).transport = lower_transport(value);
-    if (!operation_ok(cancel.make_child(?session_at(index).root, connection, false,
-        time.Time{sec: 0, nsec: 0}))) {
+    if (!operation_ok(cancel.make_child(?session_at(index).root, connection,
+        opt[time.Instant].none{}))) {
         ret false;
     }
     session_at(index).root_live = true;
@@ -754,22 +893,24 @@ pub fun begin(index: usize, policy: *tls.Policy, verification_time: i64,
     extra.data.data = nil;
     extra.data.len  = 0;
     if (!tls_server.init_with_credential_selector(?session_at(index).engine,
-        ?policy.configuration, handshake_storage(index), extra, 0,
+        ?policy.configuration, lease(index), extra, 0,
         tls.tls_alpn_selector(policy))) {
         destroy_scopes(index);
         ret false;
     }
     session_at(index).engine_started = true;
-    if (!renew_operation_scope(index, handshake)) {
+    if (!renew_scope(index, false, handshake)) {
         tls_server.destroy(?session_at(index).engine);
         session_at(index).engine_started = false;
         destroy_scopes(index);
         ret false;
     }
+    value.write_generation = next_generation(value.write_generation);
     if (!tls_stream.serve(?session_at(index).stream, ?session_at(index).engine,
-        wire_storage(index), ?session_at(index).transport,
-        ?session_at(index).operation_scope, next_token(value), verification_time,
-        0)) {
+        lease(index), secret_lease(index), ?session_at(index).transport,
+        ?session_at(index).write_scope,
+        lane_token(WRITE_LANE_TOKEN, value.write_generation),
+        completion_context(value))) {
         tls_server.destroy(?session_at(index).engine);
         session_at(index).engine_started = false;
         destroy_scopes(index);
@@ -777,26 +918,48 @@ pub fun begin(index: usize, policy: *tls.Policy, verification_time: i64,
     }
     session_at(index).stream_started = true;
     value.state                      = HANDSHAKING;
-    value.current                    = KIND_HANDSHAKE;
+    value.writing                    = KIND_HANDSHAKE;
     settle(index);
     ret true;
 }
 
 # route one runtime completion into the TLS stream and resolve whatever it
-# finished
+# finished. a socket readiness wait is this channel's own, not the stream's
 pub fun accept(index: usize, completion: *io_runtime.Completion) bool {
     prepare();
-    if (!claimed_index(index) || !channel_at(index).live
-        || !session_at(index).stream_started) { ret false; }
+    if (!claimed_index(index) || !session_at(index).stream_started) { ret false; }
+    val value: *Channel = channel_at(index);
+    if (completion.kind == io_runtime.READABLE) {
+        value.readable_waiting = false;
+        val slot: *Pending = ?value.readable;
+        if (!slot.active) { ret true; }
+        slot.active = false;
+        if (completion.has_error) {
+            push_done(value, http_transport.failed(slot.token, http_transport.READABLE, 0,
+                completion.error));
+        }
+        or (completion.end_of_stream) {
+            push_done(value, http_transport.end_of(slot.token, http_transport.READABLE, 0));
+        }
+        or { push_done(value, http_transport.completed(slot.token, http_transport.READABLE, 0)); }
+        ret true;
+    }
     if (!tls_stream.accept(?session_at(index).stream, completion)) { ret false; }
     settle(index);
     ret true;
 }
 
+# retry a lane parked for memory, when the connection's account is woken. a
+# stream with nothing parked ignores it
+pub fun resume(index: usize) bool {
+    prepare();
+    if (!claimed_index(index) || !session_at(index).stream_started) { ret false; }
+    ret tls_stream.resume(?session_at(index).stream);
+}
+
 pub fun handshake_settled(index: usize) bool {
     prepare();
-    ret claimed_index(index) && channel_at(index).live
-        && channel_at(index).handshake_settled;
+    ret claimed_index(index) && channel_at(index).handshake_settled;
 }
 
 pub fun handshake_error(index: usize) tls_error.Error {
@@ -815,24 +978,33 @@ pub fun negotiated(index: usize) tls_engine.Snapshot {
 
 pub fun open(index: usize) bool {
     prepare();
-    ret claimed_index(index) && channel_at(index).live
-        && channel_at(index).state == OPEN;
+    ret claimed_index(index) && channel_at(index).state == OPEN;
 }
 
-# collect the one completion this session has published, if any
+# whether both lanes have settled, which is when the session may be released
+pub fun idle(index: usize) bool {
+    prepare();
+    if (!claimed_index(index)) { ret true; }
+    val value: *Channel = channel_at(index);
+    ret value.reading == KIND_NONE && value.writing == KIND_NONE && !value.readable_waiting;
+}
+
+# collect one completion this session has published, oldest first
 pub fun take(index: usize, settled: *http_transport.Completion) bool {
     prepare();
-    if (!claimed_index(index) || !channel_at(index).ready || settled == nil) {
-        ret false;
-    }
-    @settled                = channel_at(index).ready_completion;
-    channel_at(index).ready = false;
+    if (!claimed_index(index) || settled == nil) { ret false; }
+    val value: *Channel = channel_at(index);
+    if (value.done_count == 0) { ret false; }
+    @settled = value.done[0];
+    if (value.done_count == 2) { value.done[0] = value.done[1]; }
+    value.done_count = value.done_count - 1;
     ret true;
 }
 
 pub rec Snapshot {
     state:             State;
-    current:           Kind;
+    reading:           Kind;
+    writing:           Kind;
     read_queued:       bool;
     write_queued:      bool;
     ready:             bool;
@@ -845,7 +1017,8 @@ pub fun snapshot(index: usize) Snapshot {
     var value: Snapshot;
     if (!claimed_index(index)) {
         value.state             = CLOSED;
-        value.current           = KIND_NONE;
+        value.reading           = KIND_NONE;
+        value.writing           = KIND_NONE;
         value.read_queued       = false;
         value.write_queued      = false;
         value.ready             = false;
@@ -855,48 +1028,42 @@ pub fun snapshot(index: usize) Snapshot {
     }
     val entry: *Channel = channel_at(index);
     value.state             = entry.state;
-    value.current           = entry.current;
-    value.read_queued       = entry.read.active;
-    value.write_queued      = entry.write.active;
-    value.ready             = entry.ready;
+    value.reading           = entry.reading;
+    value.writing           = entry.writing;
+    value.read_queued       = entry.read.active || entry.readable.active;
+    value.write_queued      = entry.write.active || entry.shutdown.active || entry.close.active;
+    value.ready             = entry.done_count != 0;
     value.handshake_settled = entry.handshake_settled;
     value.handshake_error   = entry.handshake_error;
     ret value;
 }
 
-test "secure: a queued write takes the stream ahead of a queued read" {
+test "secure: the write lane keeps the order its operations were queued in" {
     val index: usize = acquire();
     if (index == NO_SESSION) { ret 1; }
     val entry: *Channel = channel_at(index);
-    entry.state       = OPEN;
-    entry.read.active = true;
-    if (next_kind(entry) != KIND_READ) {
+    entry.close.active    = true;
+    entry.shutdown.active = true;
+    entry.write.active    = true;
+    # a response goes out before the half close and the close behind it
+    if (next_write(entry) != KIND_WRITE) {
         release(index);
         ret 2;
     }
-    entry.write.active = true;
-    # the response, not the speculative read, is what runs next
-    if (next_kind(entry) != KIND_WRITE) {
+    entry.write.active = false;
+    if (next_write(entry) != KIND_SHUTDOWN) {
         release(index);
         ret 3;
     }
-    entry.close.active = true;
-    if (next_kind(entry) != KIND_CLOSE) {
+    entry.shutdown.active = false;
+    if (next_write(entry) != KIND_CLOSE) {
         release(index);
         ret 4;
     }
-    entry.close.active    = false;
-    entry.write.active    = false;
-    entry.shutdown.active = true;
-    if (next_kind(entry) != KIND_SHUTDOWN) {
+    entry.close.active = false;
+    if (next_write(entry) != KIND_NONE) {
         release(index);
         ret 5;
-    }
-    entry.shutdown.active = false;
-    entry.read.active     = false;
-    if (next_kind(entry) != KIND_NONE) {
-        release(index);
-        ret 6;
     }
     release(index);
     ret 0;
@@ -920,51 +1087,65 @@ test "secure: an operation the engine did not submit is refused" {
         release(index);
         ret 3;
     }
+    # a readable wait shares the read direction with it
+    val waiting: res[bool, io_error.Error] = adapter_readable(context,
+        http_transport.Token{index: 0, generation: 3}, nil);
+    if (sel waiting.ok) {
+        release(index);
+        ret 4;
+    }
+    # a write runs in the other lane, so it is taken beside the read
+    val writing: res[bool, io_error.Error] = adapter_write(context,
+        http_transport.Token{index: 1, generation: 1}, nil, nil, 0);
+    if (sel writing.err) {
+        release(index);
+        ret 5;
+    }
     # and a session that is not live accepts nothing at all
     channel_at(index).live = false;
-    val dead: res[bool, io_error.Error] = adapter_write(context,
-        http_transport.Token{index: 1, generation: 1}, nil, nil, 0);
+    val dead: res[bool, io_error.Error] = adapter_shutdown(context,
+        http_transport.Token{index: 1, generation: 2}, nil);
     channel_at(index).live = true;
     if (sel dead.ok) {
         release(index);
-        ret 4;
+        ret 6;
     }
     release(index);
     ret 0;
 }
 
-test "secure: a failed session settles its queued operations rather than hanging" {
+test "secure: a failed session settles every queued operation rather than hanging" {
     val index: usize = acquire();
     if (index == NO_SESSION) { ret 1; }
     val entry: *Channel = channel_at(index);
-    entry.state       = FAILED;
-    entry.read.active = true;
-    entry.read.token  = http_transport.Token{index: 0, generation: 7};
-    if (!drive(index, true)) {
+    entry.state        = FAILED;
+    entry.read.active  = true;
+    entry.read.token   = http_transport.Token{index: 0, generation: 7};
+    entry.write.active = true;
+    entry.write.token  = http_transport.Token{index: 1, generation: 8};
+    if (!drive(index)) {
         release(index);
         ret 2;
     }
-    var settled: http_transport.Completion;
-    if (!take(index, ?settled)) {
+    var first:  http_transport.Completion;
+    var second: http_transport.Completion;
+    if (!take(index, ?first) || !take(index, ?second)) {
         release(index);
         ret 3;
     }
-    if (settled.status != http_transport.IO_ERROR) {
+    if (first.status != http_transport.IO_ERROR || second.status != http_transport.IO_ERROR) {
         release(index);
         ret 4;
     }
-    if (settled.kind != http_transport.READ) {
+    if (first.kind != http_transport.READ || first.token.generation != 7
+        || second.kind != http_transport.WRITE || second.token.generation != 8) {
         release(index);
         ret 5;
     }
-    if (settled.token.generation != 7) {
+    # each completion is published exactly once
+    if (take(index, ?first)) {
         release(index);
         ret 6;
-    }
-    # the completion is published exactly once
-    if (take(index, ?settled)) {
-        release(index);
-        ret 7;
     }
     release(index);
     ret 0;

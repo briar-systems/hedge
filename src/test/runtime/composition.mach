@@ -298,8 +298,8 @@ test "composition: production wiring serves after its construction frame is gone
     val started: composition.StartReport = boot(?harness, ?controls, true);
     if (started.status != composition.START_OK) { ret 2; }
     # the connection pool is no longer among them: serve claims its slots and
-    # connection records as peers arrive
-    if (harness.count.calls != 4) {
+    # connection records as peers arrive. the worker's buffer pool is one
+    if (harness.count.calls != 5) {
         composition.stop(harness.runtime, ?controls);
         ret 3;
     }
@@ -346,8 +346,8 @@ test "composition: disabled caching acquires no cache resource" {
     if (!prepare(?harness, false)) { ret 1; }
     val started: composition.StartReport = boot(?harness, ?controls, false);
     if (started.status != composition.START_OK) { ret 2; }
-    # the telemetry queue plus the serving slot and connection pools are allocated
-    if (harness.count.calls != 1 || composition.cache(harness.runtime) != nil) {
+    # the telemetry queue and the worker's buffer pool are allocated
+    if (harness.count.calls != 2 || composition.cache(harness.runtime) != nil) {
         composition.stop(harness.runtime, ?controls);
         ret 3;
     }
@@ -373,6 +373,9 @@ test "composition: quic pumps publish reload and release with their socket" {
     if (!prepare(?harness, false)) { ret 1; }
     quic_graph(?harness);
     harness.graph.limits.max_connections = opt[usize].none{};
+    # below any kernel cap, so the socket must report at least this much
+    harness.graph.listeners[0].receive_buffer_bytes = opt[usize].some{65536};
+    harness.graph.listeners[0].send_buffer_bytes    = opt[usize].some{65536};
     val started: composition.StartReport = boot(?harness, ?controls, false);
     if (started.status != composition.START_OK)                { ret 2; }
     if (!composition.controls_view(?controls, ?quic_controls)) { ret 2; }
@@ -385,13 +388,17 @@ test "composition: quic pumps publish reload and release with their socket" {
         || initial.pumps != 1 || initial.live != 0
         # a listening QUIC pump with no configured limit holds no per-connection
         # storage until a connection arrives
-        || controls.connections.capacity != 0 || controls.secret_storages.capacity != 0
+        || controls.connections.capacity != 0 || controls.handshakes.capacity != 0
         || controls.sessions.capacity != 0
         || harness.runtime.quic.pending_initials.capacity != 0
         || harness.runtime.quic.routes.capacity != 0
-        || harness.runtime.quic.timer_queue.node_capacity != 0
+        || harness.runtime.serving.timers.entries.capacity != 0
         || storage.held[quic_runtime.ConnectionStorage](
         ?harness.runtime.quic.connection_storages) != 0
+        || serve.socket_buffers(?harness.runtime.serving, 0).receive_requested != 65536
+        || serve.socket_buffers(?harness.runtime.serving, 0).receive_effective < 65536
+        || serve.socket_buffers(?harness.runtime.serving, 0).send_requested != 65536
+        || serve.socket_buffers(?harness.runtime.serving, 0).send_effective < 65536
         || harness.runtime.serving.state != serve.READY
         || !serve.poll(?quic_controls, ?harness.runtime.serving, 0)) {
         composition.stop(harness.runtime, ?controls);
@@ -836,8 +843,8 @@ fun silent_peer_is_closed(harness: *Harness) i32 {
     var quic_controls: quic_runtime.ControlView;
     var client:        tcp.Stream;
     if (!wire.connect(harness.endpoint, ?client)) { ret 10; }
-    val started: time.Time = clock.monotonic();
-    var rounds:  usize     = 0;
+    val started: time.Instant = clock.instant();
+    var rounds:  usize        = 0;
     for (rounds < 400 && harness.runtime.serving.live == 0) {
         serve.poll(?quic_controls, ?harness.runtime.serving, 1);
         rounds = rounds + 1;
@@ -849,10 +856,10 @@ fun silent_peer_is_closed(harness: *Harness) i32 {
     # ten times the timeout is the most a working deadline can take
     val limit_ns: i64 = (SILENT_TIMEOUT_MS * 10 * 1000000)::i64;
     for (harness.runtime.serving.live != 0
-        && time.time_sub(clock.monotonic(), started) < limit_ns) {
+        && time.instant_sub(clock.instant(), started) < limit_ns) {
         serve.poll(?quic_controls, ?harness.runtime.serving, 5);
     }
-    val elapsed_ms: i64  = time.time_sub(clock.monotonic(), started) / 1000000;
+    val elapsed_ms: i64  = time.instant_sub(clock.instant(), started) / 1000000;
     val closed:     bool = harness.runtime.serving.live == 0;
     tcp.stream_close(?client);
     if (!closed) { ret 12; }
@@ -923,7 +930,7 @@ fun stall_graph(harness: *Harness, protocols: u8, handshake_ms: u64) {
     harness.graph.timeouts.keep_alive_ms = STALL_TIMEOUT_MS;
 }
 
-fun closed_within(harness: *Harness, since: time.Time, timeout_ms: u64) i32 {
+fun closed_within(harness: *Harness, since: time.Instant, timeout_ms: u64) i32 {
     var quic_controls: quic_runtime.ControlView;
     var rounds:        usize = 0;
     for (rounds < 400 && harness.runtime.serving.live == 0) {
@@ -933,11 +940,11 @@ fun closed_within(harness: *Harness, since: time.Time, timeout_ms: u64) i32 {
     if (harness.runtime.serving.live == 0) { ret 20; }
     val limit_ns: i64 = (timeout_ms * 10 * 1000000)::i64;
     for (harness.runtime.serving.live != 0
-        && time.time_sub(clock.monotonic(), since) < limit_ns) {
+        && time.instant_sub(clock.instant(), since) < limit_ns) {
         serve.poll(?quic_controls, ?harness.runtime.serving, 5);
     }
     if (harness.runtime.serving.live != 0) { ret 21; }
-    val elapsed_ms: i64 = time.time_sub(clock.monotonic(), since) / 1000000;
+    val elapsed_ms: i64 = time.instant_sub(clock.instant(), since) / 1000000;
     if (elapsed_ms < (timeout_ms / 2)::i64) { ret 22; }
     ret 0;
 }
@@ -977,7 +984,7 @@ fun hello_stall(half: bool) i32 {
     if (!tlswire.hello(stall.client, stall.harness.endpoint)) { ret stall_finish(?stall, 4); }
     var length: usize = tlswire.hello_length(stall.client);
     if (half) { length = length / 2; }
-    val since: time.Time = clock.monotonic();
+    val since: time.Instant = clock.instant();
     if (!tlswire.send_raw(stall.client, tlswire.hello_bytes(stall.client), length)) {
         ret stall_finish(?stall, 5);
     }
@@ -1022,14 +1029,14 @@ test "composition: a TLS client silent after its handshake is closed at the keep
         || !tlswire.handshake(stall.client, stall.harness.endpoint)) {
         ret stall_finish(?stall, 3);
     }
-    ret stall_finish(?stall, closed_within(?stall.harness, clock.monotonic(), STALL_TIMEOUT_MS));
+    ret stall_finish(?stall, closed_within(?stall.harness, clock.instant(), STALL_TIMEOUT_MS));
 }
 
 test "composition: a partial request header over TLS is closed at the header timeout" {
     var stall:  Stall;
     val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP1, "http/1.1");
     if (opened != 0) { ret stall_finish(?stall, opened); }
-    val since: time.Time = clock.monotonic();
+    val since: time.Instant = clock.instant();
     if (!send_text(stall.client, "GET / HTTP/1.1\r\nHost: api.exa")) { ret stall_finish(?stall, 7); }
     ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
 }
@@ -1047,7 +1054,7 @@ test "composition: an idle TLS keep-alive connection is closed at the keep-alive
     if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
         ret stall_finish(?stall, 8);
     }
-    val since: time.Time = clock.monotonic();
+    val since: time.Instant = clock.instant();
     ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
 }
 
@@ -1059,7 +1066,7 @@ test "composition: an HTTP/2 client silent after its handshake is closed at the 
     var stall:  Stall;
     val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
     if (opened != 0) { ret stall_finish(?stall, opened); }
-    ret stall_finish(?stall, closed_within(?stall.harness, clock.monotonic(), STALL_TIMEOUT_MS));
+    ret stall_finish(?stall, closed_within(?stall.harness, clock.instant(), STALL_TIMEOUT_MS));
 }
 
 test "composition: an HTTP/2 client that sends only its preface is closed at the header timeout" {
@@ -1067,8 +1074,8 @@ test "composition: an HTTP/2 client that sends only its preface is closed at the
     val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
     if (opened != 0) { ret stall_finish(?stall, opened); }
     var frames: [256]u8;
-    val length: usize     = wire.put_connection_start(?frames[0]);
-    val since:  time.Time = clock.monotonic();
+    val length: usize        = wire.put_connection_start(?frames[0]);
+    val since:  time.Instant = clock.instant();
     if (!send_frames(stall.client, ?frames[0], length)) { ret stall_finish(?stall, 7); }
     ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
 }
@@ -1081,7 +1088,7 @@ test "composition: an HTTP/2 client that stalls inside a HEADERS frame is closed
     val start:  usize = wire.put_connection_start(?frames[0]);
     wire.put_request(?frames[0], start, 1);
     # the frame header and the first bytes of its block, and nothing after
-    val since: time.Time = clock.monotonic();
+    val since: time.Instant = clock.instant();
     if (!send_frames(stall.client, ?frames[0], start + 12)) { ret stall_finish(?stall, 7); }
     ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
 }
@@ -1095,7 +1102,7 @@ test "composition: an HTTP/2 header block that never ends is closed at the heade
     # END_STREAM without END_HEADERS: the block waits for a CONTINUATION
     val ended: usize = wire.put_request(?frames[0], start, 1);
     frames[start + 4] = 0x01;
-    val since: time.Time = clock.monotonic();
+    val since: time.Instant = clock.instant();
     if (!send_frames(stall.client, ?frames[0], ended)) { ret stall_finish(?stall, 7); }
     ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
 }
@@ -1136,12 +1143,80 @@ fun served_h2(client: *tlswire.Client) bool {
     ret h2_response_ended(?response[0], length);
 }
 
+fun h2_has_frame(bytes: *u8, length: usize, wanted: u8) bool {
+    var at: usize = 0;
+    for (at + 9 <= length) {
+        val size: usize = (bytes[at]::usize << 16) | (bytes[at + 1]::usize << 8)
+            | bytes[at + 2]::usize;
+        if (bytes[at + 3] == wanted) { ret true; }
+        at = at + 9 + size;
+    }
+    ret false;
+}
+
+fun put_data(frames: *u8, at: usize, count: usize, size: usize, last: bool) usize {
+    var length: usize = at;
+    var sent:   usize = 0;
+    for (sent < count) {
+        var flags: u8 = 0;
+        if (last && sent + 1 == count) { flags = 0x01; }
+        val payload: usize = wire.put_frame(frames, length, size, 0x00, flags, 1);
+        var i:       usize = 0;
+        for (i < size) {
+            frames[payload + i] = 'x';
+            i                   = i + 1;
+        }
+        length = payload + size;
+        sent   = sent + 1;
+    }
+    ret length;
+}
+
+# read frames until one of kind `wanted` has arrived, or the response has ended
+# when `wanted` is 0xff
+fun h2_await(client: *tlswire.Client, response: *u8, received: *usize, wanted: u8) bool {
+    var reads: usize = 0;
+    for (reads < 16) {
+        if (wanted == 0xff && h2_response_ended(response, @received))    { ret true; }
+        if (wanted != 0xff && h2_has_frame(response, @received, wanted)) { ret true; }
+        val got: usize = tlswire.receive(client, ?response[@received],
+            RESPONSE_BYTES - @received, nil);
+        if (got == 0) { ret false; }
+        @received = @received + got;
+        reads     = reads + 1;
+    }
+    ret false;
+}
+
+# a body larger than the initial window can only finish once the server has read
+# what it holds and credited the window back, with nothing new on the socket to
+# tell it to
+test "composition: an HTTP/2 request body over TLS larger than its window completes" {
+    var stall:  Stall;
+    val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    val claimed: res[*u8, allocator.Error] = allocator.zallocate[u8](?stall.harness.heap, 65536);
+    if (sel claimed.err) { ret stall_finish(?stall, 7); }
+    val frames: *u8   = claimed.ok;
+    var length: usize = wire.put_connection_start(frames);
+    length = wire.put_open_request(frames, length, 1);
+    length = put_data(frames, length, 8, 8000, false);
+    if (!send_frames(stall.client, frames, length)) { ret stall_finish(?stall, 8); }
+    var response: [RESPONSE_BYTES]u8;
+    var received: usize = 0;
+    if (!h2_await(stall.client, ?response[0], ?received, 0x08)) { ret stall_finish(?stall, 9); }
+    length = put_data(frames, 0, 5, 8000, true);
+    if (!send_frames(stall.client, frames, length))             { ret stall_finish(?stall, 10); }
+    if (!h2_await(stall.client, ?response[0], ?received, 0xff)) { ret stall_finish(?stall, 11); }
+    ret stall_finish(?stall, 0);
+}
+
 test "composition: an idle HTTP/2 connection is closed at the keep-alive timeout" {
     var stall:  Stall;
     val opened: i32 = open_stall(?stall, schema.PROTOCOL_HTTP2, "h2");
     if (opened != 0)              { ret stall_finish(?stall, opened); }
     if (!served_h2(stall.client)) { ret stall_finish(?stall, 8); }
-    val since: time.Time = clock.monotonic();
+    val since: time.Instant = clock.instant();
     ret stall_finish(?stall, closed_within(?stall.harness, since, STALL_TIMEOUT_MS));
 }
 

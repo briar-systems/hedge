@@ -13,6 +13,7 @@ use hedge.dispatch.plan;
 use hedge.service;
 use hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
+use hedge_wake:      hedge.wake;
 use http.core.body;
 use http.core.exchange;
 use http.core.field;
@@ -28,6 +29,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -111,6 +113,25 @@ fun refusal_status(outcome: Outcome) status.Status {
     ret status.BAD_REQUEST;
 }
 
+# a queued request runs again when a release admits it, or at its queue deadline
+fun park_budget(active: *call.Call, held: *budget.Charge) exchange.ServiceStatus {
+    var deadline: time.Instant;
+    var at:       u64 = 0;
+    if (budget.deadline(held, ?deadline)) { at = clock.to_ns(deadline); }
+    ret call.park(active, call.WAIT_WAKE, at);
+}
+
+# give a handler its turn. a handler that reports itself pending without naming
+# what it waits on would never be given another, so that is a failure
+fun enter_handler(handler: service.Handler, active: *call.Call) exchange.ServiceStatus {
+    call.unpark(active);
+    val served: exchange.ServiceStatus = handler.serve(handler.ctx, active);
+    if (served == exchange.SERVICE_PENDING && !call.parked(active)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret served;
+}
+
 fun serve_listener(active: *call.Call,
     selected: *service.ListenerService) Result {
     if (selected == nil || !service.has_handler(selected.handler)) {
@@ -122,8 +143,7 @@ fun serve_listener(active: *call.Call,
     })) {
         ret result(FAILED, plan.NO_INDEX, exchange.SERVICE_FAILED);
     }
-    val served: exchange.ServiceStatus = selected.handler.serve(
-        selected.handler.ctx, active);
+    val served: exchange.ServiceStatus = enter_handler(selected.handler, active);
     if (served == exchange.SERVICE_FAILED) {
         ret result(FAILED, plan.NO_INDEX, served);
     }
@@ -145,19 +165,19 @@ fun serve_listener(active: *call.Call,
 # resumes; one with neither refuses it as unavailable rather than running work
 # the operator said there was no room for.
 fun admit(budgets: *budget.Set, selected: *plan.Entry, held: *budget.Charge,
-    memory_bytes: usize, now: time.Time) budget.Outcome {
+    memory_bytes: usize, now: time.Instant, waker: hedge_wake.Waker) budget.Outcome {
     if (budgets == nil || held == nil) { ret budget.ADMITTED; }
     var index: usize = budget.NO_BUDGET;
     if (selected.budget_index != plan.NO_INDEX
         && selected.budget_index != schema.NO_BUDGET_INDEX) {
         index = selected.budget_index;
     }
-    ret budget.charge(budgets, index, memory_bytes, now, held);
+    ret budget.charge(budgets, index, memory_bytes, now, held, waker);
 }
 
 pub fun serve(active_plan: *plan.Plan, active: *call.Call, captures: *router.Capture,
     capture_capacity: usize, budgets: *budget.Set, held: *budget.Charge,
-    now: time.Time) Result {
+    now: time.Instant) Result {
     if (active_plan == nil || !plan.sealed(active_plan) || active == nil || !active.bound) {
         ret result(FAILED, plan.NO_INDEX, exchange.SERVICE_FAILED);
     }
@@ -201,9 +221,10 @@ pub fun serve(active_plan: *plan.Plan, active: *call.Call, captures: *router.Cap
     # charged before the handler, which is the last point at which refusing the
     # request costs nothing
     val admitted: budget.Outcome = admit(budgets, selected, held,
-        call.memory_capacity(active), now);
+        call.memory_capacity(active), now, call.waker(active));
     if (admitted == budget.QUEUED) {
-        ret result(PENDING, matched.source_index, exchange.SERVICE_PENDING);
+        call.unpark(active);
+        ret result(PENDING, matched.source_index, park_budget(active, held));
     }
     if (admitted != budget.ADMITTED) {
         ret refuse(active, refusal_status(OVER_BUDGET), OVER_BUDGET);
@@ -219,7 +240,7 @@ pub fun serve(active_plan: *plan.Plan, active: *call.Call, captures: *router.Cap
         middleware.run_error(active_plan.storage.middleware, selected.middleware_start, ran, active, exchange.SERVICE_FAILED);
         ret result(FAILED, matched.source_index, exchange.SERVICE_FAILED);
     }
-    val served: exchange.ServiceStatus = handler.serve(handler.ctx, active);
+    val served: exchange.ServiceStatus = enter_handler(handler, active);
     if (served == exchange.SERVICE_FAILED) {
         middleware.run_error(active_plan.storage.middleware, selected.middleware_start, ran, active, served);
         ret result(FAILED, matched.source_index, served);
@@ -237,7 +258,7 @@ pub fun serve(active_plan: *plan.Plan, active: *call.Call, captures: *router.Cap
 # deadline, cancellation, arena, telemetry context, and body disposition were
 # established once. this only gives the same service another turn.
 pub fun resume(active_plan: *plan.Plan, active: *call.Call, budgets: *budget.Set,
-    held: *budget.Charge, now: time.Time) Result {
+    held: *budget.Charge, now: time.Instant) Result {
     if (active_plan == nil || !plan.sealed(active_plan) || active == nil
         || !active.bound || !call.entered(active)) {
         ret result(FAILED, plan.NO_INDEX, exchange.SERVICE_FAILED);
@@ -253,7 +274,8 @@ pub fun resume(active_plan: *plan.Plan, active: *call.Call, budgets: *budget.Set
     if (held != nil && held.live && held.outcome == budget.QUEUED) {
         val waited: budget.Outcome = budget.retry(budgets, held, now);
         if (waited == budget.QUEUED) {
-            ret result(PENDING, active.route.index, exchange.SERVICE_PENDING);
+            call.unpark(active);
+            ret result(PENDING, active.route.index, park_budget(active, held));
         }
         if (waited != budget.ADMITTED) {
             ret refuse(active, refusal_status(OVER_BUDGET), OVER_BUDGET);
@@ -263,7 +285,7 @@ pub fun resume(active_plan: *plan.Plan, active: *call.Call, budgets: *budget.Set
     if (!service.has_handler(handler)) {
         ret result(FAILED, active.route.index, exchange.SERVICE_FAILED);
     }
-    val served: exchange.ServiceStatus = handler.serve(handler.ctx, active);
+    val served: exchange.ServiceStatus = enter_handler(handler, active);
     if (served == exchange.SERVICE_FAILED) {
         middleware.run_error(active_plan.storage.middleware, selected.middleware_start,
             selected.middleware_count, active, served);
@@ -291,6 +313,7 @@ rec Fixture {
     informationals:    [2]message.Informational;
     exchange:          exchange.Exchange;
     heap:              A.Allocator;
+    wakes:             hedge_wake.Queue;
     chunks:            storage.Chunks;
     memory:            call.Memory;
     trace:             telemetry_trace.Context;
@@ -335,7 +358,7 @@ fun finalize_probe(owner: ptr, active: *call.Call) bool {
 
 fun make_fixture(fixture: *Fixture, generation: u64, path: str, host: str) bool {
     val configured: message.Limits = message.limits_default();
-    if (!operation_ok(cancel.make_root(?fixture.scope, false, time.Time{sec: 0, nsec: 0}))) { ret false; }
+    if (!operation_ok(cancel.make_root(?fixture.scope, opt[time.Instant].none{}))) { ret false; }
     fixture.reader = body.empty_reader(generation);
     var fields: field.Fields = field.init(?fixture.request_fields[0], 8, configured.request_fields);
     if (field.append(?fields, field.Field{
@@ -351,8 +374,7 @@ fun make_fixture(fixture: *Fixture, generation: u64, path: str, host: str) bool 
         peer:          message.endpoint(message.ENDPOINT_IP, service.text_view("127.0.0.1"), 40000),
         local:         message.endpoint(message.ENDPOINT_IP, service.text_view("127.0.0.1"), 8080),
         received_at:   time.Time{sec: 1, nsec: 0},
-        has_deadline:  false,
-        deadline:      time.Time{sec: 0, nsec: 0},
+        deadline:      opt[time.Instant].none{},
         request_index: 1,
     };
     if (!message.init_request(?fixture.request, method.from_kind(method.GET),
@@ -367,7 +389,9 @@ fun make_fixture(fixture: *Fixture, generation: u64, path: str, host: str) bool 
     if (!storage.make_chunks(?fixture.chunks, ?fixture.heap)
         || !call.make_memory(?fixture.memory, ?fixture.chunks, storage.MIN_CHUNK)) { ret false; }
     if (!telemetry_trace.make_root(?fixture.trace, false)) { ret false; }
-    ret call.bind(?fixture.call, ?fixture.exchange, ?fixture.memory, ?fixture.trace, generation, "test");
+    if (!hedge_wake.make(?fixture.wakes, ?fixture.heap))   { ret false; }
+    ret call.bind(?fixture.call, ?fixture.exchange, ?fixture.memory, ?fixture.trace, generation, "test",
+        hedge_wake.waker(?fixture.wakes, 1));
 }
 
 rec PlanFixture {
@@ -427,7 +451,7 @@ test "dispatch: a sealed plan serves a route and crosses the service boundary on
     var fixture: Fixture;
     if (!make_fixture(?fixture, 7, "/greet", "example.test")) { ret 2; }
     var captures: [4]router.Capture;
-    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.monotonic());
+    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant());
     if (served.outcome != SERVED || served.route != 0)                                                       { ret 3; }
     if (!call.entered(?fixture.call) || call.disposition(?fixture.call) != call.BODY_DRAIN)                  { ret 4; }
     if (fixture.response.status != 200 || !fixture.response.committed)                                       { ret 5; }
@@ -482,7 +506,7 @@ test "dispatch: listener services precede public routes under one observer" {
     if (!make_fixture(?fixture, 41, "/greet", "example.test")) { ret 2; }
     var captures: [4]router.Capture;
     val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4,
-        nil, nil, clock.monotonic());
+        nil, nil, clock.instant());
     if (served.outcome != SERVED || served.route != plan.NO_INDEX
         || fixture.response.status != status.ACCEPTED
         || !str_equals(fixture.call.route.name, "administration")
@@ -528,7 +552,7 @@ test "dispatch: an unmatched path is refused without entering a service" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, 3, "/absent", "example.test")) { ret 2; }
     var captures: [4]router.Capture;
-    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.monotonic());
+    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant());
     if (served.outcome != NOT_FOUND)                 { ret 3; }
     if (call.entered(?fixture.call))                 { ret 4; }
     if (fixture.response.status != status.NOT_FOUND) { ret 5; }
@@ -543,7 +567,7 @@ test "dispatch: a host outside the route graph matches nothing" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, 4, "/greet", "other.test")) { ret 2; }
     var captures: [4]router.Capture;
-    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.monotonic());
+    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant());
     if (served.outcome != NOT_FOUND || call.entered(?fixture.call)) { ret 3; }
     ret 0;
 }
@@ -556,8 +580,8 @@ test "dispatch: a call bound to another generation never reaches a service" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, 8, "/greet", "example.test")) { ret 2; }
     var captures: [4]router.Capture;
-    if (serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.monotonic()).outcome != FAILED) { ret 3; }
-    if (call.entered(?fixture.call))                                                                         { ret 4; }
+    if (serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant()).outcome != FAILED) { ret 3; }
+    if (call.entered(?fixture.call))                                                                       { ret 4; }
     ret 0;
 }
 
@@ -570,8 +594,8 @@ test "dispatch: a cancelled scope is rejected before route selection" {
     if (!make_fixture(?fixture, 5, "/greet", "example.test")) { ret 2; }
     cancel.cancel(?fixture.scope);
     var captures: [4]router.Capture;
-    if (serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.monotonic()).outcome != REJECTED) { ret 3; }
-    if (call.entered(?fixture.call))                                                                           { ret 4; }
+    if (serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant()).outcome != REJECTED) { ret 3; }
+    if (call.entered(?fixture.call))                                                                         { ret 4; }
     ret 0;
 }
 
@@ -587,7 +611,7 @@ fun application_handler(context: ptr, active: *call.Call) exchange.ServiceStatus
     val state: *Recorder = context::*Recorder;
     state.calls     = state.calls + 1;
     state.saw_route = str_equals(active.route.name, "root");
-    var when: time.Time;
+    var when: time.Instant;
     state.saw_deadline = call.deadline(active, ?when);
     if (call.cancelled(active)) { ret exchange.SERVICE_FAILED; }
     if (message.set_status(call.response(active), status.ACCEPTED) != message.RESPONSE_OK) {
@@ -629,7 +653,7 @@ test "dispatch: a registered application is reached through the same service bou
     var fixture: Fixture;
     if (!make_fixture(?fixture, 11, "/greet", "example.test")) { ret 4; }
     var captures: [4]router.Capture;
-    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.monotonic());
+    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant());
     if (served.outcome != SERVED || observed.calls != 1 || !observed.saw_route) { ret 5; }
     if (fixture.response.status != status.ACCEPTED)                             { ret 6; }
     if (call.disposition(?fixture.call) != call.BODY_REJECT)                    { ret 7; }
@@ -657,7 +681,7 @@ test "dispatch: middleware short circuits before the service is entered" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, 12, "/greet", "example.test")) { ret 5; }
     var captures: [4]router.Capture;
-    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.monotonic());
+    val served:   Result = serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant());
     if (served.outcome != SERVED || guard.calls != 1)                                                   { ret 6; }
     if (fixture.response.status != status.FORBIDDEN || fixture.response.body_kind != message.BODY_NONE) { ret 7; }
     ret 0;
@@ -666,5 +690,64 @@ test "dispatch: middleware short circuits before the service is entered" {
 test "dispatch: the smallest configurable request memory is exactly one chunk" {
     if (schema.MIN_CALL_MEMORY_BYTES != storage.MIN_CHUNK)                                      { ret 1; }
     if (storage.chunk_class_size(schema.MAX_CALL_MEMORY_BYTES) != schema.MAX_CALL_MEMORY_BYTES) { ret 2; }
+    ret 0;
+}
+
+val PEND_BARE:  u8 = 0;
+val PEND_WAKE:  u8 = 1;
+val PEND_YIELD: u8 = 2;
+val PEND_TIMED: u8 = 3;
+
+fun pending_handler(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    val mode: *u8 = context::*u8;
+    if (@mode == PEND_WAKE)  { ret call.park(active, call.WAIT_WAKE, 0); }
+    if (@mode == PEND_YIELD) { ret call.yield_turn(active); }
+    if (@mode == PEND_TIMED) { ret call.park(active, call.WAIT_NONE, 99); }
+    ret exchange.SERVICE_PENDING;
+}
+
+fun serve_pending(mode: u8, fixture: *Fixture, generation: u64) Result {
+    var failed:  Result = result(FAILED, plan.NO_INDEX, exchange.SERVICE_FAILED);
+    var planned: PlanFixture;
+    sample_graph(?planned.graph);
+    planned.graph.services[0].kind = schema.SERVICE_LAUREL;
+    schema.set_text(?planned.graph.services[0].target, "site");
+    var chosen:   u8 = mode;
+    var slots:    [2]service.Application;
+    var registry: service.Applications;
+    if (!service.make_applications(?registry, ?slots[0], 2)) { ret failed; }
+    if (!service.register_application(?registry, "site", service.Handler{
+        ctx: (?chosen)::ptr,
+        serve: pending_handler,
+    }, 0)) { ret failed; }
+    var resolver: service.Resolver = service.no_resolver();
+    resolver.applications = ?registry;
+    if (make_plan(?planned, generation, ?planned.graph, ?resolver, nil).status != plan.PLAN_OK) { ret failed; }
+    if (!make_fixture(fixture, generation, "/greet", "example.test"))                           { ret failed; }
+    var captures: [4]router.Capture;
+    ret serve(?planned.plan, ?fixture.call, ?captures[0], 4, nil, nil, clock.instant());
+}
+
+test "dispatch: a service pending on nothing fails, one that names its wait stays pending" {
+    var bare: Fixture;
+    if (serve_pending(PEND_BARE, ?bare, 13).outcome != FAILED) { ret 1; }
+    var woken: Fixture;
+    if (serve_pending(PEND_WAKE, ?woken, 14).outcome != PENDING || !call.parked(?woken.call)) { ret 2; }
+    if (hedge_wake.pending(?woken.wakes))                                                     { ret 3; }
+    var timed: Fixture;
+    if (serve_pending(PEND_TIMED, ?timed, 15).outcome != PENDING) { ret 4; }
+    var at: u64 = 0;
+    if (!call.wait_deadline(?timed.call, ?at) || at != 99) { ret 5; }
+    ret 0;
+}
+
+test "dispatch: a yielding service is woken for its next turn" {
+    var yielded: Fixture;
+    if (serve_pending(PEND_YIELD, ?yielded, 16).outcome != PENDING) { ret 1; }
+    var owners: [2]u64;
+    if (hedge_wake.take(?yielded.wakes, ?owners[0], 2) != 1 || owners[0] != 1) { ret 2; }
+    call.unpark(?yielded.call);
+    if (call.parked(?yielded.call))                                             { ret 3; }
+    if (call.park(?yielded.call, call.WAIT_NONE, 0) != exchange.SERVICE_FAILED) { ret 4; }
     ret 0;
 }
