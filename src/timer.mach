@@ -57,7 +57,6 @@ rec Entry {
     next:       usize;
     prev:       usize;
     list:       usize;
-    next_free:  usize;
     state:      u8;
 }
 
@@ -67,11 +66,13 @@ pub rec Wheel {
     tails:    [LISTS]usize;
     occupied: [LEVELS][4]u64;
     # the tick every entry at or before has been fired
-    now:       u64;
-    claimed:   usize;
-    free_head: usize;
-    armed:     usize;
-    live:      usize;
+    now: u64;
+    # a wheel-global monotonic handle generation. a compaction zeroes a reused
+    # entry, so a per-entry counter could repeat a value a held handle still
+    # carries; a u64 counter that never resets keeps every handle distinct
+    generation: u64;
+    armed:      usize;
+    live:       usize;
     # loop turns advance has taken, which a long idle gap must keep small
     steps:       u64;
     initialized: bool;
@@ -92,7 +93,8 @@ fun entry_at(wheel: *Wheel, index: usize) *Entry {
 }
 
 fun entry_for(wheel: *Wheel, handle: Handle) *Entry {
-    if (wheel == nil || !wheel.initialized || handle.index >= wheel.claimed) { ret nil; }
+    if (wheel == nil || !wheel.initialized
+        || handle.index >= hedge_storage.table_capacity[Entry](?wheel.entries)) { ret nil; }
     val found: *Entry = entry_at(wheel, handle.index);
     if (found == nil || found.state == STATE_FREE
         || found.generation != handle.generation) { ret nil; }
@@ -274,8 +276,7 @@ pub fun make(wheel: *Wheel, a: *A.Allocator, now_ns: u64) bool {
         level = level + 1;
     }
     wheel.now         = floor_ticks(now_ns);
-    wheel.claimed     = 0;
-    wheel.free_head   = NONE;
+    wheel.generation  = 0;
     wheel.armed       = 0;
     wheel.live        = 0;
     wheel.steps       = 0;
@@ -293,29 +294,19 @@ pub fun destroy(wheel: *Wheel) bool {
 # allocator refuses to grow the table
 pub fun claim(wheel: *Wheel, owner: u64) Handle {
     if (wheel == nil || !wheel.initialized) { ret no_handle(); }
-    var index: usize = wheel.free_head;
-    if (index != NONE) {
-        wheel.free_head = entry_at(wheel, index).next_free;
-    }
-    or {
-        if (wheel.claimed == wheel.entries.capacity
-            && !hedge_storage.grow_table[Entry](?wheel.entries)) {
-            ret no_handle();
-        }
-        index         = wheel.claimed;
-        wheel.claimed = wheel.claimed + 1;
-    }
+    val index: usize = hedge_storage.table_claim[Entry](?wheel.entries);
+    if (index == NONE) { ret no_handle(); }
+    wheel.generation = wheel.generation + 1;
+    if (wheel.generation == 0) { wheel.generation = 1; }
     val value: *Entry = entry_at(wheel, index);
-    value.generation = value.generation + 1;
-    if (value.generation == 0) { value.generation = 1; }
-    value.owner     = owner;
-    value.deadline  = 0;
-    value.next      = NONE;
-    value.prev      = NONE;
-    value.list      = NONE;
-    value.next_free = NONE;
-    value.state     = STATE_IDLE;
-    wheel.live      = wheel.live + 1;
+    value.generation = wheel.generation;
+    value.owner      = owner;
+    value.deadline   = 0;
+    value.next       = NONE;
+    value.prev       = NONE;
+    value.list       = NONE;
+    value.state      = STATE_IDLE;
+    wheel.live       = wheel.live + 1;
     ret Handle{index: index, generation: value.generation};
 }
 
@@ -324,11 +315,9 @@ pub fun release(wheel: *Wheel, handle: Handle) Status {
     val value: *Entry = entry_for(wheel, handle);
     if (value == nil)               { ret STALE; }
     if (value.state == STATE_ARMED) { unlink(wheel, value); }
-    value.state      = STATE_FREE;
-    value.generation = value.generation + 1;
-    value.next_free  = wheel.free_head;
-    wheel.free_head  = handle.index;
-    wheel.live       = wheel.live - 1;
+    value.state = STATE_FREE;
+    wheel.live  = wheel.live - 1;
+    if (!hedge_storage.table_release[Entry](?wheel.entries, handle.index)) { ret INVALID; }
     ret OK;
 }
 
@@ -595,6 +584,69 @@ test "timer: growth keeps every entry where it was" {
         round = round + 1;
     }
     if (total != 1999 || armed_count(?wheel) != 0) { ret 4; }
+    destroy(?wheel);
+    ret 0;
+}
+
+test "timer: a handle into a compacted-away chunk is refused after regrow" {
+    var pages: A.Allocator;
+    var wheel: Wheel;
+    if (!test_wheel(?wheel, ?pages)) { ret 1; }
+    # fill entry chunk 0 and open chunk 1 so a release can drop a trailing chunk
+    var handles: [hedge_storage.FIRST_CHUNK + 1]Handle;
+    var i:       usize = 0;
+    for (i <= hedge_storage.FIRST_CHUNK) {
+        handles[i] = claim(?wheel, i::u64);
+        if (handles[i].index != i) {
+            destroy(?wheel);
+            ret 2;
+        }
+        i = i + 1;
+    }
+    val high:       usize  = hedge_storage.FIRST_CHUNK;
+    val stale:      Handle = handles[high];
+    val cap_before: usize  = hedge_storage.table_capacity[Entry](?wheel.entries);
+    if (release(?wheel, stale) != OK) {
+        destroy(?wheel);
+        ret 3;
+    }
+    if (hedge_storage.table_capacity[Entry](?wheel.entries) >= cap_before) {
+        destroy(?wheel);
+        ret 4;
+    }
+    # the same index returns as a zeroed entry under a fresh, strictly greater
+    # generation from the wheel-global counter
+    val fresh: Handle = claim(?wheel, 999);
+    if (fresh.index != high) {
+        destroy(?wheel);
+        ret 5;
+    }
+    if (fresh.generation <= stale.generation) {
+        destroy(?wheel);
+        ret 6;
+    }
+    # the stale handle resolves to nothing, so neither arm nor release accepts it
+    if (arm(?wheel, stale, ms(10)) != STALE) {
+        destroy(?wheel);
+        ret 7;
+    }
+    if (release(?wheel, stale) != STALE) {
+        destroy(?wheel);
+        ret 8;
+    }
+    # release everything still held so the wheel can be destroyed
+    if (release(?wheel, fresh) != OK) {
+        destroy(?wheel);
+        ret 9;
+    }
+    i = 0;
+    for (i < hedge_storage.FIRST_CHUNK) {
+        if (release(?wheel, handles[i]) != OK) {
+            destroy(?wheel);
+            ret 10;
+        }
+        i = i + 1;
+    }
     destroy(?wheel);
     ret 0;
 }

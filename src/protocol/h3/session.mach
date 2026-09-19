@@ -161,7 +161,11 @@ pub rec RequestStorage {
 }
 
 rec RequestSlot {
+    # the request's buffers, borrowed from the request lane while it is live and
+    # released when it retires; nil and unheld on an idle slot
     storage:                       *RequestStorage;
+    storage_chunk:                 buffers.Chunk;
+    storage_held:                  bool;
     live:                          bool;
     phase:                         RequestPhase;
     id:                            u64;
@@ -223,7 +227,6 @@ pub rec SessionStorage {
     control_queue:       [QUEUE_BYTES]u8;
     encoder_queue:       [QUEUE_BYTES]u8;
     decoder_queue:       [QUEUE_BYTES]u8;
-    requests:            [MAX_STREAMS]RequestStorage;
     plan:                *plan.Plan;
     budgets:             *budget.Set;
     limits:              message.Limits;
@@ -240,11 +243,10 @@ pub rec SessionStorage {
 }
 
 pub rec Session {
-    storage:   *SessionStorage;
-    live:      bool;
-    next_free: usize;
-    state:     State;
-    io:        adapter.Adapter;
+    storage: *SessionStorage;
+    live:    bool;
+    state:   State;
+    io:      adapter.Adapter;
     # the connection's source and account, which outlive the engine
     source:            buffers.Source;
     account:           *buffers.Account;
@@ -264,31 +266,58 @@ pub rec Session {
 # welded session pointers are entry-point local and never retained here. the
 # sessions themselves live in the caller's secret table, which the pool grows.
 pub rec Pool {
-    storages:  hedge_storage.Recycler[SessionStorage];
-    live:      usize;
-    free_head: usize;
+    storages: hedge_storage.Recycler[SessionStorage];
+    live:     usize;
 }
 
 fun reset_request(slot: *RequestSlot) {
     val storage: *RequestStorage = slot.storage;
+    val chunk:   buffers.Chunk   = slot.storage_chunk;
+    val held:    bool            = slot.storage_held;
     var cleared: RequestSlot;
     @slot                = cleared;
     slot.storage         = storage;
+    slot.storage_chunk   = chunk;
+    slot.storage_held    = held;
     slot.phase           = REQUEST_FREE;
     slot.call_release_ok = true;
     slot.charge          = budget.no_charge();
     if (storage != nil) { slot.body.data = ?storage.body_data[0]; }
 }
 
-# a pool claims no storage until a session is taken. sessions the table already
-# holds, from an earlier pool, are threaded back onto the free list.
+# borrow this slot's request buffers from the request lane, or false when the
+# lane cannot fund them. a fresh chunk is zeroed so every embedded struct starts
+# from the state a first claim used to give the inline storage
+fun borrow_request_storage(session: *Session, slot: *RequestSlot) bool {
+    if (slot.storage_held) { ret true; }
+    val got: buffers.Acquired = buffers.source_acquire(?session.source,
+        session.account, buffers.Request{bytes: $size_of(RequestStorage),
+        align:  $align_of(RequestStorage), lane: hedge_memory.LANE_REQUEST,
+        secret: false}, true);
+    if (!(sel got.status.ok)) { ret false; }
+    slot.storage_chunk = got.chunk;
+    slot.storage_held  = true;
+    slot.storage       = (got.chunk.data)::*RequestStorage;
+    memory.raw_zero((slot.storage)::ptr, $size_of(RequestStorage));
+    ret true;
+}
+
+# return a retired slot's request buffers to the lane; a no-op when not held
+fun release_request_storage(session: *Session, slot: *RequestSlot) {
+    if (!slot.storage_held) { ret; }
+    buffers.source_release(?session.source, session.account, slot.storage_chunk);
+    slot.storage_held = false;
+    slot.storage      = nil;
+}
+
+# a pool claims no storage until a session is taken. the sessions live in the
+# caller's secret table, whose slab tracks free indices, so the pool keeps no
+# free list of its own.
 pub fun make_pool(pool: *Pool, a: *A.Allocator,
     sessions: *hedge_storage.SecretTable[Session]) bool {
     if (pool == nil || a == nil || sessions == nil
         || !hedge_storage.make[SessionStorage](?pool.storages, a, 1)) { ret false; }
-    pool.live      = 0;
-    pool.free_head = NO_SESSION;
-    thread_sessions(pool, sessions, 0);
+    pool.live = 0;
     ret true;
 }
 
@@ -298,34 +327,13 @@ pub fun destroy_pool(pool: *Pool) bool {
     ret hedge_storage.destroy[SessionStorage](?pool.storages);
 }
 
-# a free session carries its free-list link and nothing else. its storage is a
-# megabyte, so it is claimed when the session is taken and returned with it.
-fun thread_sessions(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
-    first: usize) {
-    var i: usize = sessions.capacity;
-    for (i > first) {
-        i = i - 1;
-        val session: *Session = hedge_storage.secret_table_at[Session](sessions, i);
-        session.live      = false;
-        session.storage   = nil;
-        session.next_free = pool.free_head;
-        pool.free_head    = i;
-    }
-}
-
-fun grow_sessions(pool: *Pool, sessions: *hedge_storage.SecretTable[Session]) bool {
-    val first: usize = sessions.capacity;
-    if (!hedge_storage.grow_secret_table[Session](sessions)) { ret false; }
-    thread_sessions(pool, sessions, first);
-    ret true;
-}
-
 # put a taken session's storage and request slots into their empty state
 fun arm_session(session: *Session, storage: *SessionStorage) {
     session.storage = storage;
     var j: usize = 0;
     for (j < MAX_STREAMS) {
-        session.requests_slots[j].storage = ?storage.requests[j];
+        session.requests_slots[j].storage      = nil;
+        session.requests_slots[j].storage_held = false;
         reset_request(?session.requests_slots[j]);
         j = j + 1;
     }
@@ -333,16 +341,17 @@ fun arm_session(session: *Session, storage: *SessionStorage) {
 
 pub fun acquire(pool: *Pool, sessions: *hedge_storage.SecretTable[Session]) usize {
     if (pool == nil || sessions == nil) { ret NO_SESSION; }
-    if (pool.free_head == NO_SESSION && !grow_sessions(pool, sessions)) {
+    # the slab grows the welded chunk on demand and hands back the lowest free
+    # index; the megabyte storage is claimed alongside and released with it
+    val index: usize = hedge_storage.secret_table_claim[Session](sessions);
+    if (index == hedge_storage.NO_INDEX) { ret NO_SESSION; }
+    val storage: *SessionStorage = hedge_storage.claim[SessionStorage](?pool.storages);
+    if (storage == nil) {
+        hedge_storage.secret_table_release[Session](sessions, index);
         ret NO_SESSION;
     }
-    val storage: *SessionStorage = hedge_storage.claim[SessionStorage](?pool.storages);
-    if (storage == nil) { ret NO_SESSION; }
-    val index:   usize    = pool.free_head;
     val session: *Session = hedge_storage.secret_table_at[Session](sessions, index);
-    pool.free_head = session.next_free;
     arm_session(session, storage);
-    session.next_free      = NO_SESSION;
     session.live           = true;
     session.state          = IDLE;
     session.release_failed = false;
@@ -360,42 +369,6 @@ pub fun session_at(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
     ret session;
 }
 
-fun clear_borrowed_request_storage(storage: *RequestStorage) {
-    var i: usize = 0;
-    for (i < RESPONSE_FIELD_SLOTS) {
-        storage.response_fields[i].name  = view.view(nil, 0);
-        storage.response_fields[i].value = view.view(nil, 0);
-        i                                = i + 1;
-    }
-    i = 0;
-    for (i < RESPONSE_TRAILER_SLOTS) {
-        storage.response_trailers[i].name  = view.view(nil, 0);
-        storage.response_trailers[i].value = view.view(nil, 0);
-        i                                  = i + 1;
-    }
-    i = 0;
-    for (i < INFORMATIONAL_SLOTS) {
-        storage.informationals[i].fields.items = nil;
-        storage.informationals[i].fields.len   = 0;
-        storage.informationals[i].fields.valid = false;
-        i                                      = i + 1;
-    }
-    i = 0;
-    for (i < CAPTURE_SLOTS) {
-        storage.captures[i].name               = view.view(nil, 0);
-        storage.captures[i].value              = view.view(nil, 0);
-        storage.captures[i].router_generation  = 0;
-        storage.captures[i].request_generation = 0;
-        i                                      = i + 1;
-    }
-    i = 0;
-    for (i < HEADER_ITEM_SLOTS) {
-        storage.header_items[i].name  = view.view(nil, 0);
-        storage.header_items[i].value = view.view(nil, 0);
-        i                             = i + 1;
-    }
-}
-
 fun return_session(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
     index: usize) {
     val session: *Session        = hedge_storage.secret_table_at[Session](sessions, index);
@@ -407,18 +380,20 @@ fun return_session(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
     storage.peer_text[0]     = 0;
     storage.local            = message.unspecified_endpoint();
     storage.local_text[0]    = 0;
+    # settle_request returns each request's buffers as it retires; this releases
+    # any that a torn-down session still holds so none outlive the connection
     var i: usize = 0;
     for (i < MAX_STREAMS) {
-        clear_borrowed_request_storage(?storage.requests[i]);
+        release_request_storage(session, ?session.requests_slots[i]);
         i = i + 1;
     }
     # held storage is only ever refused back when its free would also fail
     hedge_storage.release[SessionStorage](?pool.storages, storage);
     var cleared: Session;
-    @session          = cleared;
-    session.state     = IDLE;
-    session.next_free = pool.free_head;
-    pool.free_head    = index;
+    @session      = cleared;
+    session.state = IDLE;
+    # release before compaction so a reclaimed chunk strands no live storage
+    hedge_storage.secret_table_release[Session](sessions, index);
     if (pool.live != 0) { pool.live = pool.live - 1; }
 }
 
@@ -440,7 +415,7 @@ test "hedge.protocol.h3.session: abandon retains a live child scope" {
     page.make(?pool_heap);
     var sessions: hedge_storage.SecretTable[Session];
     var pool:     Pool;
-    if (!hedge_storage.make_secret_table[Session](?sessions)
+    if (!hedge_storage.make_secret_table[Session](?sessions, ?pool_heap)
         || !make_pool(?pool, ?pool_heap, ?sessions)) { ret 1; }
     val index:   usize    = acquire(?pool, ?sessions);
     val session: *Session = session_at(?pool, ?sessions, index);
@@ -456,7 +431,8 @@ test "hedge.protocol.h3.session: abandon retains a live child scope" {
         || pool.live != 1) { ret 3; }
     if (!operation_ok(cancel.destroy(?child))
         || !abandon(?pool, ?sessions, index)
-        || session.live || pool.live != 0 || !operation_ok(cancel.destroy(?root))) { ret 4; }
+        || session_at(?pool, ?sessions, index) != nil || pool.live != 0
+        || !operation_ok(cancel.destroy(?root))) { ret 4; }
     ret 0;
 }
 
@@ -465,7 +441,7 @@ test "hedge.protocol.h3.session: retained start scope blocks mutation" {
     page.make(?pool_heap);
     var sessions: hedge_storage.SecretTable[Session];
     var pool:     Pool;
-    if (!hedge_storage.make_secret_table[Session](?sessions)
+    if (!hedge_storage.make_secret_table[Session](?sessions, ?pool_heap)
         || !make_pool(?pool, ?pool_heap, ?sessions)) { ret 1; }
     val index:   usize    = acquire(?pool, ?sessions);
     val session: *Session = session_at(?pool, ?sessions, index);
@@ -503,7 +479,8 @@ test "hedge.protocol.h3.session: retained start scope blocks mutation" {
         || abandon(?pool, ?sessions, index)) { ret 3; }
     if (!operation_ok(cancel.destroy(?child))
         || !abandon(?pool, ?sessions, index)
-        || session.live || !operation_ok(cancel.destroy(?root))) { ret 4; }
+        || session_at(?pool, ?sessions, index) != nil
+        || !operation_ok(cancel.destroy(?root))) { ret 4; }
     ret 0;
 }
 
@@ -596,6 +573,19 @@ pub fun session_config(limits: message.Limits, max_requests: usize) h3.Config {
     ret configured;
 }
 
+# the request-lane bytes one HTTP/3 request borrows on demand: this session's
+# RequestStorage chunk plus the engine's own per-request set, each charged at its
+# pool class. the engine measures its set through a pool-free measurement source,
+# so hedge asks mach-http for the footprint rather than mirroring its chunk list.
+# the connection budget is sized from this so it moves whenever the storage or the
+# engine's per-request set changes.
+pub fun set_bytes() usize {
+    var source:     buffers.Source = hedge_memory.measurement_source();
+    val configured: h3.Config      = session_config(message.limits_default(), MAX_STREAMS);
+    ret hedge_memory.charged($size_of(RequestStorage))
+        + h3.request_footprint(?source, configured);
+}
+
 # caller storage stays fixed while a pooled session is active
 fun start_session(session: *Session,
     driver: *qt.Driver[binding.Binding], clock: *u64,
@@ -663,11 +653,18 @@ fun request_for(session: *Session, id: u64) *RequestSlot {
     ret nil;
 }
 
+# claim a free request slot and borrow its buffers from the request lane, or nil
+# when every slot is live or the lane cannot fund another. a nil return is the
+# connection's back pressure: the caller rejects the stream. the returned slot is
+# reset and its storage is a stable chunk for the request's whole life
 fun free_request(session: *Session) *RequestSlot {
     var i: usize = 0;
     for (i < MAX_STREAMS) {
         if (!session.requests_slots[i].live) {
-            ret ?session.requests_slots[i];
+            val slot: *RequestSlot = ?session.requests_slots[i];
+            if (!borrow_request_storage(session, slot)) { ret nil; }
+            reset_request(slot);
+            ret slot;
         }
         i = i + 1;
     }
@@ -1432,6 +1429,9 @@ fun settle_request(session: *Session, slot: *RequestSlot) Step {
     }
     val ownership_ok: bool = slot.call_release_ok;
     reset_request(slot);
+    # the request is fully retired; its buffers return to the request lane so an
+    # idle connection holds none of them
+    release_request_storage(session, slot);
     if (!ownership_ok) { ret STEP_ERROR; }
     ret STEP_PROGRESS;
 }
@@ -1555,10 +1555,14 @@ fun open_request(session: *Session, event: h3.Event,
     now: time.Instant) Step {
     val slot: *RequestSlot = free_request(session);
     if (slot == nil) {
-        h3.cancel_connection[adapter.Adapter](?session.engine);
-        ret STEP_ERROR;
+        # the request lane cannot fund this request's buffers; reject just this
+        # stream so the peer may retry, rather than failing the whole connection
+        if (!h3.release_event[adapter.Adapter](?session.engine, event.stream_id,
+            event.generation)
+            || !h3.cancel_stream[adapter.Adapter](?session.engine, event.stream_id,
+            h3.H3_REQUEST_REJECTED)) { ret STEP_ERROR; }
+        ret STEP_PROGRESS;
     }
-    reset_request(slot);
     slot.live             = true;
     slot.id               = event.stream_id;
     slot.generation       = event.generation;
@@ -1914,51 +1918,58 @@ pub fun snapshot(session: *Session) Snapshot {
     ret value;
 }
 
-test "hedge.protocol.h3.session: pool ownership grows and reuses what it is given back" {
+test "hedge.protocol.h3.session: pool ownership grows, compacts, and holds live records still" {
     var heap: A.Allocator;
     page.make(?heap);
     var sessions: hedge_storage.SecretTable[Session];
     var pool:     Pool;
-    if (!hedge_storage.make_secret_table[Session](?sessions)
-        || !make_pool(?pool, ?heap, ?sessions) || pool.live != 0 || sessions.capacity != 0
+    if (!hedge_storage.make_secret_table[Session](?sessions, ?heap)
+        || !make_pool(?pool, ?heap, ?sessions) || pool.live != 0
+        || hedge_storage.secret_table_capacity[Session](?sessions) != 0
         || hedge_storage.held[SessionStorage](?pool.storages) != 0) { ret 1; }
     val first: usize    = acquire(?pool, ?sessions);
     val taken: *Session = session_at(?pool, ?sessions, first);
     if (first != 0 || pool.live != 1 || taken == nil || taken.storage == nil
-        || sessions.capacity != hedge_storage.FIRST_CHUNK) { ret 2; }
-    val storage: *SessionStorage = taken.storage;
-    storage.requests[0].response_fields[0].name = view.view("x-stale", 7);
-    storage.requests[0].captures[0].name        = view.view("route", 5);
-    storage.requests[0].header_items[0].value   = view.view("stale", 5);
-    taken.io.clock                              = ?taken.now_ns;
+        || hedge_storage.secret_table_capacity[Session](?sessions)
+        != hedge_storage.FIRST_CHUNK) { ret 2; }
+    # releasing the only session compacts the welded chunk away
     if (!abandon(?pool, ?sessions, first) || pool.live != 0
         || session_at(?pool, ?sessions, first) != nil
         || hedge_storage.held[SessionStorage](?pool.storages) != 0
-        || storage.requests[0].response_fields[0].name.data != nil
-        || storage.requests[0].captures[0].name.data != nil
-        || storage.requests[0].header_items[0].value.data != nil
-        || taken.storage != nil || taken.io.clock != nil) { ret 3; }
-    val second: usize = acquire(?pool, ?sessions);
-    if (second != first || taken.storage != storage
+        || hedge_storage.secret_table_capacity[Session](?sessions) != 0) { ret 3; }
+    # a reclaimed index reads as a fresh, armed session
+    val second: usize    = acquire(?pool, ?sessions);
+    val again:  *Session = session_at(?pool, ?sessions, second);
+    if (second != first || again == nil || again.storage == nil
         || !abandon(?pool, ?sessions, second)) { ret 4; }
-    # past the first chunk the directory grows and no earlier session moves
+    # past the first chunk the table grows and no live session ever moves
     val count: usize = hedge_storage.FIRST_CHUNK * 3 + 1;
     var held:  [49]usize;
+    var addrs: [49]*Session;
     var i:     usize = 0;
     for (i < count) {
-        held[i] = acquire(?pool, ?sessions);
-        if (held[i] != i || session_at(?pool, ?sessions, i) == nil) { ret 5; }
+        held[i]  = acquire(?pool, ?sessions);
+        addrs[i] = session_at(?pool, ?sessions, held[i]);
+        if (held[i] != i || addrs[i] == nil) { ret 5; }
         i = i + 1;
     }
-    if (session_at(?pool, ?sessions, 0) != taken || pool.live != count
-        || sessions.capacity < count) { ret 6; }
     i = 0;
     for (i < count) {
-        if (!abandon(?pool, ?sessions, held[i])) { ret 7; }
+        if (session_at(?pool, ?sessions, i) != addrs[i]) { ret 6; }
         i = i + 1;
     }
-    if (pool.live != 0 || !destroy_pool(?pool)
-        || !hedge_storage.destroy_secret_table[Session](?sessions)) { ret 8; }
+    if (pool.live != count
+        || hedge_storage.secret_table_capacity[Session](?sessions) < count) { ret 7; }
+    i = 0;
+    for (i < count) {
+        if (!abandon(?pool, ?sessions, held[i])) { ret 8; }
+        i = i + 1;
+    }
+    # draining every session compacts the table back to nothing
+    if (pool.live != 0
+        || hedge_storage.secret_table_capacity[Session](?sessions) != 0
+        || !destroy_pool(?pool)
+        || !hedge_storage.destroy_secret_table[Session](?sessions)) { ret 9; }
     ret 0;
 }
 
@@ -2557,5 +2568,44 @@ test "hedge.protocol.h3.session: stream scratch holds two maximum fields" {
     if (configured.inbound_qpack.max_field_bytes > SCRATCH_BYTES / 2)  { ret 1; }
     if (configured.outbound_qpack.max_field_bytes > SCRATCH_BYTES / 2) { ret 2; }
     if (STRING_BYTES > SCRATCH_BYTES / 2)                              { ret 3; }
+    ret 0;
+}
+
+test "hedge.protocol.h3.session: request buffers are borrowed on demand and released when idle" {
+    var pages: A.Allocator;
+    page.make(?pages);
+    var pool: hedge_memory.Memory;
+    if (!hedge_memory.make(?pool, 524288, ?pages)) { ret 1; }
+    var lender:  hedge_memory.Borrower;
+    var account: buffers.Account;
+    hedge_memory.borrower(?lender, ?pool, 7, 0,
+        hedge_memory.connection_budgets(262144, 0, 0, 0, 0, 0));
+    if (!hedge_memory.open(?lender, ?account)) { ret 2; }
+    var session: Session;
+    session.source  = hedge_memory.borrowed_source(?lender);
+    session.account = ?account;
+    # an idle session borrows no request storage
+    val idle_start: hedge_memory.Snapshot = hedge_memory.snapshot(?pool);
+    if (idle_start.lanes[hedge_memory.LANE_REQUEST::usize].held != 0) { ret 3; }
+    # each claimed request borrows its buffers from the request lane
+    val first: *RequestSlot = free_request(?session);
+    if (first == nil || !first.storage_held || first.storage == nil) { ret 4; }
+    first.live = true;
+    val second: *RequestSlot = free_request(?session);
+    if (second == nil || second == first || !second.storage_held) { ret 5; }
+    second.live = true;
+    val active: hedge_memory.Snapshot = hedge_memory.snapshot(?pool);
+    if (active.lanes[hedge_memory.LANE_REQUEST::usize].held
+        < 2 * $size_of(RequestStorage)) { ret 6; }
+    # retiring each request returns its buffers, so an idle connection holds none
+    release_request_storage(?session, first);
+    first.live = false;
+    release_request_storage(?session, second);
+    second.live = false;
+    val idle_end: hedge_memory.Snapshot = hedge_memory.snapshot(?pool);
+    if (idle_end.lanes[hedge_memory.LANE_REQUEST::usize].held != 0) { ret 7; }
+    if (idle_end.lanes[hedge_memory.LANE_REQUEST::usize].peak
+        < $size_of(RequestStorage)) { ret 8; }
+    if (!hedge_memory.close(?pool, ?account) || !hedge_memory.destroy(?pool)) { ret 9; }
     ret 0;
 }

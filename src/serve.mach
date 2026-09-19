@@ -56,8 +56,8 @@ pub rec Slot {
     # queued to be driven or retired on this worker's next pass
     ready:      bool;
     ready_next: usize;
-    # the wheel entry for the connection's earliest deadline, claimed once for
-    # the slot and reused by every connection that holds it
+    # the wheel entry for the connection's earliest deadline, claimed when the
+    # slot is taken and released when it is returned so a receding pool frees it
     timer:      hedge_timer.Handle;
     timer_live: bool;
     # accepted and holding a place in its budget's queue, not yet being served
@@ -68,7 +68,6 @@ pub rec Slot {
     charge:    budget.Charge;
     prev_live: usize;
     next_live: usize;
-    next_free: usize;
 }
 
 rec BudgetGeneration {
@@ -119,10 +118,8 @@ pub rec Runtime {
     # context or a body reader may hold a pointer into one for its life
     slots:         hedge_storage.Table[Slot];
     connections:   hedge_storage.Recycler[connection.Connection];
-    claimed_slots: usize;
     live:          usize;
     live_head:     usize;
-    free_head:     usize;
     next_id:       u64;
     plan:          *plan.Plan;
     graph:         *schema.Graph;
@@ -211,7 +208,6 @@ pub fun make(
     }
     runtime.state          = NEW;
     runtime.generation     = 0;
-    runtime.claimed_slots  = 0;
     runtime.live           = 0;
     runtime.next_id        = 1;
     runtime.plan           = active_plan;
@@ -240,7 +236,6 @@ pub fun make(
     if (!configure_budgets(?runtime.budget_generations[0], graph)) { ret false; }
     runtime.active_budgets = ?runtime.budget_generations[0].set;
     runtime.live_head      = NO_SLOT;
-    runtime.free_head      = NO_SLOT;
     runtime.ready_head     = NO_SLOT;
     runtime.ready_tail     = NO_SLOT;
     var i: usize = 0;
@@ -341,10 +336,15 @@ fun quic_config(runtime: *Runtime, graph: *schema.Graph, index: usize,
             schema.text(?configured.budget));
     }
     val connection_config: connection.Config = connection.config_from(graph);
-    var max_requests:      usize             = connection_config.max_streams;
+    # HTTP/3 borrows more per request than HTTP/2, so its advertised concurrency
+    # is capped against its own funded count, not the HTTP/2 figure above
+    var max_requests: usize = graph.limits.max_pipeline_depth;
     if (max_requests > h3_session.MAX_STREAMS) {
         max_requests = h3_session.MAX_STREAMS;
     }
+    val h3_split:  hedge_memory.Budgets = lanes.budgets(?graph.limits);
+    val h3_funded: usize                = hedge_memory.request_capacity(h3_split, h3_session.set_bytes());
+    if (max_requests > h3_funded) { max_requests = h3_funded; }
     @output = quic_runtime.PumpConfig{
         admission_generation:     generation,
         connection_limit:         graph.limits.max_connections,
@@ -509,15 +509,13 @@ pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation
 fun release_pool(runtime: *Runtime) bool {
     var ok: bool = hedge_storage.destroy[connection.Connection](?runtime.connections);
     if (!hedge_storage.destroy_table[Slot](?runtime.slots)) { ok = false; }
-    runtime.claimed_slots = 0;
-    runtime.free_head     = NO_SLOT;
-    runtime.live_head     = NO_SLOT;
+    runtime.live_head = NO_SLOT;
     ret ok;
 }
 
 # the connection record a claimed slot holds, or nil when the slot is free
 pub fun slot_connection(runtime: *Runtime, index: usize) *connection.Connection {
-    if (runtime == nil || index >= runtime.claimed_slots) { ret nil; }
+    if (runtime == nil || index >= hedge_storage.table_capacity[Slot](?runtime.slots)) { ret nil; }
     ret hedge_storage.table_at[Slot](?runtime.slots, index).handle;
 }
 
@@ -529,6 +527,20 @@ pub fun last_refusal(runtime: *Runtime) prologue.Refusal {
 # a claimed slot, so a caller can observe its lifecycle without owning the pool
 pub fun slot_at(runtime: *Runtime, index: usize) *Slot {
     ret hedge_storage.table_at[Slot](?runtime.slots, index);
+}
+
+# the size the slot directory has grown to, which recedes as connections leave
+pub fun slot_capacity(runtime: *Runtime) usize {
+    if (runtime == nil) { ret 0; }
+    ret hedge_storage.table_capacity[Slot](?runtime.slots);
+}
+
+# whether a slot holds a live connection. an index whose chunk a compaction has
+# released reads as not live rather than faulting, so a caller can query a slot
+# whose pool has since receded
+pub fun slot_live(runtime: *Runtime, index: usize) bool {
+    val slot: *Slot = slot_at(runtime, index);
+    ret slot != nil && slot.live;
 }
 
 fun link_live(runtime: *Runtime, index: usize) {
@@ -560,47 +572,44 @@ fun unlink_live(runtime: *Runtime, index: usize) {
 # refuses is the only reason a claim fails, and that is a refusal like a full
 # pool was, not a crash
 fun free_slot(runtime: *Runtime) usize {
-    var index: usize = runtime.free_head;
-    if (index != NO_SLOT) {
-        runtime.free_head                 = slot_at(runtime, index).next_free;
-        slot_at(runtime, index).next_free = NO_SLOT;
-    }
-    or {
-        if (runtime.claimed_slots == runtime.slots.capacity
-            && !hedge_storage.grow_table[Slot](?runtime.slots)) { ret NO_SLOT; }
-        index                 = runtime.claimed_slots;
-        runtime.claimed_slots = runtime.claimed_slots + 1;
-        val fresh: *Slot = slot_at(runtime, index);
-        fresh.prev_live  = NO_SLOT;
-        fresh.next_live  = NO_SLOT;
-        fresh.next_free  = NO_SLOT;
-        fresh.charge     = budget.no_charge();
-        fresh.ready      = false;
-        fresh.ready_next = NO_SLOT;
-        fresh.timer      = hedge_timer.claim(?runtime.timers, tcp_owner(index));
-        fresh.timer_live = fresh.timer.index != hedge_timer.NONE;
-    }
+    val index: usize = hedge_storage.table_claim[Slot](?runtime.slots);
+    if (index == NO_SLOT) { ret NO_SLOT; }
+    # the slab may hand back a reused slot with stale contents or a freshly grown
+    # zeroed one, so every field a claim relies on is set here rather than trusted
     val slot: *Slot = slot_at(runtime, index);
-    slot.handle =
+    slot.prev_live  = NO_SLOT;
+    slot.next_live  = NO_SLOT;
+    slot.charge     = budget.no_charge();
+    slot.ready      = false;
+    slot.ready_next = NO_SLOT;
+    slot.timer      = hedge_timer.claim(?runtime.timers, tcp_owner(index));
+    slot.timer_live = slot.timer.index != hedge_timer.NONE;
+    slot.handle     =
         hedge_storage.claim[connection.Connection](?runtime.connections);
     if (slot.handle == nil) {
-        slot.next_free    = runtime.free_head;
-        runtime.free_head = index;
+        if (slot.timer_live) { hedge_timer.release(?runtime.timers, slot.timer); }
+        slot.timer_live = false;
+        hedge_storage.table_release[Slot](?runtime.slots, index);
         ret NO_SLOT;
     }
     ret index;
 }
 
 fun return_slot(runtime: *Runtime, index: usize) {
-    if (index >= runtime.claimed_slots) { ret; }
+    if (index >= hedge_storage.table_capacity[Slot](?runtime.slots)) { ret; }
     val slot: *Slot = slot_at(runtime, index);
     if (slot.handle != nil) {
         hedge_storage.release[connection.Connection](?runtime.connections,
             slot.handle);
         slot.handle = nil;
     }
-    slot.next_free    = runtime.free_head;
-    runtime.free_head = index;
+    # release the wheel entry before the slab can drop this slot's chunk, so a
+    # compaction never strands a timer bound to a slot that no longer exists
+    if (slot.timer_live) {
+        hedge_timer.release(?runtime.timers, slot.timer);
+        slot.timer_live = false;
+    }
+    hedge_storage.table_release[Slot](?runtime.slots, index);
 }
 
 # a slot whose connection is in teardown is spoken for but about to be free, and
@@ -745,7 +754,7 @@ fun arm_waiting(runtime: *Runtime, index: usize) {
 }
 
 fun retire(runtime: *Runtime, index: usize) {
-    if (index >= runtime.claimed_slots) { ret; }
+    if (index >= hedge_storage.table_capacity[Slot](?runtime.slots)) { ret; }
     val slot: *Slot = slot_at(runtime, index);
     if (!slot.live) { ret; }
     if (!slot.retiring) {
@@ -794,7 +803,7 @@ fun owns_tcp(owner: u64) bool {
 }
 
 fun mark_ready(runtime: *Runtime, index: usize) {
-    if (index >= runtime.claimed_slots) { ret; }
+    if (index >= hedge_storage.table_capacity[Slot](?runtime.slots)) { ret; }
     val slot: *Slot = slot_at(runtime, index);
     if (!slot.live || slot.ready) { ret; }
     slot.ready      = true;
@@ -1399,9 +1408,7 @@ test "serve: the live list holds exactly the live connection slots" {
         || !hedge_storage.make[connection.Connection](?runtime.connections, ?a, 1)) {
         ret 1;
     }
-    runtime.claimed_slots = 0;
-    runtime.live_head     = NO_SLOT;
-    runtime.free_head     = NO_SLOT;
+    runtime.live_head = NO_SLOT;
 
     val first:  usize = free_slot(?runtime);
     val second: usize = free_slot(?runtime);
@@ -1409,7 +1416,7 @@ test "serve: the live list holds exactly the live connection slots" {
     if (first != 0 || second != 1 || third != 2) { ret 2; }
     # a fourth claim is where a three-slot pool refused
     val fourth: usize = free_slot(?runtime);
-    if (fourth != 3 || runtime.claimed_slots != 4) { ret 3; }
+    if (fourth != 3 || hedge_storage.table_live[Slot](?runtime.slots) != 4) { ret 3; }
     return_slot(?runtime, fourth);
 
     link_live(?runtime, first);

@@ -34,7 +34,6 @@ use http_transport: http.core.transport;
 use A:              std.allocator;
 use std.allocator.page;
 use std.chrono.time;
-use std.collections.vector;
 use io_error: std.io.error;
 use std.io.lifecycle;
 use io_runtime: std.io.runtime;
@@ -159,10 +158,9 @@ rec Session {
 
 var sessions: storage.SecretTable[Session];
 var channels: storage.Table[Channel];
-var heap:     A.Allocator;
-# released indices, reused before the tables grow again
-var released:   vector.Vector[usize];
-var claimed:    usize;
+# channel (plain) and session (welded) are the two storages of one shared slab
+var paired:     storage.Slab[storage.Table[Channel], storage.SecretTable[Session]];
+var heap:       A.Allocator;
 var prepared:   bool;
 var live_count: usize;
 
@@ -203,24 +201,24 @@ fun reset_channel(value: *Channel, index: usize) {
 fun prepare() {
     if (prepared) { ret; }
     page.make(?heap);
-    storage.make_secret_table[Session](?sessions);
-    storage.make_table[Channel](?channels, ?heap);
-    released   = vector.init[usize](?heap);
-    claimed    = 0;
+    # channel and session are the two storages of one slab, so they grow and
+    # compact in lockstep and channel_at(i)/session_at(i) stay index-locked
+    storage.make_paired[Channel, Session](?paired, ?channels, ?sessions, ?heap);
     live_count = 0;
     prepared   = true;
 }
 
 fun session_at(index: usize) *Session {
-    ret storage.secret_table_at[Session](?sessions, index);
+    ret storage.secret_record[Session](?sessions, index, paired.capacity);
 }
 
 fun channel_at(index: usize) *Channel {
-    ret storage.table_at[Channel](?channels, index);
+    ret storage.table_record[Channel](?channels, index, paired.capacity);
 }
 
 fun claimed_index(index: usize) bool {
-    ret index < claimed && channel_at(index).live;
+    val value: *Channel = channel_at(index);
+    ret value != nil && value.live;
 }
 
 pub fun live() usize {
@@ -228,23 +226,13 @@ pub fun live() usize {
     ret live_count;
 }
 
-# an index is reused before either table grows, and a table that cannot grow
+# one claim grows both storages in lockstep and hands back the lowest free
+# index, so channel and session always share it; a table that cannot grow
 # refuses the connection rather than overcommitting record storage
 pub fun acquire() usize {
     prepare();
-    var index:  usize      = NO_SESSION;
-    val reused: opt[usize] = vector.pop[usize](?released);
-    if (sel reused.some) { index = reused.some; }
-    or {
-        # sessions grow first, so every claimable channel index has a session
-        if (claimed == channels.capacity) {
-            if (sessions.capacity == channels.capacity
-                && !storage.grow_secret_table[Session](?sessions)) { ret NO_SESSION; }
-            if (!storage.grow_table[Channel](?channels)) { ret NO_SESSION; }
-        }
-        index   = claimed;
-        claimed = claimed + 1;
-    }
+    val index: usize = storage.paired_claim[Channel, Session](?paired);
+    if (index == storage.NO_INDEX) { ret NO_SESSION; }
     val value: *Channel = channel_at(index);
     reset_channel(value, index);
     value.live = true;
@@ -313,8 +301,8 @@ pub fun release(index: usize) bool {
     destroy_scopes(index);
     reset_channel(value, index);
     if (live_count > 0) { live_count = live_count - 1; }
-    # an index the free list cannot take is simply never reused
-    vector.push[usize](?released, index);
+    # release the shared index, compacting both tables' trailing empty chunks
+    storage.paired_release[Channel, Session](?paired, index);
     ret true;
 }
 
@@ -1177,5 +1165,28 @@ test "secure: sessions grow past any fixed table and never move" {
     }
     if (!release(first) || live() != before)   { ret 8; }
     if (release(NO_SESSION) || release(first)) { ret 9; }
+    ret 0;
+}
+
+test "secure: channel and session share one index space in lockstep" {
+    val before: usize = live();
+    var held:   [40]usize;
+    var i:      usize = 0;
+    for (i < 40) {
+        held[i] = acquire();
+        # one claim on the shared slab grows both storages, so the plain channel
+        # and the welded session both resolve at the same index
+        if (held[i] == NO_SESSION || channel_at(held[i]) == nil
+            || session_at(held[i]) == nil) { ret 1; }
+        i = i + 1;
+    }
+    # the shared slab covers every claimed index for both storages
+    if (paired.capacity <= held[39]) { ret 2; }
+    i = 0;
+    for (i < 40) {
+        if (!release(held[i])) { ret 3; }
+        i = i + 1;
+    }
+    if (live() != before) { ret 4; }
     ret 0;
 }
