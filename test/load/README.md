@@ -14,7 +14,7 @@ mach build . --profile release
 ```
 
 `HEDGE_BINARY` qualifies a different build. `LOAD_QUIC_SERVED=0` skips the
-assertions that HTTP/3 transfers were served, which cannot pass until hedge#145
+assertions that HTTP/3 transfers were served, which cannot pass until hedge#231
 is fixed; CI sets it, and admission and refusal are checked regardless. `LOAD_CONNECTIONS` and `LOAD_TARGET`
 change the shape of the TCP load, `LOAD_QUIC_CONNECTIONS` and `LOAD_QUIC_RATE`
 the QUIC load. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
@@ -79,14 +79,92 @@ number.
 ## `h3load`
 
 `h3load/` is a quic-go client that does for QUIC what `fairness.py` does for
-TCP, and can prove a cap on its own with `-expect-connected` and `-hold`. It is
-not in the lane yet. hedge declares a 1200-byte UDP payload, which refuses
-quic-go's 1280-byte Initials, and at mach-quic v0.7.0 declaring more stalls
-stream delivery for every client (hedge#140). Run it by hand when a mach-quic
-pin bump claims to fix that:
+TCP, can prove a cap on its own with `-expect-connected` and `-hold`, and holds
+idle connections for the scale lane with `-serve=false -hold`. `-dialing N`
+bounds the handshakes in flight, because a burst of several thousand loses some
+to their timeout (#232). The lanes build it into `.tools/` with the Go
+toolchain on the box, module cache beside it.
 
 ```sh
 cd test/load/h3load && go run . -address 127.0.0.1:PORT -connections 1100
 ```
 
-Once it serves, the QUIC cells move onto it.
+Its served cells are not in the lane while #231 stands: past a few hundred
+concurrent connections a third of the responses never arrive, over this client
+and over curl alike.
+
+## The scale lane
+
+```sh
+mach build . --profile release
+./test/load/scale.sh
+```
+
+`scale.sh` measures what an idle connection costs, on the same binary and
+configuration shape as `run.sh`. For each transport it starts a fresh server,
+holds `LOAD_SCALE_SMALL` connections (1000) and then `LOAD_SCALE_LARGE`
+(10000) open and idle, and reads the process's resident set from
+`/proc/<pid>/smaps_rollup` at each step. TCP and TLS connections are HTTP/1.1
+keep-alive connections that have served one request (`hold.py`, with `--tls`
+for the second); QUIC connections are handshake-only holds over `h3load`,
+because no client hedge can be measured with holds an HTTP/3 connection idle
+after a request, and served HTTP/3 at these counts waits on #231.
+
+It prints, per transport, the resident set at 0, small, the midpoint and
+large, the address space and mapping count at large, the slope in bytes per
+connection between small and large with its two halves beside it, what the
+first connections brought once, and the projection to 100k connections. The
+served process runs with transparent huge pages disabled
+(`PR_SET_THP_DISABLE`), because a resident set under them counts 2 MiB for the
+first byte touched in each region and moves as pages collapse, which is the
+kernel's policy, not hedge's footprint.
+
+The slope is the regression guard #214 asked for. It is pinned per transport,
+`LOAD_SCALE_PIN_TCP`, `_TLS` and `_QUIC`, at the value the lane achieved when
+it was written, and a slope past the pin by more than `LOAD_SCALE_TOLERANCE`
+percent (25) fails. A build that starts holding a buffer per idle connection
+again moves the slope by tens of kilobytes; a build that grows faster than
+linearly passes the pin at 10k only by holding less than the pin below it.
+The pins are achieved values, not the targets in #169 section 4, and the
+projection is a number the release notes carry, not a gate.
+
+QUIC connections live in secret tables, and a secret table wipes a chunk
+whole when it welds it, so every slot of the newest chunk is resident from the
+moment the chunk exists. The QUIC counts are therefore rounded to the nearest
+count at which every chunk is full (1008 and 8176 for 1000 and 10000), so the
+slope is the cost of one welded slot rather than of wherever the count fell
+in the top chunk, and the 100k projection pays for the 131056 slots 100k
+connections need.
+
+What the process gives back after the connections leave is printed and not
+asserted: the record tables release their trailing chunks, and what the
+allocator then returns to the kernel is the allocator's business.
+
+### The measured run for 0.7.0
+
+`dev` for 0.7.0, release build, linux-x86_64, 16 cores, loopback, 1000 to
+10000 connections, transparent huge pages off:
+
+| transport | bytes per idle connection | halves (1000..5500, 5500..10000) | resident at 10000 | projected at 100k |
+| --- | ---: | ---: | ---: | ---: |
+| TCP, HTTP/1.1 keep-alive after one request | 13,956 | 13,888 / 14,024 | 139 MiB | 1,336 MiB |
+| TLS, HTTP/1.1 keep-alive after one request | 29,591 | 28,481 / 30,700 | 282 MiB | 2,821 MiB |
+| QUIC, handshake only (1008..8176, halves 1008..4080, 4080..8176) | 111,857 | 112,025 / 111,731 | 878 MiB at 8176 | 13,985 MiB for 131,056 slots |
+
+The records behind those numbers, from `$size_of` on the same build:
+`connection.Connection` 10,984 bytes, `listener.Connection` 280,
+`secure.Channel` 440, `quic_runtime.Connection` 10,520,
+`quic_runtime.ConnectionStorage` 13,544, `h3_session.Session` 22,944. The
+rest of a TLS connection is its session in `protocol/secure` and one TLS
+record chunk; the rest of a QUIC connection is mach-quic's per-connection
+assembly and crypto state and the pool chunks its handshake left welded.
+
+The lane ends with #220: two requests on one HTTP/3 connection, each throttled,
+must be served at the same time under the default budget (the slowest finishes
+within half again the fastest), and under a `connection_memory_bytes` that
+funds one request the same two are served one after the other, because hedge
+advertises only the concurrency its request lane funds.
+
+CI runs it on the light tier at `LOAD_SCALE_SMALL=200 LOAD_SCALE_LARGE=1000`,
+which is enough connections for the slopes to be measured and few enough to
+fit the runner.

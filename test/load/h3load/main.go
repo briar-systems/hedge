@@ -50,6 +50,8 @@ type options struct {
 	hold bool
 	// issue requests on every admitted connection
 	serve bool
+	// at most this many handshakes in flight at once, or zero for all of them
+	dialing int
 }
 
 type worker struct {
@@ -137,13 +139,22 @@ func run(o *options) int {
 	conns := make([]*quic.Conn, o.connections)
 	started := time.Now()
 
-	// every handshake is in flight at once, which is the load the pool has to
-	// grow under, and none is torn down until the verdict is in
+	// every handshake is in flight at once unless -dialing bounds them, which
+	// is the load the pool has to grow under, and none is torn down until the
+	// verdict is in
 	var dialing sync.WaitGroup
+	var inFlight chan struct{}
+	if o.dialing > 0 {
+		inFlight = make(chan struct{}, o.dialing)
+	}
 	for i := range workers {
 		dialing.Add(1)
 		go func(i int) {
 			defer dialing.Done()
+			if inFlight != nil {
+				inFlight <- struct{}{}
+				defer func() { <-inFlight }()
+			}
 			conn, err := dial(context.Background(), o)
 			if err != nil {
 				workers[i].fail("connect: %v", err)
@@ -301,6 +312,7 @@ func main() {
 	flag.DurationVar(&o.deadline, "deadline", 120*time.Second, "safety deadline for reaching the target")
 	flag.DurationVar(&o.idleTimeout, "idle-timeout", 60*time.Second, "QUIC idle timeout")
 	flag.BoolVar(&o.serve, "serve", true, "issue requests on every admitted connection")
+	flag.IntVar(&o.dialing, "dialing", 0, "handshakes in flight at once, or zero for all of them")
 	flag.BoolVar(&o.hold, "hold", false, "after a passing run, print `held N` and keep the connections open until stdin closes")
 	flag.IntVar(&o.expectConnected, "expect-connected", -1, "exact number of connections the server must admit, the rest refused")
 	flag.Parse()

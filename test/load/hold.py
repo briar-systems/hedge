@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hold served HTTP/1.1 connections open until told to let go.
+"""Hold served HTTP/1.1 connections open until told to let go, over TCP or TLS.
 
 Opens `--connections` connections, completes one request on each, and prints
 `held N` where N is how many were served. It then keeps every connection open
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import ssl
 import sys
 
 
@@ -21,12 +22,23 @@ def main() -> int:
     parser.add_argument("--path", default="/body")
     parser.add_argument("--connections", type=int, required=True)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--tls", action="store_true")
     args = parser.parse_args()
+
+    context = None
+    if args.tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
 
     held = []
     for _ in range(args.connections):
-        connection = http.client.HTTPConnection(args.host, args.port,
-                                                timeout=args.timeout)
+        if context is not None:
+            connection = http.client.HTTPSConnection(
+                args.host, args.port, timeout=args.timeout, context=context)
+        else:
+            connection = http.client.HTTPConnection(args.host, args.port,
+                                                    timeout=args.timeout)
         try:
             connection.request("GET", args.path,
                                headers={"Accept-Encoding": "identity"})

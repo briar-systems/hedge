@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- `test/load/scale.sh` measures what an idle connection costs on the release binary (#214). For each transport it holds 1000, then 5500, then 10000 connections idle, reads the process's resident set at each step with transparent huge pages disabled, and reports bytes per connection, the two halves of that slope, the address space and mapping count, and the projection to 100k connections. The slope is pinned per transport at the value achieved for this release and a build past the pin by more than 25% fails; CI runs the lane at 200 to 1000 connections. On `dev` for 0.7.0 (linux-x86_64, release build): 13,956 bytes per idle TCP connection, 29,591 per idle TLS connection, both HTTP/1.1 keep-alive after one served request, and 111,857 per handshake-only QUIC connection, each linear across the span, projecting to 1.3 GiB, 2.8 GiB and 13.7 GiB at 100k. The QUIC figure is per welded slot: a secret table wipes a chunk whole when it welds it, so the QUIC counts are taken where every chunk is full and the projection pays for the 131,056 slots 100k connections need.
+- The lane ends with an end-to-end HTTP/3 concurrency check (#220): two throttled requests on one QUIC connection are served at the same time under the default budget, and one after the other under a `connection_memory_bytes` that funds a single request, because hedge advertises only the concurrency its request lane funds.
+- `test/load/h3load` holds idle QUIC connections for the scale lane and takes `-dialing N` to bound the handshakes in flight (#214). Its served cells stay out of the lane while #231 stands.
+- `test/load/lib.sh` carries what the load lanes share: the generated configuration and credentials, the holders and the HTTP/3 curl (#214). `hold.py` holds TLS connections with `--tls`.
+
+### Known issues
+
+- Past a few hundred concurrent HTTP/3 connections a third of the responses never arrive (#231). Present in 0.6.0 as well. The 1100-connection cell in `test/load/run.sh` cannot pass and CI skips its served assertion.
+- A burst of several thousand QUIC handshakes at once loses some to their handshake timeout (#232); at 64 in flight all 10000 complete.
+
 ## [0.6.0] - 2026-09-18
 
 ### Security
