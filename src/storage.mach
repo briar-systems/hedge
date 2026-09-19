@@ -174,14 +174,14 @@ fun chunk_of(index: usize) usize {
     ret chunk;
 }
 
-# the record-table index allocator, shared by Table[T] and SecretTable[T].
+# the record-table index allocator, generic over its one or two typed storages.
 #
-# one index space [0, capacity) is drawn on by up to MAX_STORAGES storages that
-# grow and compact in lockstep (the paired channel/session tables are two storages
-# on one slab). chunk k holds FIRST_CHUNK << k slots. the slab owns a per-chunk
-# free stack in its own `links` storage, a per-chunk live count, and the lowest
-# non-full chunk, so a claim pops the lowest free index in O(1) amortized and
-# O(TABLE_CHUNKS) worst, never an O(capacity) scan.
+# one index space [0, capacity) is drawn on by the storages, which grow and compact
+# in lockstep (the paired channel/session tables are two storages on one slab).
+# chunk k holds FIRST_CHUNK << k slots. the slab owns a per-chunk free stack in its
+# own `links` storage, a per-chunk live count, and the lowest non-full chunk, so a
+# claim pops the lowest free index in O(1) amortized and O(TABLE_CHUNKS) worst,
+# never an O(capacity) scan.
 #
 # releasing the last live record of the trailing chunk releases that chunk and
 # cascades, so chunks [0, count) stay a dense prefix and a record never moves --
@@ -190,22 +190,34 @@ fun chunk_of(index: usize) usize {
 # allocation drives down as high slots churn out, converging to proportional to the
 # live count; a record pinned at a high index holds its chunk until it releases,
 # the correct cost of never moving a record.
-pub val MAX_STORAGES: usize = 2;
+#
+# each storage is a TYPED context and typed grow/release hooks, never erased to a
+# `ptr`: a slab over a secret table is itself welded, so it never aliases secret
+# storage to a public pointer (which the language forbids). a single-storage table
+# uses Unit as its second storage with no-op hooks; the arity is the type, so a
+# consumer that needs a third storage declares a wider slab rather than widening
+# this one.
+rec Unit {}
 
-# a typed storage the slab drives. grow(ctx, k) adds chunk k (allocating or reusing
-# a cached chunk); release(ctx, k) frees the trailing chunk k (a plain dealloc, or
-# zeroize and unweld for secret storage). ctx is the owning table, fixed for the
-# slab's life -- a table must not be relocated after slab_storage.
-pub rec Storage {
-    ctx:     ptr;
-    grow:    fun(ptr, usize) bool;
-    release: fun(ptr, usize) bool;
+fun unit_grow(unit: *Unit, k: usize) bool {
+    ret true;
 }
 
-pub rec Slab {
+fun unit_release(unit: *Unit, k: usize) bool {
+    ret true;
+}
+
+# a shared, stateless stand-in for an absent second storage
+var absent_storage: Unit;
+
+pub rec Slab[S1, S2] {
     allocator:         *A.Allocator;
-    storages:          [MAX_STORAGES]Storage;
-    storage_count:     usize;
+    s1:                *S1;
+    grow1:             fun(*S1, usize) bool;
+    release1:          fun(*S1, usize) bool;
+    s2:                *S2;
+    grow2:             fun(*S2, usize) bool;
+    release2:          fun(*S2, usize) bool;
     links:             [TABLE_CHUNKS]*usize;
     links_cache:       *usize;
     links_cache_class: usize;
@@ -217,10 +229,19 @@ pub rec Slab {
     lowest_free:       usize;
 }
 
-pub fun slab_make(slab: *Slab, a: *A.Allocator) bool {
-    if (slab == nil || a == nil) { ret false; }
+# wire two storages onto a slab; both grow and compact in lockstep
+pub fun slab_make_paired[S1, S2](slab: *Slab[S1, S2], a: *A.Allocator,
+    s1: *S1, grow1: fun(*S1, usize) bool, release1: fun(*S1, usize) bool,
+    s2: *S2, grow2: fun(*S2, usize) bool, release2: fun(*S2, usize) bool) bool {
+    if (slab == nil || a == nil || s1 == nil || s2 == nil || grow1 == nil
+        || release1 == nil || grow2 == nil || release2 == nil) { ret false; }
     slab.allocator         = a;
-    slab.storage_count     = 0;
+    slab.s1                = s1;
+    slab.grow1             = grow1;
+    slab.release1          = release1;
+    slab.s2                = s2;
+    slab.grow2             = grow2;
+    slab.release2          = release2;
     slab.links_cache       = nil;
     slab.links_cache_class = TABLE_CHUNKS;
     slab.count             = 0;
@@ -237,18 +258,15 @@ pub fun slab_make(slab: *Slab, a: *A.Allocator) bool {
     ret true;
 }
 
-# register a storage before the first claim
-pub fun slab_storage(slab: *Slab, ctx: ptr, grow: fun(ptr, usize) bool,
-    release: fun(ptr, usize) bool) bool {
-    if (slab == nil || slab.storage_count == MAX_STORAGES || slab.count != 0
-        || grow == nil || release == nil) { ret false; }
-    slab.storages[slab.storage_count] = Storage{ctx: ctx, grow: grow, release: release};
-    slab.storage_count                = slab.storage_count + 1;
-    ret true;
+# wire a single storage onto a slab; the second storage is the shared no-op Unit
+pub fun slab_make[S1](slab: *Slab[S1, Unit], a: *A.Allocator, s1: *S1,
+    grow1: fun(*S1, usize) bool, release1: fun(*S1, usize) bool) bool {
+    ret slab_make_paired[S1, Unit](slab, a, s1, grow1, release1,
+        ?absent_storage, unit_grow, unit_release);
 }
 
 # keep exactly one cached link chunk, the one closest to the regrow boundary
-fun cache_links(slab: *Slab, chunk: *usize, class: usize) {
+fun cache_links[S1, S2](slab: *Slab[S1, S2], chunk: *usize, class: usize) {
     if (slab.links_cache == nil) {
         slab.links_cache       = chunk;
         slab.links_cache_class = class;
@@ -263,8 +281,8 @@ fun cache_links(slab: *Slab, chunk: *usize, class: usize) {
     A.deallocate[usize](slab.allocator, chunk, chunk_size(class));
 }
 
-# add the next chunk to every storage and the slab's own link stack, in lockstep
-fun slab_grow(slab: *Slab) bool {
+# add the next chunk to both storages and the slab's own link stack, in lockstep
+fun slab_grow[S1, S2](slab: *Slab[S1, S2]) bool {
     if (slab.count == TABLE_CHUNKS) { ret false; }
     val k:    usize  = slab.count;
     val size: usize  = chunk_size(k);
@@ -279,18 +297,14 @@ fun slab_grow(slab: *Slab) bool {
         if (sel got.err) { ret false; }
         link = got.ok;
     }
-    var i: usize = 0;
-    for (i < slab.storage_count) {
-        if (!slab.storages[i].grow(slab.storages[i].ctx, k)) {
-            var j: usize = 0;
-            for (j < i) {
-                slab.storages[j].release(slab.storages[j].ctx, k);
-                j = j + 1;
-            }
-            cache_links(slab, link, k);
-            ret false;
-        }
-        i = i + 1;
+    if (!slab.grow1(slab.s1, k)) {
+        cache_links[S1, S2](slab, link, k);
+        ret false;
+    }
+    if (!slab.grow2(slab.s2, k)) {
+        slab.release1(slab.s1, k);
+        cache_links[S1, S2](slab, link, k);
+        ret false;
     }
     slab.links[k] = link;
     val base: usize = chunk_start(k);
@@ -307,15 +321,15 @@ fun slab_grow(slab: *Slab) bool {
     ret true;
 }
 
-# claim the lowest free index, growing all storages when the space is full.
+# claim the lowest free index, growing both storages when the space is full.
 # NO_INDEX only when a storage or a link allocation refuses.
-pub fun slab_claim(slab: *Slab) usize {
+pub fun slab_claim[S1, S2](slab: *Slab[S1, S2]) usize {
     if (slab == nil) { ret NO_INDEX; }
     for (slab.lowest_free < slab.count && slab.free_head[slab.lowest_free] == NO_INDEX) {
         slab.lowest_free = slab.lowest_free + 1;
     }
     if (slab.lowest_free == slab.count) {
-        if (!slab_grow(slab)) { ret NO_INDEX; }
+        if (!slab_grow[S1, S2](slab)) { ret NO_INDEX; }
         slab.lowest_free = slab.count - 1;
     }
     val k:     usize = slab.lowest_free;
@@ -326,14 +340,11 @@ pub fun slab_claim(slab: *Slab) usize {
     ret index;
 }
 
-fun release_trailing(slab: *Slab) {
+fun release_trailing[S1, S2](slab: *Slab[S1, S2]) {
     val k: usize = slab.count - 1;
-    var i: usize = 0;
-    for (i < slab.storage_count) {
-        slab.storages[i].release(slab.storages[i].ctx, k);
-        i = i + 1;
-    }
-    cache_links(slab, slab.links[k], k);
+    slab.release1(slab.s1, k);
+    slab.release2(slab.s2, k);
+    cache_links[S1, S2](slab, slab.links[k], k);
     slab.links[k]      = nil;
     slab.free_head[k]  = NO_INDEX;
     slab.chunk_live[k] = 0;
@@ -342,7 +353,7 @@ fun release_trailing(slab: *Slab) {
 }
 
 # return an index to its chunk's free stack, releasing trailing all-free chunks
-pub fun slab_release(slab: *Slab, index: usize) bool {
+pub fun slab_release[S1, S2](slab: *Slab[S1, S2], index: usize) bool {
     if (slab == nil || index >= slab.capacity) { ret false; }
     val k: usize = chunk_of(index);
     if (slab.chunk_live[k] == 0) { ret false; }
@@ -353,7 +364,7 @@ pub fun slab_release(slab: *Slab, index: usize) bool {
     if (k < slab.lowest_free) { slab.lowest_free = k; }
     if (slab.chunk_live[k] == 0 && k == slab.count - 1) {
         for (slab.count > 0 && slab.chunk_live[slab.count - 1] == 0) {
-            release_trailing(slab);
+            release_trailing[S1, S2](slab);
         }
         if (slab.lowest_free > slab.count) { slab.lowest_free = slab.count; }
     }
@@ -361,7 +372,7 @@ pub fun slab_release(slab: *Slab, index: usize) bool {
 }
 
 # free the slab's own link storage and cache; storages free their own chunks
-pub fun slab_destroy(slab: *Slab) bool {
+pub fun slab_destroy[S1, S2](slab: *Slab[S1, S2]) bool {
     if (slab == nil) { ret false; }
     var ok: bool  = true;
     var i:  usize = 0;
@@ -391,9 +402,13 @@ pub fun slab_destroy(slab: *Slab) bool {
 # an index-addressed table of records, one storage on a Slab. records never move;
 # the table commits a record chunk when the slab grows the index space and releases
 # it (to a one-deep cache, then the allocator) when the slab compacts a trailing
-# all-free chunk, so it holds chunks proportional to the highest live index.
+# all-free chunk, so it holds chunks proportional to the highest live index. it
+# carries its own allocator so its grow hook is correct whether it drives its
+# embedded slab (standalone) or a shared slab another owner drives (the paired
+# secure channel table).
 pub rec Table[T] {
-    slab:        Slab;
+    slab:        Slab[Table[T], Unit];
+    allocator:   *A.Allocator;
     chunks:      [TABLE_CHUNKS]*T;
     cache:       *T;
     cache_class: usize;
@@ -401,16 +416,15 @@ pub rec Table[T] {
 
 # the slab's grow hook: commit record chunk k, reusing the cache when it fits.
 # zeroed, because a fresh record must read as unused
-fun table_grow_hook[T](ctx: ptr, k: usize) bool {
-    val table: *Table[T] = ctx::*Table[T];
-    var chunk: *T        = nil;
+fun table_grow_hook[T](table: *Table[T], k: usize) bool {
+    var chunk: *T = nil;
     if (table.cache != nil && table.cache_class == k) {
         chunk             = table.cache;
         table.cache       = nil;
         table.cache_class = TABLE_CHUNKS;
     }
     or {
-        val allocated: res[*T, A.Error] = A.zallocate[T](table.slab.allocator, chunk_size(k));
+        val allocated: res[*T, A.Error] = A.zallocate[T](table.allocator, chunk_size(k));
         if (sel allocated.err) { ret false; }
         chunk = allocated.ok;
     }
@@ -419,26 +433,28 @@ fun table_grow_hook[T](ctx: ptr, k: usize) bool {
 }
 
 # the slab's release hook: keep the lowest released chunk cached, free the rest
-fun table_release_hook[T](ctx: ptr, k: usize) bool {
-    val table: *Table[T] = ctx::*Table[T];
+fun table_release_hook[T](table: *Table[T], k: usize) bool {
     if (table.cache == nil) {
         table.cache       = table.chunks[k];
         table.cache_class = k;
     }
     or (k < table.cache_class) {
-        A.deallocate[T](table.slab.allocator, table.cache, chunk_size(table.cache_class));
+        A.deallocate[T](table.allocator, table.cache, chunk_size(table.cache_class));
         table.cache       = table.chunks[k];
         table.cache_class = k;
     }
     or {
-        A.deallocate[T](table.slab.allocator, table.chunks[k], chunk_size(k));
+        A.deallocate[T](table.allocator, table.chunks[k], chunk_size(k));
     }
     table.chunks[k] = nil;
     ret true;
 }
 
-pub fun make_table[T](table: *Table[T], a: *A.Allocator) bool {
+# init the record chunks and allocator without wiring a slab, for a table that
+# will be a storage on a shared slab another owner drives
+pub fun init_table[T](table: *Table[T], a: *A.Allocator) bool {
     if (table == nil || a == nil) { ret false; }
+    table.allocator = a;
     var i: usize = 0;
     for (i < TABLE_CHUNKS) {
         table.chunks[i] = nil;
@@ -446,8 +462,13 @@ pub fun make_table[T](table: *Table[T], a: *A.Allocator) bool {
     }
     table.cache       = nil;
     table.cache_class = TABLE_CHUNKS;
-    if (!slab_make(?table.slab, a)) { ret false; }
-    ret slab_storage(?table.slab, table::ptr, table_grow_hook[T], table_release_hook[T]);
+    ret true;
+}
+
+pub fun make_table[T](table: *Table[T], a: *A.Allocator) bool {
+    if (!init_table[T](table, a)) { ret false; }
+    ret slab_make[Table[T]](?table.slab, a, table, table_grow_hook[T],
+        table_release_hook[T]);
 }
 
 pub fun table_capacity[T](table: *Table[T]) usize {
@@ -455,7 +476,7 @@ pub fun table_capacity[T](table: *Table[T]) usize {
     ret table.slab.capacity;
 }
 
-pub fun table_count[T](table: *Table[T]) usize {
+pub fun table_chunks[T](table: *Table[T]) usize {
     if (table == nil) { ret 0; }
     ret table.slab.count;
 }
@@ -469,35 +490,45 @@ pub fun table_live[T](table: *Table[T]) usize {
 # NO_INDEX only when the allocator refuses
 pub fun table_claim[T](table: *Table[T]) usize {
     if (table == nil) { ret NO_INDEX; }
-    ret slab_claim(?table.slab);
+    ret slab_claim[Table[T], Unit](?table.slab);
 }
 
 # release a claimed index, compacting trailing all-free chunks
 pub fun table_release[T](table: *Table[T], index: usize) bool {
     if (table == nil) { ret false; }
-    ret slab_release(?table.slab, index);
+    ret slab_release[Table[T], Unit](?table.slab, index);
 }
 
 # adds the next chunk without claiming an index (the pre-slab claim path still
 # used by consumers not yet migrated to table_claim)
 pub fun grow_table[T](table: *Table[T]) bool {
     if (table == nil) { ret false; }
-    ret slab_grow(?table.slab);
+    ret slab_grow[Table[T], Unit](?table.slab);
 }
 
-pub fun table_at[T](table: *Table[T], index: usize) *T {
-    if (table == nil || index >= table.slab.capacity) { ret nil; }
+# a record by index, bounded by an explicit capacity so a table sharing a slab it
+# does not own reads the owner's capacity rather than its unused embedded slab
+pub fun table_record[T](table: *Table[T], index: usize, capacity: usize) *T {
+    if (table == nil || index >= capacity) { ret nil; }
     val chunk: usize = chunk_of(index);
+    if (table.chunks[chunk] == nil) { ret nil; }
     ret ?table.chunks[chunk][index - chunk_start(chunk)];
 }
 
-pub fun destroy_table[T](table: *Table[T]) bool {
+pub fun table_at[T](table: *Table[T], index: usize) *T {
+    if (table == nil) { ret nil; }
+    ret table_record[T](table, index, table.slab.capacity);
+}
+
+# free every record chunk and the cache; leaves the slab alone, so a shared-slab
+# owner can free the records without touching a slab it does not own
+pub fun free_table_chunks[T](table: *Table[T]) bool {
     if (table == nil) { ret false; }
     var ok: bool  = true;
     var i:  usize = 0;
-    for (i < table.slab.count) {
+    for (i < TABLE_CHUNKS) {
         if (table.chunks[i] != nil) {
-            val returned: err[A.Error] = A.deallocate[T](table.slab.allocator,
+            val returned: err[A.Error] = A.deallocate[T](table.allocator,
                 table.chunks[i], chunk_size(i));
             if (sel returned.err) { ok = false; }
             table.chunks[i] = nil;
@@ -505,25 +536,56 @@ pub fun destroy_table[T](table: *Table[T]) bool {
         i = i + 1;
     }
     if (table.cache != nil) {
-        val returned: err[A.Error] = A.deallocate[T](table.slab.allocator, table.cache,
+        val returned: err[A.Error] = A.deallocate[T](table.allocator, table.cache,
             chunk_size(table.cache_class));
         if (sel returned.err) { ok = false; }
         table.cache       = nil;
         table.cache_class = TABLE_CHUNKS;
     }
-    if (!slab_destroy(?table.slab)) { ok = false; }
     ret ok;
 }
 
-# the same shape for secret-welded records, which only crypto.secret may allocate
-pub rec SecretTable[T] {
-    allocator: secret.ArrayAllocator[T];
-    chunks:    [TABLE_CHUNKS]secret.SecretArray[T];
-    count:     usize;
-    capacity:  usize;
+pub fun destroy_table[T](table: *Table[T]) bool {
+    if (table == nil) { ret false; }
+    var ok: bool = free_table_chunks[T](table);
+    if (!slab_destroy[Table[T], Unit](?table.slab)) { ok = false; }
+    ret ok;
 }
 
-pub fun make_secret_table[T](table: *SecretTable[T]) bool {
+# the same shape for secret-welded records, which only crypto.secret may allocate,
+# one storage on a Slab. records never move; a chunk is welded on grow and zeroized
+# and unwelded on release, so a secret table holds welded memory proportional to
+# its highest live index and converges under churn. a standalone table drives its
+# embedded slab; the paired secure session table is a second storage on the channel
+# table's slab (see make_paired). the storage context is the TYPED *SecretTable[T],
+# never erased to a `ptr`, so the slab over it is itself welded -- no public alias
+# to secret storage is ever formed. T is a plain record: its secrecy is the welded,
+# wiped-on-release memory, not type-level `^` fields.
+pub rec SecretTable[T] {
+    slab:      Slab[SecretTable[T], Unit];
+    allocator: secret.ArrayAllocator[T];
+    chunks:    [TABLE_CHUNKS]secret.SecretArray[T];
+}
+
+# the slab's grow hook for secret storage: weld record chunk k. a chunk a prior
+# release wiped but could not free is wiped and freed again before re-welding
+fun secret_grow_hook[T](table: *SecretTable[T], k: usize) bool {
+    if (secret.array_cleanup_pending[T](?table.chunks[k])
+        && secret.destroy_array[T](?table.chunks[k]) != contracts.OK) { ret false; }
+    ret secret.init_array[T](?table.chunks[k], ?table.allocator,
+        chunk_size(k)) == contracts.OK;
+}
+
+# the slab's release hook for secret storage: zeroize and unweld chunk k per
+# crypto.secret, never a plain dealloc. a chunk that cannot be freed is left wiped
+# (its bytes are gone) for a later grow or destroy to reclaim
+fun secret_release_hook[T](table: *SecretTable[T], k: usize) bool {
+    ret secret.destroy_array[T](?table.chunks[k]) == contracts.OK;
+}
+
+# init the welded chunks and the crypto.secret allocator without wiring a slab, for
+# a secret table that will be a storage on a shared slab another owner drives
+pub fun init_secret_table[T](table: *SecretTable[T]) bool {
     if (table == nil) { ret false; }
     table.allocator = secret.system_array_allocator[T]();
     var i: usize = 0;
@@ -531,49 +593,117 @@ pub fun make_secret_table[T](table: *SecretTable[T]) bool {
         table.chunks[i] = secret.empty_array[T]();
         i               = i + 1;
     }
-    table.count    = 0;
-    table.capacity = 0;
     ret true;
 }
 
-pub fun grow_secret_table[T](table: *SecretTable[T]) bool {
-    if (table == nil || table.count == TABLE_CHUNKS) { ret false; }
-    if (secret.init_array[T](?table.chunks[table.count], ?table.allocator,
-        chunk_size(table.count)) != contracts.OK) { ret false; }
-    table.capacity = table.capacity + chunk_size(table.count);
-    table.count    = table.count + 1;
-    ret true;
+# a standalone secret table drives its own index space. it takes a plain allocator
+# for the slab's link storage; the welded records use crypto.secret's own allocator
+pub fun make_secret_table[T](table: *SecretTable[T], a: *A.Allocator) bool {
+    if (table == nil || a == nil) { ret false; }
+    init_secret_table[T](table);
+    ret slab_make[SecretTable[T]](?table.slab, a, table, secret_grow_hook[T],
+        secret_release_hook[T]);
 }
 
-pub fun secret_table_at[T](table: *SecretTable[T], index: usize) *T {
-    if (table == nil || index >= table.capacity) { ret nil; }
+pub fun secret_table_capacity[T](table: *SecretTable[T]) usize {
+    if (table == nil) { ret 0; }
+    ret table.slab.capacity;
+}
+
+# claim the lowest free index, growing the index space; NO_INDEX only when a
+# storage or a link allocation refuses
+pub fun secret_table_claim[T](table: *SecretTable[T]) usize {
+    if (table == nil) { ret NO_INDEX; }
+    ret slab_claim[SecretTable[T], Unit](?table.slab);
+}
+
+pub fun secret_table_release[T](table: *SecretTable[T], index: usize) bool {
+    if (table == nil) { ret false; }
+    ret slab_release[SecretTable[T], Unit](?table.slab, index);
+}
+
+# a record by index, bounded by an explicit capacity so a session table sharing the
+# channel table's slab reads that slab's capacity, not its unused embedded slab
+pub fun secret_record[T](table: *SecretTable[T], index: usize, capacity: usize) *T {
+    if (table == nil || index >= capacity) { ret nil; }
     val chunk: usize = chunk_of(index);
     val data:  *T    = secret.array_data[T](?table.chunks[chunk]);
     if (data == nil) { ret nil; }
     ret ?data[index - chunk_start(chunk)];
 }
 
-# a chunk that fails to destroy stays owned, so a later call retries it rather
-# than abandoning wiped secret memory
+pub fun secret_table_at[T](table: *SecretTable[T], index: usize) *T {
+    if (table == nil) { ret nil; }
+    ret secret_record[T](table, index, table.slab.capacity);
+}
+
+# unweld every chunk this storage holds. a chunk that fails to destroy stays owned
+# so a later call retries it rather than abandoning wiped secret memory. leaves the
+# slab alone, so a shared-slab owner frees the records without touching a slab it
+# does not own
+pub fun free_secret_chunks[T](table: *SecretTable[T]) bool {
+    if (table == nil) { ret false; }
+    var ok: bool  = true;
+    var i:  usize = 0;
+    for (i < TABLE_CHUNKS) {
+        if (secret.destroy_array[T](?table.chunks[i]) != contracts.OK) { ok = false; }
+        i = i + 1;
+    }
+    ret ok;
+}
+
 pub fun destroy_secret_table[T](table: *SecretTable[T]) bool {
     if (table == nil) { ret false; }
-    for (table.count > 0) {
-        val last: usize = table.count - 1;
-        if (secret.destroy_array[T](?table.chunks[last]) != contracts.OK) { ret false; }
-        table.count    = last;
-        table.capacity = table.capacity - chunk_size(last);
-    }
-    ret true;
+    var ok: bool = free_secret_chunks[T](table);
+    if (!slab_destroy[SecretTable[T], Unit](?table.slab)) { ok = false; }
+    ret ok;
 }
 
 pub fun secret_table_cleanup_pending[T](table: *SecretTable[T]) bool {
     if (table == nil) { ret false; }
     var i: usize = 0;
-    for (i < table.count) {
+    for (i < TABLE_CHUNKS) {
         if (secret.array_cleanup_pending[T](?table.chunks[i])) { ret true; }
         i = i + 1;
     }
     ret false;
+}
+
+# --- paired storages: a plain table and a secret table on one shared slab ---
+#
+# the channel/session pair in secure. both draw on one index space and grow and
+# compact in lockstep, so channel index i and session index i are always both live
+# or both free. the slab lives with the caller (a module in secure); the two tables
+# are its storages and hold only their record chunks.
+pub fun make_paired[T1, T2](slab: *Slab[Table[T1], SecretTable[T2]],
+    channels: *Table[T1], sessions: *SecretTable[T2], a: *A.Allocator) bool {
+    if (slab == nil || channels == nil || sessions == nil || a == nil)    { ret false; }
+    if (!init_table[T1](channels, a) || !init_secret_table[T2](sessions)) { ret false; }
+    ret slab_make_paired[Table[T1], SecretTable[T2]](slab, a,
+        channels, table_grow_hook[T1], table_release_hook[T1],
+        sessions, secret_grow_hook[T2], secret_release_hook[T2]);
+}
+
+# free both tables' record chunks and the shared slab
+pub fun destroy_paired[T1, T2](slab: *Slab[Table[T1], SecretTable[T2]],
+    channels: *Table[T1], sessions: *SecretTable[T2]) bool {
+    var ok: bool = true;
+    if (!free_table_chunks[T1](channels))                { ok = false; }
+    if (!free_secret_chunks[T2](sessions))               { ok = false; }
+    if (!slab_destroy[Table[T1], SecretTable[T2]](slab)) { ok = false; }
+    ret ok;
+}
+
+# claim one shared index across both storages
+pub fun paired_claim[T1, T2](slab: *Slab[Table[T1], SecretTable[T2]]) usize {
+    if (slab == nil) { ret NO_INDEX; }
+    ret slab_claim[Table[T1], SecretTable[T2]](slab);
+}
+
+pub fun paired_release[T1, T2](slab: *Slab[Table[T1], SecretTable[T2]],
+    index: usize) bool {
+    if (slab == nil) { ret false; }
+    ret slab_release[Table[T1], SecretTable[T2]](slab, index);
 }
 
 rec Probe {
@@ -634,21 +764,45 @@ test "storage: a table grows by chunks and never moves a record" {
     ret 0;
 }
 
+# a secret record is a plain record held in welded, wiped-on-release memory; its
+# secrecy is the memory, not type-level `^` fields (which the ctx round-trip
+# through the slab cannot carry, and which no secret record in the tree uses)
 rec SecretProbe {
-    key:   [8]^u8;
+    key:   [8]u8;
     index: usize;
 }
 
-test "storage: a secret table grows without exposing its records" {
+test "storage: a secret table claims, holds live records still, and compacts" {
+    var a: A.Allocator;
+    page.make(?a);
     var table: SecretTable[SecretProbe];
-    if (!make_secret_table[SecretProbe](?table))                                            { ret 1; }
-    if (!grow_secret_table[SecretProbe](?table) || !grow_secret_table[SecretProbe](?table)) { ret 2; }
-    val record: *SecretProbe = secret_table_at[SecretProbe](?table, FIRST_CHUNK + 1);
-    if (record == nil || record.index != 0) { ret 3; }
-    record.index  = 5;
-    record.key[0] = 9;
-    if (secret_table_at[SecretProbe](?table, FIRST_CHUNK * 3) != nil) { ret 4; }
-    if (!destroy_secret_table[SecretProbe](?table))                   { ret 5; }
+    if (!make_secret_table[SecretProbe](?table, ?a)
+        || secret_table_capacity[SecretProbe](?table) != 0
+        || secret_table_at[SecretProbe](?table, 0) != nil) { ret 1; }
+    # every claim welds on demand and hands back the lowest free index
+    var i: usize = 0;
+    for (i < 60) {
+        if (secret_table_claim[SecretProbe](?table) != i) { ret 2; }
+        i = i + 1;
+    }
+    if (secret_table_capacity[SecretProbe](?table) < 60) { ret 3; }
+    val anchor: *SecretProbe = secret_table_at[SecretProbe](?table, 0);
+    if (anchor == nil || anchor.index != 0) { ret 4; }
+    anchor.index  = 7;
+    anchor.key[0] = 9;
+    # releasing every trailing index recedes whole welded chunks; index 0 stays
+    # live and pins its own chunk, so its record never moves
+    i = 60;
+    for (i > 1) {
+        i = i - 1;
+        if (!secret_table_release[SecretProbe](?table, i)) { ret 5; }
+    }
+    if (secret_table_at[SecretProbe](?table, 0) != anchor || anchor.index != 7
+        || secret_table_capacity[SecretProbe](?table) != FIRST_CHUNK) { ret 6; }
+    if (!secret_table_release[SecretProbe](?table, 0)
+        || secret_table_capacity[SecretProbe](?table) != 0
+        || secret_table_at[SecretProbe](?table, 0) != nil) { ret 7; }
+    if (!destroy_secret_table[SecretProbe](?table)) { ret 8; }
     ret 0;
 }
 
@@ -691,7 +845,7 @@ test "storage: a table releases trailing chunks as records recede" {
         i          = i + 1;
     }
     if (table_live[Probe](?table) != 2000) { ret 3; }
-    val full_count: usize = table_count[Probe](?table);
+    val full_count: usize = table_chunks[Probe](?table);
     if (full_count < 7) { ret 4; }
     # a low, still-live record and its content must survive the recede
     val kept: *Probe = table_at[Probe](?table, claimed[100]);
@@ -705,8 +859,8 @@ test "storage: a table releases trailing chunks as records recede" {
     }
     if (table_live[Probe](?table) != 200) { ret 7; }
     # the table now holds chunks proportional to 200 live, not 2000
-    if (table_count[Probe](?table) >= full_count) { ret 8; }
-    if (table_count[Probe](?table) != 4)          { ret 9; }
+    if (table_chunks[Probe](?table) >= full_count) { ret 8; }
+    if (table_chunks[Probe](?table) != 4)          { ret 9; }
     # the surviving low record never moved and kept its content
     if (table_at[Probe](?table, claimed[100]) != kept || kept.value != 43981) { ret 10; }
     # claim back to 2000: no still-live pointer was invalidated by the recede
@@ -731,14 +885,14 @@ test "storage: a released index in a compacted-away chunk is never handed out" {
         if (table_claim[Probe](?table) == NO_INDEX) { ret 2; }
         i = i + 1;
     }
-    if (table_count[Probe](?table) != 2 || table_capacity[Probe](?table) != 48) { ret 3; }
+    if (table_chunks[Probe](?table) != 2 || table_capacity[Probe](?table) != 48) { ret 3; }
     # release all of chunk 1, which compacts it away
     i = 16;
     for (i < 48) {
         if (!table_release[Probe](?table, i)) { ret 4; }
         i = i + 1;
     }
-    if (table_count[Probe](?table) != 1 || table_capacity[Probe](?table) != 16) { ret 5; }
+    if (table_chunks[Probe](?table) != 1 || table_capacity[Probe](?table) != 16) { ret 5; }
     # an index in the gone chunk is out of range, not a live record
     if (table_at[Probe](?table, 20) != nil) { ret 6; }
     # claim a batch: every claim is valid and unique, never a dead index popped
@@ -773,7 +927,7 @@ test "storage: churn packs live records low and the table converges to live size
         live_n           = live_n + 1;
         i                = i + 1;
     }
-    val full_count: usize = table_count[Probe](?table);
+    val full_count: usize = table_chunks[Probe](?table);
     # release 1800 chosen pseudo-randomly, keeping 200 live
     var state: u64 = 19088743;
     for (live_n > 200) {
@@ -792,11 +946,11 @@ test "storage: churn packs live records low and the table converges to live size
         val idx: usize = table_claim[Probe](?table);
         if (idx == NO_INDEX) { ret 6; }
         live_idx[pick] = idx;
-        if (table_count[Probe](?table) <= 5) { brk; }
+        if (table_chunks[Probe](?table) <= 5) { brk; }
         cycles = cycles + 1;
     }
-    if (table_count[Probe](?table) > 5)           { ret 7; }
-    if (table_count[Probe](?table) >= full_count) { ret 8; }
+    if (table_chunks[Probe](?table) > 5)           { ret 7; }
+    if (table_chunks[Probe](?table) >= full_count) { ret 8; }
     i = 0;
     for (i < live_n) {
         table_release[Probe](?table, live_idx[i]);
