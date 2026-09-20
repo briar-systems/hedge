@@ -481,6 +481,11 @@ pub rec Connection {
     # the peer's share of the handshake bound, held with the record
     handshake_lease:      process_admission.Lease;
     handshake_lease_live: bool;
+    # when the handshake was promoted and when it must be done by, so a
+    # completion samples the wall time a handshake takes and an early end
+    # past the deadline is counted as an expiry
+    handshake_started_ns:  u64;
+    handshake_deadline_ns: u64;
     # datagrams held for delivery on the worker's handshake turn, in order
     held:          HeldQueue;
     charge:        admission.Charge;
@@ -623,7 +628,9 @@ pub rec Snapshot {
     handshakes_completed: u64;
     handshakes_dropped:   u64;
     handshakes_refused:   u64;
+    handshakes_expired:   u64;
     service_ns:           u64;
+    finish_ns:            u64;
     stopping:             bool;
     initialized:          bool;
 }
@@ -690,6 +697,11 @@ pub rec Runtime {
     # divide by. zero when no chain of samples is open
     service_ns:         u64;
     last_completion_ns: u64;
+    # the running estimate of the wall time a promoted handshake takes to
+    # reach established: its crypto plus the client's round trip. the
+    # promotion rule judges a record's remaining time by this, not by one
+    # crypto unit. zero until the first completion seeds it
+    finish_ns: u64;
     # the worker time spent turning arrivals away or sending them Retries: a
     # burst's front is thousands of these before its first handshake completes,
     # and they are the one transient the samples leave out, since the arrival
@@ -714,8 +726,11 @@ pub rec Runtime {
     handshakes_completed: u64;
     # dropped: turned away silently, the client's PTO retransmits. refused: told
     # so with a stateless close, once quic can send one
-    handshakes_dropped:    u64;
-    handshakes_refused:    u64;
+    handshakes_dropped: u64;
+    handshakes_refused: u64;
+    # promoted handshakes that ended on their own deadline: crypto spent,
+    # client told nothing. the promotion rule exists to keep this at zero
+    handshakes_expired:    u64;
     pump_count:            usize;
     next_source:           u64;
     connection_generation: u64;
@@ -827,17 +842,19 @@ fun pending_at(runtime: *Runtime, index: usize) *PendingInitial {
 # a free slot owns no connection storage. it is claimed when the slot is taken
 # and returned when the slot is freed, so an idle listener holds none of it.
 fun reset_connection(value: *Connection) {
-    value.live                 = false;
-    value.state                = CONNECTION_FREE;
-    value.storage              = nil;
-    value.next_live            = NO_CONNECTION;
-    value.prev_live            = NO_CONNECTION;
-    value.h3_session           = h3_session.NO_SESSION;
-    value.h3_deadline_ns       = 0;
-    value.memory_deadline_ns   = 0;
-    value.handshake            = NO_HANDSHAKE;
-    value.handshake_lease      = process_admission.no_lease();
-    value.handshake_lease_live = false;
+    value.live                  = false;
+    value.state                 = CONNECTION_FREE;
+    value.storage               = nil;
+    value.next_live             = NO_CONNECTION;
+    value.prev_live             = NO_CONNECTION;
+    value.h3_session            = h3_session.NO_SESSION;
+    value.h3_deadline_ns        = 0;
+    value.memory_deadline_ns    = 0;
+    value.handshake             = NO_HANDSHAKE;
+    value.handshake_lease       = process_admission.no_lease();
+    value.handshake_lease_live  = false;
+    value.handshake_started_ns  = 0;
+    value.handshake_deadline_ns = 0;
     reset_held(?value.held);
     value.ready_handshake      = false;
     value.scope_live           = false;
@@ -938,7 +955,14 @@ fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
     if (completed) {
         runtime.handshakes_completed = runtime.handshakes_completed + 1;
         observe_service(runtime, now_ns);
+        observe_finish(runtime, value.handshake_started_ns, now_ns);
     }
+    or (now_ns != 0 && value.handshake_deadline_ns != 0
+        && now_ns >= value.handshake_deadline_ns) {
+        runtime.handshakes_expired = runtime.handshakes_expired + 1;
+    }
+    value.handshake_started_ns  = 0;
+    value.handshake_deadline_ns = 0;
     if (value.handshake_lease_live) {
         if (!process_admission.release(?runtime.handshakes, value.handshake_lease)) {
             connection_failed(runtime);
@@ -997,19 +1021,28 @@ fun hold_deferred(runtime: *Runtime, pending: *PendingInitial) {
     runtime.handshakes_deferred = runtime.handshakes_deferred + 1;
 }
 
-# the worker time the handshakes ahead of one represent: every handshake in
-# flight and, for an arrival, every Initial already waiting, at the running
-# cost per handshake, plus its own
+# the wall time one handshake takes from promotion to established: the
+# measured finish once one has completed, its crypto unit alone before that
+fun own_ns(runtime: *Runtime) u64 {
+    if (runtime.finish_ns != 0) { ret runtime.finish_ns; }
+    ret runtime.service_ns;
+}
+
+# the time the handshakes ahead of one represent: every handshake in flight
+# and, for an arrival, every Initial already waiting, at the running worker
+# cost per handshake, plus the wall time its own takes to finish
 fun work_ahead_ns(runtime: *Runtime, waiting: usize) u64 {
-    val count: usize = waiting + runtime.handshakes_in_flight + 1;
+    val count: usize = waiting + runtime.handshakes_in_flight;
     if (count::u64 > 0xffffffffffffffff / runtime.service_ns) {
         ret 0xffffffffffffffff;
     }
-    ret count::u64 * runtime.service_ns;
+    ret saturated_add(count::u64 * runtime.service_ns, own_ns(runtime));
 }
 
 # whether an Initial that arrived at arrival_ns can still finish inside its
-# own handshake deadline once the work ahead of it is done
+# own handshake deadline once the work ahead of it is done. a record promoted
+# with less than a finish left would spend its crypto and expire, so it is
+# refused at its turn instead
 fun deadline_allows(runtime: *Runtime, arrival_ns: u64, handshake_timeout_ns: u64,
     now_ns: u64, waiting: usize) bool {
     ret saturated_add(now_ns, work_ahead_ns(runtime, waiting))
@@ -1107,6 +1140,24 @@ fun observe_service(runtime: *Runtime, now_ns: u64) {
     }
     runtime.last_completion_ns   = now_ns;
     runtime.arrival_work_mark_ns = runtime.arrival_work_ns;
+}
+
+# a promoted handshake reached established: the wall time from its promotion
+# is one sample of what a handshake takes to finish. the first seeds the
+# estimate, later ones move it by the same eighth and cap as the service
+# estimate, so one client mid-PTO is an outlier and a slower population gets
+# there in a few
+fun observe_finish(runtime: *Runtime, started_ns: u64, now_ns: u64) {
+    if (started_ns == 0 || now_ns <= started_ns) { ret; }
+    var sample: u64 = now_ns - started_ns;
+    if (runtime.finish_ns == 0) {
+        runtime.finish_ns = sample;
+        ret;
+    }
+    val cap: u64 = runtime.finish_ns * HANDSHAKE_SERVICE_SAMPLE_CAP;
+    if (cap > runtime.finish_ns && sample > cap) { sample = cap; }
+    runtime.finish_ns = runtime.finish_ns - runtime.finish_ns / 8 + sample / 8;
+    if (runtime.finish_ns == 0) { runtime.finish_ns = 1; }
 }
 
 # put the storage a taken slot is about to use into its empty state. a
@@ -1312,6 +1363,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.deferred_count        = 0;
     runtime.service_ns            = HANDSHAKE_SERVICE_SEED_NS;
     runtime.last_completion_ns    = 0;
+    runtime.finish_ns             = 0;
     runtime.arrival_work_ns       = 0;
     runtime.arrival_work_mark_ns  = 0;
     runtime.unit_ns               = HANDSHAKE_SERVICE_SEED_NS;
@@ -1326,6 +1378,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.handshakes_dropped    = 0;
     runtime.handshakes_refused    = 0;
     runtime.handshakes_completed  = 0;
+    runtime.handshakes_expired    = 0;
     runtime.pump_count            = 0;
     runtime.next_source           = 1;
     runtime.connection_generation = next_generation(runtime.connection_generation);
@@ -2588,9 +2641,11 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     config.drain_timeout       = config_snapshot.drain_timeout_ns::i64 * duration.NANOSECOND;
     # the deadline counts from arrival: time spent waiting for a slot was the
     # client's, and a wait that could not fit was refused before this
-    config.tls_deadline = opt[time.Instant].some{clock.from_ns(saturated_add(arrival_ns,
-        config_snapshot.handshake_timeout_ns))};
-    config.tls_budget = config_snapshot.memory_budgets.lanes[memory.LANE_TLS::usize];
+    value.handshake_started_ns  = now_ns;
+    value.handshake_deadline_ns = saturated_add(arrival_ns,
+        config_snapshot.handshake_timeout_ns);
+    config.tls_deadline = opt[time.Instant].some{clock.from_ns(value.handshake_deadline_ns)};
+    config.tls_budget   = config_snapshot.memory_budgets.lanes[memory.LANE_TLS::usize];
     # hedge composes its own lanes onto quic's supply: the lanes after quic's
     # three carry hedge's io and request budgets, and the account is opened and
     # woken under the connection's timer owner
@@ -4594,6 +4649,8 @@ pub fun admission_report(runtime: *Runtime) telemetry.HandshakeReport {
     value.completed        = runtime.handshakes_completed;
     value.dropped          = runtime.handshakes_dropped;
     value.refused          = runtime.handshakes_refused;
+    value.expired          = runtime.handshakes_expired;
+    value.finish_ns        = runtime.finish_ns;
     value.retries_dropped  = runtime.stateless_dropped;
     value.arrivals_dropped = runtime.arrivals_dropped;
     ret value;
@@ -4850,7 +4907,9 @@ pub fun snapshot(controls: *ControlView, runtime: *Runtime) Snapshot {
     value.handshakes_completed = runtime.handshakes_completed;
     value.handshakes_dropped   = runtime.handshakes_dropped;
     value.handshakes_refused   = runtime.handshakes_refused;
+    value.handshakes_expired   = runtime.handshakes_expired;
     value.service_ns           = runtime.service_ns;
+    value.finish_ns            = runtime.finish_ns;
     value.stopping             = runtime.stopping;
     value.initialized          = true;
     var i: usize = runtime.live_head;
@@ -6266,6 +6325,98 @@ test "hedge.protocol.quic.runtime: the admission deadline counts the work ahead 
     runtime.service_ns = 5000000;
     if (!deadline_allows(?runtime, 0, 10000000000, 0, 1998)
         || deadline_allows(?runtime, 0, 10000000000, 0, 1999)) { ret 5; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: the admission deadline judges a record's own time by the measured finish" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    runtime.service_ns = 10000000;
+    # before any handshake has completed, its own time is one crypto unit
+    if (runtime.finish_ns != 0 || own_ns(?runtime) != 10000000) { ret 1; }
+    if (!deadline_allows(?runtime, 0, 10000000000, 0, 998)
+        || deadline_allows(?runtime, 0, 10000000000, 0, 999)) { ret 2; }
+    # a finish of 500 ms: 950 units of work ahead end at 9.5 s and the
+    # record's own finish just fits inside 10 s. one more unit and it does not
+    runtime.finish_ns = 500000000;
+    if (own_ns(?runtime) != 500000000) { ret 3; }
+    if (!deadline_allows(?runtime, 0, 10000000000, 0, 949)
+        || deadline_allows(?runtime, 0, 10000000000, 0, 950)) { ret 4; }
+    # at its turn, nothing ahead: a record with less than a finish left is
+    # refused rather than promoted to expire
+    if (!deadline_allows(?runtime, 0, 10000000000, 9499999999, 0)
+        || deadline_allows(?runtime, 0, 10000000000, 9500000000, 0)) { ret 5; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: the finish estimate is seeded by the first completion and follows the rest" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    # a completion with no promotion time is no sample, nor one out of order
+    observe_finish(?runtime, 0, 1000000000);
+    observe_finish(?runtime, 1000000000, 1000000000);
+    if (runtime.finish_ns != 0) { ret 1; }
+    # the first sample is the estimate
+    observe_finish(?runtime, 1000000000, 1040000000);
+    if (runtime.finish_ns != 40000000) { ret 2; }
+    # later ones fold in at one eighth
+    observe_finish(?runtime, 2000000000, 2080000000);
+    if (runtime.finish_ns != 40000000 - 5000000 + 10000000) { ret 3; }
+    # a client mid-PTO is one outlier: a sample counts for at most four estimates
+    val settled: u64 = runtime.finish_ns;
+    observe_finish(?runtime, 3000000000, 13000000000);
+    if (runtime.finish_ns != settled - settled / 8 + settled * 4 / 8) { ret 4; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a handshake released past its deadline without completing is an expiry" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    controls.pumps[0].live       = true;
+    controls.pumps[0].generation = 4;
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.Lease{index: 0, generation: 1});
+    if (index == NO_CONNECTION) { ret 1; }
+    val value: *Connection = connection_at(controls, index);
+    # a completion inside the deadline samples the finish and expires nothing
+    value.handshake = claim_handshake(controls);
+    if (value.handshake == NO_HANDSHAKE) { ret 2; }
+    runtime.handshakes_in_flight = 1;
+    value.handshake_started_ns   = 1000000000;
+    value.handshake_deadline_ns  = 11000000000;
+    if (!release_handshake(controls, ?runtime, index, true, 1050000000)
+        || runtime.handshakes_expired != 0 || runtime.finish_ns != 50000000
+        || value.handshake_started_ns != 0 || value.handshake_deadline_ns != 0) { ret 3; }
+    # an early end inside the deadline is the client going away, not an expiry
+    value.handshake = claim_handshake(controls);
+    if (value.handshake == NO_HANDSHAKE) { ret 4; }
+    runtime.handshakes_in_flight = 1;
+    value.handshake_started_ns   = 2000000000;
+    value.handshake_deadline_ns  = 12000000000;
+    if (!release_handshake(controls, ?runtime, index, false, 5000000000)
+        || runtime.handshakes_expired != 0) { ret 5; }
+    # an early end at or past the deadline is an expiry: crypto spent for nothing
+    value.handshake = claim_handshake(controls);
+    if (value.handshake == NO_HANDSHAKE) { ret 6; }
+    runtime.handshakes_in_flight = 1;
+    value.handshake_started_ns   = 3000000000;
+    value.handshake_deadline_ns  = 13000000000;
+    if (!release_handshake(controls, ?runtime, index, false, 13000000000)
+        || runtime.handshakes_expired != 1) { ret 7; }
+    # a release that carries no time classifies nothing
+    value.handshake = claim_handshake(controls);
+    if (value.handshake == NO_HANDSHAKE) { ret 8; }
+    runtime.handshakes_in_flight = 1;
+    value.handshake_deadline_ns  = 1;
+    if (!release_handshake(controls, ?runtime, index, false, 0)
+        || runtime.handshakes_expired != 1) { ret 9; }
+    if (admission_report(?runtime).expired != 1) { ret 10; }
     ret 0;
 }
 
