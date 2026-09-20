@@ -71,9 +71,10 @@ use quic_capacity: hedge.protocol.quic.capacity;
 use hedge.protocol.quic.routing;
 use hedge_tls:     hedge.protocol.tls;
 use hedge_storage: hedge.storage;
-use wheel:         hedge.timer;
-use hedge_wake:    hedge.wake;
-use A:             std.allocator;
+use hedge.telemetry;
+use wheel:      hedge.timer;
+use hedge_wake: hedge.wake;
+use A:          std.allocator;
 use std.allocator.page;
 use allocator_testing: std.allocator.testing;
 
@@ -100,7 +101,7 @@ fun monotonic_ns() u64 {
 
 pub val MAX_PUMPS:             usize = quic_capacity.MAX_PUMPS;
 pub val ADMISSION_BANKS:       usize = quic_capacity.ADMISSION_BANKS;
-pub val RECEIVE_BATCH:         usize = 16;
+pub val RECEIVE_BATCH:         usize = 64;
 pub val MAX_STATELESS_PENDING: usize = quic_capacity.MAX_STATELESS_PENDING;
 pub val CONNECTION_ID_BYTES:   usize = 20;
 # how long one closed connection may linger before the transport abandons it.
@@ -112,6 +113,26 @@ pub val ENDPOINT_BYTES:      usize = 80;
 pub val NO_PUMP:             usize = (-1)::usize;
 pub val NO_CONNECTION:       usize = (-1)::usize;
 val     NO_HANDSHAKE:        usize = (-1)::usize;
+# the worker time one handshake is taken to cost before any has been measured.
+# the running estimate replaces it from the first promotion
+pub val HANDSHAKE_SERVICE_SEED_NS: u64 = 10000000;
+# a promotion sample larger than this is a stall, not a handshake, and would
+# poison the estimate
+val HANDSHAKE_SERVICE_CAP_NS: u64 = 1000000000;
+# datagrams held for one connection mid-handshake, and for one pending
+# initial, before more are dropped. a handshake exchanges a few; what a
+# waiting client retransmits repeats its ClientHello and is dropped past the
+# ceiling, and the copy after promotion goes to the connection instead
+pub val HELD_PER_CONNECTION: usize = 8;
+pub val HELD_PER_PENDING:    usize = 4;
+# the smallest datagram a client may carry an Initial in (RFC 9000 14.1): what
+# one held arrival costs the socket, so the arrival queue is sized in these
+pub val MIN_INITIAL_BYTES: usize = 1200;
+# preflights per turn. the sockets are read after every one, so the bound is
+# the turn's length: a Retry is the cheap end of admission, and what it refuses
+# early never costs a handshake, so a turn carries many of them per unit of
+# handshake work
+pub val PREFLIGHT_BUDGET: usize = 4 * RECEIVE_BATCH;
 
 pub def Status: u8;
 pub val OK:      Status = 1;
@@ -164,9 +185,17 @@ pub rec PumpConfig {
     # absent is no cap: storage grows until the allocator refuses
     connection_limit:         opt[usize];
     max_connections_per_peer: opt[usize];
-    require_retry:            bool;
-    retry_max_age_ns:         u64;
-    address_max_age_ns:       u64;
+    # the process-wide bound on connections admitted but not yet established,
+    # and the share of it one address may hold. every pump carries the same
+    # values, and the runtime takes them from whichever update it applies last
+    max_handshakes:          usize;
+    max_handshakes_per_peer: opt[usize];
+    # the socket receive buffer the listener asked for: the arrival queue holds
+    # as many Initials as that buffer would
+    receive_buffer_bytes: usize;
+    require_retry:        bool;
+    retry_max_age_ns:     u64;
+    address_max_age_ns:   u64;
     # the Retry nonces remembered against replay, never zero
     max_replay:           usize;
     tls_policy:           *hedge_tls.Policy;
@@ -249,9 +278,15 @@ pub rec PendingConfig {
 }
 
 pub rec PendingInitial {
-    next_live:             usize;
-    prev_live:             usize;
-    data:                  [assembly.MAX_UDP_PAYLOAD]u8;
+    next_live: usize;
+    prev_live: usize;
+    data:      [assembly.MAX_UDP_PAYLOAD]u8;
+    # the listener's acceptance stays reserved, not committed, while the
+    # Initial waits: a wait that ends in a drop cancels it, and the token the
+    # client holds is still good for its retransmit. `accepted` is set only on
+    # a cleanup-only record that owns a committed charge
+    acceptance:            quic_listener.Acceptance;
+    acceptance_live:       bool;
     accepted:              quic_listener.Accepted;
     config:                PendingConfig;
     budget_charge:         budget.Charge;
@@ -270,12 +305,30 @@ pub rec PendingInitial {
     cleanup_only:          bool;
     live:                  bool;
     # a queued initial waits on its budget: a release wakes it and this entry
-    # fires when its queue deadline passes
+    # fires when its queue deadline passes. a deferred one waits on a handshake
+    # slot, and the entry fires at its admission deadline instead
     timer:      wheel.Handle;
     timer_live: bool;
     ready:      bool;
     ready_next: usize;
     ready_prev: usize;
+    # when the Initial arrived. its handshake deadline counts from here whether
+    # it waits or not, so waiting never buys a connection more time
+    arrival_ns: u64;
+    # budget admitted, waiting for a handshake slot in arrival order
+    deferred:      bool;
+    deferred_next: usize;
+    deferred_prev: usize;
+    # counted once, the first time a handshake slot was not there for it
+    counted_deferred:     bool;
+    handshake_lease:      process_admission.Lease;
+    handshake_lease_live: bool;
+    # the client's later datagrams, routed here by the connection ID it was
+    # given, held in order for the connection it becomes
+    generation: u64;
+    route_key:  routing.Key;
+    route_live: bool;
+    held:       HeldQueue;
 }
 
 # the welded records are owned by the caller, which grows nothing itself. the
@@ -347,10 +400,45 @@ rec StatelessSend {
     pending:      bool;
 }
 
+# an Initial or version request from no known connection, held as received
+# until the worker's preflight turn. preflight may answer it with a Retry, which
+# is crypto, and crypto never runs in the receive path: the socket is read at
+# read speed and this queue, sized to the socket's own buffer, is the visible
+# backlog the kernel's buffer used to be
+rec Arrival {
+    data:                  [assembly.MAX_UDP_PAYLOAD]u8;
+    peer:                  ip.Endpoint;
+    local_destination:     ip.Addr;
+    length:                usize;
+    interface_index:       u32;
+    has_local_destination: bool;
+    arrival_ns:            u64;
+    next:                  usize;
+}
+
 rec PublishedRoute {
     key:     routing.Key;
     binding: routing.Binding;
     live:    bool;
+}
+
+# a datagram for a connection mid-handshake, held until the worker's turn for
+# handshake work comes: delivering it is where the handshake crypto runs, so
+# the receive path copies it and reads on
+rec HeldDatagram {
+    data:                  [assembly.MAX_UDP_PAYLOAD]u8;
+    peer:                  ip.Endpoint;
+    local_destination:     ip.Addr;
+    length:                usize;
+    interface_index:       u32;
+    next:                  usize;
+    has_local_destination: bool;
+}
+
+rec HeldQueue {
+    head:  usize;
+    tail:  usize;
+    count: usize;
 }
 
 rec AdmissionGeneration {
@@ -372,7 +460,12 @@ pub rec Connection {
     storage:  *ConnectionStorage;
     assembly: assembly.Connection;
     # the handshake record this connection holds, or NO_HANDSHAKE
-    handshake:     usize;
+    handshake: usize;
+    # the peer's share of the handshake bound, held with the record
+    handshake_lease:      process_admission.Lease;
+    handshake_lease_live: bool;
+    # datagrams held for delivery on the worker's handshake turn, in order
+    held:          HeldQueue;
     charge:        admission.Charge;
     budget_charge: budget.Charge;
     lease:         process_admission.Lease;
@@ -398,11 +491,13 @@ pub rec Connection {
     transport_timer: qt.Timer;
     # the connections with work, in arrival order, and those an h3 service
     # holds waiting, which are tried every turn until #181 gives services wakers
-    ready_next:         usize;
-    ready_prev:         usize;
-    waiting_next:       usize;
-    waiting_prev:       usize;
-    ready:              bool;
+    ready_next:   usize;
+    ready_prev:   usize;
+    waiting_next: usize;
+    waiting_prev: usize;
+    ready:        bool;
+    # which ready list holds it: the handshake list while it holds a record
+    ready_handshake:    bool;
     waiting:            bool;
     generation:         u64;
     source:             u64;
@@ -468,12 +563,18 @@ pub rec Pump {
     stateless_generation: u64;
     stateless_pending:    usize;
     stateless_live:       usize;
-    receive_pending:      bool;
-    scope_live:           bool;
-    started:              bool;
-    draining:             bool;
-    cancelling:           bool;
-    live:                 bool;
+    # unknown Initials held for the preflight turn, in arrival order
+    arrivals:         hedge_storage.Table[Arrival];
+    arrival_head:     usize;
+    arrival_tail:     usize;
+    arrival_live:     usize;
+    arrival_capacity: usize;
+    receive_pending:  bool;
+    scope_live:       bool;
+    started:          bool;
+    draining:         bool;
+    cancelling:       bool;
+    live:             bool;
 }
 
 pub rec Snapshot {
@@ -488,10 +589,23 @@ pub rec Snapshot {
     connection_failures: u64;
     # Retries dropped because a pump held its ceiling of pending sends
     stateless_dropped: u64;
+    # unknown Initials dropped because a pump's arrival queue was full
+    arrivals_dropped: u64;
     # Retry-token Initials refused because a replay store was full
     replay_full: u64;
-    stopping:    bool;
-    initialized: bool;
+    # the handshake bound: what holds a slot now, what waits for one now, and
+    # since make, what was held back, promoted, completed, dropped silently
+    # and refused
+    handshakes_in_flight: usize;
+    handshakes_waiting:   usize;
+    handshakes_deferred:  u64;
+    handshakes_promoted:  u64;
+    handshakes_completed: u64;
+    handshakes_dropped:   u64;
+    handshakes_refused:   u64;
+    service_ns:           u64;
+    stopping:             bool;
+    initialized:          bool;
 }
 
 pub rec Runtime {
@@ -519,6 +633,7 @@ pub rec Runtime {
     datagram_failures:   u64;
     connection_failures: u64;
     stateless_dropped:   u64;
+    arrivals_dropped:    u64;
     # Retry-token Initials refused because a replay store was full
     replay_full: u64;
     # the queued initials, so a sweep costs what is queued rather than what
@@ -527,6 +642,48 @@ pub rec Runtime {
     pending_ready_head:    usize;
     pending_ready_tail:    usize;
     pending_initial_count: usize;
+    # the handshake bound. connections holding a handshake record count
+    # against max_handshakes, and the manager holds each peer's share of the
+    # deferred and in-flight handshakes together
+    max_handshakes:       usize;
+    handshakes:           process_admission.Manager;
+    handshakes_in_flight: usize;
+    # stamped on each pending initial so a route to a slot the table has
+    # since reused is detected as stale
+    pending_generation: u64;
+    # the Initials waiting for a slot, in arrival order
+    deferred_head:  usize;
+    deferred_tail:  usize;
+    deferred_count: usize;
+    # connections mid-handshake with work, in order. their work is the
+    # handshake crypto, so it is taken one connection per turn under the
+    # crypto budget rather than swept with the ready list
+    handshake_ready_head: usize;
+    handshake_ready_tail: usize;
+    held:                 hedge_storage.Table[HeldDatagram];
+    held_dropped:         u64;
+    # the running estimate of the worker's time per handshake, sampled as the
+    # interval between two handshakes completing while Initials were waiting:
+    # the worker was saturated, so the interval is what one handshake costs it
+    # with everything else a turn carries. zero when no chain of samples is open
+    service_ns:         u64;
+    last_completion_ns: u64;
+    # one unit of handshake work is done per turn: a promotion or a held
+    # delivery
+    crypto_budget: usize;
+    # the owner's socket poll, called between units of preflight crypto so a
+    # receive that settled meanwhile is read before the next unit. nil when no
+    # owner drives the sockets
+    read_on:             fun(ptr) bool;
+    read_on_ctx:         ptr;
+    handshakes_deferred: u64;
+    handshakes_promoted: u64;
+    # promoted handshakes that reached established; the rest ended early
+    handshakes_completed: u64;
+    # dropped: turned away silently, the client's PTO retransmits. refused: told
+    # so with a stateless close, once quic can send one
+    handshakes_dropped:    u64;
+    handshakes_refused:    u64;
     pump_count:            usize;
     next_source:           u64;
     connection_generation: u64;
@@ -580,6 +737,15 @@ fun limit_holds(limit: opt[usize], active: usize, queued: usize) bool {
     ret true;
 }
 
+fun handshake_limits_valid(config: *PumpConfig) bool {
+    if (config.max_handshakes == 0) { ret false; }
+    if (sel config.max_handshakes_per_peer.some) {
+        ret config.max_handshakes_per_peer.some != 0
+            && config.max_handshakes_per_peer.some <= config.max_handshakes;
+    }
+    ret true;
+}
+
 fun pump_config_shape_valid(config: *PumpConfig) bool {
     ret config != nil && config.admission_generation != 0
         && limit_valid(config.connection_limit)
@@ -595,6 +761,7 @@ fun pump_config_shape_valid(config: *PumpConfig) bool {
         && config.max_requests <= h3_session.MAX_STREAMS
         && config.listener_name != nil
         && str_len(config.listener_name) != 0
+        && handshake_limits_valid(config)
         && str_len(config.listener_name) < schema.TEXT_CAP
         && config.handshake_timeout_ns != 0
         && config.idle_timeout_ms != 0 && config.drain_timeout_ns != 0;
@@ -637,6 +804,10 @@ fun reset_connection(value: *Connection) {
     value.h3_deadline_ns       = 0;
     value.memory_deadline_ns   = 0;
     value.handshake            = NO_HANDSHAKE;
+    value.handshake_lease      = process_admission.no_lease();
+    value.handshake_lease_live = false;
+    reset_held(?value.held);
+    value.ready_handshake      = false;
     value.scope_live           = false;
     value.charge_live          = false;
     value.budget_charge_live   = false;
@@ -671,14 +842,25 @@ fun reset_connection(value: *Connection) {
 # the rest, and link_pending_live sets the live links
 fun reset_pending_initial(runtime: *Runtime, index: usize) {
     val pending: *PendingInitial = pending_at(runtime, index);
-    pending.live       = false;
-    pending.next_live  = NO_CONNECTION;
-    pending.prev_live  = NO_CONNECTION;
-    pending.timer      = wheel.no_handle();
-    pending.timer_live = false;
-    pending.ready      = false;
-    pending.ready_next = NO_CONNECTION;
-    pending.ready_prev = NO_CONNECTION;
+    pending.live                 = false;
+    pending.next_live            = NO_CONNECTION;
+    pending.prev_live            = NO_CONNECTION;
+    pending.timer                = wheel.no_handle();
+    pending.timer_live           = false;
+    pending.ready                = false;
+    pending.ready_next           = NO_CONNECTION;
+    pending.ready_prev           = NO_CONNECTION;
+    pending.arrival_ns           = 0;
+    pending.deferred             = false;
+    pending.deferred_next        = NO_CONNECTION;
+    pending.deferred_prev        = NO_CONNECTION;
+    pending.counted_deferred     = false;
+    pending.handshake_lease      = process_admission.no_lease();
+    pending.handshake_lease_live = false;
+    pending.generation           = 0;
+    pending.route_live           = false;
+    pending.acceptance_live      = false;
+    reset_held(?pending.held);
 }
 
 # a free pending initial exists afterwards, so an admitted initial always has
@@ -702,13 +884,130 @@ fun claim_handshake(controls: *ControlView) usize {
 
 # the record goes back once nothing refers to it: its engine was destroyed, or
 # the assembly finished the handshake or released the connection. releasing the
-# index zeroizes and unwelds its chunk once the chunk goes empty
-fun release_handshake(controls: *ControlView, value: *Connection) bool {
+# index zeroizes and unwelds its chunk once the chunk goes empty. the record is
+# what holds a slot of the handshake bound, so the slot and the peer's share go
+# back with it, and the oldest deferred Initial may take the slot next turn
+fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
+    completed: bool, now_ns: u64) bool {
+    val value: *Connection = connection_at(controls, index);
     if (value.handshake == NO_HANDSHAKE) { ret true; }
     if (!hedge_storage.secret_table_release[server.Handshake](controls.handshakes,
         value.handshake)) { ret false; }
     value.handshake = NO_HANDSHAKE;
+    if (runtime.handshakes_in_flight != 0) {
+        runtime.handshakes_in_flight = runtime.handshakes_in_flight - 1;
+    }
+    if (completed) {
+        runtime.handshakes_completed = runtime.handshakes_completed + 1;
+        observe_service(runtime, now_ns);
+    }
+    release_held(runtime, ?value.held);
+    # its work is no longer handshake work: what it is marked for moves lists
+    if (value.ready && value.ready_handshake) {
+        unmark_ready(controls, runtime, index);
+        mark_ready(controls, runtime, index);
+    }
+    if (value.handshake_lease_live) {
+        if (!process_admission.release(?runtime.handshakes, value.handshake_lease)) {
+            connection_failed(runtime);
+        }
+        value.handshake_lease_live = false;
+        value.handshake_lease      = process_admission.no_lease();
+    }
     ret true;
+}
+
+fun handshake_room(runtime: *Runtime) bool {
+    ret runtime.handshakes_in_flight < runtime.max_handshakes;
+}
+
+# whether the oldest deferred Initial could take a slot this turn
+fun promotable(runtime: *Runtime) bool {
+    ret runtime.deferred_head != NO_CONNECTION && handshake_room(runtime);
+}
+
+fun link_deferred(runtime: *Runtime, index: usize) {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    pending.deferred      = true;
+    pending.deferred_next = NO_CONNECTION;
+    pending.deferred_prev = runtime.deferred_tail;
+    if (runtime.deferred_tail != NO_CONNECTION) {
+        pending_at(runtime, runtime.deferred_tail).deferred_next = index;
+    }
+    or { runtime.deferred_head = index; }
+    runtime.deferred_tail  = index;
+    runtime.deferred_count = runtime.deferred_count + 1;
+}
+
+fun unlink_deferred(runtime: *Runtime, index: usize) {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (!pending.deferred) { ret; }
+    if (pending.deferred_prev != NO_CONNECTION) {
+        pending_at(runtime, pending.deferred_prev).deferred_next = pending.deferred_next;
+    }
+    or { runtime.deferred_head = pending.deferred_next; }
+    if (pending.deferred_next != NO_CONNECTION) {
+        pending_at(runtime, pending.deferred_next).deferred_prev = pending.deferred_prev;
+    }
+    or { runtime.deferred_tail = pending.deferred_prev; }
+    pending.deferred      = false;
+    pending.deferred_next = NO_CONNECTION;
+    pending.deferred_prev = NO_CONNECTION;
+    if (runtime.deferred_count != 0) {
+        runtime.deferred_count = runtime.deferred_count - 1;
+    }
+}
+
+# the first time a slot is not there for an Initial it is counted as deferred
+fun hold_deferred(runtime: *Runtime, pending: *PendingInitial) {
+    if (pending.counted_deferred) { ret; }
+    pending.counted_deferred    = true;
+    runtime.handshakes_deferred = runtime.handshakes_deferred + 1;
+}
+
+# the worker time the handshakes ahead of one represent: every handshake in
+# flight and, for an arrival, every Initial already waiting, at the running
+# cost per handshake, plus its own
+fun work_ahead_ns(runtime: *Runtime, waiting: usize) u64 {
+    val count: usize = waiting + runtime.handshakes_in_flight + 1;
+    if (count::u64 > 0xffffffffffffffff / runtime.service_ns) {
+        ret 0xffffffffffffffff;
+    }
+    ret count::u64 * runtime.service_ns;
+}
+
+# whether an Initial that arrived at arrival_ns can still finish inside its
+# own handshake deadline once the work ahead of it is done
+fun deadline_allows(runtime: *Runtime, arrival_ns: u64, handshake_timeout_ns: u64,
+    now_ns: u64, waiting: usize) bool {
+    ret saturated_add(now_ns, work_ahead_ns(runtime, waiting))
+        < saturated_add(arrival_ns, handshake_timeout_ns);
+}
+
+# the one place an Initial that will not be served is turned away. today it is
+# dropped and the client's PTO retransmits it; once quic sends a stateless
+# CONNECTION_CLOSE(CONNECTION_REFUSED) under Initial keys this sends it and
+# counts a refusal instead. the ceiling drop and the deadline drop route here
+# and nothing else does
+fun refuse_initial(runtime: *Runtime) {
+    runtime.handshakes_dropped = runtime.handshakes_dropped + 1;
+}
+
+# a handshake completed. with Initials waiting, the interval since the last
+# completion is one sample of the worker's cost per handshake; without any,
+# the worker was idle between them and the chain of samples closes
+fun observe_service(runtime: *Runtime, now_ns: u64) {
+    if (runtime.deferred_count == 0) {
+        runtime.last_completion_ns = 0;
+        ret;
+    }
+    if (runtime.last_completion_ns != 0 && now_ns > runtime.last_completion_ns) {
+        var sample: u64 = now_ns - runtime.last_completion_ns;
+        if (sample > HANDSHAKE_SERVICE_CAP_NS) { sample = HANDSHAKE_SERVICE_CAP_NS; }
+        runtime.service_ns = runtime.service_ns - runtime.service_ns / 8 + sample / 8;
+        if (runtime.service_ns == 0) { runtime.service_ns = 1; }
+    }
+    runtime.last_completion_ns = now_ns;
 }
 
 # put the storage a taken slot is about to use into its empty state. a
@@ -793,15 +1092,30 @@ fun unmark_pending_ready(runtime: *Runtime, index: usize) {
     pending.ready_prev = NO_CONNECTION;
 }
 
+# the wheel deadline a pending initial waits under: its admission deadline
+# once deferred, otherwise its budget queue deadline if it has one, else none
+fun pending_deadline(pending: *PendingInitial, deferred: bool,
+    charge: *budget.Charge, output: *u64) bool {
+    if (deferred) {
+        @output = saturated_add(pending.arrival_ns, pending.config.handshake_timeout_ns);
+        ret true;
+    }
+    var deadline: time.Instant;
+    if (!budget.deadline(charge, ?deadline)) { ret false; }
+    @output = clock.to_ns(deadline);
+    ret true;
+}
+
 # claim and arm the wheel entry a queued charge waits on, before the charge
 # moves into the pending record, so a failure leaves it with the caller
-fun claim_pending_timer(runtime: *Runtime, index: usize, charge: *budget.Charge) bool {
+fun claim_pending_timer(runtime: *Runtime, index: usize, deferred: bool,
+    charge: *budget.Charge) bool {
     val pending: *PendingInitial = pending_at(runtime, index);
     val handle:  wheel.Handle    = wheel.claim(runtime.timers, pending_owner(index));
     if (handle.index == wheel.NONE) { ret false; }
-    var deadline: time.Instant;
-    if (budget.deadline(charge, ?deadline)
-        && wheel.arm(runtime.timers, handle, clock.to_ns(deadline)) != wheel.OK) {
+    var deadline_ns: u64 = 0;
+    if (pending_deadline(pending, deferred, charge, ?deadline_ns)
+        && wheel.arm(runtime.timers, handle, deadline_ns) != wheel.OK) {
         wheel.release(runtime.timers, handle);
         ret false;
     }
@@ -861,7 +1175,10 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
         config.backing)
         || !routing.make(?runtime.routes, config.backing)
         || !h3_session.make_pool(?runtime.sessions, config.backing,
-        controls.sessions)) {
+        controls.sessions)
+        || !process_admission.make(?runtime.handshakes, config.backing,
+        opt[usize].none{}, opt[usize].none{})
+        || !hedge_storage.make_table[HeldDatagram](?runtime.held, config.backing)) {
         hedge_storage.destroy[ConnectionStorage](?runtime.connection_storages);
         ret false;
     }
@@ -880,6 +1197,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.live_connections      = 0;
     runtime.live_total            = 0;
     runtime.stateless_dropped     = 0;
+    runtime.arrivals_dropped      = 0;
     runtime.replay_full           = 0;
     runtime.datagram_failures     = 0;
     runtime.connection_failures   = 0;
@@ -887,6 +1205,25 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.pending_ready_head    = NO_CONNECTION;
     runtime.pending_ready_tail    = NO_CONNECTION;
     runtime.pending_initial_count = 0;
+    runtime.max_handshakes        = schema.DEFAULT_MAX_HANDSHAKES;
+    runtime.handshakes_in_flight  = 0;
+    runtime.pending_generation    = 0;
+    runtime.deferred_head         = NO_CONNECTION;
+    runtime.deferred_tail         = NO_CONNECTION;
+    runtime.deferred_count        = 0;
+    runtime.service_ns            = HANDSHAKE_SERVICE_SEED_NS;
+    runtime.last_completion_ns    = 0;
+    runtime.crypto_budget         = 0;
+    runtime.handshake_ready_head  = NO_CONNECTION;
+    runtime.handshake_ready_tail  = NO_CONNECTION;
+    runtime.held_dropped          = 0;
+    runtime.read_on               = nil;
+    runtime.read_on_ctx           = nil;
+    runtime.handshakes_deferred   = 0;
+    runtime.handshakes_promoted   = 0;
+    runtime.handshakes_dropped    = 0;
+    runtime.handshakes_refused    = 0;
+    runtime.handshakes_completed  = 0;
     runtime.pump_count            = 0;
     runtime.next_source           = 1;
     runtime.connection_generation = next_generation(runtime.connection_generation);
@@ -1117,6 +1454,10 @@ fun abandon_attached_pump(pump: *Pump) bool {
     if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) {
         success = false;
     }
+    if (!hedge_storage.destroy_table[Arrival](?pump.arrivals)) {
+        success = false;
+    }
+    reset_arrivals(pump);
     if (!success) { ret false; }
     pump.driver        = nil;
     pump.socket        = nil;
@@ -1171,6 +1512,13 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     pump.stateless_generation = 0;
     pump.stateless_pending    = NO_CONNECTION;
     pump.stateless_live       = 0;
+    if (!hedge_storage.make_table[Arrival](?pump.arrivals, pump.backing)) {
+        if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) {
+            connection_failed(runtime);
+        }
+        ret FAILED;
+    }
+    reset_arrivals(pump);
     var i: usize = 0;
     for (i < ADMISSION_BANKS) {
         pump.admissions[i].live     = false;
@@ -1199,7 +1547,7 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
         abandon_attached_pump(pump);
         ret FAILED;
     }
-    apply_pump_config(pump, ?config);
+    apply_pump_config(runtime, pump, ?config);
     i = 0;
     for (i < RECEIVE_BATCH) {
         reset_receive_packet(pump, i);
@@ -1297,7 +1645,10 @@ fun reap_admission(bank: *AdmissionGeneration) bool {
     ret true;
 }
 
-fun apply_pump_config(pump: *Pump, config: *PumpConfig) {
+fun apply_pump_config(runtime: *Runtime, pump: *Pump, config: *PumpConfig) {
+    runtime.max_handshakes = config.max_handshakes;
+    process_admission.retune(?runtime.handshakes, opt[usize].none{},
+        config.max_handshakes_per_peer);
     pump.config                   = @config;
     pump.tls_policy               = config.tls_policy;
     pump.plan                     = config.plan;
@@ -1311,6 +1662,16 @@ fun apply_pump_config(pump: *Pump, config: *PumpConfig) {
     pump.connection_limit         = config.connection_limit;
     pump.max_connections_per_peer = config.max_connections_per_peer;
     pump.max_requests             = config.max_requests;
+    pump.arrival_capacity         = arrival_capacity(config.receive_buffer_bytes);
+}
+
+# as many held Initials as the socket's receive buffer holds, and never fewer
+# than one receive batch, so a reload that shrinks the buffer cannot leave the
+# queue smaller than one turn's reads
+fun arrival_capacity(receive_buffer_bytes: usize) usize {
+    var capacity: usize = receive_buffer_bytes / MIN_INITIAL_BYTES;
+    if (capacity < RECEIVE_BATCH) { capacity = RECEIVE_BATCH; }
+    ret capacity;
 }
 
 fun clear_pump_config(pump: *Pump) {
@@ -1450,7 +1811,7 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
     for (i < count) {
         val pump: *Pump = ?controls.pumps[updates[i].handle.index];
         if (changed[i]) { pump.active_admission = 1 - pump.active_admission; }
-        apply_pump_config(pump, ?updates[i].config);
+        apply_pump_config(runtime, pump, ?updates[i].config);
         i = i + 1;
     }
     mark_superseded_graceful(controls, runtime);
@@ -1611,6 +1972,7 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     value.local                    = ip.endpoint(0, 0, 0, 0, 0);
     unmark_ready(controls, runtime, index);
     set_waiting(controls, runtime, index, false);
+    release_held(runtime, ?value.held);
     wheel.release(runtime.timers, value.timer);
     value.timer = wheel.no_handle();
     var send: usize = 0;
@@ -1652,7 +2014,8 @@ fun same_route_binding(left: routing.Binding,
         && left.route_index == right.route_index
         && left.route_generation == right.route_generation
         && left.route_sequence == right.route_sequence
-        && left.pump_generation == right.pump_generation;
+        && left.pump_generation == right.pump_generation
+        && left.pending == right.pending;
 }
 
 fun route_binding(value: *Connection, slot: usize,
@@ -1806,19 +2169,25 @@ fun refresh_timer(controls: *ControlView, runtime: *Runtime, index: usize) bool 
     ret arm_timer(runtime, value, 0);
 }
 
+# a connection with work joins the ready list, or the handshake ready list
+# while it holds a handshake record, since its work is then the crypto
 fun mark_ready(controls: *ControlView, runtime: *Runtime, index: usize) {
     val value: *Connection = connection_at(controls, index);
     if (value == nil || !value.live || value.ready) { ret; }
-    value.ready      = true;
-    value.ready_next = NO_CONNECTION;
-    value.ready_prev = runtime.ready_tail;
-    if (runtime.ready_tail != NO_CONNECTION) {
-        connection_at(controls, runtime.ready_tail).ready_next = index;
+    val handshaking: bool  = value.handshake != NO_HANDSHAKE;
+    var tail:        usize = runtime.ready_tail;
+    if (handshaking) { tail = runtime.handshake_ready_tail; }
+    value.ready           = true;
+    value.ready_handshake = handshaking;
+    value.ready_next      = NO_CONNECTION;
+    value.ready_prev      = tail;
+    if (tail != NO_CONNECTION) {
+        connection_at(controls, tail).ready_next = index;
     }
-    or {
-        runtime.ready_head = index;
-    }
-    runtime.ready_tail = index;
+    or (handshaking) { runtime.handshake_ready_head = index; }
+    or               { runtime.ready_head = index; }
+    if (handshaking) { runtime.handshake_ready_tail = index; }
+    or               { runtime.ready_tail = index; }
 }
 
 fun unmark_ready(controls: *ControlView, runtime: *Runtime, index: usize) {
@@ -1827,14 +2196,107 @@ fun unmark_ready(controls: *ControlView, runtime: *Runtime, index: usize) {
     if (value.ready_prev != NO_CONNECTION) {
         connection_at(controls, value.ready_prev).ready_next = value.ready_next;
     }
-    or { runtime.ready_head = value.ready_next; }
+    or (value.ready_handshake) { runtime.handshake_ready_head = value.ready_next; }
+    or                         { runtime.ready_head = value.ready_next; }
     if (value.ready_next != NO_CONNECTION) {
         connection_at(controls, value.ready_next).ready_prev = value.ready_prev;
     }
-    or { runtime.ready_tail = value.ready_prev; }
-    value.ready      = false;
-    value.ready_next = NO_CONNECTION;
-    value.ready_prev = NO_CONNECTION;
+    or (value.ready_handshake) { runtime.handshake_ready_tail = value.ready_prev; }
+    or                         { runtime.ready_tail = value.ready_prev; }
+    value.ready           = false;
+    value.ready_handshake = false;
+    value.ready_next      = NO_CONNECTION;
+    value.ready_prev      = NO_CONNECTION;
+}
+
+fun held_at(runtime: *Runtime, index: usize) *HeldDatagram {
+    ret hedge_storage.table_at[HeldDatagram](?runtime.held, index);
+}
+
+fun reset_held(queue: *HeldQueue) {
+    queue.head  = NO_CONNECTION;
+    queue.tail  = NO_CONNECTION;
+    queue.count = 0;
+}
+
+# copy a datagram onto a held queue: a connection's mid-handshake, or a pending
+# initial's. past the per-queue ceiling, or when the table cannot grow, it is
+# dropped and the client's retransmit is the retry
+fun hold_datagram(runtime: *Runtime, queue: *HeldQueue, ceiling: usize,
+    received: *net_types.Packet) bool {
+    if (queue.count >= ceiling) {
+        runtime.held_dropped = runtime.held_dropped + 1;
+        ret false;
+    }
+    val slot: usize = hedge_storage.table_claim[HeldDatagram](?runtime.held);
+    if (slot == hedge_storage.NO_INDEX) {
+        runtime.held_dropped = runtime.held_dropped + 1;
+        ret false;
+    }
+    val held: *HeldDatagram = held_at(runtime, slot);
+    std_memory.raw_copy(?held.data[0], received.buffer, received.length);
+    held.peer                  = received.peer;
+    held.local_destination     = received.local_destination;
+    held.length                = received.length;
+    held.interface_index       = received.interface_index;
+    held.has_local_destination = received.has_local_destination;
+    held.next                  = NO_CONNECTION;
+    if (queue.tail != NO_CONNECTION) {
+        held_at(runtime, queue.tail).next = slot;
+    }
+    or { queue.head = slot; }
+    queue.tail  = slot;
+    queue.count = queue.count + 1;
+    ret true;
+}
+
+fun release_held(runtime: *Runtime, queue: *HeldQueue) {
+    var i: usize = queue.head;
+    for (i != NO_CONNECTION) {
+        val next: usize = held_at(runtime, i).next;
+        hedge_storage.table_release[HeldDatagram](?runtime.held, i);
+        i = next;
+    }
+    reset_held(queue);
+}
+
+# a promoted initial's held datagrams become its connection's
+fun move_held(target: *HeldQueue, source: *HeldQueue) {
+    @target = @source;
+    reset_held(source);
+}
+
+# deliver what was held, in order. this is where a handshake's crypto runs
+fun deliver_held(controls: *ControlView, runtime: *Runtime, index: usize,
+    now_ns: u64) {
+    val value: *Connection = connection_at(controls, index);
+    for (value.held.head != NO_CONNECTION && value.live
+        && value.state != CONNECTION_BROKEN) {
+        val slot:   usize         = value.held.head;
+        val held:   *HeldDatagram = held_at(runtime, slot);
+        var packet: net_types.Packet;
+        packet.buffer                = ?held.data[0];
+        packet.capacity              = held.length;
+        packet.length                = held.length;
+        packet.peer                  = held.peer;
+        packet.local_destination     = held.local_destination;
+        packet.interface_index       = held.interface_index;
+        packet.has_local_destination = held.has_local_destination;
+        packet.truncated             = false;
+        packet.zero_length           = false;
+        val delivered: qt.OperationResult = qt.receive_native[binding.Binding](
+            ?value.assembly.driver, ?packet, value.local, clock.from_ns(now_ns), 0);
+        # released after delivery: a release may compact the chunk the data is in
+        value.held.head = held.next;
+        if (value.held.head == NO_CONNECTION) { value.held.tail = NO_CONNECTION; }
+        value.held.count = value.held.count - 1;
+        hedge_storage.table_release[HeldDatagram](?runtime.held, slot);
+        if (delivered.status == qt.STATUS_ERROR
+            || !reconcile_routes(controls, runtime, index)
+            || !refresh_timer(controls, runtime, index)) {
+            fail_connection(controls, runtime, index, now_ns);
+        }
+    }
 }
 
 fun set_waiting(controls: *ControlView, runtime: *Runtime, index: usize, waiting: bool) {
@@ -1865,7 +2327,8 @@ fun set_waiting(controls: *ControlView, runtime: *Runtime, index: usize, waiting
 pub fun has_ready(runtime: *Runtime) bool {
     ret runtime != nil && runtime.initialized
         && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil
-        || runtime.pending_ready_head != NO_CONNECTION);
+        || runtime.pending_ready_head != NO_CONNECTION
+        || runtime.handshake_ready_head != NO_CONNECTION || promotable(runtime));
 }
 
 fun copy_listener_name(value: *Connection, name: str) bool {
@@ -1917,7 +2380,7 @@ fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize) b
         value.tls_live = false;
     }
     if (!value.tls_live && (!value.assembly_attempted || assembly.reusable(?value.assembly))) {
-        release_handshake(controls, value);
+        release_handshake(controls, runtime, index, false, 0);
     }
     if (value.charge_live) {
         if (quic_listener.release_connection(?bank.listener,
@@ -1972,7 +2435,7 @@ fun adopt_local_cid(value: *Connection,
 fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize, index: usize, accepted: *quic_listener.Accepted,
     received: *net_types.Packet, config_snapshot: *ConnectionConfig,
-    now_ns: u64) bool {
+    arrival_ns: u64, now_ns: u64) bool {
     val pump:  *Pump       = ?controls.pumps[pump_index];
     val value: *Connection = connection_at(controls, index);
     value.policy             = config_snapshot.tls_policy;
@@ -1986,6 +2449,9 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     value.request_timeout_ns = config_snapshot.request_timeout_ns;
     value.memory_wait_ns     = config_snapshot.memory_wait_ns;
     value.handshake          = claim_handshake(controls);
+    if (value.handshake != NO_HANDSHAKE) {
+        runtime.handshakes_in_flight = runtime.handshakes_in_flight + 1;
+    }
     # the connection's account spans every hedge lane. quic owns its three
     # (send, receive, crypto) and hedge composes its own (io, request) onto the
     # lanes after them through the assembly config below; the borrower declares
@@ -2012,7 +2478,9 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     config.server_name_length  = 0;
     config.max_idle_timeout    = config_snapshot.idle_timeout_ms::i64 * duration.MILLISECOND;
     config.drain_timeout       = config_snapshot.drain_timeout_ns::i64 * duration.NANOSECOND;
-    config.tls_deadline        = opt[time.Instant].some{clock.from_ns(saturated_add(now_ns,
+    # the deadline counts from arrival: time spent waiting for a slot was the
+    # client's, and a wait that could not fit was refused before this
+    config.tls_deadline = opt[time.Instant].some{clock.from_ns(saturated_add(arrival_ns,
         config_snapshot.handshake_timeout_ns))};
     config.tls_budget = config_snapshot.memory_budgets.lanes[memory.LANE_TLS::usize];
     # hedge composes its own lanes onto quic's supply: the lanes after quic's
@@ -2250,10 +2718,17 @@ fun copy_pending_packet(pending: *PendingInitial,
     ret true;
 }
 
+# every token Initial queues here. one whose budget admitted it is deferred:
+# it waits its turn for a handshake slot in arrival order and is promoted by
+# advance_pending_initials, so the receive path never spends a handshake's
+# crypto and the socket is read at read speed. one whose budget queued it waits
+# on the budget first and is deferred when that admits it.
 fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize,
-    bank_index: usize, accepted: quic_listener.Accepted,
-    received: *net_types.Packet, config_snapshot: PumpConfig,
-    named_charge: *budget.Charge, lease: process_admission.Lease) bool {
+    bank_index: usize, acceptance: quic_listener.Acceptance,
+    key: routing.Key, received: *net_types.Packet, config_snapshot: PumpConfig,
+    named_charge: *budget.Charge, lease: process_admission.Lease,
+    deferred: bool, handshake_lease: process_admission.Lease,
+    arrival_ns: u64) bool {
     val index: usize = free_pending_initial(runtime);
     if (index == NO_CONNECTION) { ret false; }
     val pending: *PendingInitial = pending_at(runtime, index);
@@ -2262,21 +2737,34 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
         hedge_storage.table_release[PendingInitial](?runtime.pending_initials, index);
         ret false;
     }
-    if (!claim_pending_timer(runtime, index, named_charge)) {
+    pending.arrival_ns = arrival_ns;
+    if (!claim_pending_timer(runtime, index, deferred, named_charge)) {
         hedge_storage.table_release[PendingInitial](?runtime.pending_initials, index);
         ret false;
     }
-    pending.accepted = accepted;
+    pending.acceptance      = acceptance;
+    pending.acceptance_live = true;
     take_pending_charge(runtime, index, config_snapshot.budgets, named_charge);
     pending.lease              = lease;
     pending.pump               = pump_index;
     pending.pump_generation    = controls.pumps[pump_index].generation;
     pending.admission_bank     = bank_index;
-    pending.q_charge_live      = true;
+    pending.q_charge_live      = false;
     pending.budget_charge_live = pending.budget_charge.live;
     pending.lease_live         = true;
     pending.cleanup_only       = false;
     pending.live               = true;
+    if (deferred) {
+        pending.handshake_lease      = handshake_lease;
+        pending.handshake_lease_live = true;
+        link_deferred(runtime, index);
+        if (!handshake_room(runtime) || runtime.deferred_count > 1) {
+            hold_deferred(runtime, pending);
+        }
+    }
+    # a route that cannot be published loses the client's later datagrams to
+    # the unknown path, which drops them as replays; the client retransmits
+    publish_pending_route(runtime, index, key);
     link_pending_live(runtime, index);
     runtime.pending_initial_count              = runtime.pending_initial_count + 1;
     runtime.live_total                         = runtime.live_total + 1;
@@ -2347,6 +2835,7 @@ fun take_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize
     pending.accepted.charge.source     = 0;
     pending.accepted.charge.index      = 0;
     pending.accepted.charge.generation = 0;
+    pending.acceptance_live            = false;
     pending.budget_charge              = budget.no_charge();
     pending.lease                      = process_admission.no_lease();
     pending.q_charge_live              = false;
@@ -2354,6 +2843,12 @@ fun take_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize
     pending.lease_live                 = false;
     pending.cleanup_only               = false;
     pending.length                     = 0;
+    pending.handshake_lease            = process_admission.no_lease();
+    pending.handshake_lease_live       = false;
+    pending.counted_deferred           = false;
+    unpublish_pending_route(runtime, index);
+    release_held(runtime, ?pending.held);
+    unlink_deferred(runtime, index);
     unmark_pending_ready(runtime, index);
     if (pending.timer_live) {
         wheel.release(runtime.timers, pending.timer);
@@ -2385,16 +2880,66 @@ fun release_pending_initial(controls: *ControlView, runtime: *Runtime, index: us
         pending.accepted.charge).action == quic_listener.ACTION_ACCEPT) {
         pending.q_charge_live = false;
     }
+    if (pending.acceptance_live && cancel_acceptance(bank, pending.acceptance)) {
+        pending.acceptance_live = false;
+    }
     if (pending.lease_live && runtime.admission != nil
         && process_admission.release(runtime.admission,
         pending.lease)) { pending.lease_live = false; }
+    if (pending.handshake_lease_live
+        && process_admission.release(?runtime.handshakes,
+        pending.handshake_lease)) { pending.handshake_lease_live = false; }
     val success: bool = !pending.budget_charge_live
-        && !pending.q_charge_live && !pending.lease_live;
+        && !pending.q_charge_live && !pending.acceptance_live
+        && !pending.lease_live && !pending.handshake_lease_live;
     if (!success) { ret false; }
     take_pending_initial(controls, runtime, index);
     if (bank.retiring && bank.active_connections == 0
         && bank.queued_initials == 0) { reap_admission(bank); }
     ret true;
+}
+
+fun pending_binding(runtime: *Runtime, index: usize) routing.Binding {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    ret routing.Binding{connection_slot: index,
+        connection_generation: pending.generation, route_index: 0,
+        route_generation:      1, route_sequence: 0,
+        pump_generation:       pending.pump_generation, pending: true};
+}
+
+# the connection ID the client was given in its Retry routes to the pending
+# initial until it is promoted, so the datagrams the client sends behind its
+# first Initial wait with it instead of arriving as strangers
+fun publish_pending_route(runtime: *Runtime, index: usize, key: routing.Key) bool {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (!key.valid) { ret false; }
+    runtime.pending_generation = next_generation(runtime.pending_generation);
+    pending.generation         = runtime.pending_generation;
+    pending.route_key          = key;
+    if (routing.publish(?runtime.routes, pending.route_key,
+        pending_binding(runtime, index)) != routing.ROUTE_OK) { ret false; }
+    pending.route_live = true;
+    ret true;
+}
+
+fun unpublish_pending_route(runtime: *Runtime, index: usize) {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (!pending.route_live) { ret; }
+    routing.unpublish(?runtime.routes, pending.route_key,
+        pending_binding(runtime, index));
+    pending.route_live = false;
+}
+
+# a datagram routed to a pending initial is held with it
+fun deliver_pending(runtime: *Runtime, found: routing.Lookup,
+    received: *net_types.Packet) Status {
+    val index: usize = found.binding.connection_slot;
+    if (index >= hedge_storage.table_capacity[PendingInitial](?runtime.pending_initials)) { ret STALE; }
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (!pending.live || !pending.route_live
+        || pending.generation != found.binding.connection_generation) { ret STALE; }
+    hold_datagram(runtime, ?pending.held, HELD_PER_PENDING, received);
+    ret OK;
 }
 
 fun pending_packet(pending: *PendingInitial) net_types.Packet {
@@ -2412,17 +2957,19 @@ fun pending_packet(pending: *PendingInitial) net_types.Packet {
 }
 
 fun transfer_pending_ownership(pending: *PendingInitial,
-    value: *Connection) bool {
+    accepted: *quic_listener.Accepted, value: *Connection) bool {
     if (pending == nil || value == nil || !pending.live
-        || !value.live || !pending.q_charge_live
-        || !pending.lease_live) { ret false; }
-    value.charge      = pending.accepted.charge;
+        || !value.live || !pending.lease_live) { ret false; }
+    value.charge      = accepted.charge;
     value.charge_live = true;
     budget.relocate(pending.config.budgets, ?value.budget_charge, ?pending.budget_charge);
-    value.budget_charge_live   = pending.budget_charge_live;
-    pending.lease_live         = false;
-    pending.q_charge_live      = false;
-    pending.budget_charge_live = false;
+    value.budget_charge_live     = pending.budget_charge_live;
+    value.handshake_lease        = pending.handshake_lease;
+    value.handshake_lease_live   = pending.handshake_lease_live;
+    pending.lease_live           = false;
+    pending.q_charge_live        = false;
+    pending.budget_charge_live   = false;
+    pending.handshake_lease_live = false;
     ret true;
 }
 
@@ -2448,8 +2995,136 @@ fun replay_refused(result: *quic_listener.Result) bool {
         && result.detail == token.ERROR_REPLAY_FULL::u64;
 }
 
+fun reset_arrivals(pump: *Pump) {
+    pump.arrival_head = NO_CONNECTION;
+    pump.arrival_tail = NO_CONNECTION;
+    pump.arrival_live = 0;
+}
+
+fun arrival_at(pump: *Pump, index: usize) *Arrival {
+    ret hedge_storage.table_at[Arrival](?pump.arrivals, index);
+}
+
+# holds an unknown datagram for the preflight turn, or drops it at the queue's
+# bound: the client's PTO retransmits it, exactly as a kernel drop would have
+# cost, except that this one is counted
+fun hold_arrival(runtime: *Runtime, pump: *Pump, received: *net_types.Packet,
+    now_ns: u64) Status {
+    if (received.length == 0
+        || received.length > assembly.MAX_UDP_PAYLOAD) { ret INVALID; }
+    if (pump.arrival_live >= pump.arrival_capacity) {
+        runtime.arrivals_dropped = runtime.arrivals_dropped + 1;
+        ret BLOCKED;
+    }
+    val index: usize = hedge_storage.table_claim[Arrival](?pump.arrivals);
+    if (index == hedge_storage.NO_INDEX) {
+        runtime.arrivals_dropped = runtime.arrivals_dropped + 1;
+        ret BLOCKED;
+    }
+    val arrival: *Arrival = arrival_at(pump, index);
+    std_memory.raw_copy(?arrival.data[0], received.buffer, received.length);
+    arrival.peer                  = received.peer;
+    arrival.local_destination     = received.local_destination;
+    arrival.length                = received.length;
+    arrival.interface_index       = received.interface_index;
+    arrival.has_local_destination = received.has_local_destination;
+    arrival.arrival_ns            = now_ns;
+    arrival.next                  = NO_CONNECTION;
+    if (pump.arrival_tail != NO_CONNECTION) {
+        arrival_at(pump, pump.arrival_tail).next = index;
+    }
+    or { pump.arrival_head = index; }
+    pump.arrival_tail = index;
+    pump.arrival_live = pump.arrival_live + 1;
+    ret OK;
+}
+
+fun arrival_packet(arrival: *Arrival) net_types.Packet {
+    var value: net_types.Packet;
+    value.buffer                = ?arrival.data[0];
+    value.capacity              = arrival.length;
+    value.length                = arrival.length;
+    value.peer                  = arrival.peer;
+    value.local_destination     = arrival.local_destination;
+    value.interface_index       = arrival.interface_index;
+    value.has_local_destination = arrival.has_local_destination;
+    value.truncated             = false;
+    value.zero_length           = false;
+    ret value;
+}
+
+# preflights the oldest held arrival. its packet is copied out first so the
+# record is released before admission, which may itself claim storage
+fun preflight_arrival(controls: *ControlView, runtime: *Runtime, pump_index: usize,
+    now: time.Instant, now_ns: u64) Status {
+    val pump: *Pump = ?controls.pumps[pump_index];
+    if (pump.arrival_head == NO_CONNECTION) { ret BLOCKED; }
+    val index:   usize    = pump.arrival_head;
+    val arrival: *Arrival = arrival_at(pump, index);
+    var copy:    Arrival  = @arrival;
+    pump.arrival_head = arrival.next;
+    if (pump.arrival_head == NO_CONNECTION) { pump.arrival_tail = NO_CONNECTION; }
+    pump.arrival_live = pump.arrival_live - 1;
+    hedge_storage.table_release[Arrival](?pump.arrivals, index);
+    var received:   net_types.Packet                 = arrival_packet(?copy);
+    val classified: quic_listener.ClassifiedDatagram =
+        quic_listener.classify_datagram(received.buffer, received.length,
+        CONNECTION_ID_BYTES);
+    if (classified.class == quic_listener.DATAGRAM_MALFORMED) { ret OK; }
+    val key: routing.Key = routing.key(?classified.destination.data[0],
+        classified.destination.length);
+    # a route published since it was held claims it: a retransmission of an
+    # Initial whose first copy was admitted from this same queue
+    val found: routing.Lookup = routing.lookup(?runtime.routes, key);
+    if (found.status == routing.ROUTE_OK && found.binding.pending) {
+        ret deliver_pending(runtime, found, ?received);
+    }
+    if (found.status == routing.ROUTE_OK) {
+        ret deliver_known(controls, runtime, ?received, found, now, now_ns);
+    }
+    ret handle_unknown(controls, runtime, pump_index, ?received, key, now,
+        now_ns, copy.arrival_ns);
+}
+
+# the sockets are read between units of crypto: the owner's poll settles any
+# receive that completed meanwhile onto the completion list, and settling it
+# submits the next read, so the socket is never left unread for longer than
+# one unit costs. true when something settled
+fun read_on(controls: *ControlView, runtime: *Runtime, now: time.Instant,
+    now_ns: u64) bool {
+    if (runtime.read_on::usize == 0 || !runtime.read_on(runtime.read_on_ctx)
+        || runtime.completions_head == nil) { ret false; }
+    if (drain_completions(controls, runtime, now, now_ns) == FAILED) {
+        connection_failed(runtime);
+    }
+    ret true;
+}
+
+# a turn of preflight work across the pumps, bounded, oldest arrival first
+# pump by pump, the sockets read after every one: a Retry is crypto, and a
+# burst of Initials must not stall the reads that carry it
+fun advance_arrivals(controls: *ControlView, runtime: *Runtime, now: time.Instant,
+    now_ns: u64) Status {
+    var status: Status = OK;
+    var budget: usize  = PREFLIGHT_BUDGET;
+    var i:      usize  = 0;
+    for (i < MAX_PUMPS && budget != 0) {
+        val pump: *Pump = ?controls.pumps[i];
+        for (pump.live && budget != 0 && pump.arrival_head != NO_CONNECTION) {
+            if (preflight_arrival(controls, runtime, i, now, now_ns) == FAILED) {
+                status = FAILED;
+            }
+            budget = budget - 1;
+            read_on(controls, runtime, now, now_ns);
+        }
+        i = i + 1;
+    }
+    ret status;
+}
+
 fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
-    received: *net_types.Packet, now: time.Instant, now_ns: u64) Status {
+    received: *net_types.Packet, key: routing.Key, now: time.Instant,
+    now_ns: u64, arrival_ns: u64) Status {
     val pump: *Pump = ?controls.pumps[pump_index];
     if (pump.draining || pump.cancelling) { ret STOPPED; }
     val bank_index: usize                = pump.active_admission;
@@ -2496,52 +3171,63 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
         pump.config.listener_budget, $size_of(Connection), now,
         ?named_charge, hedge_wake.no_waker());
     if (outcome != budget.ADMITTED && outcome != budget.QUEUED) {
-        val lease_released: bool =
-            process_admission.release(runtime.admission, lease);
-        val cancelled: bool = cancel_acceptance(bank, result.acceptance);
-        if (!lease_released) {
-            var none: quic_listener.Accepted;
-            if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-                none, false, pump.config, ?named_charge, lease,
-                true)) { ret FAILED; }
+        ret abandon_admission(controls, runtime, pump_index, bank_index,
+            result.acceptance, ?named_charge, lease);
+    }
+    var handshake_lease: process_admission.Lease = process_admission.no_lease();
+    if (outcome == budget.ADMITTED) {
+        # the ceiling: an Initial the queue ahead of it would carry past its
+        # own deadline is turned away now rather than promoted with no time
+        # left, and so is one past its peer's share of the bound
+        if (!deadline_allows(runtime, arrival_ns, pump.config.handshake_timeout_ns,
+            now_ns, runtime.deferred_count)
+            || !process_admission.acquire(?runtime.handshakes, ?received.peer,
+            ?handshake_lease)) {
+            refuse_initial(runtime);
+            ret abandon_admission(controls, runtime, pump_index, bank_index,
+                result.acceptance, ?named_charge, lease);
         }
-        if (!cancelled) { ret FAILED; }
-        ret OK;
     }
-    val accepted: quic_listener.Accepted =
-        quic_listener.commit(?bank.listener, result.acceptance);
-    if (accepted.action != quic_listener.ACTION_ACCEPT) {
-        if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-            accepted, false, pump.config, ?named_charge, lease,
-            true)) { ret FAILED; }
-        ret FAILED;
-    }
-    if (outcome == budget.QUEUED) {
-        if (!enqueue_initial(controls, runtime, pump_index, bank_index, accepted,
-            received, pump.config, ?named_charge, lease)) {
-            if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-                accepted, true, pump.config, ?named_charge, lease,
-                true)) { ret FAILED; }
-            ret FAILED;
-        }
-        ret OK;
-    }
-    val index: usize = acquire_connection(controls, runtime, pump_index, bank_index,
-        lease);
-    if (index == NO_CONNECTION) {
-        if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
-            accepted, true, pump.config, ?named_charge, lease,
-            true)) { ret FAILED; }
+    if (!enqueue_initial(controls, runtime, pump_index, bank_index,
+        result.acceptance, key, received, pump.config, ?named_charge, lease,
+        outcome == budget.ADMITTED, handshake_lease, arrival_ns)) {
+        release_handshake_lease(runtime, ?handshake_lease);
+        if (abandon_admission(controls, runtime, pump_index, bank_index,
+            result.acceptance, ?named_charge, lease) != OK) { ret FAILED; }
         ret BLOCKED;
     }
-    var connection_config: ConnectionConfig;
-    if (!active_connection_config(?pump.config,
-        ?connection_config)) { ret FAILED; }
-    own_connection_admission(connection_at(controls, index),
-        ?accepted, pump.config.budgets, ?named_charge);
-    if (!initialize_connection(controls, runtime, pump_index, bank_index, index,
-        ?accepted, received, ?connection_config, now_ns)) { ret FAILED; }
-    if (!deliver_initial(controls, runtime, index, received, now_ns)) { ret FAILED; }
+    ret OK;
+}
+
+fun release_handshake_lease(runtime: *Runtime, lease: *process_admission.Lease) {
+    if (lease.generation == 0) { ret; }
+    if (!process_admission.release(?runtime.handshakes, @lease)) {
+        connection_failed(runtime);
+    }
+    @lease = process_admission.no_lease();
+}
+
+# an acceptance that goes no further: its budget charge, process lease and
+# listener acceptance all go back, through a cleanup-only pending record when
+# a release refuses now
+fun abandon_admission(controls: *ControlView, runtime: *Runtime, pump_index: usize,
+    bank_index: usize, acceptance: quic_listener.Acceptance,
+    named_charge: *budget.Charge, lease: process_admission.Lease) Status {
+    val pump:            *Pump                = ?controls.pumps[pump_index];
+    val bank:            *AdmissionGeneration = ?pump.admissions[bank_index];
+    var charge_released: bool                 = true;
+    if (named_charge.live) {
+        charge_released = budget.release(pump.budgets, named_charge);
+    }
+    val lease_released: bool = process_admission.release(runtime.admission, lease);
+    val cancelled:      bool = cancel_acceptance(bank, acceptance);
+    if (!lease_released || !charge_released) {
+        var none: quic_listener.Accepted;
+        if (!own_pending_cleanup(controls, runtime, pump_index, bank_index,
+            none, false, pump.config, named_charge, lease,
+            !lease_released)) { ret FAILED; }
+    }
+    if (!cancelled) { ret FAILED; }
     ret OK;
 }
 
@@ -2693,7 +3379,7 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
         if (!assembly.release_closed(?value.assembly)) { ret FAILED; }
         value.assembly_released = true;
     }
-    if (!release_handshake(controls, value)) { ret FAILED; }
+    if (!release_handshake(controls, runtime, index, false, 0)) { ret FAILED; }
     value.state = CONNECTION_FINALIZING;
     ret finalize_connection(controls, runtime, index);
 }
@@ -2908,7 +3594,7 @@ fun progress_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     }
     val sends_ok: bool = generate_sends(controls, runtime, index, now_ns);
     if (value.handshake != NO_HANDSHAKE && assembly.tls_released(?value.assembly)
-        && !release_handshake(controls, value)) { ret false; }
+        && !release_handshake(controls, runtime, index, true, now_ns)) { ret false; }
     observe_memory(value, now_ns);
     if (!reconcile_routes(controls, runtime, index)
         || !refresh_timer(controls, runtime, index)) { ret false; }
@@ -2918,8 +3604,15 @@ fun progress_connection(controls: *ControlView, runtime: *Runtime, index: usize,
 fun deliver_known(controls: *ControlView, runtime: *Runtime, received: *net_types.Packet,
     found: routing.Lookup, now: time.Instant, now_ns: u64) Status {
     if (!route_is_current(controls, runtime, found)) { ret STALE; }
-    val index:     usize              = found.binding.connection_slot;
-    val value:     *Connection        = connection_at(controls, index);
+    val index: usize       = found.binding.connection_slot;
+    val value: *Connection = connection_at(controls, index);
+    # a connection mid-handshake takes its datagrams on the worker's handshake
+    # turn, so the receive path spends no crypto and reads on
+    if (value.handshake != NO_HANDSHAKE) {
+        hold_datagram(runtime, ?value.held, HELD_PER_CONNECTION, received);
+        mark_ready(controls, runtime, index);
+        ret OK;
+    }
     val delivered: qt.OperationResult = qt.receive_native[binding.Binding](
         ?value.assembly.driver, received, value.local, clock.from_ns(now_ns), 0);
     if (delivered.status == qt.STATUS_ERROR
@@ -2943,12 +3636,17 @@ fun process_datagram(controls: *ControlView, runtime: *Runtime, pump_index: usiz
     val key: routing.Key = routing.key(?classified.destination.data[0],
         classified.destination.length);
     val found: routing.Lookup = routing.lookup(?runtime.routes, key);
+    if (found.status == routing.ROUTE_OK && found.binding.pending) {
+        ret deliver_pending(runtime, found, received);
+    }
     if (found.status == routing.ROUTE_OK) {
         ret deliver_known(controls, runtime, received, found, now, now_ns);
     }
     if (classified.class == quic_listener.DATAGRAM_INITIAL
         || classified.class == quic_listener.DATAGRAM_NEGOTIATE) {
-        ret handle_unknown(controls, runtime, pump_index, received, now, now_ns);
+        val pump: *Pump = ?controls.pumps[pump_index];
+        if (pump.draining || pump.cancelling) { ret STOPPED; }
+        ret hold_arrival(runtime, pump, received, now_ns);
     }
     ret OK;
 }
@@ -3082,6 +3780,16 @@ fun complete_at(controls: *ControlView, runtime: *Runtime, context: *CompletionC
 
 # the shared cap is the manager itself, so there is nothing to agree on beyond
 # binding it before anything is connected
+# the owner's socket poll: a non-blocking wait on its io runtime that settles
+# what completed. bound once, before anything is connected
+pub fun bind_read_on(runtime: *Runtime, hook: fun(ptr) bool, ctx: ptr) bool {
+    if (runtime == nil || !runtime.initialized || hook::usize == 0
+        || runtime.live_total != 0) { ret false; }
+    runtime.read_on     = hook;
+    runtime.read_on_ctx = ctx;
+    ret true;
+}
+
 pub fun bind_admission(runtime: *Runtime,
     manager: *process_admission.Manager) bool {
     if (runtime == nil || !runtime.initialized || manager == nil
@@ -3214,14 +3922,46 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
         }
         value.assembly_released = true;
     }
-    if (!release_handshake(controls, value)) { ret FAILED; }
+    if (!release_handshake(controls, runtime, index, false, 0)) { ret FAILED; }
     value.state = CONNECTION_FINALIZING;
     ret finalize_connection(controls, runtime, index);
 }
 
+# a budget-admitted initial takes its place in the deferred queue. its wheel
+# entry moves from the budget deadline to the admission deadline, and the
+# ceiling and the peer's share apply as they do at arrival
+fun defer_admitted(runtime: *Runtime, index: usize, now_ns: u64) bool {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (!deadline_allows(runtime, pending.arrival_ns,
+        pending.config.handshake_timeout_ns, now_ns, runtime.deferred_count)
+        || !process_admission.acquire(?runtime.handshakes, ?pending.peer,
+        ?pending.handshake_lease)) {
+        refuse_initial(runtime);
+        ret false;
+    }
+    pending.handshake_lease_live = true;
+    if (pending.timer_live) {
+        wheel.arm(runtime.timers, pending.timer,
+            saturated_add(pending.arrival_ns, pending.config.handshake_timeout_ns));
+    }
+    link_deferred(runtime, index);
+    if (!handshake_room(runtime) || runtime.deferred_count > 1) {
+        hold_deferred(runtime, pending);
+    }
+    ret true;
+}
+
+# the deferred queue is promoted one Initial per turn, in arrival order, when
+# a handshake slot is free and the turn's crypto budget is unspent. one per
+# turn keeps every turn short enough that the receive is back on the socket
+# between handshakes, and costs no throughput: a turn with a promotion waiting
+# is a turn the worker runs at once
 fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: time.Instant,
     now_ns: u64) Status {
     var status: Status = OK;
+    if (promotable(runtime) && runtime.crypto_budget != 0) {
+        mark_pending_ready(runtime, runtime.deferred_head);
+    }
     # an initial marked while these are serviced waits for the next turn
     val last: usize = runtime.pending_ready_tail;
     var i:    usize = runtime.pending_ready_head;
@@ -3259,16 +3999,37 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             i = next;
             cnt;
         }
-        val outcome: budget.Outcome = budget.retry(
-            pending.config.budgets, ?pending.budget_charge, now);
-        if (outcome == budget.QUEUED) {
-            i = next;
-            cnt;
-        }
-        if (outcome != budget.ADMITTED) {
-            if (!pending.budget_charge.live) {
-                pending.budget_charge_live = false;
+        if (!pending.deferred) {
+            val outcome: budget.Outcome = budget.retry(
+                pending.config.budgets, ?pending.budget_charge, now);
+            if (outcome == budget.QUEUED) {
+                i = next;
+                cnt;
             }
+            if (outcome != budget.ADMITTED) {
+                if (!pending.budget_charge.live) {
+                    pending.budget_charge_live = false;
+                }
+                if (!release_pending_initial(controls, runtime, i)) {
+                    retry_release(runtime, i);
+                    status = FAILED;
+                }
+                i = next;
+                cnt;
+            }
+            if (!defer_admitted(runtime, i, now_ns)) {
+                if (!release_pending_initial(controls, runtime, i)) {
+                    retry_release(runtime, i);
+                    status = FAILED;
+                }
+                i = next;
+                cnt;
+            }
+        }
+        val deadline_ns: u64 = saturated_add(pending.arrival_ns,
+            pending.config.handshake_timeout_ns);
+        if (now_ns >= deadline_ns) {
+            refuse_initial(runtime);
             if (!release_pending_initial(controls, runtime, i)) {
                 retry_release(runtime, i);
                 status = FAILED;
@@ -3276,8 +4037,25 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             i = next;
             cnt;
         }
-        val packet_value:    net_types.Packet       = pending_packet(pending);
-        val accepted:        quic_listener.Accepted = pending.accepted;
+        if (i != runtime.deferred_head || runtime.crypto_budget == 0
+            || !handshake_room(runtime)) {
+            hold_deferred(runtime, pending);
+            i = next;
+            cnt;
+        }
+        # the deadline drop: promoted now, this handshake would still end past
+        # its own deadline, so the crypto is not spent on it
+        if (!deadline_allows(runtime, pending.arrival_ns,
+            pending.config.handshake_timeout_ns, now_ns, 0)) {
+            refuse_initial(runtime);
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
+            i = next;
+            cnt;
+        }
+        val packet_value:    net_types.Packet = pending_packet(pending);
         var config_snapshot: ConnectionConfig;
         if (!materialize_pending_config(?pending.config,
             ?config_snapshot)) {
@@ -3301,9 +4079,23 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             i = next;
             cnt;
         }
+        # the acceptance is committed only now: the connection is being made
+        val accepted: quic_listener.Accepted =
+            quic_listener.commit(?bank.listener, pending.acceptance);
+        pending.acceptance_live = false;
+        if (accepted.action != quic_listener.ACTION_ACCEPT) {
+            connection_failed(runtime);
+            free_connection(controls, runtime, connection_index);
+            if (!release_pending_initial(controls, runtime, i)) {
+                retry_release(runtime, i);
+                status = FAILED;
+            }
+            i = next;
+            cnt;
+        }
         val value: *Connection =
             connection_at(controls, connection_index);
-        if (!transfer_pending_ownership(pending, value)) {
+        if (!transfer_pending_ownership(pending, ?accepted, value)) {
             status           = FAILED;
             value.lease_live = false;
             value.lease      = process_admission.no_lease();
@@ -3316,14 +4108,19 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             i = next;
             cnt;
         }
+        val arrival_ns: u64 = pending.arrival_ns;
+        # the connection publishes the same ID once initialized
+        unpublish_pending_route(runtime, i);
         val initialized: bool = initialize_connection(controls, runtime,
             pump_index, bank_index,
             connection_index, ?accepted, ?packet_value,
-            ?config_snapshot, now_ns);
+            ?config_snapshot, arrival_ns, now_ns);
         var delivered: bool = false;
         if (initialized) {
+            move_held(?value.held, ?pending.held);
             delivered = deliver_initial(controls, runtime, connection_index,
                 ?packet_value, now_ns);
+            if (delivered) { deliver_held(controls, runtime, connection_index, now_ns); }
             mark_connection_superseded(controls, runtime, connection_index);
             if (delivered
                 && !progress_connection(controls, runtime, connection_index,
@@ -3332,7 +4129,9 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             }
         }
         take_pending_initial(controls, runtime, i);
-        i = next;
+        runtime.handshakes_promoted = runtime.handshakes_promoted + 1;
+        runtime.crypto_budget       = runtime.crypto_budget - 1;
+        i                           = next;
     }
     ret status;
 }
@@ -3496,10 +4295,38 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
         service_connection(controls, runtime, index, now, now_ns);
         if (index == last) { brk; }
     }
+    # one unit of handshake work per turn, so every turn returns to the
+    # socket between handshakes. a turn with handshake work waiting runs at once
+    runtime.crypto_budget = 1;
+    if (runtime.handshake_ready_head != NO_CONNECTION) {
+        val index: usize = runtime.handshake_ready_head;
+        unmark_ready(controls, runtime, index);
+        deliver_held(controls, runtime, index, now_ns);
+        service_connection(controls, runtime, index, now, now_ns);
+        runtime.crypto_budget = 0;
+    }
+    if (advance_arrivals(controls, runtime, now, now_ns) == FAILED) {
+        connection_failed(runtime);
+    }
     if (advance_pending_initials(controls, runtime, now, now_ns) == FAILED) {
         connection_failed(runtime);
     }
     ret status;
+}
+
+# the handshake admission counters, read every turn, so they cost no walk
+pub fun admission_report(runtime: *Runtime) telemetry.HandshakeReport {
+    var value: telemetry.HandshakeReport;
+    if (runtime == nil || !runtime.initialized) { ret value; }
+    value.in_flight        = runtime.handshakes_in_flight;
+    value.deferred         = runtime.handshakes_deferred;
+    value.promoted         = runtime.handshakes_promoted;
+    value.completed        = runtime.handshakes_completed;
+    value.dropped          = runtime.handshakes_dropped;
+    value.refused          = runtime.handshakes_refused;
+    value.retries_dropped  = runtime.stateless_dropped;
+    value.arrivals_dropped = runtime.arrivals_dropped;
+    ret value;
 }
 
 # Retry-token Initials refused at the replay bound since make
@@ -3635,6 +4462,8 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
     pump.listener_name = nil;
     clear_pump_config(pump);
     if (!hedge_storage.destroy_table[StatelessSend](?pump.stateless)) { ret FAILED; }
+    if (!hedge_storage.destroy_table[Arrival](?pump.arrivals))        { ret FAILED; }
+    reset_arrivals(pump);
     pump.stateless_generation = 0;
     pump.stateless_pending    = NO_CONNECTION;
     pump.storage              = nil;
@@ -3664,7 +4493,10 @@ pub fun release(controls: *ControlView, runtime: *Runtime) Status {
         && !hedge_storage.destroy[ConnectionStorage](?runtime.connection_storages))
         || !hedge_storage.destroy_table[PendingInitial](?runtime.pending_initials)
         || (runtime.routes.initialized && !routing.destroy(?runtime.routes))
-        || (runtime.sessions.storages.live && !h3_session.destroy_pool(?runtime.sessions))) {
+        || (runtime.sessions.storages.live && !h3_session.destroy_pool(?runtime.sessions))
+        || (runtime.handshakes.initialized
+        && !process_admission.destroy(?runtime.handshakes))
+        || !hedge_storage.destroy_table[HeldDatagram](?runtime.held)) {
         ret FAILED;
     }
     # every record is back by now, since no connection is live; the secret tables
@@ -3726,17 +4558,26 @@ pub fun budgets_in_use(controls: *ControlView, runtime: *Runtime, target: *budge
 pub fun snapshot(controls: *ControlView, runtime: *Runtime) Snapshot {
     var value: Snapshot;
     if (runtime == nil || !runtime.initialized) { ret value; }
-    value.pumps               = runtime.pump_count;
-    value.live                = runtime.live_total;
-    value.superseded          = superseded(controls, runtime);
-    value.routes              = runtime.routes.len;
-    value.timers              = wheel.armed_count(runtime.timers);
-    value.datagram_failures   = runtime.datagram_failures;
-    value.connection_failures = runtime.connection_failures;
-    value.stateless_dropped   = runtime.stateless_dropped;
-    value.replay_full         = runtime.replay_full;
-    value.stopping            = runtime.stopping;
-    value.initialized         = true;
+    value.pumps                = runtime.pump_count;
+    value.live                 = runtime.live_total;
+    value.superseded           = superseded(controls, runtime);
+    value.routes               = runtime.routes.len;
+    value.timers               = wheel.armed_count(runtime.timers);
+    value.datagram_failures    = runtime.datagram_failures;
+    value.connection_failures  = runtime.connection_failures;
+    value.stateless_dropped    = runtime.stateless_dropped;
+    value.arrivals_dropped     = runtime.arrivals_dropped;
+    value.replay_full          = runtime.replay_full;
+    value.handshakes_in_flight = runtime.handshakes_in_flight;
+    value.handshakes_waiting   = runtime.deferred_count;
+    value.handshakes_deferred  = runtime.handshakes_deferred;
+    value.handshakes_promoted  = runtime.handshakes_promoted;
+    value.handshakes_completed = runtime.handshakes_completed;
+    value.handshakes_dropped   = runtime.handshakes_dropped;
+    value.handshakes_refused   = runtime.handshakes_refused;
+    value.service_ns           = runtime.service_ns;
+    value.stopping             = runtime.stopping;
+    value.initialized          = true;
     var i: usize = runtime.live_head;
     for (i != NO_CONNECTION) {
         if (connection_at(controls, i).state == CONNECTION_BROKEN) {
@@ -3762,6 +4603,9 @@ fun test_pump_config(generation: u64, policy: *hedge_tls.Policy,
     config.admission_generation     = generation;
     config.connection_limit         = opt[usize].some{1};
     config.max_connections_per_peer = opt[usize].some{1};
+    config.max_handshakes           = schema.DEFAULT_MAX_HANDSHAKES;
+    config.max_handshakes_per_peer  = opt[usize].none{};
+    config.receive_buffer_bytes     = schema.DEFAULT_QUIC_RECEIVE_BUFFER;
     config.require_retry            = false;
     config.retry_max_age_ns         = 1000000000;
     config.address_max_age_ns       = 1000000000;
@@ -3831,8 +4675,8 @@ fun test_allocator() *A.Allocator {
     ret ?test_backing;
 }
 
-fun test_prepare_pump(pump: *Pump, storage: *PumpStorage, generation: u64,
-    config: *PumpConfig) bool {
+fun test_prepare_pump(runtime: *Runtime, pump: *Pump, storage: *PumpStorage,
+    generation: u64, config: *PumpConfig) bool {
     pump.storage                = storage;
     pump.backing                = test_allocator();
     pump.generation             = generation;
@@ -3847,7 +4691,7 @@ fun test_prepare_pump(pump: *Pump, storage: *PumpStorage, generation: u64,
     pump.admissions[0].retiring = false;
     pump.admissions[1].live     = false;
     pump.admissions[1].retiring = false;
-    apply_pump_config(pump, config);
+    apply_pump_config(runtime, pump, config);
     if (!initialize_admission_inner(pump, 0, config, false)) {
         ret false;
     }
@@ -3911,8 +4755,8 @@ test "hedge.protocol.quic.runtime: multi-pump update rolls back staging" {
         ?selected_plan, ?budgets);
     val second_new: PumpConfig = test_pump_config(21, ?policy,
         ?selected_plan, ?budgets);
-    if (!test_prepare_pump(?controls.pumps[0], ?storages[0], 1, ?first_old)
-        || !test_prepare_pump(?controls.pumps[1], ?storages[1], 2, ?second_old)) { ret 1; }
+    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?storages[0], 1, ?first_old)
+        || !test_prepare_pump(?runtime, ?controls.pumps[1], ?storages[1], 2, ?second_old)) { ret 1; }
     # the second pump cannot grow a bank, so staging the first must roll back
     controls.pumps[1].backing = nil;
     var updates: [2]PumpUpdate;
@@ -3957,7 +4801,7 @@ test "hedge.protocol.quic.runtime: failed rollback is fatal before commit" {
         ?selected_plan, ?budgets);
     val new_config: PumpConfig = test_pump_config(11, ?policy,
         ?selected_plan, ?budgets);
-    if (!test_prepare_pump(?controls.pumps[0], ?storage, 1, ?old_config)
+    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?storage, 1, ?old_config)
         || !initialize_admission_inner(?controls.pumps[0], 1, ?new_config,
         false)) { ret 1; }
     controls.pumps[0].admissions[1].listener.closing = true;
@@ -4006,7 +4850,7 @@ test "hedge.protocol.quic.runtime: update reports committed retirement failure" 
         ?old_plan, ?budgets);
     val new_config: PumpConfig = test_pump_config(41, ?policy,
         ?new_plan, ?budgets);
-    if (!test_prepare_pump(?controls.pumps[0], ?storage, 5, ?old_config)) { ret 1; }
+    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?storage, 5, ?old_config)) { ret 1; }
     controls.pumps[0].admissions[0].listener.closing = true;
     var updates: [1]PumpUpdate;
     updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 5},
@@ -4049,7 +4893,7 @@ test "hedge.protocol.quic.runtime: update gracefully retires superseded" {
         ?old_plan, ?old_budgets);
     val new_config: PumpConfig = test_pump_config(31, ?policy,
         ?new_plan, ?new_budgets);
-    if (!test_prepare_pump(?controls.pumps[0], ?pump_storage, 4, ?old_config)) { ret 1; }
+    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?pump_storage, 4, ?old_config)) { ret 1; }
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (index != 0) { ret 2; }
@@ -4315,7 +5159,7 @@ test "hedge.protocol.quic.runtime: pending transfer preserves old generation" {
     controls.pumps[0].admissions[0].queued_initials = 1;
     val value: *Connection = connection_at(controls, index);
     value.plan = pending.config.plan;
-    if (index != 0 || !transfer_pending_ownership(pending, value)) { ret 1; }
+    if (index != 0 || !transfer_pending_ownership(pending, ?pending.accepted, value)) { ret 1; }
     value.state = CONNECTION_LIVE;
     mark_connection_superseded(controls, ?runtime, index);
     take_pending_initial(controls, ?runtime, 0);
@@ -4335,7 +5179,7 @@ test "hedge.protocol.quic.runtime: pending transfer preserves old generation" {
 fun test_queue_pending(controls: *ControlView, runtime: *Runtime,
     budgets: *budget.Set, waiting: *budget.Charge) *PendingInitial {
     val pending: *PendingInitial = test_take_pending(runtime);
-    if (pending == nil || !claim_pending_timer(runtime, 0, waiting)) { ret nil; }
+    if (pending == nil || !claim_pending_timer(runtime, 0, false, waiting)) { ret nil; }
     runtime.pending_initial_count                   = 1;
     runtime.live_total                              = 1;
     controls.pumps[0].live                          = true;
@@ -4543,7 +5387,7 @@ test "hedge.protocol.quic.runtime: shutdown cancels queued ownership" {
     runtime.pending_initial_count = 1;
     runtime.live_total            = 1;
     runtime.pump_count            = 1;
-    if (!test_prepare_pump(?controls.pumps[0], ?pump_storage, 1, ?config)) { ret 3; }
+    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?pump_storage, 1, ?config)) { ret 3; }
     controls.pumps[0].queued_initials               = 1;
     controls.pumps[0].admissions[0].queued_initials = 1;
     pending.live                                    = true;
@@ -5093,5 +5937,333 @@ test "hedge.protocol.quic.runtime: only a full replay store is a replay refusal"
     expired.action = quic_listener.ACTION_DROP;
     expired.detail = token.ERROR_EXPIRED::u64;
     if (replay_refused(?expired)) { ret 3; }
+    ret 0;
+}
+
+# queue an admitted initial as deferred pending `index`, the way enqueue_initial
+# does for a budget that admitted it, with a live pump and bank so promotion
+# and release take their real paths
+fun test_defer_pending(controls: *ControlView, runtime: *Runtime, index: usize,
+    arrival_ns: u64, handshake_timeout_ns: u64) *PendingInitial {
+    val claimed: usize = free_pending_initial(runtime);
+    if (claimed != index) { ret nil; }
+    val pending: *PendingInitial = pending_at(runtime, index);
+    pending.arrival_ns                  = arrival_ns;
+    pending.config.handshake_timeout_ns = handshake_timeout_ns;
+    if (!claim_pending_timer(runtime, index, true, ?pending.budget_charge)) { ret nil; }
+    controls.pumps[0].live               = true;
+    controls.pumps[0].generation         = 2;
+    controls.pumps[0].admissions[0].live = true;
+    pending.live                         = true;
+    pending.pump                         = 0;
+    pending.pump_generation              = 2;
+    pending.admission_bank               = 0;
+    link_deferred(runtime, index);
+    link_pending_live(runtime, index);
+    runtime.pending_initial_count                   = runtime.pending_initial_count + 1;
+    runtime.live_total                              = runtime.live_total + 1;
+    controls.pumps[0].queued_initials               = controls.pumps[0].queued_initials + 1;
+    controls.pumps[0].admissions[0].queued_initials =
+        controls.pumps[0].admissions[0].queued_initials + 1;
+    ret pending;
+}
+
+test "hedge.protocol.quic.runtime: the admission deadline counts the work ahead at the running cost" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    if (runtime.service_ns != HANDSHAKE_SERVICE_SEED_NS)  { ret 1; }
+    runtime.service_ns = 10000000;
+    # 998 waiting and none in flight: the thousandth handshake ends at 10 s,
+    # inside a 10 s deadline. one more waiting and it does not
+    if (!deadline_allows(?runtime, 0, 10000000000, 0, 998)
+        || deadline_allows(?runtime, 0, 10000000000, 0, 999)) { ret 2; }
+    # handshakes in flight are work ahead as much as waiting initials are
+    runtime.handshakes_in_flight = 500;
+    if (!deadline_allows(?runtime, 0, 10000000000, 0, 498)
+        || deadline_allows(?runtime, 0, 10000000000, 0, 499)) { ret 3; }
+    # time already spent waiting is time gone from the same deadline
+    runtime.handshakes_in_flight = 0;
+    if (!deadline_allows(?runtime, 0, 10000000000, 5000000000, 498)
+        || deadline_allows(?runtime, 0, 10000000000, 5000000000, 499)) { ret 4; }
+    # a cost estimate that halves doubles what the deadline admits
+    runtime.service_ns = 5000000;
+    if (!deadline_allows(?runtime, 0, 10000000000, 0, 1998)
+        || deadline_allows(?runtime, 0, 10000000000, 0, 1999)) { ret 5; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: the service estimate follows completions only while initials wait" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    # with nothing waiting the worker may have idled between completions, so
+    # no chain of samples opens and the seed stands
+    observe_service(?runtime, 1000000000);
+    observe_service(?runtime, 1500000000);
+    if (runtime.service_ns != HANDSHAKE_SERVICE_SEED_NS
+        || runtime.last_completion_ns != 0) { ret 1; }
+    # with initials waiting, the first completion opens the chain and each
+    # later one folds its interval in at one eighth
+    runtime.deferred_count = 5;
+    observe_service(?runtime, 2000000000);
+    if (runtime.service_ns != HANDSHAKE_SERVICE_SEED_NS
+        || runtime.last_completion_ns != 2000000000) { ret 2; }
+    observe_service(?runtime, 2002000000);
+    if (runtime.service_ns != 10000000 - 1250000 + 250000) { ret 3; }
+    # a stall longer than a second is not a handshake and is capped
+    observe_service(?runtime, 12002000000);
+    if (runtime.service_ns > 9000000 - 1125000 + 125000000) { ret 4; }
+    # the queue draining closes the chain: the next completion is not a sample
+    runtime.deferred_count = 0;
+    val settled: u64 = runtime.service_ns;
+    observe_service(?runtime, 13000000000);
+    if (runtime.service_ns != settled || runtime.last_completion_ns != 0) { ret 5; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a deferred initial past its deadline is dropped, one inside it waits its turn" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    runtime.max_handshakes = 1;
+    val first:  *PendingInitial = test_defer_pending(controls, ?runtime, 0, 0, 10000000000);
+    val second: *PendingInitial = test_defer_pending(controls, ?runtime, 1, 1000000000, 10000000000);
+    if (first == nil || second == nil || runtime.deferred_count != 2
+        || runtime.deferred_head != 0 || runtime.deferred_tail != 1
+        || !promotable(?runtime) || !has_ready(?runtime)) { ret 1; }
+    # the second was not first in line, so it counts as held back; the first
+    # only once a turn passes it over
+    if (runtime.handshakes_deferred != 0) { ret 2; }
+    # the bound is full: a turn marks nothing and promotes nothing
+    runtime.handshakes_in_flight = 1;
+    runtime.crypto_budget        = 1;
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 2, nsec: 0}, 2000000000) != OK
+        || !first.live || !second.live || runtime.handshakes_promoted != 0
+        || has_ready(?runtime) || promotable(?runtime)) { ret 3; }
+    # the bound has room but the turn has no unit of handshake work left: the
+    # head is not marked
+    runtime.handshakes_in_flight = 0;
+    runtime.crypto_budget        = 0;
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 2, nsec: 0}, 2000000000) != OK
+        || !first.live || runtime.handshakes_promoted != 0) { ret 4; }
+    # its deadline fires: the first is dropped and counted, and nothing else
+    # is touched, since the second was not marked
+    var owners: [4]u64;
+    if (wheel.advance(?fixture.timers, 10000000000, ?owners[0], 4) != 1
+        || !owns(owners[0])) { ret 5; }
+    fire(controls, ?runtime, owners[0], 10000000000);
+    runtime.crypto_budget = 1;
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 10, nsec: 0}, 10000000000) != OK
+        || first.live || !second.live || runtime.handshakes_dropped != 1
+        || runtime.handshakes_refused != 0 || runtime.deferred_count != 1
+        || runtime.deferred_head != 1 || runtime.pending_initial_count != 1
+        || runtime.live_total != 1) { ret 6; }
+    # the second, promoted now, would end past its own deadline at the running
+    # cost, so it is dropped rather than started
+    runtime.service_ns = 2000000000;
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 9, nsec: 500000000}, 9500000000) != OK
+        || second.live || runtime.handshakes_dropped != 2
+        || runtime.handshakes_promoted != 0 || runtime.deferred_count != 0
+        || runtime.pending_initial_count != 0 || runtime.live_total != 0
+        || has_ready(?runtime) || wheel.armed_count(?fixture.timers) != 0) { ret 7; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: the deferred queue is promoted in arrival order and one per turn" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val first:  *PendingInitial = test_defer_pending(controls, ?runtime, 0, 0, 10000000000);
+    val second: *PendingInitial = test_defer_pending(controls, ?runtime, 1, 0, 10000000000);
+    val third:  *PendingInitial = test_defer_pending(controls, ?runtime, 2, 0, 10000000000);
+    if (first == nil || second == nil || third == nil) { ret 1; }
+    # without a unit of handshake work this turn nothing is marked or taken
+    runtime.crypto_budget = 0;
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 1, nsec: 0}, 1000000000) != OK
+        || !first.live || !second.live || !third.live
+        || runtime.handshakes_deferred != 0) { ret 2; }
+    # no policy stands behind the pending config here, so a promotion goes no
+    # further than releasing the initial it took: the order of release is the
+    # order of promotion, one per turn
+    runtime.crypto_budget = 1;
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 1, nsec: 0}, 1000000000) != OK
+        || first.live || !second.live || !third.live
+        || runtime.deferred_head != 1 || runtime.handshakes_promoted != 0) { ret 3; }
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 1, nsec: 0}, 1000000000) != OK
+        || second.live || !third.live || runtime.deferred_head != 2) { ret 4; }
+    if (advance_pending_initials(controls, ?runtime,
+        time.Instant{sec: 1, nsec: 0}, 1000000000) != OK
+        || third.live || runtime.deferred_count != 0
+        || runtime.pending_initial_count != 0 || runtime.live_total != 0
+        || has_ready(?runtime)) { ret 5; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a pending initial routes the datagrams behind it and holds a bounded few" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val pending: *PendingInitial = test_defer_pending(controls, ?runtime, 0, 0, 10000000000);
+    if (pending == nil) { ret 1; }
+    var id: [CONNECTION_ID_BYTES]u8;
+    var i:  usize = 0;
+    for (i < CONNECTION_ID_BYTES) {
+        id[i] = (i + 7)::u8;
+        i     = i + 1;
+    }
+    val key: routing.Key = routing.key(?id[0], CONNECTION_ID_BYTES);
+    if (!publish_pending_route(?runtime, 0, key) || !pending.route_live
+        || runtime.routes.len != 1) { ret 2; }
+    val found: routing.Lookup = routing.lookup(?runtime.routes, key);
+    if (found.status != routing.ROUTE_OK || !found.binding.pending
+        || found.binding.connection_slot != 0) { ret 3; }
+    var payload:      [64]u8;
+    var packet_value: net_types.Packet;
+    packet_value.buffer   = ?payload[0];
+    packet_value.capacity = 64;
+    packet_value.length   = 64;
+    i                     = 0;
+    for (i < HELD_PER_PENDING) {
+        payload[0] = i::u8;
+        if (deliver_pending(?runtime, found, ?packet_value) != OK) { ret 4; }
+        i = i + 1;
+    }
+    if (pending.held.count != HELD_PER_PENDING || runtime.held_dropped != 0) { ret 5; }
+    # past the ceiling the datagram is dropped, and the retransmit is the retry
+    if (deliver_pending(?runtime, found, ?packet_value) != OK
+        || pending.held.count != HELD_PER_PENDING || runtime.held_dropped != 1) { ret 6; }
+    # what was held is in arrival order
+    if (held_at(?runtime, pending.held.head).data[0] != 0
+        || held_at(?runtime, pending.held.tail).data[0] != (HELD_PER_PENDING - 1)::u8) { ret 7; }
+    # a stale generation is not this initial
+    var stale: routing.Lookup = found;
+    stale.binding.connection_generation = stale.binding.connection_generation + 1;
+    if (deliver_pending(?runtime, stale, ?packet_value) != STALE) { ret 8; }
+    # releasing the initial takes its route and what it held with it
+    take_pending_initial(controls, ?runtime, 0);
+    if (pending.live || pending.route_live || runtime.routes.len != 0
+        || hedge_storage.table_live[HeldDatagram](?runtime.held) != 0) { ret 9; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a connection with work joins the handshake list while it holds a record" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    controls.pumps[0].live       = true;
+    controls.pumps[0].generation = 4;
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.Lease{index: 0, generation: 1});
+    if (index == NO_CONNECTION) { ret 1; }
+    val value: *Connection = connection_at(controls, index);
+    value.handshake = claim_handshake(controls);
+    if (value.handshake == NO_HANDSHAKE) { ret 2; }
+    runtime.handshakes_in_flight = 1;
+    mark_ready(controls, ?runtime, index);
+    if (!value.ready || !value.ready_handshake || runtime.ready_head != NO_CONNECTION
+        || runtime.handshake_ready_head != index
+        || runtime.handshake_ready_tail != index || !has_ready(?runtime)) { ret 3; }
+    # the record going back moves its work to the ready list and frees a slot
+    if (!release_handshake(controls, ?runtime, index, false, 0)
+        || value.handshake != NO_HANDSHAKE || runtime.handshakes_in_flight != 0
+        || !value.ready || value.ready_handshake || runtime.ready_head != index
+        || runtime.handshake_ready_head != NO_CONNECTION) { ret 4; }
+    unmark_ready(controls, ?runtime, index);
+    if (value.ready || runtime.ready_head != NO_CONNECTION || has_ready(?runtime)) { ret 5; }
+    value.lease_live = false;
+    free_connection(controls, ?runtime, index);
+    ret 0;
+}
+
+var test_read_on_calls: usize = 0;
+
+fun test_read_on(ctx: ptr) bool {
+    test_read_on_calls = test_read_on_calls + 1;
+    ret false;
+}
+
+test "hedge.protocol.quic.runtime: an unknown initial is held in arrival order and dropped past the socket's worth" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val pump: *Pump = ?controls.pumps[0];
+    if (!hedge_storage.make_table[Arrival](?pump.arrivals, test_allocator())) { ret 91; }
+    reset_arrivals(pump);
+    # the queue holds what the socket buffer holds, never less than a batch
+    if (arrival_capacity(schema.DEFAULT_QUIC_RECEIVE_BUFFER)
+        != schema.DEFAULT_QUIC_RECEIVE_BUFFER / MIN_INITIAL_BYTES) { ret 1; }
+    if (arrival_capacity(1) != RECEIVE_BATCH) { ret 2; }
+    pump.arrival_capacity = 2;
+    var data:  [MIN_INITIAL_BYTES]u8;
+    var first: net_types.Packet;
+    first.buffer   = ?data[0];
+    first.capacity = MIN_INITIAL_BYTES;
+    first.length   = MIN_INITIAL_BYTES;
+    data[0]        = 1;
+    if (hold_arrival(?runtime, pump, ?first, 100) != OK) { ret 3; }
+    data[0] = 2;
+    if (hold_arrival(?runtime, pump, ?first, 200) != OK) { ret 4; }
+    # the third is past the bound: dropped and counted, nothing held
+    data[0] = 3;
+    if (hold_arrival(?runtime, pump, ?first, 300) != BLOCKED
+        || runtime.arrivals_dropped != 1 || pump.arrival_live != 2) { ret 5; }
+    # held in arrival order with each one's own arrival time and bytes
+    val head: *Arrival = arrival_at(pump, pump.arrival_head);
+    if (head.arrival_ns != 100 || head.data[0] != 1
+        || head.length != MIN_INITIAL_BYTES) { ret 6; }
+    if (arrival_at(pump, head.next).arrival_ns != 200
+        || arrival_at(pump, head.next).data[0] != 2) { ret 7; }
+    # a turn drains the queue, reading the sockets after every preflight.
+    # neither held datagram is a well-formed Initial, so each is preflighted
+    # off the queue and discarded without reaching a listener
+    pump.live          = true;
+    test_read_on_calls = 0;
+    if (!bind_read_on(?runtime, test_read_on, nil)) { ret 8; }
+    if (advance_arrivals(controls, ?runtime, clock.from_ns(500), 500) != OK
+        || pump.arrival_live != 0 || pump.arrival_head != NO_CONNECTION
+        || pump.arrival_tail != NO_CONNECTION || test_read_on_calls != 2) { ret 9; }
+    if (hold_arrival(?runtime, pump, ?first, 600) != OK
+        || pump.arrival_head != pump.arrival_tail) { ret 10; }
+    pump.live = false;
+    if (!hedge_storage.destroy_table[Arrival](?pump.arrivals)) { ret 92; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a pump config carries a nonzero handshake bound and a share within it" {
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols:      [1]tls_config.ProtocolName;
+    var policy:         hedge_tls.Policy;
+    var chosen:         plan.Plan;
+    var items:          [1]budget.Budget;
+    var set:            budget.Set;
+    if (!budget.make(?set, ?items[0], 1)) { ret 1; }
+    chosen.sealed = true;
+    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
+    var config: PumpConfig = test_pump_config(1, ?policy, ?chosen, ?set);
+    if (!handshake_limits_valid(?config)) { ret 2; }
+    config.max_handshakes = 0;
+    if (handshake_limits_valid(?config)) { ret 3; }
+    config.max_handshakes          = 8;
+    config.max_handshakes_per_peer = opt[usize].some{9};
+    if (handshake_limits_valid(?config)) { ret 4; }
+    config.max_handshakes_per_peer = opt[usize].some{8};
+    if (!handshake_limits_valid(?config)) { ret 5; }
+    config.max_handshakes_per_peer = opt[usize].some{0};
+    if (handshake_limits_valid(?config)) { ret 6; }
     ret 0;
 }

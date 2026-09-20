@@ -14,9 +14,8 @@ mach build . --profile release
 ```
 
 `HEDGE_BINARY` qualifies a different build. `LOAD_QUIC_SERVED=0` skips the
-assertions that HTTP/3 transfers were served, which cannot pass until hedge#231
-is fixed; CI sets it, and admission and refusal are checked regardless. `LOAD_CONNECTIONS` and `LOAD_TARGET`
-change the shape of the TCP load, `LOAD_QUIC_CONNECTIONS` and `LOAD_QUIC_RATE`
+assertions that HTTP/3 transfers were served, leaving admission and refusal
+checked. `LOAD_CONNECTIONS` and `LOAD_TARGET` change the shape of the TCP load, `LOAD_QUIC_CONNECTIONS` and `LOAD_QUIC_RATE`
 the QUIC load. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
 and releases every server and client on every exit path. The QUIC cells use the
 system `curl` when it is built with HTTP/3, and otherwise fetch a pinned static
@@ -81,17 +80,44 @@ number.
 `h3load/` is a quic-go client that does for QUIC what `fairness.py` does for
 TCP, can prove a cap on its own with `-expect-connected` and `-hold`, and holds
 idle connections for the scale lane with `-serve=false -hold`. `-dialing N`
-bounds the handshakes in flight, because a burst of several thousand loses some
-to their timeout (#232). The lanes build it into `.tools/` with the Go
+bounds the handshakes in flight, so the scale lane measures held connections
+rather than a handshake burst. The lanes build it into `.tools/` with the Go
 toolchain on the box, module cache beside it.
 
 ```sh
 cd test/load/h3load && go run . -address 127.0.0.1:PORT -connections 1100
 ```
 
-Its served cells are not in the lane while #231 stands: past a few hundred
-concurrent connections a third of the responses never arrive, over this client
-and over curl alike.
+## The burst lane
+
+```sh
+mach build . --profile release
+./test/load/burst.sh
+```
+
+`burst.sh` dials more QUIC handshakes at once than the server can finish inside
+its handshake deadline and asserts the shape that bounded, deferred admission
+([#164](https://github.com/briar-systems/hedge/issues/164)) gives such a
+burst. It is the measurement cell for
+[#232](https://github.com/briar-systems/hedge/issues/232): before it, a burst
+of several thousand dials lost some to their handshake timeout because the
+handshake crypto ran in the receive path, the socket was read at the crypto
+rate, and the kernel receive buffer filled and dropped.
+
+A warm-up of `LOAD_BURST_WARM` dials (200) must all connect and gives the
+service rate. Then `LOAD_BURST` dials (3000) go out together with a client
+budget of `LOAD_BURST_CONNECT_TIMEOUT` seconds (30) against a server
+`handshake_ms` of `LOAD_BURST_HANDSHAKE_MS` (10000), and the lane reads the
+admission counters from an admin listener and the socket's drop counter from
+`/proc/net/udp`. It passes when every promoted handshake completed (connected
+equals promoted, so nothing was admitted and then lost), every dial either
+completed or was refused (connected plus dropped covers the burst), the socket
+dropped nothing, and the completions are the measured rate over the client
+budget within `LOAD_BURST_TOLERANCE` (0.35). A refused dial is a silent drop
+today, so its retransmission arrives afresh and the horizon is the client's
+budget; when mach-quic can send a stateless close, a refused dial fails in one
+round trip and the horizon becomes the server deadline. The lane binds ports
+19110 to 19113.
 
 ## The scale lane
 
@@ -108,7 +134,7 @@ holds `LOAD_SCALE_SMALL` connections (1000) and then `LOAD_SCALE_LARGE`
 keep-alive connections that have served one request (`hold.py`, with `--tls`
 for the second); QUIC connections are handshake-only holds over `h3load`,
 because no client hedge can be measured with holds an HTTP/3 connection idle
-after a request, and served HTTP/3 at these counts waits on #231.
+after a request.
 
 It prints, per transport, the resident set at 0, small, the midpoint and
 large, the address space and mapping count at large, the slope in bytes per

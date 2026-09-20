@@ -20,9 +20,8 @@ target="${LOAD_TARGET:-8}"
 quic_connections="${LOAD_QUIC_CONNECTIONS:-1100}"
 # slow enough that every transfer is still running when the last one connects
 quic_rate="${LOAD_QUIC_RATE:-4k}"
-# 0 skips every assertion that HTTP/3 transfers were served. hedge#231 keeps
-# them from passing today, and CI sets it until that is fixed. admission and
-# refusal are still checked either way.
+# 0 skips every assertion that HTTP/3 transfers were served, for a box whose
+# crypto rate cannot carry the burst; admission and refusal are still checked.
 quic_served="${LOAD_QUIC_SERVED:-1}"
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -67,8 +66,7 @@ python3 test/load/fairness.py \
 report $? "every TLS connection is served under concurrent load"
 
 # a small body over HTTP/3, one connection at a time. this is what keeps a
-# change that stops HTTP/3 being served at all from merging, as #143 did, and
-# it holds while hedge#231 keeps the loaded cells below from passing
+# change that stops HTTP/3 being served at all from merging, as #143 did
 smoke=0
 for i in 1 2 3 4 5; do
     fetched="$("$h3curl" --http3-only --insecure --silent --max-time 10 \
@@ -101,7 +99,7 @@ if [ "$quic_served" = 1 ]; then
         }' "$work/open.out"
     report $? "every one of $quic_connections concurrent QUIC connections is served with no configured limit"
 else
-    echo "skipped every one of $quic_connections concurrent QUIC connections is served (LOAD_QUIC_SERVED=0, hedge#231)"
+    echo "skipped every one of $quic_connections concurrent QUIC connections is served (LOAD_QUIC_SERVED=0)"
 fi
 
 if stop_hedge; then
