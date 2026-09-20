@@ -203,14 +203,16 @@ retransmission to carry. An Initial waits under its own `handshake_ms` deadline,
 counts from arrival whether it waits or not. One that the queue ahead of it
 would carry past that deadline, at the cost per handshake the worker is
 measuring, is turned away on arrival rather than started late, and so is one
-whose turn comes with no time left. Today that refusal is a silent drop: the
-Retry token the client holds stays good for its retransmission, which is
-admitted when there is room. A refusal the client is told of, a stateless
-`CONNECTION_CLOSE` under Initial keys, follows when mach-quic can send one.
+whose turn comes with no time left. The refusal is a stateless
+`CONNECTION_CLOSE` with `CONNECTION_REFUSED` under the Initial keys, so the
+client learns within one round trip and can move on rather than retransmit
+into its own timeout.
 `server.limits.max_handshakes_per_peer` is absent by default and stops one
 address holding the whole bound. Both are reloadable, and neither sizes
 storage. Retries, version negotiation and established connections do not count
-against them. The admission counters are `hedge_quic_handshakes_in_flight`,
+against them. The admission series are `hedge_quic_handshakes_in_flight`,
+`hedge_quic_handshake_service_ns` (the running per-handshake estimate the
+deadline rule judges by),
 `hedge_quic_handshakes_deferred_total`, `hedge_quic_handshakes_promoted_total`,
 `hedge_quic_handshakes_completed_total` (promoted handshakes that reached
 established, so promoted minus completed minus in flight is what ended early),
@@ -496,7 +498,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 31 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 32 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
