@@ -46,6 +46,7 @@ use tls.tls13;
 
 use quic.connection.admission;
 use quic.connection.assembly;
+use quic_core:        quic.connection.core;
 use test_credentials: quic.connection.credentials_simulated;
 use quic_listener:    quic.connection.listener;
 use quic.connection.token;
@@ -116,9 +117,10 @@ val     NO_HANDSHAKE:        usize = (-1)::usize;
 # the worker time one handshake is taken to cost before any has been measured.
 # the running estimate replaces it from the first promotion
 pub val HANDSHAKE_SERVICE_SEED_NS: u64 = 10000000;
-# a promotion sample larger than this is a stall, not a handshake, and would
-# poison the estimate
-val HANDSHAKE_SERVICE_CAP_NS: u64 = 1000000000;
+# one sample moves the estimate by at most this factor's worth: a stall or a
+# client that answered late is one outlier, a worker that really slowed down
+# keeps sampling and gets there in a few
+val HANDSHAKE_SERVICE_SAMPLE_CAP: u64 = 4;
 # datagrams held for one connection mid-handshake, and for one pending
 # initial, before more are dropped. a handshake exchanges a few; what a
 # waiting client retransmits repeats its ClientHello and is dropped past the
@@ -128,10 +130,9 @@ pub val HELD_PER_PENDING:    usize = 4;
 # the smallest datagram a client may carry an Initial in (RFC 9000 14.1): what
 # one held arrival costs the socket, so the arrival queue is sized in these
 pub val MIN_INITIAL_BYTES: usize = 1200;
-# preflights per turn. the sockets are read after every one, so the bound is
-# the turn's length: a Retry is the cheap end of admission, and what it refuses
-# early never costs a handshake, so a turn carries many of them per unit of
-# handshake work
+# preflights per turn at most. the sockets are read after every one, and the
+# turn's arrival work is bounded in time as well, by what the last unit of
+# handshake work cost, so a burst of Initials takes at most half the worker
 pub val PREFLIGHT_BUDGET: usize = 4 * RECEIVE_BATCH;
 
 pub def Status: u8;
@@ -663,11 +664,23 @@ pub rec Runtime {
     held:                 hedge_storage.Table[HeldDatagram];
     held_dropped:         u64;
     # the running estimate of the worker's time per handshake, sampled as the
-    # interval between two handshakes completing while Initials were waiting:
-    # the worker was saturated, so the interval is what one handshake costs it
-    # with everything else a turn carries. zero when no chain of samples is open
+    # interval between two handshakes completing while handshake work waited,
+    # admitted or deferred: the worker was saturated, so the interval is what
+    # one handshake costs it with everything else a turn carries, the burst's
+    # own Retries and reads included, which is what the deadline rule has to
+    # divide by. zero when no chain of samples is open
     service_ns:         u64;
     last_completion_ns: u64;
+    # the worker time spent turning arrivals away or sending them Retries: a
+    # burst's front is thousands of these before its first handshake completes,
+    # and they are the one transient the samples leave out, since the arrival
+    # queue bounds them and a refused client sends nothing more
+    arrival_work_ns:      u64;
+    arrival_work_mark_ns: u64;
+    # what the last turn's unit of handshake work cost: the next turn's
+    # arrival work is bounded by it, so a burst of Initials takes at most half
+    # the worker and the handshakes already admitted keep the other half
+    unit_ns: u64;
     # one unit of handshake work is done per turn: a promotion or a held
     # delivery
     crypto_budget: usize;
@@ -897,15 +910,15 @@ fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
     if (runtime.handshakes_in_flight != 0) {
         runtime.handshakes_in_flight = runtime.handshakes_in_flight - 1;
     }
-    if (completed) {
-        runtime.handshakes_completed = runtime.handshakes_completed + 1;
-        observe_service(runtime, now_ns);
-    }
     release_held(runtime, ?value.held);
     # its work is no longer handshake work: what it is marked for moves lists
     if (value.ready && value.ready_handshake) {
         unmark_ready(controls, runtime, index);
         mark_ready(controls, runtime, index);
+    }
+    if (completed) {
+        runtime.handshakes_completed = runtime.handshakes_completed + 1;
+        observe_service(runtime, now_ns);
     }
     if (value.handshake_lease_live) {
         if (!process_admission.release(?runtime.handshakes, value.handshake_lease)) {
@@ -984,30 +997,97 @@ fun deadline_allows(runtime: *Runtime, arrival_ns: u64, handshake_timeout_ns: u6
         < saturated_add(arrival_ns, handshake_timeout_ns);
 }
 
-# the one place an Initial that will not be served is turned away. today it is
-# dropped and the client's PTO retransmits it; once quic sends a stateless
-# CONNECTION_CLOSE(CONNECTION_REFUSED) under Initial keys this sends it and
-# counts a refusal instead. the ceiling drop and the deadline drop route here
-# and nothing else does
-fun refuse_initial(runtime: *Runtime) {
+# the one place an Initial that will not be served is turned away: a stateless
+# CONNECTION_CLOSE(CONNECTION_REFUSED) under the Initial keys its destination
+# id derives (RFC 9000 10.2.3), so the client learns in one round trip rather
+# than after its retransmissions. a close that cannot be built or sent is a
+# drop, counted apart, and the client's PTO retransmits. the ceiling drop and
+# the deadline drop route here and nothing else does
+fun refuse_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize,
+    bank_index: usize, initial: *net_types.Packet, now_ns: u64) {
+    val pump: *Pump                = ?controls.pumps[pump_index];
+    val bank: *AdmissionGeneration = ?pump.admissions[bank_index];
+    if (!pump.live || pump.draining || pump.cancelling) {
+        runtime.handshakes_dropped = runtime.handshakes_dropped + 1;
+        ret;
+    }
+    var request: quic_listener.Request;
+    request.peer                     = initial.peer;
+    request.data                     = initial.buffer;
+    request.length                   = initial.length;
+    request.now                      = clock.from_ns(now_ns);
+    request.version_negotiation_bits = 0;
+    request.output                   = ?pump.storage.preflight_output[0];
+    request.output_capacity          = assembly.MAX_UDP_PAYLOAD;
+    val result: quic_listener.Result = quic_listener.refuse(?bank.listener,
+        ?request, quic_core.CONNECTION_REFUSED);
+    if (result.action == quic_listener.ACTION_REFUSE
+        && submit_stateless(controls, runtime, pump_index, initial,
+        ?pump.storage.preflight_output[0], result.output_count) == OK) {
+        runtime.handshakes_refused = runtime.handshakes_refused + 1;
+        ret;
+    }
     runtime.handshakes_dropped = runtime.handshakes_dropped + 1;
 }
 
-# a handshake completed. with Initials waiting, the interval since the last
-# completion is one sample of the worker's cost per handshake; without any,
-# the worker was idle between them and the chain of samples closes
+fun refuse_pending(controls: *ControlView, runtime: *Runtime, pending: *PendingInitial,
+    now_ns: u64) {
+    var initial:    net_types.Packet = pending_packet(pending);
+    val started_ns: u64              = monotonic_ns();
+    refuse_initial(controls, runtime, pending.pump, pending.admission_bank, ?initial,
+        now_ns);
+    charge_arrival_work(runtime, started_ns);
+}
+
+fun elapsed_since(started_ns: u64) u64 {
+    val ended_ns: u64 = monotonic_ns();
+    if (ended_ns <= started_ns) { ret 0; }
+    ret ended_ns - started_ns;
+}
+
+fun charge_arrival_work(runtime: *Runtime, started_ns: u64) {
+    runtime.arrival_work_ns = saturated_add(runtime.arrival_work_ns,
+        elapsed_since(started_ns));
+}
+
+# a receive batch's time is charged to arrival work by the share of it that
+# was unknown datagrams: a burst's front is batches of nothing else
+fun charge_arrival_batch(runtime: *Runtime, pump: *Pump, started_ns: u64,
+    held_before: usize, dropped_before: u64, items: usize) {
+    if (items == 0) { ret; }
+    val unknown: u64 = (pump.arrival_live - held_before)::u64
+        + (runtime.arrivals_dropped - dropped_before);
+    if (unknown == 0) { ret; }
+    val elapsed: u64 = elapsed_since(started_ns);
+    runtime.arrival_work_ns = saturated_add(runtime.arrival_work_ns,
+        elapsed / items::u64 * unknown);
+}
+
+# a handshake completed. with handshake work still queued, admitted or
+# deferred, the worker runs one unit per turn back to back, so the interval
+# between completions, less the arrival work in it, is one sample of its cost
+# per handshake; with none, the worker may idle before the next and the chain
+# of samples closes. an admitted queue samples too, so a warm-up under the
+# bound seeds the estimate a burst is then judged by
 fun observe_service(runtime: *Runtime, now_ns: u64) {
-    if (runtime.deferred_count == 0) {
+    if (runtime.deferred_count == 0 && runtime.handshake_ready_head == NO_CONNECTION) {
         runtime.last_completion_ns = 0;
         ret;
     }
     if (runtime.last_completion_ns != 0 && now_ns > runtime.last_completion_ns) {
-        var sample: u64 = now_ns - runtime.last_completion_ns;
-        if (sample > HANDSHAKE_SERVICE_CAP_NS) { sample = HANDSHAKE_SERVICE_CAP_NS; }
-        runtime.service_ns = runtime.service_ns - runtime.service_ns / 8 + sample / 8;
-        if (runtime.service_ns == 0) { runtime.service_ns = 1; }
+        var sample:  u64 = now_ns - runtime.last_completion_ns;
+        val arrival: u64 = runtime.arrival_work_ns - runtime.arrival_work_mark_ns;
+        if (arrival < sample) { sample = sample - arrival; }
+        or                    { sample = 0; }
+        val cap: u64 = runtime.service_ns * HANDSHAKE_SERVICE_SAMPLE_CAP;
+        if (cap > runtime.service_ns && sample > cap) { sample = cap; }
+        if (sample != 0) {
+            runtime.service_ns = runtime.service_ns - runtime.service_ns / 8 + sample / 8;
+            if (runtime.service_ns == 0) { runtime.service_ns = 1; }
+        }
     }
-    runtime.last_completion_ns = now_ns;
+    runtime.last_completion_ns   = now_ns;
+    runtime.arrival_work_mark_ns = runtime.arrival_work_ns;
 }
 
 # put the storage a taken slot is about to use into its empty state. a
@@ -1213,6 +1293,9 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.deferred_count        = 0;
     runtime.service_ns            = HANDSHAKE_SERVICE_SEED_NS;
     runtime.last_completion_ns    = 0;
+    runtime.arrival_work_ns       = 0;
+    runtime.arrival_work_mark_ns  = 0;
+    runtime.unit_ns               = HANDSHAKE_SERVICE_SEED_NS;
     runtime.crypto_budget         = 0;
     runtime.handshake_ready_head  = NO_CONNECTION;
     runtime.handshake_ready_tail  = NO_CONNECTION;
@@ -3100,20 +3183,26 @@ fun read_on(controls: *ControlView, runtime: *Runtime, now: time.Instant,
     ret true;
 }
 
-# a turn of preflight work across the pumps, bounded, oldest arrival first
-# pump by pump, the sockets read after every one: a Retry is crypto, and a
-# burst of Initials must not stall the reads that carry it
+# a turn of preflight work across the pumps, oldest arrival first pump by
+# pump, the sockets read after every one: a Retry is crypto, and a burst of
+# Initials must not stall the reads that carry it. the turn ends at the
+# preflight bound or once its arrival work has cost what the last unit of
+# handshake work did
 fun advance_arrivals(controls: *ControlView, runtime: *Runtime, now: time.Instant,
     now_ns: u64) Status {
     var status: Status = OK;
     var budget: usize  = PREFLIGHT_BUDGET;
+    var spent:  u64    = 0;
     var i:      usize  = 0;
-    for (i < MAX_PUMPS && budget != 0) {
+    for (i < MAX_PUMPS && budget != 0 && spent < runtime.unit_ns) {
         val pump: *Pump = ?controls.pumps[i];
-        for (pump.live && budget != 0 && pump.arrival_head != NO_CONNECTION) {
+        for (pump.live && budget != 0 && spent < runtime.unit_ns
+            && pump.arrival_head != NO_CONNECTION) {
+            val started_ns: u64 = monotonic_ns();
             if (preflight_arrival(controls, runtime, i, now, now_ns) == FAILED) {
                 status = FAILED;
             }
+            spent  = saturated_add(spent, elapsed_since(started_ns));
             budget = budget - 1;
             read_on(controls, runtime, now, now_ns);
         }
@@ -3183,7 +3272,7 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
             now_ns, runtime.deferred_count)
             || !process_admission.acquire(?runtime.handshakes, ?received.peer,
             ?handshake_lease)) {
-            refuse_initial(runtime);
+            refuse_initial(controls, runtime, pump_index, bank_index, received, now_ns);
             ret abandon_admission(controls, runtime, pump_index, bank_index,
                 result.acceptance, ?named_charge, lease);
         }
@@ -3675,7 +3764,10 @@ fun settle_receive(controls: *ControlView, runtime: *Runtime, context: *Completi
         || completion.items > RECEIVE_BATCH) { ret FAILED; }
     var status: Status = OK;
     if (!completion.has_error) {
-        var i: usize = 0;
+        val started_ns:     u64   = monotonic_ns();
+        val held_before:    usize = pump.arrival_live;
+        val dropped_before: u64   = runtime.arrivals_dropped;
+        var i:              usize = 0;
         for (i < completion.items) {
             val applied: Status = process_datagram(controls, runtime, context.pump,
                 ?pump.storage.receive_packets[i], now, now_ns);
@@ -3684,6 +3776,8 @@ fun settle_receive(controls: *ControlView, runtime: *Runtime, context: *Completi
             }
             i = i + 1;
         }
+        charge_arrival_batch(runtime, pump, started_ns, held_before, dropped_before,
+            completion.items);
     }
     or (scope_active(?pump.storage.scope)) {
         status = FAILED;
@@ -3930,13 +4024,14 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
 # a budget-admitted initial takes its place in the deferred queue. its wheel
 # entry moves from the budget deadline to the admission deadline, and the
 # ceiling and the peer's share apply as they do at arrival
-fun defer_admitted(runtime: *Runtime, index: usize, now_ns: u64) bool {
+fun defer_admitted(controls: *ControlView, runtime: *Runtime, index: usize,
+    now_ns: u64) bool {
     val pending: *PendingInitial = pending_at(runtime, index);
     if (!deadline_allows(runtime, pending.arrival_ns,
         pending.config.handshake_timeout_ns, now_ns, runtime.deferred_count)
         || !process_admission.acquire(?runtime.handshakes, ?pending.peer,
         ?pending.handshake_lease)) {
-        refuse_initial(runtime);
+        refuse_pending(controls, runtime, pending, now_ns);
         ret false;
     }
     pending.handshake_lease_live = true;
@@ -4017,7 +4112,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
                 i = next;
                 cnt;
             }
-            if (!defer_admitted(runtime, i, now_ns)) {
+            if (!defer_admitted(controls, runtime, i, now_ns)) {
                 if (!release_pending_initial(controls, runtime, i)) {
                     retry_release(runtime, i);
                     status = FAILED;
@@ -4029,7 +4124,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         val deadline_ns: u64 = saturated_add(pending.arrival_ns,
             pending.config.handshake_timeout_ns);
         if (now_ns >= deadline_ns) {
-            refuse_initial(runtime);
+            refuse_pending(controls, runtime, pending, now_ns);
             if (!release_pending_initial(controls, runtime, i)) {
                 retry_release(runtime, i);
                 status = FAILED;
@@ -4047,7 +4142,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         # its own deadline, so the crypto is not spent on it
         if (!deadline_allows(runtime, pending.arrival_ns,
             pending.config.handshake_timeout_ns, now_ns, 0)) {
-            refuse_initial(runtime);
+            refuse_pending(controls, runtime, pending, now_ns);
             if (!release_pending_initial(controls, runtime, i)) {
                 retry_release(runtime, i);
                 status = FAILED;
@@ -4299,17 +4394,25 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
     # socket between handshakes. a turn with handshake work waiting runs at once
     runtime.crypto_budget = 1;
     if (runtime.handshake_ready_head != NO_CONNECTION) {
-        val index: usize = runtime.handshake_ready_head;
+        val index:      usize = runtime.handshake_ready_head;
+        val started_ns: u64   = monotonic_ns();
         unmark_ready(controls, runtime, index);
         deliver_held(controls, runtime, index, now_ns);
         service_connection(controls, runtime, index, now, now_ns);
         runtime.crypto_budget = 0;
+        runtime.unit_ns       = elapsed_since(started_ns);
     }
+    val arrivals_started_ns: u64 = monotonic_ns();
     if (advance_arrivals(controls, runtime, now, now_ns) == FAILED) {
         connection_failed(runtime);
     }
+    charge_arrival_work(runtime, arrivals_started_ns);
+    val promotion_started_ns: u64 = monotonic_ns();
     if (advance_pending_initials(controls, runtime, now, now_ns) == FAILED) {
         connection_failed(runtime);
+    }
+    if (runtime.crypto_budget == 0) {
+        runtime.unit_ns = elapsed_since(promotion_started_ns);
     }
     ret status;
 }
@@ -4319,6 +4422,7 @@ pub fun admission_report(runtime: *Runtime) telemetry.HandshakeReport {
     var value: telemetry.HandshakeReport;
     if (runtime == nil || !runtime.initialized) { ret value; }
     value.in_flight        = runtime.handshakes_in_flight;
+    value.service_ns       = runtime.service_ns;
     value.deferred         = runtime.handshakes_deferred;
     value.promoted         = runtime.handshakes_promoted;
     value.completed        = runtime.handshakes_completed;
@@ -5994,7 +6098,7 @@ test "hedge.protocol.quic.runtime: the admission deadline counts the work ahead 
     ret 0;
 }
 
-test "hedge.protocol.quic.runtime: the service estimate follows completions only while initials wait" {
+test "hedge.protocol.quic.runtime: the service estimate follows completions only while handshake work waits" {
     var fixture:  TestControls;
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
@@ -6013,14 +6117,30 @@ test "hedge.protocol.quic.runtime: the service estimate follows completions only
         || runtime.last_completion_ns != 2000000000) { ret 2; }
     observe_service(?runtime, 2002000000);
     if (runtime.service_ns != 10000000 - 1250000 + 250000) { ret 3; }
-    # a stall longer than a second is not a handshake and is capped
+    # a stall is one outlier: a sample counts for at most four estimates
+    val settled_in: u64 = runtime.service_ns;
     observe_service(?runtime, 12002000000);
-    if (runtime.service_ns > 9000000 - 1125000 + 125000000) { ret 4; }
-    # the queue draining closes the chain: the next completion is not a sample
-    runtime.deferred_count = 0;
-    val settled: u64 = runtime.service_ns;
+    if (runtime.service_ns != settled_in - settled_in / 8 + settled_in * 4 / 8) { ret 4; }
+    # admitted handshakes waiting their turn keep the chain open as well
+    runtime.deferred_count       = 0;
+    runtime.handshake_ready_head = 0;
     observe_service(?runtime, 13000000000);
-    if (runtime.service_ns != settled || runtime.last_completion_ns != 0) { ret 5; }
+    if (runtime.last_completion_ns != 13000000000) { ret 5; }
+    # arrival work done in the interval is not handshake cost and comes out
+    val before: u64 = runtime.service_ns;
+    runtime.arrival_work_ns = runtime.arrival_work_ns + 1000000000;
+    observe_service(?runtime, 14002000000);
+    if (runtime.service_ns != before - before / 8 + 2000000 / 8) { ret 6; }
+    # an interval that was all arrival work is no sample
+    runtime.arrival_work_ns = runtime.arrival_work_ns + 5000000000;
+    val held: u64 = runtime.service_ns;
+    observe_service(?runtime, 15000000000);
+    if (runtime.service_ns != held || runtime.last_completion_ns != 15000000000) { ret 7; }
+    # every queue draining closes the chain: the next completion is not a sample
+    runtime.handshake_ready_head = NO_CONNECTION;
+    val settled: u64 = runtime.service_ns;
+    observe_service(?runtime, 16000000000);
+    if (runtime.service_ns != settled || runtime.last_completion_ns != 0) { ret 8; }
     ret 0;
 }
 

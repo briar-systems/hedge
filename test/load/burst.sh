@@ -36,8 +36,8 @@ warm="${LOAD_BURST_WARM:-200}"
 burst="${LOAD_BURST:-3000}"
 # the server's handshake deadline, and the refusal horizon
 handshake_ms="${LOAD_BURST_HANDSHAKE_MS:-10000}"
-# a refused dial retransmits its Initial and is re-admitted with a fresh
-# arrival, so the client budget is longer than the server's deadline
+# a dial the server never answers gives up after this; a refused one gives
+# up at once, so the budget only bounds a dial that was lost
 connect_timeout="${LOAD_BURST_CONNECT_TIMEOUT:-30}"
 # completions within this fraction of rate x horizon pass
 tolerance="${LOAD_BURST_TOLERANCE:-0.35}"
@@ -162,13 +162,14 @@ report $? "every dial completes or is refused before the server spends a handsha
 test "$drops_after" = "$drops_before"
 report $? "the socket drops nothing across the burst ($((drops_after - drops_before)))"
 
-# every dial arrives at once and a refused dial's retransmission arrives afresh
-# under its own deadline, so the horizon over which the measured rate can
-# complete dials is the client's own budget, capped at the burst itself
-expected="$(awk -v r="$rate" -v h="$connect_timeout" -v n="$burst" \
+# every dial arrives at once and a refused dial is gone, so the horizon over
+# which the measured rate can complete dials is the server's own handshake
+# deadline, capped at the burst itself
+horizon="$(awk -v ms="$handshake_ms" 'BEGIN { print ms / 1000 }')"
+expected="$(awk -v r="$rate" -v h="$horizon" -v n="$burst" \
     'BEGIN { e = int(r * h); if (e > n) e = n; print e }')"
 awk -v got="$connected" -v want="$expected" -v tol="$tolerance" \
-    -v rate="$rate" -v horizon="$connect_timeout" 'BEGIN {
+    -v rate="$rate" -v horizon="$horizon" 'BEGIN {
     printf "burst: expected about %d at %s/s over %ss, got %d (%.0f%%)\n",
         want, rate, horizon, got, 100 * got / want
     exit !(got >= want * (1 - tol) && got <= want * (1 + tol))
