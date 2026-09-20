@@ -25,7 +25,9 @@
 
 use crypto.contracts;
 use crypto.secret;
+use hedge.listener;
 use hedge.memory;
+use hedge.operation;
 use A: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
@@ -80,9 +82,9 @@ val     AUTHORITY_SIGNATURE_SCHEMES: usize = 5;
 pub val MAX_SESSIONS: usize = 16;
 pub val NO_SESSION:   usize = MAX_SESSIONS;
 
-# the completion tag the lower half submits under. the transport that owns the
-# driver routes anything carrying it back here.
-pub val COMPLETION_CONTEXT: usize = 5;
+# the owner is told each time the engine settles one of its socket operations,
+# so an exchange is stepped on the completion rather than at its next deadline
+pub def NotifyFun: fun(ptr);
 
 pub def Status: u8;
 pub val OK:      Status = 1;
@@ -102,6 +104,10 @@ pub val SHUTDOWN:  Kind = 4;
 rec Channel {
     driver:           *net_async.Driver;
     socket:           *tcp.Stream;
+    operation:        operation.Operation;
+    context:          listener.ConnectionContext;
+    owner:            ptr;
+    notify:           NotifyFun;
     index:            usize;
     generation:       u32;
     token_generation: u32;
@@ -162,6 +168,8 @@ pub fun no_handle() Handle {
 fun reset_channel(value: *Channel, index: usize) {
     value.driver           = nil;
     value.socket           = nil;
+    value.owner            = nil;
+    value.notify           = (0::usize)::NotifyFun;
     value.index            = index;
     value.token_generation = 0;
     value.current          = NONE;
@@ -238,7 +246,7 @@ fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
     }
     ret net_async.submit_read(value.driver, scope, value.socket, buffer,
-        length, COMPLETION_CONTEXT);
+        length, (?value.context)::usize);
 }
 
 fun lower_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
@@ -249,7 +257,7 @@ fun lower_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WRITE)};
     }
     ret net_async.submit_write(value.driver, scope, value.socket, buffer,
-        length, COMPLETION_CONTEXT);
+        length, (?value.context)::usize);
 }
 
 fun lower_shutdown(context: ptr, scope: *cancel.Scope,
@@ -260,7 +268,7 @@ fun lower_shutdown(context: ptr, scope: *cancel.Scope,
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_SHUTDOWN)};
     }
     ret net_async.submit_shutdown_write(value.driver, scope, value.socket,
-        COMPLETION_CONTEXT);
+        (?value.context)::usize);
 }
 
 fun lower_close(context: ptr, scope: *cancel.Scope,
@@ -271,7 +279,7 @@ fun lower_close(context: ptr, scope: *cancel.Scope,
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)};
     }
     ret net_async.submit_stream_close(value.driver, scope, value.socket,
-        lifecycle.EXPLICIT, COMPLETION_CONTEXT);
+        lifecycle.EXPLICIT, (?value.context)::usize);
 }
 
 fun overlaps(base: usize, size: usize, data: *u8, len: usize) bool {
@@ -345,7 +353,7 @@ fun close_memory(index: usize) bool {
 }
 
 # a woken account resumes whatever the stream parked for memory. the retry
-# arrives as a completion under COMPLETION_CONTEXT
+# arrives as a completion on the channel's bound operation
 fun resume_woken(index: usize) {
     if (!sessions[index].memory_live || !memory.has_woken(?sessions[index].memory)) { ret; }
     var woken: [4]u64;
@@ -508,10 +516,12 @@ pub fun release(handle: Handle) bool {
 # `trust` is the anchor set the authority is verified against; without one
 # there is nothing to verify against and the connection is refused.
 pub fun begin(output: *Handle, driver: *net_async.Driver, socket: *tcp.Stream,
-    server_name: view.View, trust: *cert.TrustStore) Status {
+    server_name: view.View, trust: *cert.TrustStore, owner: ptr,
+    notify: NotifyFun) Status {
     if (output == nil || driver == nil || socket == nil || trust == nil
         || trust.len == 0 || server_name.data == nil || server_name.len == 0
-        || server_name.len > MAX_SERVER_NAME) { ret INVALID; }
+        || server_name.len > MAX_SERVER_NAME || owner == nil
+        || notify::usize == 0) { ret INVALID; }
     @output = no_handle();
     val handle: Handle = acquire();
     if (handle.index == NO_SESSION) { ret FAILED; }
@@ -519,6 +529,13 @@ pub fun begin(output: *Handle, driver: *net_async.Driver, socket: *tcp.Stream,
     val value: *Channel = ?channels[index];
     value.driver = driver;
     value.socket = socket;
+    value.owner  = owner;
+    value.notify = notify;
+    if (!operation.bind_operation(?value.operation, ?value.context,
+        (value)::ptr, settle, index)) {
+        release(handle);
+        ret FAILED;
+    }
     clear_session(index);
     var i: usize = 0;
     for (i < server_name.len) {
@@ -555,7 +572,7 @@ pub fun begin(output: *Handle, driver: *net_async.Driver, socket: *tcp.Stream,
     if (!tls_stream.connect(?sessions[index].stream,
         ?sessions[index].engine, lease(index), secret_lease(index),
         ?sessions[index].lower, ?sessions[index].operation_scope,
-        value.token, COMPLETION_CONTEXT)) {
+        value.token, index)) {
         value.failure_value = tls_error.INTERNAL_ERROR;
         release(handle);
         ret FAILED;
@@ -566,12 +583,15 @@ pub fun begin(output: *Handle, driver: *net_async.Driver, socket: *tcp.Stream,
     ret PENDING;
 }
 
-# routes one socket completion into the engine
-pub fun accept(handle: Handle, completion: *io_runtime.Completion) bool {
-    if (entry(handle) == nil || !sessions[handle.index].stream_started) {
-        ret false;
-    }
-    ret tls_stream.accept(?sessions[handle.index].stream, completion);
+# every socket completion the engine submitted lands here, routed by the
+# listener plane, and the owner is told once the engine has taken it
+fun settle(context: ptr, index: usize, completion: io_runtime.Completion) {
+    val value: *Channel = context::*Channel;
+    if (value == nil || index >= MAX_SESSIONS || !value.live
+        || !sessions[index].stream_started) { ret; }
+    var settled: io_runtime.Completion = completion;
+    tls_stream.accept(?sessions[index].stream, ?settled);
+    if (value.notify::usize != 0) { value.notify(value.owner); }
 }
 
 # resolves the operation in flight, if it has finished
@@ -610,16 +630,16 @@ fun start(handle: Handle, kind: Kind, buffer: *u8, length: usize) Status {
     if (kind == READ) {
         started = tls_stream.read(?sessions[index].stream,
             ?sessions[index].operation_scope, token, buffer, length,
-            COMPLETION_CONTEXT);
+            index);
     }
     or (kind == WRITE) {
         started = tls_stream.write(?sessions[index].stream,
             ?sessions[index].operation_scope, token, buffer, length,
-            COMPLETION_CONTEXT);
+            index);
     }
     or {
         started = tls_stream.half_close(?sessions[index].stream,
-            ?sessions[index].operation_scope, token, COMPLETION_CONTEXT);
+            ?sessions[index].operation_scope, token, index);
     }
     if (!started) {
         value.failure_value = tls_error.INTERNAL_ERROR;
