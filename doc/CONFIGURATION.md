@@ -197,9 +197,14 @@ or fails. The worker takes one unit of handshake work per turn and reads its
 sockets between the Retries it sends, so a burst is read from the socket at
 read speed rather than at the rate the crypto allows: an Initial the socket
 delivered is held in the worker's own arrival queue, one socket buffer's worth
-of them per listener, until its turn to be validated, and past that the newest
-is dropped, counted in `hedge_quic_arrivals_dropped_total`, for the client's
-retransmission to carry. An Initial waits under its own `handshake_ms` deadline, which
+of them per listener, until its turn to be validated. Past that the queue
+gives up, in order, a duplicate of a datagram it already holds, a version
+negotiation, a first flight the server has not answered, and only then a
+token-bearing Initial: a client that has answered a Retry has paid a round trip
+and the server a token, so a full queue drops a first flight to hold its token
+Initial rather than the other way round. The drop is counted in
+`hedge_quic_arrivals_dropped_total{class}` (`token`, `untoken`, `other`,
+`duplicate`) for the client's retransmission to carry. An Initial waits under its own `handshake_ms` deadline, which
 counts from arrival whether it waits or not. One that the queue ahead of it
 would carry past that deadline, at the cost per handshake the worker is
 measuring, is turned away on arrival rather than started late, and so is one
@@ -211,12 +216,17 @@ into its own timeout.
 address holding the whole bound. Both are reloadable, and neither sizes
 storage. Retries, version negotiation and established connections do not count
 against them. The admission series are `hedge_quic_handshakes_in_flight`,
-`hedge_quic_handshake_service_ns` (the running per-handshake estimate the
-deadline rule judges by),
+`hedge_quic_handshake_service_ns` (the running worker cost per handshake the
+deadline rule charges for the work ahead of an Initial),
+`hedge_quic_handshake_finish_ns` (the running wall time a promoted handshake
+takes to reach established, which the rule requires a record to have left at
+its turn, so none is promoted only to expire),
 `hedge_quic_handshakes_deferred_total`, `hedge_quic_handshakes_promoted_total`,
 `hedge_quic_handshakes_completed_total` (promoted handshakes that reached
 established, so promoted minus completed minus in flight is what ended early),
-`hedge_quic_handshakes_dropped_total` and `hedge_quic_handshakes_refused_total`,
+`hedge_quic_handshakes_dropped_total`, `hedge_quic_handshakes_refused_total`
+and `hedge_quic_handshakes_expired_total` (promoted handshakes that ended on
+their own deadline, crypto spent and the client told nothing),
 and `hedge_quic_retries_dropped_total` counts the Retries a pump dropped at its
 stateless send ceiling.
 
@@ -498,7 +508,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 32 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 37 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 

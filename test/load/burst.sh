@@ -24,6 +24,14 @@
 #   so the connected count is the measured service rate over the refusal
 #   horizon, within a stated tolerance
 #
+#   no token Initial is dropped at the arrival queue (hedge#242): a client that
+#   has answered a Retry has paid an RTT and the server a token, so under
+#   pressure the queue gives up first flights, negotiations and duplicates
+#   before one of those. the queue's drops are reported by class, and the
+#   dialler reports how many clients retransmitted a first flight (a drop the
+#   server never saw as a client) or a token Initial (a deferral, once token
+#   drops are zero) before they were admitted
+#
 # the verdict is a ratio taken inside one run, never a duration, so it says the
 # same thing on a fast machine and a loaded one.
 
@@ -92,6 +100,13 @@ metric() {
             END { if (!found) print 0 }'
 }
 
+# a labelled row: `metric_class name value` reads name{class="value"}
+metric_class() {
+    metric "$1{class=\"$2\"}"
+}
+
+arrival_classes="token untoken other duplicate"
+
 # the kernel's per-socket drop counter, the last column of the socket's row
 socket_drops() {
     local port_hex
@@ -111,6 +126,13 @@ dial() {
         "$work/$label.out"
 }
 
+# the clients of a dial that retransmitted an Initial before admission, from
+# the dialler's report: `retried first_flight token`
+retransmits() {
+    awk '/: retried=/ { split($2, r, "="); split($4, f, "="); split($5, t, "=");
+        print r[2], f[2], t[2] }' "$work/$1.out"
+}
+
 drops_before="$(socket_drops)"
 test "$drops_before" != missing
 report $? "the QUIC socket is visible in /proc/net/udp (drops $drops_before)"
@@ -122,12 +144,18 @@ rate="$(awk -v n="$connected" -v t="$elapsed" \
     'BEGIN { if (t > 0) printf "%.1f", n / t; else print 0 }')"
 echo "service rate ${rate}/s"
 
+sleep 1
 promoted_before="$(metric hedge_quic_handshakes_promoted_total)"
 completed_before="$(metric hedge_quic_handshakes_completed_total)"
 dropped_before="$(metric hedge_quic_handshakes_dropped_total)"
 deferred_before="$(metric hedge_quic_handshakes_deferred_total)"
-arrivals_before="$(metric hedge_quic_arrivals_dropped_total)"
+refused_before="$(metric hedge_quic_handshakes_refused_total)"
 retries_before="$(metric hedge_quic_retries_dropped_total)"
+declare -A arrivals_before
+for class in $arrival_classes; do
+    arrivals_before[$class]="$(metric_class hedge_quic_arrivals_dropped_total "$class")"
+done
+expired_before="$(metric hedge_quic_handshakes_expired_total)"
 
 read -r connected elapsed <<<"$(dial "$burst" burst)"
 # the last clients' Finished packets are still on the server's next turns
@@ -138,11 +166,22 @@ promoted=$(( $(metric hedge_quic_handshakes_promoted_total) - promoted_before ))
 completed=$(( $(metric hedge_quic_handshakes_completed_total) - completed_before ))
 dropped=$(( $(metric hedge_quic_handshakes_dropped_total) - dropped_before ))
 deferred=$(( $(metric hedge_quic_handshakes_deferred_total) - deferred_before ))
-arrivals_dropped=$(( $(metric hedge_quic_arrivals_dropped_total) - arrivals_before ))
+refused=$(( $(metric hedge_quic_handshakes_refused_total) - refused_before ))
 retries_dropped=$(( $(metric hedge_quic_retries_dropped_total) - retries_before ))
+declare -A arrivals_dropped
+arrivals_total=0
+for class in $arrival_classes; do
+    arrivals_dropped[$class]=$(( $(metric_class hedge_quic_arrivals_dropped_total "$class") - arrivals_before[$class] ))
+    arrivals_total=$(( arrivals_total + arrivals_dropped[$class] ))
+done
+expired=$(( $(metric hedge_quic_handshakes_expired_total) - expired_before ))
 in_flight="$(metric hedge_quic_handshakes_in_flight)"
+finish_ms="$(awk -v ns="$(metric hedge_quic_handshake_finish_ns)" 'BEGIN { print ns / 1000000 }')"
 drops_after="$(socket_drops)"
-echo "burst: dialled=$burst connected=$connected in ${elapsed}s deferred=$deferred promoted=$promoted completed=$completed dropped=$dropped arrivals_dropped=$arrivals_dropped retries_dropped=$retries_dropped in_flight=$in_flight socket_drops=$((drops_after - drops_before))"
+read -r retried first_flight_retransmits token_retransmits <<<"$(retransmits burst)"
+echo "burst: dialled=$burst connected=$connected in ${elapsed}s deferred=$deferred promoted=$promoted completed=$completed dropped=$dropped refused=$refused retries_dropped=$retries_dropped in_flight=$in_flight expired=$expired finish_ms=$finish_ms socket_drops=$((drops_after - drops_before))"
+echo "burst: arrivals dropped=$arrivals_total token=${arrivals_dropped[token]} untoken=${arrivals_dropped[untoken]} other=${arrivals_dropped[other]} duplicate=${arrivals_dropped[duplicate]}"
+echo "burst: clients retried=$retried retransmitted first_flight=$first_flight_retransmits token=$token_retransmits"
 
 # a client counts itself connected on the server's Finished, and one that
 # reaches that at the end of its run exits before its own Finished is read,
@@ -156,11 +195,22 @@ report $? "every handshake the server completed is a connection the client saw (
 test "$((promoted - completed))" -le "$in_flight"
 report $? "nothing is admitted and then lost: what was promoted but not completed was still in flight (promoted $promoted, completed $completed, in flight $in_flight)"
 
-test "$((connected + dropped))" -ge "$burst"
-report $? "every dial completes or is refused before the server spends a handshake on it (connected $connected + dropped $dropped >= $burst)"
+# a handshake promoted with less time left than a handshake takes spends its
+# crypto and expires on its deadline with the client told nothing. the
+# promotion rule judges by the measured finish so this never happens
+test "$expired" -eq 0
+report $? "no promoted handshake expired on its deadline (expired $expired, finish ${finish_ms}ms)"
+
+# a dial the deadline drops at the queue and one the ceiling refuses on
+# arrival both cost the server no handshake
+test "$((connected + dropped + refused))" -ge "$burst"
+report $? "every dial completes or is refused before the server spends a handshake on it (connected $connected + dropped $dropped + refused $refused >= $burst)"
 
 test "$drops_after" = "$drops_before"
 report $? "the socket drops nothing across the burst ($((drops_after - drops_before)))"
+
+test "${arrivals_dropped[token]}" -eq 0
+report $? "no token Initial is dropped at the arrival queue (token ${arrivals_dropped[token]}, untoken ${arrivals_dropped[untoken]}, other ${arrivals_dropped[other]}, duplicate ${arrivals_dropped[duplicate]})"
 
 # every dial arrives at once and a refused dial is gone, so the horizon over
 # which the measured rate can complete dials is the server's own handshake
