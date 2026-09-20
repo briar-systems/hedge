@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Dependency bump: mach-http `^0.16` (v0.16.0) (#248). The request failure log is coded by the engine's closure before the exchange outcome: `connection_closed`, `transport`, `peer_reset`, `local_reset` or `timed_out` when the engine closed the exchange, and `cancelled`, `timed_out` or `failed` from the outcome only when it did not. The record carries `close_code` (the wire's error code) and `transport_error` (the QUIC error for a transport closure), so a request a connection took with it is no longer logged as a caller cancellation. The HTTP/3 session still walks its request slots on a connection failure to settle its own state, but it no longer stands in for the cause.
+- The interop lane's shutdown legs gain an HTTP/3 peer holding a request open across the signal: the drain deadline tears the session down on the real QUIC driver, the stop reports the abandoned exchange and no teardown failure (#248).
+
 ### Fixed
 
 - The logged and histogrammed request duration is measured on the monotonic clock (#191). A call is stamped with the monotonic instant it is bound at receipt, and `observe_end` measures from that stamp, so a wall clock step during a request no longer logs a duration of zero (backward step) or the size of the step (forward step). `received_at` on the request metadata stays calendar time for the logged timestamp and for cache age. The other half of #191, the ACME transport deadline, was already moved to the monotonic clock in 0.7.0 (#202): `acme/manager.poll` hands every exchange `clock.instant()` and keeps wall time for the renewal schedule only.
