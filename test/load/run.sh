@@ -39,10 +39,16 @@ CAP_TCP=32
 
 prepare_load
 
-# no global limit, so connection storage grows with the load rather than the
-# run measuring a configured ceiling
-write_config "$work/hedge.toml" "max_connections_per_peer = 4096" \
-    "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT"
+# no connection limit, so connection storage grows with the load rather than
+# the run measuring a configured ceiling. the pool defaults to 256 connections'
+# worth without one, so it is sized for the burst outright, and the handshake
+# deadline is lifted past the run: this cell measures service under
+# concurrency, the burst lane measures the deadline
+write_config "$work/hedge.toml" \
+    "max_connections_per_peer = 4096
+memory_bytes = $((quic_connections * 4 * 1048576))" \
+    "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
+    "handshake_ms = 60000"
 start_hedge "$work/hedge.toml"
 
 echo "binary $binary"
@@ -83,7 +89,7 @@ if [ "$quic_served" = 1 ]; then
     # and served at once. the rate limit keeps every transfer running until after
     # the last one has connected, and that overlap is checked from curl's own
     # timings rather than assumed.
-    curl_h3 "$QUIC_PORT" "$quic_connections" open "$quic_rate" --silent --connect-timeout 30 \
+    curl_h3 "$QUIC_PORT" "$quic_connections" open "$quic_rate" --silent --connect-timeout 60 \
         >"$work/open.out" 2>"$work/open.err"
     awk -v want="$quic_connections" -v bytes="$BODY_BYTES" '
         { total++ }
