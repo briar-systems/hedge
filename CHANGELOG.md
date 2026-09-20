@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The logged and histogrammed request duration is measured on the monotonic clock (#191). A call is stamped with the monotonic instant it is bound at receipt, and `observe_end` measures from that stamp, so a wall clock step during a request no longer logs a duration of zero (backward step) or the size of the step (forward step). `received_at` on the request metadata stays calendar time for the logged timestamp and for cache age. The other half of #191, the ACME transport deadline, was already moved to the monotonic clock in 0.7.0 (#202): `acme/manager.poll` hands every exchange `clock.instant()` and keeps wall time for the renewal schedule only.
+
 ## [0.9.0] - 2026-09-20
 
 The QUIC admission path closes the two gaps a 3000-connection burst exposed on 0.8.0 (#242, #243): the arrival queue never drops a token-bearing Initial while cheaper arrivals are held, and the promotion rule judges a record's remaining time by what a handshake takes to finish, so no handshake is promoted only to expire. Telemetry names both: per-class arrival drops, expiries and the finish estimate.
