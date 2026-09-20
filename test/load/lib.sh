@@ -215,9 +215,10 @@ prepare_load() {
 # written here rather than checked in, because it carries absolute paths to the
 # generated body and credentials. the whole load comes from one peer, so the
 # per-peer limit is always raised to the global one or past the load. the
-# optional sixth argument is the body of a [server.timeouts] table.
+# optional sixth argument is the body of a [server.timeouts] table, and the
+# optional seventh is appended whole (an admin listener, telemetry).
 write_config() {
-    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}"
+    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}"
     cat > "$path" <<EOF
 [server]
 name = "load"
@@ -276,5 +277,7 @@ name = "body"
 host = "site"
 path = "/**"
 service = "body"
+
+$extra
 EOF
 }

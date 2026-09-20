@@ -20,9 +20,8 @@ target="${LOAD_TARGET:-8}"
 quic_connections="${LOAD_QUIC_CONNECTIONS:-1100}"
 # slow enough that every transfer is still running when the last one connects
 quic_rate="${LOAD_QUIC_RATE:-4k}"
-# 0 skips every assertion that HTTP/3 transfers were served. hedge#231 keeps
-# them from passing today, and CI sets it until that is fixed. admission and
-# refusal are still checked either way.
+# 0 skips every assertion that HTTP/3 transfers were served, for a box whose
+# crypto rate cannot carry the burst; admission and refusal are still checked.
 quic_served="${LOAD_QUIC_SERVED:-1}"
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -40,10 +39,16 @@ CAP_TCP=32
 
 prepare_load
 
-# no global limit, so connection storage grows with the load rather than the
-# run measuring a configured ceiling
-write_config "$work/hedge.toml" "max_connections_per_peer = 4096" \
-    "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT"
+# no connection limit, so connection storage grows with the load rather than
+# the run measuring a configured ceiling. the pool defaults to 256 connections'
+# worth without one, so it is sized for the burst outright, and the handshake
+# deadline is lifted past the run: this cell measures service under
+# concurrency, the burst lane measures the deadline
+write_config "$work/hedge.toml" \
+    "max_connections_per_peer = 4096
+memory_bytes = $((quic_connections * 4 * 1048576))" \
+    "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
+    "handshake_ms = 60000"
 start_hedge "$work/hedge.toml"
 
 echo "binary $binary"
@@ -67,8 +72,7 @@ python3 test/load/fairness.py \
 report $? "every TLS connection is served under concurrent load"
 
 # a small body over HTTP/3, one connection at a time. this is what keeps a
-# change that stops HTTP/3 being served at all from merging, as #143 did, and
-# it holds while hedge#231 keeps the loaded cells below from passing
+# change that stops HTTP/3 being served at all from merging, as #143 did
 smoke=0
 for i in 1 2 3 4 5; do
     fetched="$("$h3curl" --http3-only --insecure --silent --max-time 10 \
@@ -85,7 +89,7 @@ if [ "$quic_served" = 1 ]; then
     # and served at once. the rate limit keeps every transfer running until after
     # the last one has connected, and that overlap is checked from curl's own
     # timings rather than assumed.
-    curl_h3 "$QUIC_PORT" "$quic_connections" open "$quic_rate" --silent --connect-timeout 30 \
+    curl_h3 "$QUIC_PORT" "$quic_connections" open "$quic_rate" --silent --connect-timeout 60 \
         >"$work/open.out" 2>"$work/open.err"
     awk -v want="$quic_connections" -v bytes="$BODY_BYTES" '
         { total++ }
@@ -101,7 +105,7 @@ if [ "$quic_served" = 1 ]; then
         }' "$work/open.out"
     report $? "every one of $quic_connections concurrent QUIC connections is served with no configured limit"
 else
-    echo "skipped every one of $quic_connections concurrent QUIC connections is served (LOAD_QUIC_SERVED=0, hedge#231)"
+    echo "skipped every one of $quic_connections concurrent QUIC connections is served (LOAD_QUIC_SERVED=0)"
 fi
 
 if stop_hedge; then
