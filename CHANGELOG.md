@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking.** Dependencies: mach-std `^6.1` (v6.1.0, was v5.7.0), mach-crypto `^0.19` (v0.19.0, was v0.14.0), mach-tls `^0.9` (v0.9.0, was v0.8.1), mach-quic `^0.16` (v0.16.0, was v0.14.0), mach-http `^0.15` (v0.15.0, was v0.14.0), mach-acme `^0.6` (v0.6.0, was v0.5.0) and laurel `^0.15` (v0.15.0, was v0.14.0), and `mach.toml` requires mach `^5.9`. A consumer must be on std 6.x as well. std 6 reaches hedge in two places: the per-peer admission index is a `map.MapBy` keyed by the seeded address hash, since an `ip.Addr` carries arrays and has no natural hash, and a connection's account opens with a counted `buffers.Budgets`, so an engine that names its own lanes must pass exactly that many and the borrower refuses any other count as misuse. crypto 0.19 runs P-256 on 64-bit Montgomery limbs, so a TLS 1.3 handshake costs about a quarter of what it did. On aarch64 the program turns PSTATE.DIT on before `main` and refuses to start, with status 255, on a processor or kernel without the mode, and CI runs the aarch64 legs with `dit: required`.
+
 ## [0.7.0] - 2026-09-19
 
 Stage 6 of #169 (#175): an idle connection holds only its protocol state. Every buffer a connection once carried between requests is now borrowed from its worker's pool while bytes are in flight and returned when they are done, the per-stream and per-connection record tables recede to what is actually connected, and the whole reduction is measured on the real binary with a pinned regression guard.
