@@ -155,6 +155,7 @@ declare -A arrivals_before
 for class in $arrival_classes; do
     arrivals_before[$class]="$(metric_class hedge_quic_arrivals_dropped_total "$class")"
 done
+expired_before="$(metric hedge_quic_handshakes_expired_total)"
 
 read -r connected elapsed <<<"$(dial "$burst" burst)"
 # the last clients' Finished packets are still on the server's next turns
@@ -173,10 +174,12 @@ for class in $arrival_classes; do
     arrivals_dropped[$class]=$(( $(metric_class hedge_quic_arrivals_dropped_total "$class") - arrivals_before[$class] ))
     arrivals_total=$(( arrivals_total + arrivals_dropped[$class] ))
 done
+expired=$(( $(metric hedge_quic_handshakes_expired_total) - expired_before ))
 in_flight="$(metric hedge_quic_handshakes_in_flight)"
+finish_ms="$(awk -v ns="$(metric hedge_quic_handshake_finish_ns)" 'BEGIN { print ns / 1000000 }')"
 drops_after="$(socket_drops)"
 read -r retried first_flight_retransmits token_retransmits <<<"$(retransmits burst)"
-echo "burst: dialled=$burst connected=$connected in ${elapsed}s deferred=$deferred promoted=$promoted completed=$completed dropped=$dropped refused=$refused retries_dropped=$retries_dropped in_flight=$in_flight socket_drops=$((drops_after - drops_before))"
+echo "burst: dialled=$burst connected=$connected in ${elapsed}s deferred=$deferred promoted=$promoted completed=$completed dropped=$dropped refused=$refused retries_dropped=$retries_dropped in_flight=$in_flight expired=$expired finish_ms=$finish_ms socket_drops=$((drops_after - drops_before))"
 echo "burst: arrivals dropped=$arrivals_total token=${arrivals_dropped[token]} untoken=${arrivals_dropped[untoken]} other=${arrivals_dropped[other]} duplicate=${arrivals_dropped[duplicate]}"
 echo "burst: clients retried=$retried retransmitted first_flight=$first_flight_retransmits token=$token_retransmits"
 
@@ -191,6 +194,12 @@ report $? "every handshake the server completed is a connection the client saw (
 # the two counts agree
 test "$((promoted - completed))" -le "$in_flight"
 report $? "nothing is admitted and then lost: what was promoted but not completed was still in flight (promoted $promoted, completed $completed, in flight $in_flight)"
+
+# a handshake promoted with less time left than a handshake takes spends its
+# crypto and expires on its deadline with the client told nothing. the
+# promotion rule judges by the measured finish so this never happens
+test "$expired" -eq 0
+report $? "no promoted handshake expired on its deadline (expired $expired, finish ${finish_ms}ms)"
 
 # a dial the deadline drops at the queue and one the ceiling refuses on
 # arrival both cost the server no handshake
