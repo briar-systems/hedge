@@ -80,33 +80,6 @@ mappings() {
     wc -l < "/proc/$hedge_pid/maps"
 }
 
-# a record table grows in chunks of FIRST_CHUNK << k records (storage.mach), and
-# a secret table wipes a chunk whole when it welds it, so every slot of the
-# newest chunk is resident from the moment the chunk exists. the QUIC figures
-# are therefore taken at counts where every chunk is full, which makes the
-# slope the cost of one welded slot rather than of wherever the count fell in
-# the top chunk, and the 100k projection pays for the capacity 100k needs.
-FIRST_CHUNK=16
-# the chunk-aligned count nearest n
-aligned() {
-    local n="$1" chunk="$FIRST_CHUNK" total=0
-    while [ $((total + chunk)) -le "$n" ]; do
-        total=$((total + chunk))
-        chunk=$((chunk * 2))
-    done
-    if [ $((total + chunk - n)) -lt $((n - total)) ]; then total=$((total + chunk)); fi
-    echo "$total"
-}
-# the capacity a table holds n records in
-capacity() {
-    local n="$1" chunk="$FIRST_CHUNK" total=0
-    while [ "$total" -lt "$n" ]; do
-        total=$((total + chunk))
-        chunk=$((chunk * 2))
-    done
-    echo "$total"
-}
-
 # one server per transport so every baseline is a process that has served
 # nothing. no connection cap, a budget that admits the large count (the pool
 # preallocates nothing, so the budget is a number, not memory), and keep-alive
@@ -170,15 +143,7 @@ hold_more() {
 measure() {
     local transport="$1" pin="$2" r0 r1 r2 r3 r4 v3 m3
     local per_low per_high per once projection agree
-    local small="$small" large="$large" mid projected="$PROJECTION"
-    if [ "$transport" = quic ]; then
-        small="$(aligned "$small")"
-        large="$(aligned "$large")"
-        mid="$(aligned $(( (small + large) / 2 )))"
-        projected="$(capacity "$PROJECTION")"
-    else
-        mid=$(( (small + large) / 2 ))
-    fi
+    local mid=$(( (small + large) / 2 ))
 
     start_scale_server
     sleep 0.5
@@ -212,7 +177,7 @@ measure() {
     per_high=$(( (r3 - r2) / (large - mid) ))
     per=$(( (r3 - r1) / (large - small) ))
     once=$(( r1 - r0 - per * small ))
-    projection=$(( r0 + once + per * projected ))
+    projection=$(( r0 + once + per * PROJECTION ))
     if [ "$per_low" -gt 0 ]; then
         agree=$(( (per_high - per_low) * 100 / per_low ))
     else
@@ -225,11 +190,7 @@ measure() {
     printf '%s: bytes/connection over %d..%d=%d over %d..%d=%d (%+d%%) over %d..%d=%d, once=%d KiB\n' \
         "$transport" "$small" "$mid" "$per_low" "$mid" "$large" "$per_high" "$agree" \
         "$small" "$large" "$per" $((once / 1024))
-    printf '%s: projection at %dk=%d MiB' "$transport" $((PROJECTION / 1000)) $((projection / 1048576))
-    if [ "$projected" -ne "$PROJECTION" ]; then
-        printf ' (capacity %d)' "$projected"
-    fi
-    echo
+    printf '%s: projection at %dk=%d MiB\n' "$transport" $((PROJECTION / 1000)) $((projection / 1048576))
 
     if [ "$pin" -gt 0 ]; then
         test "$per" -le $(( pin + pin * tolerance / 100 ))
