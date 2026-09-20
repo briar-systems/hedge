@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-20
+
+The QUIC admission path closes the two gaps a 3000-connection burst exposed on 0.8.0 (#242, #243): the arrival queue never drops a token-bearing Initial while cheaper arrivals are held, and the promotion rule judges a record's remaining time by what a handshake takes to finish, so no handshake is promoted only to expire. Telemetry names both: per-class arrival drops, expiries and the finish estimate.
+
 ### Changed
 
 - The QUIC arrival queue is class-aware at its drop site (#242). Under pressure it gives up a duplicate of a datagram it already holds, then a version negotiation, then a first flight the server has not answered, and only then a token-bearing Initial, so a client that has answered a Retry is never the one dropped while cheaper arrivals are held. Before, the queue dropped the newest arrival whatever it was, and under a 3000-connection burst a third to three quarters of the clients had a token Initial dropped and completed only after a PTO step, and a client dropped two or three times arrived past its `handshake_ms` deadline and was refused for lateness the queue had made. `hedge_quic_arrivals_dropped_total` carries a `class` label (`token`, `untoken`, `other`, `duplicate`) in place of the single row, so the built-in series count rises, and `telemetry.metric_series` must cover it. The Initial's token length comes from mach-quic `^0.17` (v0.17.0), which carries it on `ClassifiedDatagram`. `test/load/burst.sh` reports the per-class drop counts and how many clients retransmitted a first flight or a token Initial before admission, counts refusals with drops in its completion check, and asserts token drops are 0. On this box, five consecutive runs: 3000 of 3000 dials complete in 9.1 to 9.5 s, 4517 to 5836 arrivals dropped per run, every one a duplicate the client's PTO sent while its original was held (token 0, untoken 0, other 0), 0 refused. Before, on v0.8.0 in the same cell: 7260 to 13015 dropped per run of which 1812 to 7386 were token Initials, 2912 to 3000 connected, and up to 166 refused for lateness the queue had made.
