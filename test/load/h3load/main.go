@@ -29,6 +29,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 )
 
 type options struct {
@@ -57,6 +58,78 @@ type options struct {
 type worker struct {
 	count atomic.Int64
 	err   atomic.Pointer[string]
+	// the CRYPTO offsets this connection's Initials carried before and after
+	// the server's Retry, from the connection's own qlog events. an offset
+	// sent twice in one phase is a PTO retransmit: of a first flight the
+	// server never answered, or of a token Initial it held or dropped. a
+	// flight split across Initials carries each offset once
+	trace   sync.Mutex
+	retried bool
+	sent    [2]map[int64]int
+}
+
+// handshakeTrace is a qlog trace that keeps only the counts the load lane
+// reads, in place of a file per connection
+type handshakeTrace struct{ w *worker }
+
+func (t handshakeTrace) AddProducer() qlogwriter.Recorder { return t }
+func (t handshakeTrace) SupportsSchemas(schema string) bool {
+	return schema == qlog.EventSchema
+}
+func (t handshakeTrace) Close() error { return nil }
+func (t handshakeTrace) RecordEvent(event qlogwriter.Event) {
+	t.w.trace.Lock()
+	defer t.w.trace.Unlock()
+	switch e := event.(type) {
+	case qlog.PacketReceived:
+		if e.Header.PacketType == qlog.PacketTypeRetry {
+			t.w.retried = true
+		}
+	case qlog.PacketSent:
+		if e.Header.PacketType != qlog.PacketTypeInitial {
+			return
+		}
+		phase := 0
+		if t.w.retried {
+			phase = 1
+		}
+		if t.w.sent[phase] == nil {
+			t.w.sent[phase] = map[int64]int{}
+		}
+		for _, frame := range e.Frames {
+			if crypto, ok := frame.Frame.(*qlog.CryptoFrame); ok {
+				t.w.sent[phase][crypto.Offset]++
+			}
+		}
+	}
+}
+
+func (w *worker) sawRetry() bool {
+	w.trace.Lock()
+	defer w.trace.Unlock()
+	return w.retried
+}
+
+// true when this phase sent some CRYPTO offset more than once
+func (w *worker) retransmitted(phase int) bool {
+	w.trace.Lock()
+	defer w.trace.Unlock()
+	for _, count := range w.sent[phase] {
+		if count > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+type traceKey struct{}
+
+func traceFor(ctx context.Context, _ bool, _ qlog.ConnectionID) qlogwriter.Trace {
+	w, ok := ctx.Value(traceKey{}).(*worker)
+	if !ok {
+		return nil
+	}
+	return handshakeTrace{w: w}
 }
 
 func (w *worker) fail(format string, args ...any) {
@@ -64,8 +137,9 @@ func (w *worker) fail(format string, args ...any) {
 	w.err.CompareAndSwap(nil, &message)
 }
 
-func dial(ctx context.Context, o *options) (*quic.Conn, error) {
-	ctx, cancel := context.WithTimeout(ctx, o.connectTimeout)
+func dial(ctx context.Context, o *options, w *worker) (*quic.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.WithValue(ctx, traceKey{}, w),
+		o.connectTimeout)
 	defer cancel()
 	address, err := net.ResolveUDPAddr("udp", o.address)
 	if err != nil {
@@ -86,8 +160,7 @@ func dial(ctx context.Context, o *options) (*quic.Conn, error) {
 		MaxIdleTimeout:       o.idleTimeout,
 		HandshakeIdleTimeout: o.connectTimeout,
 		KeepAlivePeriod:      time.Second,
-		// writes a qlog per connection only when QLOGDIR is set
-		Tracer: qlog.DefaultConnectionTracer,
+		Tracer:               traceFor,
 	})
 }
 
@@ -155,7 +228,7 @@ func run(o *options) int {
 				inFlight <- struct{}{}
 				defer func() { <-inFlight }()
 			}
-			conn, err := dial(context.Background(), o)
+			conn, err := dial(context.Background(), o, &workers[i])
 			if err != nil {
 				workers[i].fail("connect: %v", err)
 				return
@@ -180,6 +253,22 @@ func run(o *options) int {
 	}
 	fmt.Printf("%s: connected=%d/%d in %.1fs\n", o.label, connected,
 		o.connections, time.Since(started).Seconds())
+	// connections that retransmitted an Initial: the first flight before the
+	// Retry came, the token Initial after it
+	firstFlightRetransmits, tokenRetransmits, retried := 0, 0, 0
+	for i := range workers {
+		if workers[i].retransmitted(0) {
+			firstFlightRetransmits++
+		}
+		if workers[i].retransmitted(1) {
+			tokenRetransmits++
+		}
+		if workers[i].sawRetry() {
+			retried++
+		}
+	}
+	fmt.Printf("%s: retried=%d retransmitted first_flight=%d token=%d\n",
+		o.label, retried, firstFlightRetransmits, tokenRetransmits)
 	if o.expectConnected >= 0 {
 		if connected != o.expectConnected {
 			fmt.Printf("%s: expected exactly %d connections to be admitted\n",

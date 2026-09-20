@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The QUIC arrival queue is class-aware at its drop site (#242). Under pressure it gives up a duplicate of a datagram it already holds, then a version negotiation, then a first flight the server has not answered, and only then a token-bearing Initial, so a client that has answered a Retry is never the one dropped while cheaper arrivals are held. Before, the queue dropped the newest arrival whatever it was, and under a 3000-connection burst a third to three quarters of the clients had a token Initial dropped and completed only after a PTO step, and a client dropped two or three times arrived past its `handshake_ms` deadline and was refused for lateness the queue had made. `hedge_quic_arrivals_dropped_total` carries a `class` label (`token`, `untoken`, `other`, `duplicate`) in place of the single row, so the built-in series count is 35 and `telemetry.metric_series` must cover it. The Initial's token length comes from mach-quic `^0.17` (v0.17.0), which carries it on `ClassifiedDatagram`. `test/load/burst.sh` reports the per-class drop counts and how many clients retransmitted a first flight or a token Initial before admission, counts refusals with drops in its completion check, and asserts token drops are 0: on this box 3000 of 3000 dials complete with 0 token drops across five consecutive runs.
+
 ## [0.8.0] - 2026-09-19
 
 QUIC handshake admission is bounded and deferred (#164), which closes the two known limits 0.7.0 shipped with: the handshake-burst deadline (#231) and the burst losses (#232). A burst is now drained at read speed, every connection that cannot be served inside its deadline is refused in one RTT rather than started late, and the service rate the rule judges by is a running estimate exposed on the snapshot. The dependency family moves to std 6, and the handshake itself costs about a quarter of what it did on crypto 0.19.
