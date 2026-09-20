@@ -283,7 +283,9 @@ pub rec PendingConfig {
 pub rec PendingInitial {
     next_live: usize;
     prev_live: usize;
-    data:      [assembly.MAX_UDP_PAYLOAD]u8;
+    # counted in the runtime's superseded total once its pump moved on
+    superseded: bool;
+    data:       [assembly.MAX_UDP_PAYLOAD]u8;
     # the listener's acceptance stays reserved, not committed, while the
     # Initial waits: a wait that ends in a drop cancels it, and the token the
     # client holds is still good for its retransmit. `accepted` is set only on
@@ -476,6 +478,8 @@ rec AdmissionGeneration {
 pub rec Connection {
     storage:  *ConnectionStorage;
     assembly: assembly.Connection;
+    # counted in the runtime's superseded total once its pump moved on
+    superseded: bool;
     # the handshake record this connection holds, or NO_HANDSHAKE
     handshake: usize;
     # the peer's share of the handshake bound, held with the record
@@ -648,15 +652,18 @@ pub rec Runtime {
     backing:             *A.Allocator;
     # the live connections, so every sweep costs what is live rather than what
     # was configured. an idle QUIC listener sweeps nothing.
-    live_head:           usize;
-    ready_head:          usize;
-    ready_tail:          usize;
-    waiting_head:        usize;
-    completions_head:    *CompletionContext;
-    completions_tail:    *CompletionContext;
-    admission:           *process_admission.Manager;
-    live_connections:    usize;
-    live_total:          usize;
+    live_head:        usize;
+    ready_head:       usize;
+    ready_tail:       usize;
+    waiting_head:     usize;
+    completions_head: *CompletionContext;
+    completions_tail: *CompletionContext;
+    admission:        *process_admission.Manager;
+    live_connections: usize;
+    live_total:       usize;
+    # live records whose pump has moved to a later plan or admission bank,
+    # kept exact by the marks at each swap and the releases
+    superseded_total:    usize;
     datagram_failures:   u64;
     connection_failures: u64;
     stateless_dropped:   u64;
@@ -1346,6 +1353,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.live_head         = NO_CONNECTION;
     runtime.live_connections  = 0;
     runtime.live_total        = 0;
+    runtime.superseded_total  = 0;
     runtime.stateless_dropped = 0;
     clear_arrival_drops(runtime);
     runtime.replay_full           = 0;
@@ -1862,22 +1870,57 @@ fun connection_superseded(controls: *ControlView, runtime: *Runtime, value: *Con
         || value.plan.generation != pump.plan.generation;
 }
 
+fun pending_superseded(controls: *ControlView, pending: *PendingInitial) bool {
+    if (pending == nil || !pending.live || pending.pump >= MAX_PUMPS) { ret false; }
+    val pump: *Pump = ?controls.pumps[pending.pump];
+    ret !pump.live || pending.pump_generation != pump.generation
+        || pending.admission_bank != pump.active_admission
+        || pending.config.plan == nil || pump.plan == nil
+        || pending.config.plan.generation != pump.plan.generation;
+}
+
+# a record enters the superseded total once and leaves it on release
+fun note_superseded(runtime: *Runtime, flag: *bool, is: bool) {
+    if (!is || @flag) { ret; }
+    @flag                    = true;
+    runtime.superseded_total = runtime.superseded_total + 1;
+}
+
+fun release_superseded(runtime: *Runtime, flag: *bool) {
+    if (!@flag) { ret; }
+    @flag = false;
+    if (runtime.superseded_total != 0) {
+        runtime.superseded_total = runtime.superseded_total - 1;
+    }
+}
+
 fun mark_connection_superseded(controls: *ControlView, runtime: *Runtime,
     index: usize) {
     val value: *Connection = connection_at(controls, index);
-    if (value.state == CONNECTION_LIVE
-        && connection_superseded(controls, runtime, value)) {
+    val is:    bool        = connection_superseded(controls, runtime, value);
+    note_superseded(runtime, ?value.superseded, is);
+    if (value.state == CONNECTION_LIVE && is) {
         value.state = CONNECTION_GRACEFUL;
         mark_ready(controls, runtime, index);
     }
 }
 
+# a pump swap is the one event that supersedes records, so it is the one
+# place that walks them: every live record and waiting Initial of the pump
+# is marked here, and the count is O(1) from then on
 fun mark_superseded_graceful(controls: *ControlView, runtime: *Runtime) {
     var i: usize = runtime.live_head;
     for (i != NO_CONNECTION) {
         val next: usize = connection_at(controls, i).next_live;
         mark_connection_superseded(controls, runtime, i);
         i = next;
+    }
+    i = runtime.pending_live_head;
+    for (i != NO_CONNECTION) {
+        val pending: *PendingInitial = pending_at(runtime, i);
+        note_superseded(runtime, ?pending.superseded,
+            pending_superseded(controls, pending));
+        i = pending.next_live;
     }
 }
 
@@ -2070,7 +2113,8 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
     value.assembly_attempted      = false;
     value.assembly_released       = false;
     arm_connection_storage(value);
-    value.live = true;
+    value.superseded = false;
+    value.live       = true;
     link_live(controls, runtime, index);
     runtime.live_connections                      = runtime.live_connections + 1;
     runtime.live_total                            = runtime.live_total + 1;
@@ -2110,6 +2154,7 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
         runtime.live_connections = runtime.live_connections - 1;
     }
     if (runtime.live_total != 0) { runtime.live_total = runtime.live_total - 1; }
+    release_superseded(runtime, ?value.superseded);
     value.lease                    = process_admission.no_lease();
     value.policy                   = nil;
     value.plan                     = nil;
@@ -2920,6 +2965,7 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
     pending.budget_charge_live = pending.budget_charge.live;
     pending.lease_live         = true;
     pending.cleanup_only       = false;
+    pending.superseded         = false;
     pending.live               = true;
     if (deferred) {
         pending.handshake_lease      = handshake_lease;
@@ -2965,6 +3011,7 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
     pending.budget_charge_live = pending.budget_charge.live;
     pending.lease_live         = lease_live;
     pending.cleanup_only       = true;
+    pending.superseded         = false;
     pending.live               = true;
     link_pending_live(runtime, index);
     mark_pending_ready(runtime, index);
@@ -2984,6 +3031,7 @@ fun take_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize
         runtime.pending_initial_count = runtime.pending_initial_count - 1;
     }
     if (runtime.live_total != 0) { runtime.live_total = runtime.live_total - 1; }
+    release_superseded(runtime, ?pending.superseded);
     if (pending.pump < MAX_PUMPS) {
         val pump: *Pump = ?controls.pumps[pending.pump];
         if (pump.queued_initials != 0) {
@@ -4845,29 +4893,7 @@ pub fun live(runtime: *Runtime) usize {
 
 pub fun superseded(controls: *ControlView, runtime: *Runtime) usize {
     if (runtime == nil || !runtime.initialized) { ret 0; }
-    var count: usize = 0;
-    var i:     usize = runtime.live_head;
-    for (i != NO_CONNECTION) {
-        val value: *Connection = connection_at(controls, i);
-        val next:  usize       = value.next_live;
-        if (connection_superseded(controls, runtime, value)) { count = count + 1; }
-        i = next;
-    }
-    i = runtime.pending_live_head;
-    for (i != NO_CONNECTION) {
-        val pending: *PendingInitial = pending_at(runtime, i);
-        if (pending.pump < MAX_PUMPS) {
-            val pump: *Pump = ?controls.pumps[pending.pump];
-            if (!pump.live || pending.pump_generation != pump.generation
-                || pending.admission_bank != pump.active_admission
-                || pending.config.plan == nil || pump.plan == nil
-                || pending.config.plan.generation != pump.plan.generation) {
-                count = count + 1;
-            }
-        }
-        i = pending.next_live;
-    }
-    ret count;
+    ret runtime.superseded_total;
 }
 
 pub fun budgets_in_use(controls: *ControlView, runtime: *Runtime, target: *budget.Set) bool {
@@ -5768,8 +5794,12 @@ test "hedge.protocol.quic.runtime: queued old generation pins retirement" {
     pending.pump_generation = 1;
     pending.admission_bank  = 0;
     pending.config.plan     = ?old_plan;
+    # the swap that left the pump on the new plan is the mark
+    mark_superseded_graceful(controls, ?runtime);
     if (superseded(controls, ?runtime) != 1
         || reap_admission(?controls.pumps[0].admissions[0])) { ret 1; }
+    take_pending_initial(controls, ?runtime, 0);
+    if (superseded(controls, ?runtime) != 0) { ret 2; }
     ret 0;
 }
 

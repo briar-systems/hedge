@@ -45,7 +45,6 @@ fun retry_replay_limit(configured: *schema.Listener) usize {
     ret schema.DEFAULT_QUIC_RETRY_REPLAY;
 }
 
-pub val DEFAULT_POLL_MS: i32 = 50;
 # a Retry token outlives the longest wait admission can hand a client and the
 # retransmit that follows a drop: a client accepts one Retry per attempt, so a
 # token that expires while its Initial waits, or before the client's PTO brings
@@ -64,6 +63,8 @@ pub val NO_SLOT: usize = (-1)::usize;
 pub rec Slot {
     live:     bool;
     retiring: bool;
+    # asked to finish and close, whether by a reload or the shutdown sequence
+    signalled: bool;
     # queued to be driven or retired on this worker's next pass
     ready:      bool;
     ready_next: usize;
@@ -79,6 +80,21 @@ pub rec Slot {
     charge:    budget.Charge;
     prev_live: usize;
     next_live: usize;
+}
+
+# the live slots of one service generation, in admission order. a slot is on
+# the current list while its connection's generation is the runtime's and on
+# the previous list after a reload moved every live slot there at once, so the
+# superseded count and the generation drain never look at a slot they do not
+# need to (#182)
+rec LiveList {
+    head:  usize;
+    tail:  usize;
+    count: usize;
+}
+
+fun empty_list() LiveList {
+    ret LiveList{head: NO_SLOT, tail: NO_SLOT, count: 0};
 }
 
 rec BudgetGeneration {
@@ -101,6 +117,10 @@ pub val PLANE_QUIESCED: PlaneQuiesceStatus = 1;
 pub val PLANE_PENDING:  PlaneQuiesceStatus = 2;
 pub val PLANE_FAILED:   PlaneQuiesceStatus = 3;
 pub def PlaneQuiesceFun: fun(ptr, time.Instant) PlaneQuiesceStatus;
+# the plane's earliest time-based need as a monotonic deadline in ns, or false
+# when it has none. the serving loop arms it on the wheel so the poll wait
+# ends when the plane is due rather than on a fixed interval (#182)
+pub def PlaneDeadlineFun: fun(ptr, *u64) bool;
 
 # how many fired timer owners one wheel advance hands back at a time
 val FIRE_BATCH: usize = 64;
@@ -117,20 +137,30 @@ pub rec Runtime {
     # every owner something outside its own io has made runnable again
     wakes: hedge_wake.Queue;
     # the TCP slots with work, in the order they got it
-    ready_head:    usize;
-    ready_tail:    usize;
-    state:         State;
-    plane_ctx:     ptr;
-    plane:         PlaneFun;
-    plane_quiesce: PlaneQuiesceFun;
-    generation:    u64;
-    owner:         listener.Owner;
+    ready_head:     usize;
+    ready_tail:     usize;
+    state:          State;
+    plane_ctx:      ptr;
+    plane:          PlaneFun;
+    plane_quiesce:  PlaneQuiesceFun;
+    plane_deadline: PlaneDeadlineFun;
+    generation:     u64;
+    owner:          listener.Owner;
     # the slot directory grows and a record never moves, so a completion
     # context or a body reader may hold a pointer into one for its life
-    slots:         hedge_storage.Table[Slot];
-    connections:   hedge_storage.Recycler[connection.Connection];
-    live:          usize;
-    live_head:     usize;
+    slots:       hedge_storage.Table[Slot];
+    connections: hedge_storage.Recycler[connection.Connection];
+    live:        usize;
+    current:     LiveList;
+    previous:    LiveList;
+    # slots whose connection is in teardown: spoken for but about to be free
+    retiring: usize;
+    # the wheel entry that ends the previous generation's drain (#182)
+    drain_timer: hedge_timer.Handle;
+    # the wheel entry the plane's own deadline is armed on, and whether the
+    # plane asked to be driven before the next wait
+    plane_timer:   hedge_timer.Handle;
+    plane_due:     bool;
     next_id:       u64;
     plan:          *plan.Plan;
     graph:         *schema.Graph;
@@ -246,9 +276,16 @@ pub fun make(
     runtime.quic_released     = false;
     if (!configure_budgets(?runtime.budget_generations[0], graph)) { ret false; }
     runtime.active_budgets = ?runtime.budget_generations[0].set;
-    runtime.live_head      = NO_SLOT;
-    runtime.ready_head     = NO_SLOT;
-    runtime.ready_tail     = NO_SLOT;
+    runtime.current        = empty_list();
+    runtime.previous       = empty_list();
+    runtime.retiring       = 0;
+    # both entries are claimed at the first deadline they hold, so an idle
+    # worker holds no wheel storage until a plane has one or a reload lands
+    runtime.drain_timer = hedge_timer.no_handle();
+    runtime.plane_timer = hedge_timer.no_handle();
+    runtime.plane_due   = true;
+    runtime.ready_head  = NO_SLOT;
+    runtime.ready_tail  = NO_SLOT;
     var i: usize = 0;
     for (i < schema.MAX_LISTENERS) {
         runtime.quic_handle_live[i] = false;
@@ -267,21 +304,34 @@ pub fun attach_quic(runtime: *Runtime, quic: *quic_runtime.Runtime,
     ret true;
 }
 
+# a plane without a deadline function runs on every turn and never wakes one
 pub fun attach_plane(runtime: *Runtime, context: ptr, plane: PlaneFun) bool {
     if (runtime == nil || plane::usize == 0) { ret false; }
-    runtime.plane_ctx     = context;
-    runtime.plane         = plane;
-    runtime.plane_quiesce = (0::usize)::PlaneQuiesceFun;
+    runtime.plane_ctx      = context;
+    runtime.plane          = plane;
+    runtime.plane_quiesce  = (0::usize)::PlaneQuiesceFun;
+    runtime.plane_deadline = (0::usize)::PlaneDeadlineFun;
+    runtime.plane_due      = true;
     ret true;
 }
 
 pub fun attach_plane_lifecycle(runtime: *Runtime, context: ptr, plane: PlaneFun,
-    quiesce: PlaneQuiesceFun) bool {
-    if (runtime == nil || plane::usize == 0 || quiesce::usize == 0) { ret false; }
-    runtime.plane_ctx     = context;
-    runtime.plane         = plane;
-    runtime.plane_quiesce = quiesce;
+    quiesce: PlaneQuiesceFun, deadline: PlaneDeadlineFun) bool {
+    if (runtime == nil || plane::usize == 0 || quiesce::usize == 0
+        || deadline::usize == 0) { ret false; }
+    runtime.plane_ctx      = context;
+    runtime.plane          = plane;
+    runtime.plane_quiesce  = quiesce;
+    runtime.plane_deadline = deadline;
+    runtime.plane_due      = true;
     ret true;
+}
+
+# something outside the serving loop changed what the plane has to do, so it
+# runs before the next wait rather than at its armed deadline
+pub fun wake_plane(runtime: *Runtime) {
+    if (runtime == nil) { ret; }
+    runtime.plane_due = true;
 }
 
 pub fun attach_telemetry(runtime: *Runtime, observability: *telemetry.Runtime) bool {
@@ -528,7 +578,8 @@ pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation
 fun release_pool(runtime: *Runtime) bool {
     var ok: bool = hedge_storage.destroy[connection.Connection](?runtime.connections);
     if (!hedge_storage.destroy_table[Slot](?runtime.slots)) { ok = false; }
-    runtime.live_head = NO_SLOT;
+    runtime.current  = empty_list();
+    runtime.previous = empty_list();
     ret ok;
 }
 
@@ -562,29 +613,55 @@ pub fun slot_live(runtime: *Runtime, index: usize) bool {
     ret slot != nil && slot.live;
 }
 
-fun link_live(runtime: *Runtime, index: usize) {
-    val slot: *Slot = slot_at(runtime, index);
-    slot.prev_live = NO_SLOT;
-    slot.next_live = runtime.live_head;
-    if (runtime.live_head != NO_SLOT) {
-        slot_at(runtime, runtime.live_head).prev_live = index;
+# the list a live slot belongs to is decided by its connection's generation
+fun list_of(runtime: *Runtime, slot: *Slot) *LiveList {
+    if (slot.handle != nil && slot.handle.generation != runtime.generation) {
+        ret ?runtime.previous;
     }
-    runtime.live_head = index;
+    ret ?runtime.current;
 }
 
-fun unlink_live(runtime: *Runtime, index: usize) {
+fun link_live(runtime: *Runtime, list: *LiveList, index: usize) {
+    val slot: *Slot = slot_at(runtime, index);
+    slot.prev_live = NO_SLOT;
+    slot.next_live = list.head;
+    if (list.head != NO_SLOT) { slot_at(runtime, list.head).prev_live = index; }
+    or                        { list.tail = index; }
+    list.head  = index;
+    list.count = list.count + 1;
+}
+
+fun unlink_live(runtime: *Runtime, list: *LiveList, index: usize) {
     val slot: *Slot = slot_at(runtime, index);
     if (slot.prev_live != NO_SLOT) {
         slot_at(runtime, slot.prev_live).next_live = slot.next_live;
     }
-    or (runtime.live_head == index) {
-        runtime.live_head = slot.next_live;
+    or (list.head == index) {
+        list.head = slot.next_live;
     }
     if (slot.next_live != NO_SLOT) {
         slot_at(runtime, slot.next_live).prev_live = slot.prev_live;
     }
+    or (list.tail == index) {
+        list.tail = slot.prev_live;
+    }
     slot.prev_live = NO_SLOT;
     slot.next_live = NO_SLOT;
+    if (list.count != 0) { list.count = list.count - 1; }
+}
+
+# every current slot becomes a previous one in constant time: the current list
+# is spliced in front of the previous one and the generation bump does the rest
+fun supersede_live(runtime: *Runtime) {
+    if (runtime.current.head == NO_SLOT) { ret; }
+    if (runtime.previous.head != NO_SLOT) {
+        slot_at(runtime, runtime.current.tail).next_live  = runtime.previous.head;
+        slot_at(runtime, runtime.previous.head).prev_live = runtime.current.tail;
+    }
+    or { runtime.previous.tail = runtime.current.tail; }
+    runtime.previous.head  = runtime.current.head;
+    runtime.previous.count = runtime.previous.count + runtime.current.count;
+    runtime.current        = empty_list();
 }
 
 # a released slot is reused before the directory grows. storage the allocator
@@ -631,18 +708,6 @@ fun return_slot(runtime: *Runtime, index: usize) {
     hedge_storage.table_release[Slot](?runtime.slots, index);
 }
 
-# a slot whose connection is in teardown is spoken for but about to be free, and
-# the completion that frees it cannot arrive before the next wait
-fun teardown_pending(runtime: *Runtime) bool {
-    var i: usize = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot: *Slot = slot_at(runtime, i);
-        if (slot.live && slot.retiring) { ret true; }
-        i = slot.next_live;
-    }
-    ret false;
-}
-
 # admit every queued connection the pool can hold and refuse the rest at once
 fun admit(runtime: *Runtime, now: time.Instant) usize {
     var admitted: usize = 0;
@@ -652,7 +717,7 @@ fun admit(runtime: *Runtime, now: time.Instant) usize {
             # a pool full of live connections is a refusal, but one holding a
             # slot open for a teardown is not: that arrival waits a turn instead
             # of being destroyed for a slot that is already spent
-            if (teardown_pending(runtime)) { brk; }
+            if (runtime.retiring != 0) { brk; }
             var refused: listener.ConnectionToken;
             if (!listener.take_connection(?runtime.owner, ?refused)) { brk; }
             runtime.rejected = runtime.rejected + 1;
@@ -697,12 +762,13 @@ fun admit(runtime: *Runtime, now: time.Instant) usize {
             return_slot(runtime, index);
             cnt;
         }
-        slot.live     = true;
-        slot.retiring = false;
-        slot.waiting  = false;
-        slot.budgets  = runtime.active_budgets;
-        slot.token    = token;
-        link_live(runtime, index);
+        slot.live      = true;
+        slot.retiring  = false;
+        slot.signalled = false;
+        slot.waiting   = false;
+        slot.budgets   = runtime.active_budgets;
+        slot.token     = token;
+        link_live(runtime, ?runtime.current, index);
         runtime.next_id  = runtime.next_id + 1;
         runtime.live     = runtime.live + 1;
         runtime.accepted = runtime.accepted + 1;
@@ -777,8 +843,9 @@ fun retire(runtime: *Runtime, index: usize) {
     val slot: *Slot = slot_at(runtime, index);
     if (!slot.live) { ret; }
     if (!slot.retiring) {
-        slot.retiring = true;
-        slot.waiting  = false;
+        slot.retiring    = true;
+        slot.waiting     = false;
+        runtime.retiring = runtime.retiring + 1;
     }
     # an H2 body or transport cancellation may need a later completion. the
     # listener token and pool slot stay owned until that close phase settles.
@@ -802,14 +869,25 @@ fun retire(runtime: *Runtime, index: usize) {
     }
     slot.live     = false;
     slot.retiring = false;
-    if (slot.timer_live) { hedge_timer.disarm(?runtime.timers, slot.timer); }
-    unlink_live(runtime, index);
+    if (runtime.retiring != 0) { runtime.retiring = runtime.retiring - 1; }
+    if (slot.timer_live)       { hedge_timer.disarm(?runtime.timers, slot.timer); }
+    val list: *LiveList = list_of(runtime, slot);
+    unlink_live(runtime, list, index);
+    # the last superseded connection gone means nothing is left for the
+    # generation's drain deadline to cut
+    if (list == ?runtime.previous && list.count == 0
+        && runtime.drain_timer.index != hedge_timer.NONE) {
+        hedge_timer.disarm(?runtime.timers, runtime.drain_timer);
+    }
     return_slot(runtime, index);
     if (runtime.live > 0) { runtime.live = runtime.live - 1; }
 }
 
 val TCP_TAG:  u64 = 0x5443000000000000;
 val TAG_MASK: u64 = 0xffff000000000000;
+# the wheel entry the runtime itself owns for the previous generation's drain;
+# the plane's entry is owned by hedge_wake.PLANE_OWNER, the owner its wakes use
+val DRAIN_OWNER: u64 = 0x5244000000000000;
 # how many woken owners one routing pass takes at a time
 val WAKE_BATCH: usize = 64;
 
@@ -845,8 +923,15 @@ fun take_ready(runtime: *Runtime) usize {
     ret index;
 }
 
+# a waker for the plane, held by whatever completes on the worker's driver
+# outside a connection
+pub fun plane_waker(runtime: *Runtime) hedge_wake.Waker {
+    ret hedge_wake.waker(?runtime.wakes, hedge_wake.PLANE_OWNER);
+}
+
 fun has_ready(runtime: *Runtime) bool {
-    ret runtime.ready_head != NO_SLOT || hedge_wake.pending(?runtime.wakes)
+    ret runtime.ready_head != NO_SLOT || runtime.plane_due
+        || hedge_wake.pending(?runtime.wakes)
         || hedge_memory.has_woken(?runtime.memory);
 }
 
@@ -854,6 +939,7 @@ fun route_owner(controls: *quic_runtime.ControlView, runtime: *Runtime, owner: u
     if (owns_tcp(owner)) {
         mark_ready(runtime, (owner & ~TAG_MASK)::usize);
     }
+    or (owner == hedge_wake.PLANE_OWNER) { runtime.plane_due = true; }
     or (quic_runtime.owns(owner) && runtime.quic != nil && !runtime.quic_released) {
         quic_runtime.wake(controls, runtime.quic, owner);
     }
@@ -906,6 +992,14 @@ fun arm_slot(runtime: *Runtime, index: usize) {
 fun drive(runtime: *Runtime, index: usize, now: time.Instant) bool {
     val slot: *Slot = slot_at(runtime, index);
     runtime.drives = runtime.drives + 1;
+    # a connection of a superseded generation learns it on its own next turn:
+    # it finishes what it is doing and closes, and nobody walked to tell it
+    if (!slot.signalled && slot.handle.generation != runtime.generation) {
+        slot.signalled = true;
+        if (!connection.begin_graceful(slot.handle)) {
+            runtime.teardown_failures = runtime.teardown_failures + 1;
+        }
+    }
     connection.expire(slot.handle, clock.to_ns(now));
     val progress: connection.Step = connection.advance(slot.handle, now);
     if (progress == connection.STEP_DONE || progress == connection.STEP_ERROR) {
@@ -951,9 +1045,44 @@ fun fire_timers(controls: *quic_runtime.ControlView, runtime: *Runtime, now_ns: 
                 && !runtime.quic_released) {
                 quic_runtime.fire(controls, runtime.quic, owners[i], now_ns);
             }
+            or (owners[i] == DRAIN_OWNER)            { cancel_previous(runtime); }
+            or (owners[i] == hedge_wake.PLANE_OWNER) { runtime.plane_due = true; }
             i = i + 1;
         }
         if (fired < FIRE_BATCH) { brk; }
+    }
+}
+
+# the plane runs when its deadline fired, a link or a memory wake named it, or
+# a caller asked, and afterwards its next deadline is armed on the wheel. a
+# plane without a deadline function runs every turn, as before
+fun drive_plane(runtime: *Runtime, now: time.Instant) {
+    # only a plane with a deadline has a due state to wait on
+    if (runtime.plane::usize == 0 || runtime.plane_deadline::usize == 0) {
+        runtime.plane_due = false;
+        if (runtime.plane::usize != 0) { runtime.plane(runtime.plane_ctx, now); }
+        ret;
+    }
+    if (!runtime.plane_due) { ret; }
+    runtime.plane_due = false;
+    runtime.plane(runtime.plane_ctx, now);
+    var deadline: u64                = 0;
+    var armed:    hedge_timer.Status = hedge_timer.OK;
+    if (runtime.plane_deadline(runtime.plane_ctx, ?deadline)) {
+        # the entry is claimed at the first deadline there is to hold
+        if (runtime.plane_timer.index == hedge_timer.NONE) {
+            runtime.plane_timer = hedge_timer.claim(?runtime.timers, hedge_wake.PLANE_OWNER);
+        }
+        armed = hedge_timer.STALE;
+        if (runtime.plane_timer.index != hedge_timer.NONE) {
+            armed = hedge_timer.arm(?runtime.timers, runtime.plane_timer, deadline);
+        }
+    }
+    or (runtime.plane_timer.index != hedge_timer.NONE) {
+        armed = hedge_timer.disarm(?runtime.timers, runtime.plane_timer);
+    }
+    if (armed != hedge_timer.OK) {
+        runtime.teardown_failures = runtime.teardown_failures + 1;
     }
 }
 
@@ -1001,7 +1130,7 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     # refuses an arrival for a slot that this turn already freed
     run_ready(controls, runtime, now);
     if (lifecycle.serving(?runtime.shutdown)) { admit(runtime, now); }
-    if (runtime.plane::usize != 0)            { runtime.plane(runtime.plane_ctx, now); }
+    drive_plane(runtime, now);
     run_ready(controls, runtime, now);
     # plane and tcp progress can release shared budget capacity for quic
     val settled: time.Instant = clock.instant();
@@ -1053,18 +1182,41 @@ fun run_signal(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
         && quic_runtime.graceful_all(controls, runtime.quic, clock.monotonic_ns())
         != quic_runtime.OK) { ok = false; }
     runtime.state = DRAINING;
-    var i: usize = runtime.live_head;
+    if (!signal_list(runtime, ?runtime.current))  { ok = false; }
+    if (!signal_list(runtime, ?runtime.previous)) { ok = false; }
+    ret ok;
+}
+
+# HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
+# reading. the engine decides which; the runtime only asks.
+fun signal_list(runtime: *Runtime, list: *LiveList) bool {
+    var ok: bool  = true;
+    var i:  usize = list.head;
     for (i != NO_SLOT) {
         val slot: *Slot = slot_at(runtime, i);
-        # HTTP/2 sends GOAWAY, HTTP/1 marks its responses for close and stops
-        # reading. the engine decides which; the runtime only asks.
-        if (slot.live) {
+        if (slot.live && !slot.signalled) {
+            slot.signalled = true;
             if (!connection.begin_graceful(slot.handle)) { ok = false; }
             mark_ready(runtime, i);
         }
         i = slot.next_live;
     }
     ret ok;
+}
+
+fun cancel_list(runtime: *Runtime, list: *LiveList) {
+    var i: usize = list.head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = slot_at(runtime, i);
+        val next: usize = slot.next_live;
+        if (slot.live) { retire(runtime, i); }
+        i = next;
+    }
+}
+
+# the previous generation's drain deadline passed: what it still holds is cut
+fun cancel_previous(runtime: *Runtime) {
+    cancel_list(runtime, ?runtime.previous);
 }
 
 # step 5 cancel whatever the deadline did not let finish
@@ -1075,13 +1227,8 @@ fun run_cancel(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
         && quic_runtime.cancel_all(controls, runtime.quic) != quic_runtime.OK) {
         quic_ok = false;
     }
-    var i: usize = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot: *Slot = slot_at(runtime, i);
-        val next: usize = slot.next_live;
-        if (slot.live) { retire(runtime, i); }
-        i = next;
-    }
+    cancel_list(runtime, ?runtime.current);
+    cancel_list(runtime, ?runtime.previous);
     ret quic_ok && runtime.teardown_failures == failures;
 }
 
@@ -1173,7 +1320,9 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     if (runtime.active_budgets == ?runtime.budget_generations[0].set) {
         next = ?runtime.budget_generations[1];
     }
-    var i: usize = runtime.live_head;
+    # only a connection two reloads old can still hold the set about to be
+    # rebuilt, and every such connection is on the previous list
+    var i: usize = runtime.previous.head;
     for (i != NO_SLOT) {
         val slot: *Slot = slot_at(runtime, i);
         if (slot.live
@@ -1211,6 +1360,11 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
             ret false;
         }
     }
+    # every live connection is now of an older generation. it finishes what it
+    # is doing and closes on its own next event, and the generation's drain
+    # deadline cuts whatever is still open when it passes. a reload while the
+    # previous generation is still draining restarts that deadline.
+    supersede_live(runtime);
     runtime.plan             = active_plan;
     runtime.graph            = graph;
     runtime.generation       = generation;
@@ -1218,24 +1372,18 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     runtime.configured       = connection.config_from(graph);
     runtime.limits           = connection.message_limits(graph, runtime.configured);
     runtime.drain_timeout_ns = drain_timeout_ns;
-    var signalled: bool = true;
-    i = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot: *Slot = slot_at(runtime, i);
-        # every connection from an older generation finishes what it is doing
-        # and then closes, independently of the ones accepted since
-        if (slot.live
-            && slot.handle.generation != generation) {
-            if (!connection.begin_graceful(slot.handle)) {
-                signalled = false;
-            }
-            mark_ready(runtime, i);
+    var armed: bool = true;
+    if (runtime.previous.count != 0 && drain_timeout_ns != 0) {
+        if (runtime.drain_timer.index == hedge_timer.NONE) {
+            runtime.drain_timer = hedge_timer.claim(?runtime.timers, DRAIN_OWNER);
         }
-        i = slot.next_live;
+        armed = runtime.drain_timer.index != hedge_timer.NONE
+            && hedge_timer.arm(?runtime.timers, runtime.drain_timer,
+            clock.monotonic_ns() + drain_timeout_ns) == hedge_timer.OK;
     }
-    # publication already happened, so a signalling failure cannot be reported
-    # as a rejected reload. enter the ordered shutdown path and surface it there.
-    if (!signalled || (quic_result.committed
+    # publication already happened, so a failure here cannot be reported as a
+    # rejected reload. enter the ordered shutdown path and surface it there.
+    if (!armed || (quic_result.committed
         && quic_result.status != quic_runtime.OK)) {
         begin_shutdown(controls, runtime, clock.instant());
     }
@@ -1277,16 +1425,7 @@ fun listeners_changed(runtime: *Runtime, graph: *schema.Graph) bool {
 # live connections still belonging to a superseded generation
 pub fun superseded(controls: *quic_runtime.ControlView, runtime: *Runtime) usize {
     if (runtime == nil) { ret 0; }
-    var count: usize = 0;
-    var i:     usize = runtime.live_head;
-    for (i != NO_SLOT) {
-        val slot: *Slot = slot_at(runtime, i);
-        if (slot.live
-            && slot.handle.generation != runtime.generation) {
-            count = count + 1;
-        }
-        i = slot.next_live;
-    }
+    var count: usize = runtime.previous.count;
     if (runtime.quic != nil && !runtime.quic_released) {
         val quic_count: usize = quic_runtime.superseded(controls, runtime.quic);
         if (count > (-1)::usize - quic_count) { ret (-1)::usize; }
@@ -1428,7 +1567,7 @@ fun endpoint_text(owned: *listener.OwnedListener, output: *u8, capacity: usize) 
     ret ip.endpoint_format(owned.bound_endpoint, output, capacity);
 }
 
-test "serve: the live list holds exactly the live connection slots" {
+test "serve: the live lists hold exactly the live connection slots, by generation" {
     var a: A.Allocator;
     page.make(?a);
     var runtime: Runtime;
@@ -1436,7 +1575,8 @@ test "serve: the live list holds exactly the live connection slots" {
         || !hedge_storage.make[connection.Connection](?runtime.connections, ?a, 1)) {
         ret 1;
     }
-    runtime.live_head = NO_SLOT;
+    runtime.current  = empty_list();
+    runtime.previous = empty_list();
 
     val first:  usize = free_slot(?runtime);
     val second: usize = free_slot(?runtime);
@@ -1447,21 +1587,41 @@ test "serve: the live list holds exactly the live connection slots" {
     if (fourth != 3 || hedge_storage.table_live[Slot](?runtime.slots) != 4) { ret 3; }
     return_slot(?runtime, fourth);
 
-    link_live(?runtime, first);
-    link_live(?runtime, second);
-    if (runtime.live_head != second
+    link_live(?runtime, ?runtime.current, first);
+    link_live(?runtime, ?runtime.current, second);
+    if (runtime.current.head != second || runtime.current.tail != first
+        || runtime.current.count != 2
         || slot_at(?runtime, second).next_live != first
         || slot_at(?runtime, first).prev_live != second
         || slot_at(?runtime, first).next_live != NO_SLOT) { ret 4; }
 
-    unlink_live(?runtime, second);
-    if (runtime.live_head != first
-        || slot_at(?runtime, first).prev_live != NO_SLOT) { ret 5; }
+    # a reload moves every current slot to the previous list in one splice
+    supersede_live(?runtime);
+    if (runtime.current.head != NO_SLOT || runtime.current.count != 0
+        || runtime.previous.head != second || runtime.previous.tail != first
+        || runtime.previous.count != 2) { ret 5; }
+    link_live(?runtime, ?runtime.current, third);
+    if (runtime.current.count != 1 || runtime.previous.count != 2) { ret 6; }
+
+    # a second reload before the first drained splices in front of the rest
+    supersede_live(?runtime);
+    if (runtime.previous.head != third || runtime.previous.tail != first
+        || runtime.previous.count != 3
+        || slot_at(?runtime, third).next_live != second
+        || slot_at(?runtime, second).prev_live != third) { ret 7; }
+
+    unlink_live(?runtime, ?runtime.previous, second);
+    if (runtime.previous.head != third || runtime.previous.count != 2
+        || slot_at(?runtime, third).next_live != first
+        || slot_at(?runtime, first).prev_live != third) { ret 8; }
+    unlink_live(?runtime, ?runtime.previous, first);
+    if (runtime.previous.tail != third || runtime.previous.count != 1) { ret 9; }
 
     return_slot(?runtime, second);
-    if (free_slot(?runtime) != second) { ret 6; }
+    if (free_slot(?runtime) != second) { ret 10; }
 
-    unlink_live(?runtime, first);
-    if (runtime.live_head != NO_SLOT) { ret 7; }
+    unlink_live(?runtime, ?runtime.previous, third);
+    if (runtime.previous.head != NO_SLOT || runtime.previous.tail != NO_SLOT
+        || runtime.previous.count != 0) { ret 11; }
     ret 0;
 }
