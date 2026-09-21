@@ -154,13 +154,13 @@ linearly passes the pin at 10k only by holding less than the pin below it.
 The pins are achieved values, not the targets in #169 section 4, and the
 projection is a number the release notes carry, not a gate.
 
-QUIC connections live in secret tables, and a secret table wipes a chunk
-whole when it welds it, so every slot of the newest chunk is resident from the
-moment the chunk exists. The QUIC counts are therefore rounded to the nearest
-count at which every chunk is full (1008 and 8176 for 1000 and 10000), so the
-slope is the cost of one welded slot rather than of wherever the count fell
-in the top chunk, and the 100k projection pays for the 131056 slots 100k
-connections need.
+A record table commits a chunk whole (zeroed, or welded and wiped), and a
+chunk's record storage is bounded at `storage.CHUNK_BYTES` (2 MiB): chunks
+double from 16 records until the next doubling would pass the bound, and every
+chunk after that holds the bound. So the resident set at N connections is
+within one chunk of N times the per-slot cost, the counts are taken as given
+for every transport, and the 100k projection is the per-connection cost times
+100k plus what the first connections brought once.
 
 What the process gives back after the connections leave is printed and not
 asserted: the record tables release their trailing chunks, and what the
