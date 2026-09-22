@@ -31,13 +31,15 @@ use hedge.acme.wire;
 use hedge.clock;
 use hedge.config.schema;
 use hedge.telemetry;
+use hedge.wake;
 use http.core.field;
 use std.allocator;
 use std.allocator.fixed;
 use T: std.chrono.time;
 use std.crypto.rand;
-use fs:       std.filesystem;
-use io_error: std.io.error;
+use fs:        std.filesystem;
+use io_error:  std.io.error;
+use net_async: std.net.async;
 use std.net.ip;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -630,6 +632,40 @@ fun start_run(manager: *Manager, now: T.Time) Status {
     ret PENDING;
 }
 
+# when the plane next needs driving, as monotonic nanoseconds: the request in
+# flight's own deadline, the issuance run's wake while it sleeps between
+# polls, or the renewal time when nothing is outstanding. a step that is
+# the exchange's deadline while one is in flight, the renewal schedule
+# otherwise. the exchange itself completes on the worker's driver and wakes
+# the plane, so the deadline is only the bound on an authority that never
+# answers.
+pub fun deadline(manager: *Manager, at_ns: *u64) bool {
+    if (manager == nil || !manager.live || manager.state == STOPPED) { ret false; }
+    val now_ns: u64 = clock.to_ns(clock.instant());
+    var at:     T.Instant;
+    if (transport.deadline(?manager.engine, ?at)) {
+        @at_ns = clock.to_ns(at);
+        ret true;
+    }
+    if (manager.state == ISSUING && manager.run.live && manager.run.sleeping) {
+        @at_ns = clock.to_ns(manager.run.wake_at);
+        ret true;
+    }
+    if (manager.state != IDLE) {
+        @at_ns = now_ns;
+        ret true;
+    }
+    if (renewal.terminal(manager.schedule.state) || !manager.schedule.started) { ret false; }
+    val now_unix: u64 = clock.wall_seconds()::u64;
+    if (manager.schedule.next_run_unix <= now_unix) {
+        @at_ns = now_ns;
+        ret true;
+    }
+    @at_ns = clock.after_ns(now_ns,
+        (manager.schedule.next_run_unix - now_unix) * 1000000000);
+    ret true;
+}
+
 # the plane entry point. one step of whatever is outstanding, or one clock
 # comparison when nothing is. `now` is wall time and drives only the renewal
 # schedule, and every exchange deadline runs on the monotonic clock.
@@ -637,6 +673,7 @@ pub fun poll(context_pointer: ptr, now: T.Time) bool {
     val manager: *Manager = context_pointer::*Manager;
     if (manager == nil || !manager.live) { ret false; }
     if (manager.state == INSTALLING)     { ret true; }
+    if (manager.state == STOPPED)        { ret true; }
     if (manager.state == DISCOVERING) {
         val progress: session.Status = session.poll(?manager.session,
             ?manager.engine, ?manager.account, clock.instant());
@@ -708,11 +745,35 @@ pub fun poll(context_pointer: ptr, now: T.Time) bool {
     ret true;
 }
 
+# the driver every exchange runs on and the plane its completions wake. the
+# manager opens before the worker's driver exists and is attached once it does.
+pub fun attach_driver(manager: *Manager, driver: *net_async.Driver,
+    plane: wake.Waker) bool {
+    if (manager == nil || !manager.live) { ret false; }
+    ret transport.attach(?manager.engine, driver, plane);
+}
+
+pub fun attached(manager: *Manager) bool {
+    ret manager != nil && manager.live && transport.attached(?manager.engine);
+}
+
+# gives up the exchange in flight and releases its socket. PENDING until the
+# release's completions have landed, so the caller keeps dispatching them.
+pub fun quiesce(manager: *Manager) Status {
+    if (manager == nil || !manager.live) { ret INVALID; }
+    issue.cancel(?manager.run);
+    session.release(?manager.session);
+    manager.state = STOPPED;
+    if (!transport.finish(?manager.engine))   { ret FAILED; }
+    if (transport.releasing(?manager.engine)) { ret PENDING; }
+    ret OK;
+}
+
 pub fun close(manager: *Manager) bool {
     if (manager == nil || !manager.live) { ret false; }
     issue.cancel(?manager.run);
     session.release(?manager.session);
-    transport.destroy(?manager.engine);
+    if (!transport.destroy(?manager.engine)) { ret false; }
     keys.destroy(?manager.account);
     keys.destroy(?manager.pending_key);
     keys.destroy(?manager.active_key);

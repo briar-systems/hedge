@@ -16,6 +16,7 @@ use hedge.dispatch.call;
 use hedge.dispatch.plan;
 use hedge.listener;
 use hedge.memory;
+use hedge.operation;
 use hedge.protocol.h2;
 use hedge.protocol.prologue;
 use hedge.protocol.proxy_protocol;
@@ -111,34 +112,6 @@ pub val STEP_PROGRESS: Step = 2;
 pub val STEP_BLOCKED:  Step = 3;
 pub val STEP_DONE:     Step = 4;
 pub val STEP_ERROR:    Step = 5;
-
-# each in-flight transport operation carries the owner it belongs to and the
-# transport token that owner must settle when the completion arrives. the owner is
-# not always a served connection: an upstream connection uses the same routing.
-pub def SettleFun: fun(ptr, usize, io_runtime.Completion);
-
-pub rec Operation {
-    owner:         ptr;
-    settle:        SettleFun;
-    token_context: usize;
-}
-
-pub fun bind_operation(operation: *Operation, context: *listener.ConnectionContext,
-    owner: ptr, settle: SettleFun, token_context: usize) bool {
-    if (operation == nil || context == nil || owner == nil || settle::usize == 0) { ret false; }
-    operation.owner         = owner;
-    operation.settle        = settle;
-    operation.token_context = token_context;
-    ret listener.make_connection_context(context, (operation)::usize);
-}
-
-# the listener plane routes every connection-plane completion through here, and
-# each owner settles its own transport
-pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Completion) {
-    val operation: *Operation = owner_context::*Operation;
-    if (operation == nil || operation.settle::usize == 0) { ret; }
-    operation.settle(operation.owner, operation.token_context, completion);
-}
 
 # storage a connection claims only once it selects a protocol that needs it,
 # owned by the runtime and shared by every connection it drives
@@ -257,7 +230,7 @@ pub rec Connection {
     channel:            transport.Transport;
     channel_slots:      [TRANSPORT_SLOTS]transport.Slot;
     contexts:           [TRANSPORT_SLOTS]listener.ConnectionContext;
-    operations:         [TRANSPORT_SLOTS]Operation;
+    operations:         [TRANSPORT_SLOTS]operation.Operation;
     operation_root:     cancel.Scope;
     control_scope:      cancel.Scope;
     engine_scope:       cancel.Scope;
@@ -318,7 +291,7 @@ pub rec Connection {
     prologue_read:       usize;
     prologue_pending:    bool;
     prologue_ended:      bool;
-    prologue_operation:  Operation;
+    prologue_operation:  operation.Operation;
     prologue_context:    listener.ConnectionContext;
     prologue_scope:      cancel.Scope;
     prologue_scope_live: bool;
@@ -340,7 +313,7 @@ pub rec Connection {
     engine_close_started:   bool;
     exchange_cancelling:    bool;
     exchange_call_released: bool;
-    secure_operation:       Operation;
+    secure_operation:       operation.Operation;
     proxy_scratch:          [PROXY_SCRATCH_BYTES]u8;
 }
 
@@ -353,7 +326,7 @@ fun operation_for(owner: *Connection, token_context: usize) usize {
     if (!transport.context_token(token_context, ?token)) { ret TRANSPORT_SLOTS; }
     val index: usize = token.index::usize;
     if (index >= TRANSPORT_SLOTS) { ret TRANSPORT_SLOTS; }
-    if (!bind_operation(?owner.operations[index], ?owner.contexts[index], (owner)::ptr,
+    if (!operation.bind_operation(?owner.operations[index], ?owner.contexts[index], (owner)::ptr,
         settle, token_context)) { ret TRANSPORT_SLOTS; }
     ret index;
 }
@@ -792,6 +765,32 @@ fun notify(owner: *Connection) {
     if (!hedge_wake.wake(?owner.waker)) { owner.wake_failed = true; }
 }
 
+# whether the next step would make progress with nothing else happening: the
+# worker's debug audit checks that no connection answering true is left out of
+# every queue (#182). a finished connection waits only to be retired
+pub fun pending_work(owner: *Connection) bool {
+    if (owner == nil || !owner.initialized)          { ret false; }
+    if (owner.state != NEW && owner.state != ACTIVE) { ret true; }
+    # a wake that could not be queued is one the worker never sees
+    if (owner.wake_failed) { ret true; }
+    # the pool funded the account and nothing has routed its wake
+    if (owner.account_live && owner.account.is_ready) { ret true; }
+    if (owner.session != secure.NO_SESSION && secure.pending_work(owner.session)) {
+        ret true;
+    }
+    if (owner.state == NEW) {
+        if (owner.handshaking) { ret secure.handshake_settled(owner.session); }
+        ret !owner.prologue_pending;
+    }
+    if (owner.h2_session != nil || !owner.engine_live) { ret false; }
+    # bytes the engine holds to write and has not submitted
+    if (owner.engine.write_length != 0 && !owner.engine.write_pending) { ret true; }
+    # a request the engine handed over, waiting only for its exchange to start
+    if (owner.has_pending && !owner.exchange_live) { ret true; }
+    # a pending service that names nothing it waits on runs again only if polled
+    ret owner.exchange_live && owner.service_pending && !call.parked(?owner.active_call);
+}
+
 # the earliest monotonic instant this connection must be stepped for a deadline
 # alone. it reflects the state the last step left, so the worker asks again
 # after every step
@@ -1001,7 +1000,7 @@ fun begin_secure(owner: *Connection, now: time.Instant) Step {
     if (channel == nil
         || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
         staged_bytes, ?owner.borrower, ?owner.account)
-        || !bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
+        || !operation.bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
         settle_secure, 0)
         || !secure.begin(owner.session, hedge_tls.policy_at(owner.tls_policy),
         ?owner.operation_root, ?owner.prologue_scope)) {
@@ -1053,7 +1052,7 @@ fun submit_prologue_read(owner: *Connection) Step {
     if (owner.prologue_len >= PROLOGUE_BYTES) {
         ret refuse(owner, prologue.REFUSED_OVERFLOW);
     }
-    if (!bind_operation(?owner.prologue_operation, ?owner.prologue_context,
+    if (!operation.bind_operation(?owner.prologue_operation, ?owner.prologue_context,
         (owner)::ptr, settle_prologue, 0)) {
         ret refuse(owner, prologue.REFUSED_TRANSPORT);
     }

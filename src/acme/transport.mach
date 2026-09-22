@@ -5,11 +5,12 @@
 # cost hedge a bounded wait on a timer, not a stalled accept loop, so every
 # step here is a submission plus a completion rather than a blocking call.
 #
-# the transport owns its own completion runtime. the listener's runtime routes
-# completions to the connection plane by context kind, and an acme request is
-# not a connection; borrowing it would mean teaching the accept path about a
-# subsystem that has nothing to do with serving. a runtime that exists only
-# while acme is configured keeps that boundary and costs nothing when it is not.
+# the transport runs on the worker's driver. each operation is bound the way a
+# connection's are, so the listener plane routes its completion here without
+# knowing what an acme exchange is, and every completion wakes the plane so
+# the exchange is stepped on the worker's next turn rather than at its next
+# deadline. nothing here waits: an exchange that gives up, and the release of
+# its socket afterwards, are states its completions advance.
 #
 # address resolution is a contract rather than a call: a deployment that can
 # resolve names supplies a provider that answers PENDING until its own
@@ -20,6 +21,9 @@ use acme.problem;
 use hedge.acme.origination;
 use hedge.acme.wire;
 use hedge.clock;
+use hedge.listener;
+use hedge.operation;
+use hedge.wake;
 use http.core.field;
 use http.core.method;
 use A: std.allocator;
@@ -54,21 +58,16 @@ fun transition_ok(outcome: cancel.Transition) bool {
     ret (sel outcome.ok) && outcome.ok;
 }
 
-fun runtime_ok(outcome: err[io_error.Error]) bool {
-    ret sel outcome.ok;
-}
-
 pub val USER_AGENT:       str   = "hedge-acme/0.1";
 pub val USER_AGENT_BYTES: usize = 14;
 
-# one exchange at a time, plus its close, is all this transport ever has in
-# flight; the runtime is sized for that and nothing else
-val RUNTIME_SLOTS: usize = 8;
-
-val CONTEXT_CONNECT: usize = 1;
-val CONTEXT_WRITE:   usize = 2;
-val CONTEXT_READ:    usize = 3;
-val CONTEXT_CLOSE:   usize = 4;
+# the operations one exchange has in flight, one slot each. the token context
+# a completion carries is its slot.
+val OP_CONNECT: usize = 0;
+val OP_WRITE:   usize = 1;
+val OP_READ:    usize = 2;
+val OP_CLOSE:   usize = 3;
+val OP_COUNT:   usize = 4;
 
 pub def Status: u8;
 pub val OK:      Status = 1;
@@ -86,6 +85,8 @@ pub val READING:     Stage = 4;
 pub val CLOSING:     Stage = 5;
 pub val COMPLETE:    Stage = 6;
 pub val BROKEN:      Stage = 7;
+# a request accepted while the previous exchange's socket is still releasing
+pub val QUEUED: Stage = 9;
 
 pub def Cause: u8;
 pub val CAUSE_NONE:      Cause = 0;
@@ -216,15 +217,18 @@ pub fun literal_addresses() Addresses {
 }
 
 pub rec Transport {
-    heap:      A.Allocator;
-    runtime:   io_runtime.Runtime;
-    driver:    net_async.Driver;
+    driver:    *net_async.Driver;
+    plane:     wake.Waker;
     scope:     cancel.Scope;
     addresses: Addresses;
     origin:    Origin;
     trust:     *cert.TrustStore;
     tls:       origination.Handle;
     secure:    bool;
+
+    operations:  [OP_COUNT]operation.Operation;
+    contexts:    [OP_COUNT]listener.ConnectionContext;
+    outstanding: [OP_COUNT]bool;
 
     request:          *u8;
     request_capacity: usize;
@@ -244,17 +248,22 @@ pub rec Transport {
     endpoint: ip.Endpoint;
     target:   wire.Target;
     parsed:   ac.Response;
+    queued:   ac.WireRequest;
 
     stage:          Stage;
     cause:          Cause;
     request_method: method.Kind;
     deadline:       time.Instant;
     max_body:       usize;
-    pending:        bool;
-    eof:            bool;
-    stream_live:    bool;
-    scope_live:     bool;
-    live:           bool;
+    # the exchange gave up and waits for its cancelled operation to settle
+    expiring: bool;
+    # the previous exchange's socket is still being released
+    releasing:   bool;
+    eof:         bool;
+    stream_live: bool;
+    scope_live:  bool;
+    attached:    bool;
+    live:        bool;
 }
 
 fun empty_view() view.View {
@@ -268,7 +277,7 @@ fun clear_exchange(transport: *Transport) {
     transport.request_len                = 0;
     transport.request_sent               = 0;
     transport.response_len               = 0;
-    transport.pending                    = false;
+    transport.expiring                   = false;
     transport.eof                        = false;
     transport.cause                      = CAUSE_NONE;
     transport.parsed.status              = 0;
@@ -277,7 +286,26 @@ fun clear_exchange(transport: *Transport) {
     transport.parsed.retry_after_seconds = 0;
 }
 
-# storage stays caller owned for the life of the transport
+fun any_outstanding(transport: *Transport) bool {
+    var i: usize = 0;
+    for (i < OP_COUNT) {
+        if (transport.outstanding[i]) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun renew_scope(transport: *Transport) bool {
+    if (!operation_ok(cancel.make_root(?transport.scope, opt[time.Instant].none{}))) {
+        transport.scope_live = false;
+        ret false;
+    }
+    transport.scope_live = true;
+    ret true;
+}
+
+# storage stays caller owned for the life of the transport. the transport
+# reaches nothing until `attach` hands it the driver it runs on.
 pub fun make(transport: *Transport, request: *u8, request_capacity: usize,
     response: *u8, response_capacity: usize, items: *field.Field,
     item_capacity: usize, limits: field.Limits,
@@ -286,9 +314,13 @@ pub fun make(transport: *Transport, request: *u8, request_capacity: usize,
         || request_capacity == 0 || response_capacity == 0 || item_capacity == 0
         || addresses.resolve::usize == 0) { ret false; }
     transport.live              = false;
+    transport.attached          = false;
     transport.scope_live        = false;
     transport.stream_live       = false;
+    transport.releasing         = false;
     transport.stage             = IDLE;
+    transport.driver            = nil;
+    transport.plane             = wake.no_waker();
     transport.addresses         = addresses;
     transport.origin            = no_origin();
     transport.trust             = nil;
@@ -305,27 +337,36 @@ pub fun make(transport: *Transport, request: *u8, request_capacity: usize,
     transport.request_method    = method.GET;
     transport.deadline          = time.Instant{sec: 0, nsec: 0};
     transport.stream            = tcp.Stream{handle: io_handle.invalid_socket()};
+    var i: usize = 0;
+    for (i < OP_COUNT) {
+        transport.outstanding[i] = false;
+        if (!operation.bind_operation(?transport.operations[i],
+            ?transport.contexts[i], (transport)::ptr, settle, i)) { ret false; }
+        i = i + 1;
+    }
     clear_exchange(transport);
-    page.make(?transport.heap);
-    if (!runtime_ok(io_runtime.make(?transport.runtime, ?transport.heap, RUNTIME_SLOTS))) { ret false; }
-    val driven: err[io_error.Error] = net_async.make(?transport.driver,
-        ?transport.runtime);
-    if (sel driven.err) {
-        io_runtime.destroy(?transport.runtime);
-        ret false;
-    }
-    if (!operation_ok(cancel.make_root(?transport.scope, opt[time.Instant].none{}))) {
-        net_async.destroy(?transport.driver);
-        io_runtime.destroy(?transport.runtime);
-        ret false;
-    }
-    transport.scope_live = true;
-    transport.live       = true;
+    if (!renew_scope(transport)) { ret false; }
+    transport.live = true;
     ret true;
 }
 
-# binds the authority this transport reaches. it applies to every exchange,
-# because one transport serves exactly one configured authority.
+# the driver every operation is submitted on and the plane every completion
+# wakes. the transport is made before the worker's driver exists and attached
+# once it does, and it reaches nothing in between.
+pub fun attach(transport: *Transport, driver: *net_async.Driver,
+    plane: wake.Waker) bool {
+    if (transport == nil || !transport.live || driver == nil
+        || transport.stage != IDLE || transport.releasing) { ret false; }
+    transport.driver   = driver;
+    transport.plane    = plane;
+    transport.attached = true;
+    ret true;
+}
+
+pub fun attached(transport: *Transport) bool {
+    ret transport != nil && transport.live && transport.attached;
+}
+
 pub fun set_origin(transport: *Transport, origin: Origin) bool {
     if (transport == nil || !transport.live || transport.stage != IDLE) {
         ret false;
@@ -352,8 +393,9 @@ pub fun trusts(transport: *Transport) usize {
 }
 
 fun fail(transport: *Transport, cause: Cause) Status {
-    transport.cause = cause;
-    transport.stage = BROKEN;
+    transport.cause    = cause;
+    transport.stage    = BROKEN;
+    transport.expiring = false;
     ret FAILED;
 }
 
@@ -367,12 +409,51 @@ fun expired(transport: *Transport, now: time.Instant) bool {
     ret time.instant_before(transport.deadline, now);
 }
 
+fun in_flight(transport: *Transport) bool {
+    ret transport.stage != IDLE && transport.stage != COMPLETE
+        && transport.stage != BROKEN;
+}
+
+# the deadline of the request in flight, when one is. an exchange that has
+# already given up waits on a completion, not on the clock.
+pub fun deadline(transport: *Transport, at: *time.Instant) bool {
+    if (transport == nil || !transport.live || !in_flight(transport)
+        || transport.expiring) { ret false; }
+    @at = transport.deadline;
+    ret true;
+}
+
+# nothing in flight and nothing left to release
+pub fun idle(transport: *Transport) bool {
+    ret transport != nil && transport.live && transport.stage == IDLE
+        && !transport.releasing;
+}
+
+pub fun releasing(transport: *Transport) bool {
+    ret transport != nil && transport.live && transport.releasing;
+}
+
 # begins one request. the caller keeps every byte the request views point at
-# alive until the exchange completes.
+# alive until the exchange completes. a request that arrives while the previous
+# exchange's socket is still releasing is held and started once it has, so the
+# buffers a cancelled transfer may still touch are never reused under it.
 pub fun begin(transport: *Transport, request: ac.WireRequest,
     now: time.Instant) Status {
-    if (transport == nil || !transport.live) { ret INVALID; }
-    if (transport.stage != IDLE)             { ret INVALID; }
+    if (transport == nil || !transport.live || !transport.attached) { ret INVALID; }
+    if (transport.stage != IDLE)                                    { ret INVALID; }
+    transport.queued   = request;
+    transport.deadline = deadline_from(now, request.timeout_ns);
+    if (transport.releasing) {
+        transport.stage = QUEUED;
+        ret PENDING;
+    }
+    val started: Status = start_exchange(transport);
+    if (started != PENDING) { ret started; }
+    ret advance_resolving(transport, now);
+}
+
+fun start_exchange(transport: *Transport) Status {
+    val request: ac.WireRequest = transport.queued;
     clear_exchange(transport);
     if (!wire.split_url(request.url, ?transport.target)) {
         ret fail(transport, CAUSE_ADDRESS);
@@ -395,7 +476,6 @@ pub fun begin(transport: *Transport, request: ac.WireRequest,
     if (written == 0) { ret fail(transport, CAUSE_LIMIT); }
     transport.request_len    = written;
     transport.request_method = request.method.kind;
-    transport.deadline       = deadline_from(now, request.timeout_ns);
     transport.max_body       = request.max_response_bytes;
     if (transport.max_body == 0 || transport.max_body > transport.response_capacity) {
         transport.max_body = transport.response_capacity;
@@ -404,49 +484,82 @@ pub fun begin(transport: *Transport, request: ac.WireRequest,
     ret PENDING;
 }
 
+# the exchange's first submission. an address that resolves at once connects
+# here, so the exchange is on the wire before begin returns and its first
+# completion is what next wakes the plane, not a deadline.
+fun advance_resolving(transport: *Transport, now: time.Instant) Status {
+    var resolved: Status = OK;
+    if (transport.origin.configured) {
+        transport.endpoint = transport.origin.endpoint;
+    }
+    or {
+        resolved = transport.addresses.resolve(transport.addresses.ctx,
+            transport.target.host, transport.target.port,
+            ?transport.endpoint);
+    }
+    if (resolved == PENDING) {
+        if (expired(transport, now)) { ret fail(transport, CAUSE_TIMEOUT); }
+        ret PENDING;
+    }
+    if (resolved != OK) { ret fail(transport, CAUSE_ADDRESS); }
+    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_connect(
+        transport.driver, ?transport.scope, transport.endpoint,
+        context_of(transport, OP_CONNECT));
+    if (sel submitted.err) {
+        ret fail(transport, CAUSE_CONNECT);
+    }
+    transport.outstanding[OP_CONNECT] = true;
+    transport.stage                   = CONNECTING;
+    ret PENDING;
+}
+
+fun context_of(transport: *Transport, slot: usize) usize {
+    ret (?transport.contexts[slot])::usize;
+}
+
 fun submit_read(transport: *Transport) bool {
+    if (transport.expiring) { ret false; }
     val room: usize = transport.max_body - transport.response_len;
     if (room == 0) { ret false; }
     if (transport.secure) {
-        if (origination.start_read(transport.tls,
+        ret origination.start_read(transport.tls,
             ?transport.response[transport.response_len], room)
-            != origination.PENDING) { ret false; }
-        transport.pending = true;
-        ret true;
+            == origination.PENDING;
     }
     val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_read(
-        ?transport.driver, ?transport.scope, ?transport.stream,
-        ?transport.response[transport.response_len], room, CONTEXT_READ);
+        transport.driver, ?transport.scope, ?transport.stream,
+        ?transport.response[transport.response_len], room,
+        context_of(transport, OP_READ));
     if (sel submitted.err) { ret false; }
-    transport.pending = true;
+    transport.outstanding[OP_READ] = true;
     ret true;
 }
 
 fun submit_write(transport: *Transport) bool {
+    if (transport.expiring) { ret false; }
     val remaining: usize = transport.request_len - transport.request_sent;
     if (transport.secure) {
-        if (origination.start_write(transport.tls,
+        ret origination.start_write(transport.tls,
             ?transport.request[transport.request_sent], remaining)
-            != origination.PENDING) { ret false; }
-        transport.pending = true;
-        ret true;
+            == origination.PENDING;
     }
     val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_write(
-        ?transport.driver, ?transport.scope, ?transport.stream,
-        ?transport.request[transport.request_sent], remaining, CONTEXT_WRITE);
+        transport.driver, ?transport.scope, ?transport.stream,
+        ?transport.request[transport.request_sent], remaining,
+        context_of(transport, OP_WRITE));
     if (sel submitted.err) { ret false; }
-    transport.pending = true;
+    transport.outstanding[OP_WRITE] = true;
     ret true;
 }
 
 fun begin_close(transport: *Transport) {
     if (!transport.stream_live) { ret; }
     val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_stream_close(
-        ?transport.driver, ?transport.scope, ?transport.stream,
-        lifecycle.ABORTIVE, CONTEXT_CLOSE);
+        transport.driver, ?transport.scope, ?transport.stream,
+        lifecycle.ABORTIVE, context_of(transport, OP_CLOSE));
     transport.stream_live = false;
     if (sel submitted.err) { ret; }
-    transport.pending = true;
+    transport.outstanding[OP_CLOSE] = true;
 }
 
 fun parse_available(transport: *Transport) Status {
@@ -463,23 +576,24 @@ fun parse_available(transport: *Transport) Status {
 
 fun handle_connect(transport: *Transport, completion: io_runtime.Completion) {
     if (completion.has_error) {
-        fail(transport, CAUSE_CONNECT);
+        # an expiring exchange cancelled this itself: the expiry settles it
+        if (!transport.expiring) { fail(transport, CAUSE_CONNECT); }
         ret;
     }
     var connected: io_runtime.Completion = completion;
     transport.stream      = net_async.stream(?connected);
     transport.stream_live = true;
+    if (transport.expiring) { ret; }
     if (transport.secure) {
         # the certificate is verified for the name the url gives, whatever
         # address the origin sent us to
-        if (origination.begin(?transport.tls, ?transport.driver,
-            ?transport.stream,
-            transport.target.host, transport.trust) != origination.PENDING) {
+        if (origination.begin(?transport.tls, transport.driver,
+            ?transport.stream, transport.target.host, transport.trust,
+            (transport)::ptr, secured) != origination.PENDING) {
             fail(transport, CAUSE_HANDSHAKE);
             ret;
         }
-        transport.pending = true;
-        transport.stage   = HANDSHAKING;
+        transport.stage = HANDSHAKING;
         ret;
     }
     if (!submit_write(transport)) {
@@ -498,7 +612,6 @@ fun handle_connect(transport: *Transport, completion: io_runtime.Completion) {
 fun settle_secure(transport: *Transport) Status {
     val progress: origination.Status = origination.poll(transport.tls);
     if (progress == origination.PENDING) { ret PENDING; }
-    transport.pending = false;
     if (transport.stage == HANDSHAKING) {
         if (progress != origination.OK) { ret fail(transport, CAUSE_HANDSHAKE); }
         if (!submit_write(transport))   { ret fail(transport, CAUSE_WRITE); }
@@ -541,15 +654,15 @@ fun settle_secure(transport: *Transport) Status {
     ret PENDING;
 }
 
-# std 5.3.0 reports on a cancelled completion the bytes that left before the
-# cancel took effect, so what was sent is accounted before the error is
-# weighed: a request fully written and then cancelled counts as sent.
+# std reports on a cancelled completion the bytes that left before the cancel
+# took effect, so what was sent is accounted before the error is weighed: a
+# request fully written and then cancelled counts as sent.
 fun handle_write(transport: *Transport, completion: io_runtime.Completion) {
     transport.request_sent = transport.request_sent + completion.bytes;
     if (transport.request_sent < transport.request_len) {
         # more of the request is still unsent, so an error ends the exchange
         if (completion.has_error || completion.bytes == 0) {
-            fail(transport, CAUSE_WRITE);
+            if (!transport.expiring) { fail(transport, CAUSE_WRITE); }
             ret;
         }
         if (!submit_write(transport)) { fail(transport, CAUSE_WRITE); }
@@ -568,7 +681,10 @@ fun handle_write(transport: *Transport, completion: io_runtime.Completion) {
 # carried is not a whole response.
 fun handle_read(transport: *Transport, completion: io_runtime.Completion) {
     transport.response_len = transport.response_len + completion.bytes;
-    if (completion.bytes == 0 || completion.end_of_stream) { transport.eof = true; }
+    # a cancelled read reports no bytes without the stream having ended
+    if (!completion.has_error && (completion.bytes == 0 || completion.end_of_stream)) {
+        transport.eof = true;
+    }
     val parsed: Status = parse_available(transport);
     if (parsed == OK) {
         transport.stage = COMPLETE;
@@ -576,7 +692,7 @@ fun handle_read(transport: *Transport, completion: io_runtime.Completion) {
     }
     if (parsed != PENDING) { ret; }
     if (completion.has_error) {
-        fail(transport, CAUSE_READ);
+        if (!transport.expiring) { fail(transport, CAUSE_READ); }
         ret;
     }
     if (transport.eof) {
@@ -590,126 +706,149 @@ fun handle_read(transport: *Transport, completion: io_runtime.Completion) {
     if (!submit_read(transport)) { fail(transport, CAUSE_READ); }
 }
 
-fun dispatch(transport: *Transport, completion: io_runtime.Completion) {
-    # a secured exchange submits many socket operations per application
-    # operation, and the engine decides when one has settled, so a completion
-    # it owns never resolves the transport's own pending state
-    if (completion.context == origination.COMPLETION_CONTEXT) {
-        origination.accept(transport.tls, ?completion);
+# an exchange that gave up is a timeout unless the cancelled transfer carried
+# a whole response
+fun settle_expiry(transport: *Transport) {
+    if (!transport.expiring || transport.stage == COMPLETE) {
+        transport.expiring = false;
         ret;
     }
-    transport.pending = false;
-    if (completion.context == CONTEXT_CLOSE) { ret; }
+    if (transport.secure && origination.operating(transport.tls))       { ret; }
+    if (any_outstanding(transport) && !transport.outstanding[OP_CLOSE]) { ret; }
+    fail(transport, CAUSE_TIMEOUT);
+}
+
+fun dispatch(transport: *Transport, slot: usize, completion: io_runtime.Completion) {
+    if (slot == OP_CLOSE) { ret; }
     # a completion that arrives after the exchange gave up releases its
     # resource and changes nothing else
     if (transport.stage == BROKEN || transport.stage == COMPLETE) {
-        if (completion.context == CONTEXT_CONNECT && !completion.has_error) {
+        if (slot == OP_CONNECT && !completion.has_error) {
             var connected: io_runtime.Completion = completion;
             transport.stream      = net_async.stream(?connected);
             transport.stream_live = true;
-            begin_close(transport);
         }
         ret;
     }
-    if (completion.context == CONTEXT_CONNECT && transport.stage == CONNECTING) {
+    if (slot == OP_CONNECT && transport.stage == CONNECTING) {
         handle_connect(transport, completion);
-        ret;
     }
-    if (completion.context == CONTEXT_WRITE && transport.stage == WRITING) {
+    or (slot == OP_WRITE && transport.stage == WRITING) {
         handle_write(transport, completion);
-        ret;
     }
-    if (completion.context == CONTEXT_READ && transport.stage == READING) {
+    or (slot == OP_READ && transport.stage == READING) {
         handle_read(transport, completion);
     }
+    settle_expiry(transport);
 }
 
-fun drain(transport: *Transport, timeout_ms: i32) bool {
-    var completions: [8]io_runtime.Completion;
-    val waited:      res[usize, io_error.Error] = io_runtime.wait(?transport.runtime,
-        ?completions[0], 8, timeout_ms);
-    if (sel waited.err) { ret false; }
-    val count: usize = waited.ok;
-    var i:     usize = 0;
-    for (i < count) {
-        dispatch(transport, completions[i]);
-        i = i + 1;
-    }
-    ret true;
-}
-
-# cancels the operation in flight and reaps its completion so a transfer that
-# finished before the cancel took effect is accounted rather than dropped. the
-# cleartext path drains the runtime, which routes the cancelled completion
-# through the read and write handlers; the secured path drains until mach-tls
-# settles the operation, then lets settle_secure surface the bytes it kept.
-fun reap_cancelled(transport: *Transport) {
-    if (transport.secure && origination.operating(transport.tls)) {
-        origination.cancel_operation(transport.tls);
-        var tls_guard: usize = 0;
-        for (origination.operating(transport.tls) && tls_guard < 64) {
-            if (!drain(transport, 50)) { brk; }
+# the release of an exchange's socket, advanced by the completions it waits on:
+# every cancelled transfer lands first, so no buffer is reused while the kernel
+# can still write to it, then the tls engine is released, then the socket is
+# closed under a fresh scope.
+fun advance_release(transport: *Transport) {
+    if (!transport.releasing) { ret; }
+    if (transport.outstanding[OP_CONNECT] || transport.outstanding[OP_WRITE]
+        || transport.outstanding[OP_READ]) { ret; }
+    if (origination.active(transport.tls)) {
+        if (origination.operating(transport.tls)) {
             origination.poll(transport.tls);
-            tls_guard = tls_guard + 1;
+            if (origination.operating(transport.tls)) { ret; }
         }
-        settle_secure(transport);
+        if (!origination.release(transport.tls)) { ret; }
+        transport.tls = origination.no_handle();
+    }
+    if (transport.outstanding[OP_CLOSE]) { ret; }
+    if (transport.stream_live) {
+        renew_scope(transport);
+        begin_close(transport);
+        if (transport.outstanding[OP_CLOSE]) { ret; }
+    }
+    renew_scope(transport);
+    transport.releasing = false;
+    clear_exchange(transport);
+    wake.wake(?transport.plane);
+}
+
+# every completion this transport submitted lands here, routed by the listener
+# plane, and wakes the plane so the exchange is stepped on the next turn
+fun settle(context: ptr, slot: usize, completion: io_runtime.Completion) {
+    val transport: *Transport = context::*Transport;
+    if (transport == nil || !transport.live || slot >= OP_COUNT) { ret; }
+    wake.wake(?transport.plane);
+    transport.outstanding[slot] = false;
+    if (transport.releasing) {
+        if (slot == OP_CONNECT && !completion.has_error) {
+            var connected: io_runtime.Completion = completion;
+            transport.stream      = net_async.stream(?connected);
+            transport.stream_live = true;
+        }
+        advance_release(transport);
         ret;
     }
-    if (!transport.pending) { ret; }
-    transition_ok(cancel.cancel(?transport.scope));
-    var guard: usize = 0;
-    for (transport.pending && guard < 64) {
-        if (!drain(transport, 50)) { brk; }
-        guard = guard + 1;
+    dispatch(transport, slot, completion);
+}
+
+# the tls engine settled one of its operations
+fun secured(context: ptr) {
+    val transport: *Transport = context::*Transport;
+    if (transport == nil || !transport.live) { ret; }
+    wake.wake(?transport.plane);
+    if (transport.releasing) {
+        advance_release(transport);
+        ret;
     }
+    if (in_flight(transport) && origination.operating(transport.tls)) {
+        settle_secure(transport);
+    }
+    settle_expiry(transport);
+}
+
+# gives up on the exchange in flight. the outstanding operation is cancelled
+# and the exchange settles on its completion, which may still carry a whole
+# response.
+fun expire(transport: *Transport) Status {
+    if (transport.secure && origination.operating(transport.tls)) {
+        transport.expiring = true;
+        origination.cancel_operation(transport.tls);
+        ret PENDING;
+    }
+    if (transport.outstanding[OP_CONNECT] || transport.outstanding[OP_WRITE]
+        || transport.outstanding[OP_READ]) {
+        transport.expiring = true;
+        transition_ok(cancel.cancel(?transport.scope));
+        ret PENDING;
+    }
+    ret fail(transport, CAUSE_TIMEOUT);
 }
 
 # advances the exchange by whatever has completed. never waits.
 pub fun poll(transport: *Transport, now: time.Instant) Status {
     if (transport == nil || !transport.live) { ret INVALID; }
     if (transport.stage == IDLE)             { ret INVALID; }
-    if (transport.stage == RESOLVING) {
-        var resolved: Status = OK;
-        if (transport.origin.configured) {
-            transport.endpoint = transport.origin.endpoint;
-        }
-        or {
-            resolved = transport.addresses.resolve(transport.addresses.ctx,
-                transport.target.host, transport.target.port,
-                ?transport.endpoint);
-        }
-        if (resolved == PENDING) {
+    if (transport.stage == QUEUED) {
+        if (transport.releasing) {
             if (expired(transport, now)) { ret fail(transport, CAUSE_TIMEOUT); }
             ret PENDING;
         }
-        if (resolved != OK) { ret fail(transport, CAUSE_ADDRESS); }
-        val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_connect(
-            ?transport.driver, ?transport.scope, transport.endpoint,
-            CONTEXT_CONNECT);
-        if (sel submitted.err) {
-            ret fail(transport, CAUSE_CONNECT);
-        }
-        transport.pending = true;
-        transport.stage   = CONNECTING;
+        val started: Status = start_exchange(transport);
+        if (started != PENDING) { ret started; }
     }
-    drain(transport, 0);
-    if (transport.secure && transport.stage != COMPLETE
-        && transport.stage != BROKEN && origination.operating(transport.tls)) {
+    if (transport.stage == RESOLVING) {
+        val advanced: Status = advance_resolving(transport, now);
+        if (advanced != PENDING) { ret advanced; }
+    }
+    # a tls session parked for memory resumes on its pool's wake, which reaches
+    # it through this poll rather than through a completion
+    if (transport.secure && in_flight(transport) && !transport.expiring
+        && origination.operating(transport.tls)) {
         val advanced: Status = settle_secure(transport);
         if (advanced == OK || advanced == FAILED) { ret advanced; }
     }
     if (transport.stage == COMPLETE) { ret OK; }
     if (transport.stage == BROKEN)   { ret FAILED; }
-    # an expired exchange cancels its outstanding operation and reaps the
-    # completion before giving up. std 5.3.0 delivers on that completion a
-    # transfer that finished before the cancel took effect, so a response that
-    # raced the deadline completes the exchange rather than being lost to a
-    # needless reissue. anything short of a whole response is a timeout.
-    if (expired(transport, now)) {
-        reap_cancelled(transport);
-        if (transport.stage == COMPLETE) { ret OK; }
-        ret fail(transport, CAUSE_TIMEOUT);
-    }
+    if (transport.expiring)          { ret PENDING; }
+    if (expired(transport, now))     { ret expire(transport); }
     ret PENDING;
 }
 
@@ -728,57 +867,43 @@ pub fun response(transport: *Transport) ac.Response {
     ret transport.parsed;
 }
 
-# releases the exchange's socket and returns the transport to idle. every
-# outstanding completion is reaped first, so no buffer is released while the
-# kernel can still write to it.
+# releases the exchange and returns the transport to idle. the socket and every
+# outstanding operation are released on their completions, so a transport may
+# still be `releasing` afterwards; the next `begin` queues behind that.
 pub fun finish(transport: *Transport) bool {
     if (transport == nil || !transport.live) { ret false; }
     if (transport.stage == IDLE)             { ret true; }
-    if (origination.active(transport.tls)) {
-        if (origination.operating(transport.tls)) {
-            origination.cancel_operation(transport.tls);
-        }
-        var tls_guard: usize = 0;
-        for (origination.operating(transport.tls) && tls_guard < 64) {
-            if (!drain(transport, 50)) { brk; }
-            origination.poll(transport.tls);
-            tls_guard = tls_guard + 1;
-        }
-        if (origination.operating(transport.tls)
-            || !origination.release(transport.tls)) { ret false; }
-        transport.tls     = origination.no_handle();
-        transport.pending = false;
+    if (transport.stage == QUEUED) {
+        transport.stage = IDLE;
+        ret true;
     }
-    if (transport.pending) { transition_ok(cancel.cancel(?transport.scope)); }
-    var guard: usize = 0;
-    for (transport.pending && guard < 64) {
-        if (!drain(transport, 50)) { brk; }
-        guard = guard + 1;
+    if (origination.active(transport.tls) && origination.operating(transport.tls)) {
+        origination.cancel_operation(transport.tls);
     }
-    begin_close(transport);
-    guard = 0;
-    for (transport.pending && guard < 64) {
-        if (!drain(transport, 50)) { brk; }
-        guard = guard + 1;
+    if (transport.outstanding[OP_CONNECT] || transport.outstanding[OP_WRITE]
+        || transport.outstanding[OP_READ]) {
+        transition_ok(cancel.cancel(?transport.scope));
     }
-    if (!operation_ok(cancel.make_root(?transport.scope, opt[time.Instant].none{}))) {
-        transport.scope_live = false;
-    }
-    clear_exchange(transport);
-    transport.stage = IDLE;
+    transport.stage     = IDLE;
+    transport.expiring  = false;
+    transport.releasing = true;
+    advance_release(transport);
     ret true;
 }
 
+# releases the transport. everything it submitted must have settled, so a
+# transport still releasing a socket refuses and is destroyed once idle.
 pub fun destroy(transport: *Transport) bool {
     if (transport == nil || !transport.live) { ret false; }
     if (!finish(transport))                  { ret false; }
+    if (transport.releasing)                 { ret false; }
     if (transport.scope_live) {
         cancel.destroy(?transport.scope);
         transport.scope_live = false;
     }
-    net_async.destroy(?transport.driver);
-    io_runtime.destroy(?transport.runtime);
-    transport.live = false;
+    transport.attached = false;
+    transport.driver   = nil;
+    transport.live     = false;
     ret true;
 }
 
@@ -787,7 +912,13 @@ rec Fixture {
     response: [8192]u8;
     items:    [32]field.Field;
     url:      [64]u8;
+    runtime:  io_runtime.Runtime;
+    driver:   net_async.Driver;
+    pages:    A.Allocator;
+    wakes:    wake.Queue;
     engine:   Transport;
+    turns:    usize;
+    woken:    usize;
 }
 
 fun fixture_url(fixture: *Fixture, port: u16) view.View {
@@ -823,9 +954,59 @@ fun fixture_url(fixture: *Fixture, port: u16) view.View {
 }
 
 fun fixture_make(fixture: *Fixture) bool {
-    ret make(?fixture.engine, ?fixture.request[0], 4096, ?fixture.response[0],
+    fixture.turns = 0;
+    fixture.woken = 0;
+    page.make(?fixture.pages);
+    val made_runtime: err[io_error.Error] = io_runtime.make(?fixture.runtime, ?fixture.pages, 8);
+    if (sel made_runtime.err) { ret false; }
+    val made_driver: err[io_error.Error] = net_async.make(?fixture.driver, ?fixture.runtime);
+    if (sel made_driver.err) {
+        io_runtime.destroy(?fixture.runtime);
+        ret false;
+    }
+    if (!wake.make(?fixture.wakes, ?fixture.pages)) {
+        net_async.destroy(?fixture.driver);
+        io_runtime.destroy(?fixture.runtime);
+        ret false;
+    }
+    if (!make(?fixture.engine, ?fixture.request[0], 4096, ?fixture.response[0],
         8192, ?fixture.items[0], 32, field.limits(32, 8192, 128, 4096),
-        literal_addresses());
+        literal_addresses())) { ret false; }
+    ret attach(?fixture.engine, ?fixture.driver,
+        wake.waker(?fixture.wakes, wake.PLANE_OWNER));
+}
+
+# one worker turn: wait on the runtime the way serve.poll does, dispatch each
+# completion to its bound owner, and run the plane when it was woken
+fun turn(fixture: *Fixture, timeout_ms: i32) Status {
+    operation.pump(?fixture.runtime, timeout_ms);
+    var owners: [4]u64;
+    var taken:  usize = wake.take(?fixture.wakes, ?owners[0], 4);
+    for (taken != 0) {
+        fixture.woken = fixture.woken + taken;
+        taken         = wake.take(?fixture.wakes, ?owners[0], 4);
+    }
+    fixture.turns = fixture.turns + 1;
+    ret poll(?fixture.engine, clock.instant());
+}
+
+fun settle_release(fixture: *Fixture) bool {
+    var i: usize = 0;
+    for (i < 256 && !idle(?fixture.engine)) {
+        turn(fixture, 10);
+        i = i + 1;
+    }
+    ret idle(?fixture.engine);
+}
+
+fun fixture_destroy(fixture: *Fixture) bool {
+    finish(?fixture.engine);
+    settle_release(fixture);
+    val destroyed: bool = destroy(?fixture.engine);
+    wake.destroy(?fixture.wakes);
+    net_async.destroy(?fixture.driver);
+    io_runtime.destroy(?fixture.runtime);
+    ret destroyed;
 }
 
 fun advance(fixture: *Fixture, wanted: Stage, limit: usize) bool {
@@ -833,10 +1014,24 @@ fun advance(fixture: *Fixture, wanted: Stage, limit: usize) bool {
     for (i < limit) {
         if (fixture.engine.stage == wanted || fixture.engine.stage == BROKEN
             || fixture.engine.stage == COMPLETE) { ret fixture.engine.stage == wanted; }
-        poll(?fixture.engine, clock.instant());
+        turn(fixture, 10);
         i = i + 1;
     }
     ret false;
+}
+
+fun sample_request(url: view.View) ac.WireRequest {
+    var request: ac.WireRequest;
+    request.method             = method.from_kind(method.GET);
+    request.url                = url;
+    request.content_type       = view.view("application/json", 16);
+    request.body               = view.view(nil, 0);
+    request.timeout_ns         = 5000000000;
+    request.max_response_bytes = 4096;
+    request.error              = problem.none();
+    request.response_fields    = field.limits(32, 8192, 128, 4096);
+    request.replay_safe        = true;
+    ret request;
 }
 
 test "acme transport: a configured cleartext origin reaches an https authority" {
@@ -845,49 +1040,33 @@ test "acme transport: a configured cleartext origin reaches an https authority" 
     # a port nothing serves, so the exchange reaches connect and stops there
     if (!set_origin(?fixture.engine,
         cleartext_origin(ip.endpoint(127, 0, 0, 1, 1)))) { ret 2; }
-    var request: ac.WireRequest;
-    request.method             = method.from_kind(method.GET);
-    request.url                = view.view("https://acme.example:14000/dir", 30);
-    request.content_type       = view.view("application/json", 16);
-    request.body               = view.view(nil, 0);
-    request.timeout_ns         = 5000000000;
-    request.max_response_bytes = 4096;
-    request.error              = problem.none();
-    request.response_fields    = field.limits(32, 8192, 128, 4096);
-    request.replay_safe        = true;
+    val request: ac.WireRequest = sample_request(
+        view.view("https://acme.example:14000/dir", 30));
     if (begin(?fixture.engine, request, clock.instant()) != PENDING) { ret 3; }
     # the failure is at connect rather than at the address, which is what
     # proves the origin was used in place of the url's own authority
     var status: Status = PENDING;
     var rounds: usize  = 0;
-    for (status == PENDING && rounds < 4096) {
-        status = poll(?fixture.engine, clock.instant());
+    for (status == PENDING && rounds < 512) {
+        status = turn(?fixture, 10);
         rounds = rounds + 1;
     }
     if (status != FAILED || cause(?fixture.engine) != CAUSE_CONNECT) { ret 4; }
-    finish(?fixture.engine);
-    destroy(?fixture.engine);
+    if (!fixture_destroy(?fixture))                                  { ret 5; }
     ret 0;
 }
 
 test "acme transport: an https authority with no anchors is refused" {
     var fixture: Fixture;
     if (!fixture_make(?fixture)) { ret 1; }
-    var request: ac.WireRequest;
-    request.method             = method.from_kind(method.GET);
-    request.url                = view.view("https://acme.example/dir", 24);
-    request.content_type       = view.view("application/json", 16);
-    request.body               = view.view(nil, 0);
-    request.timeout_ns         = 5000000000;
-    request.max_response_bytes = 4096;
-    request.error              = problem.none();
-    request.response_fields    = field.limits(32, 8192, 128, 4096);
-    request.replay_safe        = true;
+    val request: ac.WireRequest = sample_request(
+        view.view("https://acme.example/dir", 24));
     # nothing to verify against, so the exchange never leaves the process
     # rather than being reached unverified or downgraded to cleartext
     if (begin(?fixture.engine, request, clock.instant()) != FAILED) { ret 2; }
     if (cause(?fixture.engine) != CAUSE_TRUST)                      { ret 3; }
     if (!finish(?fixture.engine) || stage(?fixture.engine) != IDLE) { ret 4; }
+    if (!settle_release(?fixture))                                  { ret 10; }
 
     # with anchors configured the same request is admitted and reaches the
     # address it was given
@@ -902,38 +1081,43 @@ test "acme transport: an https authority with no anchors is refused" {
     if (begin(?fixture.engine, request, clock.instant()) != PENDING) { ret 7; }
     var status: Status = PENDING;
     var rounds: usize  = 0;
-    for (status == PENDING && rounds < 4096) {
-        status = poll(?fixture.engine, clock.instant());
+    for (status == PENDING && rounds < 512) {
+        status = turn(?fixture, 10);
         rounds = rounds + 1;
     }
     if (status != FAILED || cause(?fixture.engine) != CAUSE_CONNECT) { ret 8; }
-    finish(?fixture.engine);
-    if (!destroy(?fixture.engine)) { ret 9; }
+    if (!fixture_destroy(?fixture))                                  { ret 9; }
     ret 0;
 }
 
 test "acme transport: a name is refused while only literal addresses resolve" {
     var fixture: Fixture;
     if (!fixture_make(?fixture)) { ret 1; }
-    var request: ac.WireRequest;
-    request.method             = method.from_kind(method.GET);
-    request.url                = view.view("http://acme.example/dir", 23);
-    request.content_type       = view.view("application/json", 16);
-    request.body               = view.view(nil, 0);
-    request.timeout_ns         = 5000000000;
-    request.max_response_bytes = 4096;
-    request.error              = problem.none();
-    request.response_fields    = field.limits(32, 8192, 128, 4096);
-    request.replay_safe        = true;
-    if (begin(?fixture.engine, request, clock.instant()) != PENDING) { ret 2; }
-    if (poll(?fixture.engine, clock.instant()) != FAILED)            { ret 3; }
-    if (cause(?fixture.engine) != CAUSE_ADDRESS)                     { ret 4; }
-    finish(?fixture.engine);
-    destroy(?fixture.engine);
+    val request: ac.WireRequest = sample_request(
+        view.view("http://acme.example/dir", 23));
+    # begin resolves the address itself, so the refusal is its own answer
+    if (begin(?fixture.engine, request, clock.instant()) != FAILED) { ret 2; }
+    if (cause(?fixture.engine) != CAUSE_ADDRESS)                    { ret 4; }
+    if (!fixture_destroy(?fixture))                                 { ret 5; }
     ret 0;
 }
 
-test "acme transport: one exchange completes against a real socket" {
+test "acme transport: an unattached transport reaches nothing" {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    var bare: Transport;
+    if (!make(?bare, ?fixture.request[0], 4096, ?fixture.response[0],
+        8192, ?fixture.items[0], 32, field.limits(32, 8192, 128, 4096),
+        literal_addresses())) { ret 2; }
+    val request: ac.WireRequest = sample_request(
+        view.view("http://127.0.0.1:1/dir", 22));
+    if (begin(?bare, request, clock.instant()) != INVALID) { ret 3; }
+    if (!destroy(?bare))                                   { ret 4; }
+    if (!fixture_destroy(?fixture))                        { ret 5; }
+    ret 0;
+}
+
+test "acme transport: one exchange completes against a real socket and its response wakes the plane" {
     val listening: res[tcp.Listener, io_error.Error] = tcp.listen(
         ip.endpoint(127, 0, 0, 1, 0), 4);
     if (sel listening.err) { ret 1; }
@@ -949,29 +1133,30 @@ test "acme transport: one exchange completes against a real socket" {
         tcp.listener_close(?server);
         ret 3;
     }
-    var request: ac.WireRequest;
-    request.method             = method.from_kind(method.GET);
-    request.url                = fixture_url(?fixture, endpoint.port);
-    request.content_type       = view.view("application/json", 16);
-    request.body               = view.view(nil, 0);
+    var request: ac.WireRequest = sample_request(fixture_url(?fixture, endpoint.port));
     request.timeout_ns         = 10000000000;
     request.max_response_bytes = 8192;
-    request.error              = problem.none();
-    request.response_fields    = field.limits(32, 8192, 128, 4096);
-    request.replay_safe        = true;
     if (begin(?fixture.engine, request, clock.instant()) != PENDING) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         tcp.listener_close(?server);
         ret 4;
     }
-    if (!advance(?fixture, WRITING, 4096) && fixture.engine.stage != READING) {
-        destroy(?fixture.engine);
+    # the connect is submitted by begin itself: a plane driven only by its
+    # deadline and by completions would otherwise not see the exchange move
+    # until the deadline
+    if (fixture.engine.stage != CONNECTING) {
+        fixture_destroy(?fixture);
+        tcp.listener_close(?server);
+        ret 15;
+    }
+    if (!advance(?fixture, WRITING, 512) && fixture.engine.stage != READING) {
+        fixture_destroy(?fixture);
         tcp.listener_close(?server);
         ret 5;
     }
     val accepted: res[tcp.Stream, io_error.Error] = tcp.accept(?server);
     if (sel accepted.err) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         tcp.listener_close(?server);
         ret 6;
     }
@@ -981,7 +1166,7 @@ test "acme transport: one exchange completes against a real socket" {
     var total:    usize = 0;
     var rounds:   usize = 0;
     for (total < 4 && rounds < 64) {
-        poll(?fixture.engine, clock.instant());
+        turn(?fixture, 10);
         val read: res[usize, io_error.Error] = tcp.stream_read(?peer,
             ?received[total], 1024 - total);
         if (sel read.ok) {
@@ -992,9 +1177,19 @@ test "acme transport: one exchange completes against a real socket" {
     if (total < 20 || !view.view_eq_str(view.view(?received[0], 20),
         "GET /dir HTTP/1.1\r\nh")) {
         tcp.stream_close(?peer);
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         tcp.listener_close(?server);
         ret 7;
+    }
+    # the request is out and the read is in flight: with the wait at -1 the
+    # runtime blocks until the response lands, and that one completion is what
+    # wakes the plane and completes the exchange. a turn that returned without
+    # the response would have been the old zero-wait drain.
+    if (!advance(?fixture, READING, 64)) {
+        tcp.stream_close(?peer);
+        fixture_destroy(?fixture);
+        tcp.listener_close(?server);
+        ret 13;
     }
     val reply:  str   = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi";
     var body:   [64]u8;
@@ -1004,32 +1199,86 @@ test "acme transport: one exchange completes against a real socket" {
         length       = length + 1;
     }
     tcp.stream_write(?peer, ?body[0], length);
-    var status: Status = PENDING;
-    rounds = 0;
-    for (status == PENDING && rounds < 4096) {
-        status = poll(?fixture.engine, clock.instant());
-        rounds = rounds + 1;
-    }
+    val before: usize  = fixture.turns;
+    val seen:   usize  = fixture.woken;
+    var status: Status = turn(?fixture, -1);
+    val woken:  bool   = fixture.woken > seen;
     tcp.stream_close(?peer);
     tcp.listener_close(?server);
-    if (status != OK) {
-        destroy(?fixture.engine);
+    if (status != OK || !woken || fixture.turns != before + 1) {
+        fixture_destroy(?fixture);
         ret 8;
     }
     val answer: ac.Response = response(?fixture.engine);
     if (answer.status != 200 || !view.view_eq_str(answer.body, "hi")) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         ret 9;
     }
     if (answer.fields.len == 0) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         ret 10;
     }
     if (!finish(?fixture.engine) || stage(?fixture.engine) != IDLE) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         ret 11;
     }
-    if (!destroy(?fixture.engine)) { ret 12; }
+    # the socket is released on its close completion, not by a wait
+    if (!releasing(?fixture.engine) || !settle_release(?fixture)) {
+        fixture_destroy(?fixture);
+        ret 14;
+    }
+    if (!fixture_destroy(?fixture)) { ret 12; }
+    ret 0;
+}
+
+test "acme transport: a request begun during a release starts once the socket is closed" {
+    val listening: res[tcp.Listener, io_error.Error] = tcp.listen(
+        ip.endpoint(127, 0, 0, 1, 0), 4);
+    if (sel listening.err) { ret 1; }
+    var server: tcp.Listener                     = listening.ok;
+    val bound:  res[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?server);
+    if (sel bound.err) {
+        tcp.listener_close(?server);
+        ret 2;
+    }
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) {
+        tcp.listener_close(?server);
+        ret 3;
+    }
+    val request: ac.WireRequest = sample_request(fixture_url(?fixture, bound.ok.port));
+    if (begin(?fixture.engine, request, clock.instant()) != PENDING
+        || !advance(?fixture, WRITING, 512) && fixture.engine.stage != READING) {
+        fixture_destroy(?fixture);
+        tcp.listener_close(?server);
+        ret 4;
+    }
+    # give up on the exchange with its read in flight and begin the next one
+    # before the cancelled read and the close have landed
+    if (!finish(?fixture.engine) || !releasing(?fixture.engine)) {
+        fixture_destroy(?fixture);
+        tcp.listener_close(?server);
+        ret 5;
+    }
+    if (begin(?fixture.engine, request, clock.instant()) != PENDING
+        || stage(?fixture.engine) != QUEUED) {
+        fixture_destroy(?fixture);
+        tcp.listener_close(?server);
+        ret 6;
+    }
+    # the queued request leaves QUEUED only once the release is over, and the
+    # release does not need a poll: its completions carry it
+    var rounds: usize = 0;
+    for (rounds < 256 && stage(?fixture.engine) == QUEUED) {
+        turn(?fixture, 10);
+        rounds = rounds + 1;
+    }
+    tcp.listener_close(?server);
+    if (stage(?fixture.engine) == QUEUED || releasing(?fixture.engine)) {
+        fixture_destroy(?fixture);
+        ret 7;
+    }
+    if (!fixture_destroy(?fixture)) { ret 8; }
     ret 0;
 }
 
@@ -1045,27 +1294,51 @@ fun load_response(fixture: *Fixture, text: str) usize {
 test "acme transport: a read cancelled after a whole response completes the exchange" {
     var fixture: Fixture;
     if (!fixture_make(?fixture)) { ret 1; }
-    # std 5.3.0 delivers on a cancelled completion the bytes that landed before
-    # the cancel took effect. a whole response carried by an error completion
-    # must still parse rather than be discarded as a failed read.
+    # std delivers on a cancelled completion the bytes that landed before the
+    # cancel took effect. a whole response carried by an error completion must
+    # still parse rather than be discarded as a failed read.
     val length: usize = load_response(?fixture,
         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi");
     fixture.engine.stage = READING;
     var completion: io_runtime.Completion;
-    completion.context   = CONTEXT_READ;
     completion.bytes     = length;
     completion.has_error = true;
     handle_read(?fixture.engine, completion);
     if (fixture.engine.stage != COMPLETE) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         ret 2;
     }
     val answer: ac.Response = response(?fixture.engine);
     if (answer.status != 200 || !view.view_eq_str(answer.body, "hi")) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         ret 3;
     }
-    if (!destroy(?fixture.engine)) { ret 4; }
+    if (!fixture_destroy(?fixture)) { ret 4; }
+    ret 0;
+}
+
+test "acme transport: an expired exchange is a timeout unless the cancelled read completed it" {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    # the exchange gave up with a read in flight. a cancelled completion with a
+    # short transfer settles it as a timeout, the read error notwithstanding.
+    fixture.engine.stage                = READING;
+    fixture.engine.expiring             = true;
+    fixture.engine.outstanding[OP_READ] = true;
+    var completion: io_runtime.Completion;
+    completion.bytes     = 0;
+    completion.has_error = true;
+    settle((?fixture.engine)::ptr, OP_READ, completion);
+    if (fixture.engine.stage != BROKEN || fixture.engine.cause != CAUSE_TIMEOUT
+        || fixture.engine.expiring) {
+        fixture_destroy(?fixture);
+        ret 2;
+    }
+    if (!wake.pending(?fixture.wakes)) {
+        fixture_destroy(?fixture);
+        ret 3;
+    }
+    if (!fixture_destroy(?fixture)) { ret 4; }
     ret 0;
 }
 
@@ -1079,20 +1352,19 @@ test "acme transport: a write cancelled after the whole request counts as sent" 
     fixture.engine.request_len  = 32;
     fixture.engine.request_sent = 0;
     var completion: io_runtime.Completion;
-    completion.context   = CONTEXT_WRITE;
     completion.bytes     = 32;
     completion.has_error = true;
     handle_write(?fixture.engine, completion);
     if (fixture.engine.request_sent != 32) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         ret 2;
     }
     # the whole request was accounted, so the exchange did not fail as a short
     # write; with no live stream the follow-on read simply cannot be submitted
     if (fixture.engine.stage == BROKEN && fixture.engine.cause == CAUSE_WRITE) {
-        destroy(?fixture.engine);
+        fixture_destroy(?fixture);
         ret 3;
     }
-    if (!destroy(?fixture.engine)) { ret 4; }
+    if (!fixture_destroy(?fixture)) { ret 4; }
     ret 0;
 }
