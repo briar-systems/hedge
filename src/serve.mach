@@ -28,6 +28,7 @@ use A: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
 use std.net.ip;
+use std.system.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -123,6 +124,11 @@ pub def PlaneQuiesceFun: fun(ptr, time.Instant) PlaneQuiesceStatus;
 # ends when the plane is due rather than on a fixed interval (#182)
 pub def PlaneDeadlineFun: fun(ptr, *u64) bool;
 
+# in debug builds the audit runs once every AUDIT_POLLS turns. it is counted in
+# turns and never armed on a timer, so it cannot end a wait itself and hide a
+# wake that went missing (#182)
+val AUDIT_POLLS: u64 = 64;
+
 # how many fired timer owners one wheel advance hands back at a time
 val FIRE_BATCH: usize = 64;
 
@@ -185,7 +191,10 @@ pub rec Runtime {
     queued:             u64;
     expired:            u64;
     # connection turns taken, which an idle connection must not add to
-    drives:           u64;
+    drives: u64;
+    # poll turns taken and audits run, which debug builds use to pace the audit
+    polls:            u64;
+    audits:           u64;
     quic:             *quic_runtime.Runtime;
     quic_storages:    *quic_runtime.PumpStorage;
     quic_handles:     [schema.MAX_LISTENERS]quic_runtime.PumpHandle;
@@ -270,6 +279,8 @@ pub fun make(
         ?runtime.drain_timeout_ns)) { ret false; }
     runtime.queued            = 0;
     runtime.expired           = 0;
+    runtime.polls             = 0;
+    runtime.audits            = 0;
     runtime.teardown_failures = 0;
     runtime.quic              = nil;
     runtime.quic_storages     = nil;
@@ -1164,7 +1175,50 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     if (!quic_ok) {
         release_quic(controls, runtime);
     }
+    $if ($mach.build.mode == $mach.mode.debug) { audit_turn(controls, runtime); }
     ret polled;
+}
+
+# the sweep that survives only as an assertion (#182). every live slot that is
+# not queued, not retiring and not waiting on its budget must hold no work its
+# next step would do, and the quic runtime answers the same for its records.
+# the worker's wakes are routed first, so an owner that was woken counts as
+# queued. returns how many hold work nothing will run
+pub fun audit(controls: *quic_runtime.ControlView, runtime: *Runtime) usize {
+    if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) { ret 0; }
+    route_wakes(controls, runtime);
+    runtime.audits = runtime.audits + 1;
+    var found: usize = audit_list(runtime, ?runtime.current)
+        + audit_list(runtime, ?runtime.previous);
+    if (runtime.quic != nil && !runtime.quic_released) {
+        found = found + quic_runtime.audit(controls, runtime.quic);
+    }
+    ret found;
+}
+
+fun audit_list(runtime: *Runtime, list: *LiveList) usize {
+    var found: usize = 0;
+    var i:     usize = list.head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = slot_at(runtime, i);
+        if (slot.live && !slot.ready && !slot.retiring && !slot.waiting
+            && connection.pending_work(slot.handle)) { found = found + 1; }
+        i = slot.next_live;
+    }
+    ret found;
+}
+
+pub fun audits(runtime: *Runtime) u64 {
+    if (runtime == nil) { ret 0; }
+    ret runtime.audits;
+}
+
+fun audit_turn(controls: *quic_runtime.ControlView, runtime: *Runtime) {
+    runtime.polls = runtime.polls + 1;
+    if (runtime.polls % AUDIT_POLLS != 0) { ret; }
+    if (audit(controls, runtime) != 0) {
+        panic.panic("hedge: a connection holds work and nothing queues it (#182)\n");
+    }
 }
 
 # --- the shutdown sequence ---
