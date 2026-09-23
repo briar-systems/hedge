@@ -1,8 +1,11 @@
 # end-to-end cache tests over real sockets, including the disabled case
 
 use http_cache: hedge.cache;
+use hedge.cache.disk;
 use hedge.cache.policy;
 use cache_store: hedge.cache.store;
+use hedge.cache.store_worker;
+use hedge.clock;
 use hedge.config.schema;
 use hedge.connection;
 use hedge.dispatch.call;
@@ -316,6 +319,27 @@ fun base_graph(harness: *Harness, cache_enabled: bool, per_service_cache: bool,
     or { schema.clear_text(?graph.cache.disk_root); }
 }
 
+# the cache's plane, as composition attaches it: queued disk requests wake it,
+# and it settles them
+fun drive_cache(context: ptr, now: time.Instant) bool {
+    ret http_cache.drive(context::*http_cache.Recorders);
+}
+
+fun quiesce_cache(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
+    val recorders: *http_cache.Recorders = context::*http_cache.Recorders;
+    http_cache.drive(recorders);
+    if (http_cache.settling(recorders)) { ret serve.PLANE_PENDING; }
+    ret serve.PLANE_QUIESCED;
+}
+
+fun cache_deadline(context: ptr, at_ns: *u64) bool {
+    ret false;
+}
+
+fun cache_work(context: ptr) bool {
+    ret http_cache.pending_work(context::*http_cache.Recorders);
+}
+
 fun boot_with_disk(harness: *Harness, generation: u64, cache_enabled: bool,
     per_service_cache: bool, payload: str, cache_control: str, vary: str,
     disk_root: str, disk_bytes: usize, protocols: u8) bool {
@@ -408,6 +432,21 @@ fun boot_with_disk(harness: *Harness, generation: u64, cache_enabled: bool,
     val owned: *listener.OwnedListener = listener.active_listener(?harness.runtime.owner, 0);
     if (owned == nil || !owned.has_bound_endpoint) { ret false; }
     harness.endpoint = owned.bound_endpoint;
+    if (cache_enabled) {
+        if (!http_cache.attach_waker(?harness.recorders, serve.plane_waker(?harness.runtime))
+            || !serve.attach_plane_lifecycle(?harness.runtime, (?harness.recorders)::ptr,
+            drive_cache, quiesce_cache, cache_deadline)
+            || !serve.attach_plane_audit(?harness.runtime, cache_work)) { ret false; }
+    }
+    # disk placement waits for the store worker to purge the root
+    if (cache_enabled && disk_root != nil) {
+        var rounds: usize = 0;
+        for (rounds < wire.MAX_ROUNDS && !cache_store.disk_ready(?harness.layer.backing)) {
+            serve.poll(?quic_controls, ?harness.runtime, 2);
+            rounds = rounds + 1;
+        }
+        if (!cache_store.disk_ready(?harness.layer.backing)) { ret false; }
+    }
     ret true;
 }
 
@@ -428,7 +467,7 @@ fun shutdown(harness: *Harness) {
     var quic_controls: quic_runtime.ControlView;
     serve.stop(?quic_controls, ?harness.runtime);
     if (harness.recorders.live) { http_cache.close_recorders(?harness.recorders); }
-    http_cache.close(?harness.layer);
+    http_cache.close(?harness.layer, harness.graph.timeouts.stop_ms * 1000000);
 }
 
 # the store is written when the exchange settles, which is after the client has
@@ -437,7 +476,8 @@ fun shutdown(harness: *Harness) {
 fun settle(harness: *Harness) {
     var quic_controls: quic_runtime.ControlView;
     var rounds:        usize = 0;
-    for (rounds < wire.MAX_ROUNDS && !serve.idle(?harness.runtime)) {
+    for (rounds < wire.MAX_ROUNDS && (!serve.idle(?harness.runtime)
+        || http_cache.settling(?harness.recorders))) {
         serve.poll(?quic_controls, ?harness.runtime, 2);
         rounds = rounds + 1;
     }
@@ -2099,5 +2139,215 @@ test "cache: a response is stored when its client stops writing before the answe
     if (calls != 1)                                                                { ret 4; }
     if (view.stores != 1)                                                          { ret 5; }
     if (failures != 0)                                                             { ret 6; }
+    ret 0;
+}
+
+# boot with a disk root and store /a on it, so the next GET /a is a disk hit
+fun boot_disk_hit(harness: *Harness, generation: u64, root: str) bool {
+    if (!ensure_dir("out") || !ensure_dir(root)) { ret false; }
+    if (!boot_with_disk(harness, generation, true, true, "on disk", "max-age=60", nil,
+        root, 4096, schema.PROTOCOL_HTTP1)) { ret false; }
+    harness.layer.backing.limits.memory_bytes = 8;
+    var response: [RESPONSE_BYTES]u8;
+    var length:   usize = 0;
+    if (!exchange_once(harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "on disk", ?response[0], RESPONSE_BYTES, ?length)) { ret false; }
+    ret harness.origin.calls == 1 && http_cache.report(?harness.layer).disk_bytes != 0;
+}
+
+# send a request and let the server take it, without waiting for its answer
+fun send_only(harness: *Harness, request: str, client: *tcp.Stream) bool {
+    if (!wire.connect(harness.endpoint, client)) { ret false; }
+    if (!wire.send(client, request)) {
+        tcp.stream_close(client);
+        ret false;
+    }
+    wire.pump(?harness.runtime, 20);
+    ret true;
+}
+
+# one exchange that does not wait for the server to go idle, which it cannot
+# while another request is parked on the disk
+fun exchange_beside(harness: *Harness, request: str, marker: str) bool {
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { ret false; }
+    if (!wire.send(?client, request)) {
+        tcp.stream_close(?client);
+        ret false;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length:   usize = wire.collect(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES,
+        marker);
+    tcp.stream_close(?client);
+    ret wire.contains(?response[0], length, marker);
+}
+
+test "cache: a hit parked on a stalled disk leaves the worker serving uncached requests" {
+    var harness: Harness;
+    if (!boot_disk_hit(?harness, 18, "out/cache-runtime-stalled")) {
+        shutdown(?harness);
+        ret 1;
+    }
+    # the disk answers nothing until resumed
+    store_worker.pause(?harness.layer.worker);
+    var parked: tcp.Stream;
+    if (!send_only(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n", ?parked)) {
+        store_worker.resume(?harness.layer.worker);
+        shutdown(?harness);
+        ret 2;
+    }
+    if (http_cache.stalled(?harness.layer, nil, 0) != 1) {
+        store_worker.resume(?harness.layer.worker);
+        tcp.stream_close(?parked);
+        shutdown(?harness);
+        ret 3;
+    }
+    var quic_controls: quic_runtime.ControlView;
+    # the parked read is a registered wait, not work nothing will run
+    if (serve.audit(?quic_controls, ?harness.runtime, clock.instant()) != 0) {
+        store_worker.resume(?harness.layer.worker);
+        tcp.stream_close(?parked);
+        shutdown(?harness);
+        ret 4;
+    }
+    var served: usize = 0;
+    for (served < 8) {
+        if (!exchange_beside(?harness,
+            "GET /u HTTP/1.1\r\nHost: localhost\r\nCache-Control: no-store\r\n\r\n",
+            "on disk")) { brk; }
+        served = served + 1;
+    }
+    # every uncached request went to the origin and was answered while the disk
+    # still held the hit's read
+    val origin_calls: usize = harness.origin.calls;
+    val still_held:   usize = http_cache.stalled(?harness.layer, nil, 0);
+    store_worker.resume(?harness.layer.worker);
+    var response: [RESPONSE_BYTES]u8;
+    val length:   usize = wire.collect(?harness.runtime, ?parked, ?response[0], RESPONSE_BYTES,
+        "on disk");
+    tcp.stream_close(?parked);
+    settle(?harness);
+    val calls: usize = harness.origin.calls;
+    shutdown(?harness);
+    if (served != 8 || origin_calls != 9 || still_held != 1) { ret 5; }
+    # the parked hit was answered from the disk once it came back
+    if (!wire.contains(?response[0], length, "on disk") || calls != 9) { ret 6; }
+    ret 0;
+}
+
+test "cache: a full store queue serves a hit from the origin and skips a disk recording" {
+    var harness: Harness;
+    if (!boot_disk_hit(?harness, 19, "out/cache-runtime-refused")) {
+        shutdown(?harness);
+        ret 1;
+    }
+    # take every stream the store worker admits
+    var held: usize = 0;
+    for (held < 1024 && disk.admit(?harness.layer.backing.disk)) { held = held + 1; }
+    if (held == 0 || held == 1024) {
+        shutdown(?harness);
+        ret 2;
+    }
+    val before:   http_cache.Report = http_cache.report(?harness.layer);
+    var response: [RESPONSE_BYTES]u8;
+    var length:   usize             = 0;
+    # the refused hit is answered by the origin, whole
+    if (!exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "on disk", ?response[0], RESPONSE_BYTES, ?length)
+        || !wire.contains(?response[0], length, "on disk") || harness.origin.calls != 2) {
+        shutdown(?harness);
+        ret 3;
+    }
+    val refused_hit: http_cache.Report = http_cache.report(?harness.layer);
+    if (refused_hit.misses != before.misses + 1 || refused_hit.hits != before.hits) {
+        shutdown(?harness);
+        ret 4;
+    }
+    # a response bound for the disk is still answered whole, and not stored
+    if (!exchange_once(?harness, "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "on disk", ?response[0], RESPONSE_BYTES, ?length)
+        || !wire.contains(?response[0], length, "on disk") || harness.origin.calls != 3) {
+        shutdown(?harness);
+        ret 5;
+    }
+    val refused_store: http_cache.Report = http_cache.report(?harness.layer);
+    if (refused_store.entries != before.entries || refused_store.stores != before.stores
+        || refused_store.rejections == before.rejections) {
+        shutdown(?harness);
+        ret 6;
+    }
+    for (held != 0) {
+        disk.leave(?harness.layer.backing.disk);
+        held = held - 1;
+    }
+    # with room again the stored entry is served from the disk
+    if (!exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "on disk", ?response[0], RESPONSE_BYTES, ?length)
+        || !wire.contains(?response[0], length, "on disk") || harness.origin.calls != 3) {
+        shutdown(?harness);
+        ret 7;
+    }
+    shutdown(?harness);
+    ret 0;
+}
+
+test "cache: stop with a disk read outstanding finishes within its deadline" {
+    var harness: Harness;
+    if (!boot_disk_hit(?harness, 20, "out/cache-runtime-stop")) {
+        shutdown(?harness);
+        ret 1;
+    }
+    # every disk request now takes a fifth of a second, so the hit is still
+    # reading when stop begins
+    store_worker.slow_down(?harness.layer.worker, 200000000);
+    harness.runtime.stop_timeout_ns = 1000000000;
+    var parked: tcp.Stream;
+    if (!send_only(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n", ?parked)) {
+        shutdown(?harness);
+        ret 2;
+    }
+    if (http_cache.stalled(?harness.layer, nil, 0) == 0) {
+        tcp.stream_close(?parked);
+        shutdown(?harness);
+        ret 3;
+    }
+    val started:       time.Instant = clock.instant();
+    var quic_controls: quic_runtime.ControlView;
+    # a debug build audits every quiesce turn, so a missed completion panics here
+    val stopped: bool = serve.stop(?quic_controls, ?harness.runtime);
+    http_cache.close_recorders(?harness.recorders);
+    val closed:  bool = http_cache.close(?harness.layer, 1000000000);
+    val elapsed: u64  = clock.between_ns(started, clock.instant());
+    tcp.stream_close(?parked);
+    if (!stopped)              { ret 4; }
+    if (!closed)               { ret 5; }
+    if (elapsed >= 1000000000) { ret 6; }
+    ret 0;
+}
+
+test "cache: stop names the disk request a stalled disk still holds" {
+    var harness: Harness;
+    if (!boot_disk_hit(?harness, 21, "out/cache-runtime-named")) {
+        shutdown(?harness);
+        ret 1;
+    }
+    store_worker.pause(?harness.layer.worker);
+    harness.runtime.stop_timeout_ns = 100000000;
+    var parked: tcp.Stream;
+    if (!send_only(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n", ?parked)) {
+        store_worker.resume(?harness.layer.worker);
+        shutdown(?harness);
+        ret 2;
+    }
+    var quic_controls: quic_runtime.ControlView;
+    val stopped:       bool  = serve.stop(?quic_controls, ?harness.runtime);
+    var named:         [4]store_worker.Outstanding;
+    val count:         usize = http_cache.stalled(?harness.layer, ?named[0], 4);
+    store_worker.resume(?harness.layer.worker);
+    tcp.stream_close(?parked);
+    shutdown(?harness);
+    # the stalled read outlived the deadline, and stop says which request it is
+    if (stopped)                                                             { ret 3; }
+    if (count != 1 || named[0].op != disk.READ || named[0].name_length == 0) { ret 4; }
     ret 0;
 }
