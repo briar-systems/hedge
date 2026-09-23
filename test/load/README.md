@@ -270,6 +270,40 @@ It is a manual lane. At 100k QUIC connections the server alone needs about
 11 GiB and the quic-go holders need several more, so on a smaller host run it
 at the largest N the host allows and state the projection it prints.
 
+### The measured run for #176
+
+`feat/176` at 7ec5491, release build (sha256 `8daad759…`), linux-x86_64,
+Ryzen 7 5800X3D, loopback, one worker, each run under `agent-heavy
+--exclusive` with `vmstat` alongside, QUIC keep-alive 15 s:
+
+| transport | span | bytes per idle connection (halves) | CPU per idle connection per second | descriptors, timer entries per connection |
+| --- | --- | ---: | ---: | --- |
+| TCP | 1k..10k | 13,166 (13,238 / 13,095) | under 0.0001 µs at both | 1, 1 |
+| TCP | 10k..100k | 12,695 (12,522 / 12,868) | under 0.0001 µs at both | 1, 1 |
+| TLS | 1k..10k | 22,501 (22,697 / 22,304) | under 0.0001 µs at both | 1, 1 |
+| QUIC | 1k..10k | 103,612 (104,122 / 103,102) | 14.79 µs, 14.12 µs | 0, 1 |
+| QUIC | 10k..30k | 102,846 (102,964 / 102,728) | 14.02 µs, 10.41 µs | 0, 1 |
+
+So CPU per idle connection is flat in N and memory is linear, up to 100k for
+TCP and 30k for QUIC. For TLS and QUIC the lane found problems past those
+counts rather than figures:
+
+- TLS at 100k: hedge held 62,925 of the 100,000 connections its clients had
+  handshaken and been served on, so connections were closed under it past
+  about 63k.
+- TCP at 100k: the server keeps 84.5 MiB more after its connections leave than
+  it does after 10k, so something grows with the peak past 10k.
+- QUIC at 30k: 12,652 connections were still live 15 s after their clients
+  closed them, which is #274's socket-drop shape at the close.
+- QUIC at 50k: the host swapped hedge's pages out. The lane now counts
+  swapped pages in the resident figure.
+
+The 10-minute churn, at 200 TLS connections a second and then 100 HTTP/3
+connections a second, served 120,000 and 60,000 with none missed. The
+resident peak moved by 140 KiB and 40 KiB between the halves. CPU per
+connection was 1,451 against 1,458 µs for TLS and 4,131 against 4,290 µs for
+HTTP/3.
+
 ## The rate lane
 
 ```sh

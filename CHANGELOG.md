@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- The scale harness (#176, stage 8 of #169). The load lanes gain four cells and the scale lane gains three measures:
+  - **`test/load/rate.sh`.** Request rates over HTTP/1.1, HTTP/1.1 over TLS, HTTP/2 and HTTP/3, and full TLS and QUIC handshake rates. Each cell reports the server's CPU per operation, read over the client's own window. It uses `test/load/rate`, a new closed-loop Go client. `LOAD_RATE_WORKERS` runs every cell at several `server.workers` counts and asserts that the rate scales. That key arrives with #173, so until then the lane runs one worker.
+  - **`test/load/ramp.sh`.** N dials at a fixed rate, with no losses: every dial held, and no QUIC handshake dropped, refused or expired.
+  - **`test/load/churn.sh`.** Connect, request and close at a fixed rate for 10 minutes, with a flat resident set and flat CPU per connection.
+  - **`test/load/migrate.sh`.** A QUIC connection must survive its client rebinding to a new port.
+  - **`test/load/scale.sh`.** It now measures CPU per idle connection per second (asserted flat in N), descriptors and timer entries. It holds from several client processes on their own source addresses, so it reaches 100k, and it counts swapped-out pages in the resident figure.
+  - **Clients.** `hold.py` and `h3load` take a source address and a dial rate. `h3load` takes `-keep-alive` and `-migrate`.
+  - **Telemetry.** New gauges `hedge_timers_claimed` and `hedge_timers_armed`. The built-in series count rises to 40, so `telemetry.metric_series` must cover it.
+  - **CI.** The light tier runs the ramp, a minute of churn, the rates and migration.
+  - **Measurements.** Release build, one worker, on a quiet host. An idle TCP or TLS connection costs no measurable CPU at 1k, 10k or 100k. An idle QUIC connection with a 15 s keep-alive costs 14.8 µs of CPU a second at 1k and 10.4 µs at 30k. Memory per connection is linear: 12,695 bytes for TCP from 10k to 100k, 22,501 for TLS from 1k to 10k, and 102,846 for QUIC from 10k to 30k.
+  - **Problems found.** Past these counts the lane found problems, not figures. At 100k TLS connections hedge held only 62,925. After 100k TCP connections leave, the server keeps 84.5 MiB more than after 10k. After 30k QUIC connections close, 12,652 were still live 15 s later. And a QUIC connection does not survive its client rebinding its port.
+
 ## [0.10.0] - 2026-09-23
 
 ### Changed

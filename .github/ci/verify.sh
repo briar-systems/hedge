@@ -15,7 +15,9 @@ case "$MACH_CI_LEG" in
         # the scale harness's 1k cells (#176): a ramp, a minute of churn, the
         # request and handshake rates, and QUIC connections surviving a rebind
         LOAD_RAMP=1000 test/load/ramp.sh
-        LOAD_CHURN_SECONDS=60 LOAD_CHURN_SAMPLE=5 test/load/churn.sh
+        # the client shares the runner's two cores with the server, which moves
+        # CPU per connection more than a quiet box does over a minute
+        LOAD_CHURN_SECONDS=60 LOAD_CHURN_SAMPLE=5 LOAD_CHURN_CPU_TOLERANCE=50 test/load/churn.sh
         LOAD_RATE_DURATION=5 LOAD_RATE_WARMUP=1 test/load/rate.sh
         test/load/migrate.sh
         ;;
