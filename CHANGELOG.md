@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-23
+
 ### Changed
 
 - A parked service is entered again only when the wait it named has moved (#131). A wake now names the call it is for (`wake.Waker.call`, `wake.for_call`, and `wake.take` hands back `wake.Wake` records of owner and call), and each protocol binds its calls with a waker derived from its connection's: HTTP/1 names its one exchange, HTTP/2 the stream's slot, HTTP/3 the request's slot. The worker routes a named call to its connection or QUIC record, request body bytes or the body's end stir a service parked on `WAIT_BODY`, and HTTP/1, HTTP/2 and HTTP/3 resume a pending service only when `call.due` says a named wait moved, its wait deadline passed or its exchange was cancelled. Before, a connection re-entered every parked service it held on any event it had: a memory or TLS wake of the connection, another stream's wake, or body bytes for a service waiting on a wake each cost a full re-entry that parked again. The debug missed-wake audit asks the same question in place of its old "pending service parked on nothing" case: a stirred call on a connection or QUIC record no queue holds is work nothing will run.
