@@ -16,6 +16,12 @@
 # memory comes from the connection's account on the TLS lane. a lane short of
 # memory parks inside mach-tls, and `resume` retries it when the account wakes.
 #
+# the channel queues its connection itself, on the two events that give it work:
+# the engine submitting an operation, and a TLS completion being routed in. a
+# submission made while the connection steps is started by that step, and
+# `end_step` wakes the connection for one the step left unstarted, so an
+# operation is never left queued with nothing to run it (#195).
+#
 # a TLS session is secret-welded, so no public pointer may name one and a session
 # cannot be reached through a callback context. sessions are therefore held in a
 # secret table and addressed by index, while every callback context is a public
@@ -30,6 +36,7 @@ use hedge.listener;
 use hedge.memory;
 use hedge.protocol.tls;
 use hedge.storage;
+use hedge_wake:     hedge.wake;
 use http_transport: http.core.transport;
 use A:              std.allocator;
 use std.allocator.page;
@@ -138,6 +145,11 @@ pub rec Channel {
     owner:             ptr;
     staged:            StagedFun;
     account:           *buffers.Account;
+    # who is woken when this channel has work, and whether a wake was lost
+    waker:       hedge_wake.Waker;
+    wake_failed: bool;
+    # the connection is stepping, so its step starts what the engine submits
+    stepping: bool;
 }
 
 rec Session {
@@ -189,6 +201,9 @@ fun reset_channel(value: *Channel, index: usize) {
     value.owner             = nil;
     value.staged            = (0::usize)::StagedFun;
     value.account           = nil;
+    value.waker             = hedge_wake.no_waker();
+    value.wake_failed       = false;
+    value.stepping          = false;
     clear_pending(?value.read);
     clear_pending(?value.readable);
     clear_pending(?value.write);
@@ -483,6 +498,11 @@ fun renew_scope(index: usize, reading: bool, owner: *cancel.Scope) bool {
     ret true;
 }
 
+# queue the connection for its next step
+fun notify(value: *Channel) {
+    if (!hedge_wake.wake(?value.waker)) { value.wake_failed = true; }
+}
+
 fun push_done(value: *Channel, settled: http_transport.Completion) {
     if (value.done_count >= DONE_SLOTS) { ret; }
     value.done[value.done_count] = settled;
@@ -766,7 +786,9 @@ fun adapter_submit(value: *Channel, kind: Kind, token: http_transport.Token,
     slot.buffer = buffer;
     slot.length = length;
     # starting is deferred to the connection's own step, so a completion is
-    # never published from inside a submission that holds the transport's lock
+    # never published from inside a submission that holds the transport's lock.
+    # a step in progress starts it, and otherwise the connection is queued
+    if (!value.stepping) { notify(value); }
     ret res[bool, io_error.Error].ok{true};
 }
 
@@ -822,15 +844,16 @@ pub fun channel(index: usize) *Channel {
 # --- lifecycle ---
 
 # bind the socket this session speaks over, the connection that owns the bytes
-# the prologue already read, and the memory its buffers come from. `borrower`
-# and `account` are the connection's, and the account must stay open until the
-# session is released
+# the prologue already read, the memory its buffers come from, and who is woken
+# when the channel has work. `borrower` and `account` are the connection's, and
+# the account must stay open until the session is released
 pub fun attach(index: usize, driver: *net_async.Driver, socket: *tcp.Stream,
     owner: ptr, staged: StagedFun, borrower: *memory.Borrower,
-    account: *buffers.Account) bool {
+    account: *buffers.Account, waker: hedge_wake.Waker) bool {
     prepare();
     if (!claimed_index(index) || driver == nil || socket == nil || borrower == nil
-        || account == nil || !account.open) { ret false; }
+        || account == nil || !account.open || !hedge_wake.valid(?waker)) { ret false; }
+    channel_at(index).waker   = waker;
     channel_at(index).driver  = driver;
     channel_at(index).socket  = socket;
     channel_at(index).owner   = owner;
@@ -910,11 +933,13 @@ pub fun begin(index: usize, policy: *tls.Policy, connection: *cancel.Scope,
 }
 
 # route one runtime completion into the TLS stream and resolve whatever it
-# finished. a socket readiness wait is this channel's own, not the stream's
+# finished, and queue the connection to take it. a socket readiness wait is this
+# channel's own, not the stream's
 pub fun accept(index: usize, completion: *io_runtime.Completion) bool {
     prepare();
     if (!claimed_index(index) || !session_at(index).stream_started) { ret false; }
     val value: *Channel = channel_at(index);
+    fin { notify(value); }
     if (completion.kind == io_runtime.READABLE) {
         value.readable_waiting = false;
         val slot: *Pending = ?value.readable;
@@ -936,7 +961,8 @@ pub fun accept(index: usize, completion: *io_runtime.Completion) bool {
 }
 
 # retry a lane parked for memory, when the connection's account is woken. a
-# stream with nothing parked ignores it
+# stream with nothing parked ignores it. each retry arrives as a completion for
+# `accept`, which queues the connection
 pub fun resume(index: usize) bool {
     prepare();
     if (!claimed_index(index) || !session_at(index).stream_started) { ret false; }
@@ -987,22 +1013,25 @@ pub fun take(index: usize, settled: *http_transport.Completion) bool {
     ret true;
 }
 
-# whether the connection's next step would find work here: a completion
-# published and not yet taken, a lane the stream finished that nobody settled,
-# or an operation queued behind a lane that is free to start it (#182)
-pub fun pending_work(index: usize) bool {
+# the connection steps: what the engine submits meanwhile is started by the step
+pub fun begin_step(index: usize) {
     prepare();
-    if (!claimed_index(index)) { ret false; }
+    if (!claimed_index(index)) { ret; }
+    channel_at(index).stepping = true;
+}
+
+# the step is over. an operation it left queued behind a free lane has nothing
+# else to start it, so the connection is queued for it
+pub fun end_step(index: usize) {
+    prepare();
+    if (!claimed_index(index)) { ret; }
     val value: *Channel = channel_at(index);
-    if (value.done_count != 0) { ret true; }
-    if (session_at(index).stream_started
-        && (value.reading != KIND_NONE || value.writing != KIND_NONE)) {
-        val view: tls_stream.Snapshot = tls_stream.snapshot(?session_at(index).stream);
-        if (value.reading != KIND_NONE
-            && view.read.state == tls_transport.OPERATION_TERMINAL) { ret true; }
-        if (value.writing != KIND_NONE
-            && view.write.state == tls_transport.OPERATION_TERMINAL) { ret true; }
-    }
+    value.stepping = false;
+    if (startable(value)) { notify(value); }
+}
+
+# an operation queued behind a lane that is free to start it
+fun startable(value: *Channel) bool {
     if (value.state != OPEN && value.state != FAILED && value.state != CLOSED) {
         ret false;
     }
@@ -1016,6 +1045,26 @@ pub fun pending_work(index: usize) bool {
     # an open session's close waits for the read it has already cancelled
     ret value.state != OPEN || wanted != KIND_CLOSE
         || value.reading == KIND_NONE || !value.read_cancelled;
+}
+
+# whether the connection's next step would find work here: a completion
+# published and not yet taken, a lane the stream finished that nobody settled,
+# an operation queued behind a lane that is free to start it (#182), or a wake
+# that could not be queued
+pub fun pending_work(index: usize) bool {
+    prepare();
+    if (!claimed_index(index)) { ret false; }
+    val value: *Channel = channel_at(index);
+    if (value.done_count != 0 || value.wake_failed) { ret true; }
+    if (session_at(index).stream_started
+        && (value.reading != KIND_NONE || value.writing != KIND_NONE)) {
+        val view: tls_stream.Snapshot = tls_stream.snapshot(?session_at(index).stream);
+        if (value.reading != KIND_NONE
+            && view.read.state == tls_transport.OPERATION_TERMINAL) { ret true; }
+        if (value.writing != KIND_NONE
+            && view.write.state == tls_transport.OPERATION_TERMINAL) { ret true; }
+    }
+    ret startable(value);
 }
 
 pub rec Snapshot {
@@ -1132,6 +1181,102 @@ test "secure: pending work is a completion not taken or an operation a free lane
     val code: i32 = pending_case(index);
     release(index);
     ret code;
+}
+
+# a submission outside a step queues the connection at once. inside one, the
+# step starts it, and `end_step` queues the connection only for an operation
+# the step left queued behind a free lane (#195)
+fun submit_case(index: usize, wakes: *hedge_wake.Queue) i32 {
+    val entry:   *Channel = channel_at(index);
+    val context: ptr      = (entry)::ptr;
+    var owners:  [4]u64;
+    entry.state = OPEN;
+    entry.waker = hedge_wake.waker(wakes, 31);
+    val read: res[bool, io_error.Error] = adapter_read(context,
+        http_transport.Token{index: 0, generation: 1}, nil, nil, 0);
+    if ((sel read.err) || hedge_wake.take(wakes, ?owners[0], 4) != 1 || owners[0] != 31) {
+        ret 1;
+    }
+    # the read is running, and a step submits a write it then starts
+    entry.reading = KIND_READ;
+    begin_step(index);
+    val write: res[bool, io_error.Error] = adapter_write(context,
+        http_transport.Token{index: 1, generation: 1}, nil, nil, 0);
+    if ((sel write.err) || hedge_wake.pending(wakes)) { ret 2; }
+    entry.writing = KIND_WRITE;
+    end_step(index);
+    if (hedge_wake.pending(wakes)) { ret 3; }
+    # a half close queued behind the running write waits for its completion,
+    # which queues the connection through `accept`
+    begin_step(index);
+    val shut: res[bool, io_error.Error] = adapter_shutdown(context,
+        http_transport.Token{index: 1, generation: 2}, nil);
+    end_step(index);
+    if ((sel shut.err) || hedge_wake.pending(wakes)) { ret 4; }
+    # a step that ends with the write lane free and the half close not started
+    # leaves it to the next step
+    entry.writing      = KIND_NONE;
+    entry.write.active = false;
+    begin_step(index);
+    end_step(index);
+    if (hedge_wake.take(wakes, ?owners[0], 4) != 1 || owners[0] != 31) { ret 5; }
+    # a wake that cannot be queued is work the audit reports
+    entry.shutdown.active = false;
+    entry.read.active     = false;
+    entry.reading         = KIND_NONE;
+    if (pending_work(index)) { ret 6; }
+    entry.waker = hedge_wake.no_waker();
+    notify(entry);
+    if (!entry.wake_failed || !pending_work(index)) { ret 7; }
+    ret 0;
+}
+
+test "secure: the channel queues its connection for what the engine submits" {
+    var pages: A.Allocator;
+    page.make(?pages);
+    var wakes: hedge_wake.Queue;
+    if (!hedge_wake.make(?wakes, ?pages)) { ret 90; }
+    val index: usize = acquire();
+    if (index == NO_SESSION) { ret 91; }
+    val code: i32 = submit_case(index, ?wakes);
+    release(index);
+    hedge_wake.destroy(?wakes);
+    ret code;
+}
+
+# mach-tls keeps a stream open when a write is cancelled between records, so
+# the cancellation is the engine's to see and the channel serves on (#195)
+test "secure: a write cancelled between records leaves the channel open" {
+    val index: usize = acquire();
+    if (index == NO_SESSION) { ret 1; }
+    val entry: *Channel = channel_at(index);
+    entry.state        = OPEN;
+    entry.write.active = true;
+    entry.write.token  = http_transport.Token{index: 1, generation: 4};
+    var cancelled: tls_transport.Snapshot;
+    cancelled.state             = tls_transport.OPERATION_TERMINAL;
+    cancelled.application_bytes = 0;
+    cancelled.terminal_error    = tls_error.CANCELLED;
+    publish(entry, KIND_WRITE, cancelled);
+    var settled: http_transport.Completion;
+    if (!take(index, ?settled) || settled.status != http_transport.IO_CANCELLED
+        || settled.token.generation != 4) {
+        release(index);
+        ret 2;
+    }
+    if (entry.state != OPEN) {
+        release(index);
+        ret 3;
+    }
+    # the next write the engine queues is one the free lane starts
+    entry.write.active = true;
+    if (!startable(entry)) {
+        release(index);
+        ret 4;
+    }
+    entry.write.active = false;
+    release(index);
+    ret 0;
 }
 
 test "secure: an operation the engine did not submit is refused" {

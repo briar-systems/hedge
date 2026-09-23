@@ -13,10 +13,11 @@ use std.chrono.time;
 use std.collections.map;
 use std.collections.vector;
 use std.crypto.ct;
-use random:        std.crypto.rand;
-use io_error:      std.io.error;
-use io_runtime:    std.io.runtime;
-use std_memory:    std.memory;
+use random:     std.crypto.rand;
+use io_error:   std.io.error;
+use io_runtime: std.io.runtime;
+use std_memory: std.memory;
+use std.memory.buffers;
 use memory_secret: std.memory.secret;
 use net_async:     std.net.async;
 use net_types:     std.net.async.types;
@@ -40,6 +41,7 @@ use crypto.encoding.keys;
 use crypto.secret;
 use tls.cert;
 use tls.cert.credentials;
+use tls_client: tls.client;
 use tls_clock:  tls.clock;
 use tls_config: tls.config;
 use tls.engine;
@@ -4655,8 +4657,17 @@ pub fun wake(controls: *ControlView, runtime: *Runtime, owner: u64) {
     if (!owns_timer(owner)) { ret; }
     val index: usize = (owner & ~TIMER_MASK)::usize;
     if (index >= hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections)) { ret; }
-    # the owner is also the account's wake handle. the pool's wake may be for
-    # quic's chunks or for the h3 session's, and both are retried
+    mark_ready(controls, runtime, index);
+}
+
+# the pool funded a record's account again. the owner is the account's wake
+# handle, and the wake may be for quic's chunks or for the h3 session's: the
+# transport retries whatever it was refused for memory once it reaches
+# storage_ready, and nothing else retries it, so the record is queued with it
+pub fun funded(controls: *ControlView, runtime: *Runtime, owner: u64) {
+    if (runtime == nil || !runtime.initialized || !owns_timer(owner)) { ret; }
+    val index: usize = (owner & ~TIMER_MASK)::usize;
+    if (index >= hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections)) { ret; }
     val value: *Connection = connection_at(controls, index);
     if (value.live && value.assembly.initialized) {
         qt.storage_ready[binding.Binding](?value.assembly.driver);
@@ -6858,8 +6869,8 @@ test "hedge.protocol.quic.runtime: the audit asks the transport what a record ho
     qt.storage_ready[binding.Binding](driver);
     if (value.assembly.core.send_refused || !qt.pending_output[binding.Binding](driver, now)
         || audit(controls, ?runtime, now) != 1) { ret 21; }
-    # the runtime's wake routes storage_ready and queues the record together
-    wake(controls, ?runtime, timer_owner(index));
+    # the runtime's funded wake routes storage_ready and queues the record together
+    funded(controls, ?runtime, timer_owner(index));
     if (!value.ready || audit(controls, ?runtime, now) != 0) { ret 22; }
     unmark_ready(controls, ?runtime, index);
     val retried: qt.Generated = qt.generate[binding.Binding](driver, ?value.storage.scope,
@@ -7058,5 +7069,205 @@ test "hedge.protocol.quic.runtime: a pump config carries a nonzero handshake bou
     if (!handshake_limits_valid(?config)) { ret 5; }
     config.max_handshakes_per_peer = opt[usize].some{0};
     if (handshake_limits_valid(?config)) { ret 6; }
+    ret 0;
+}
+
+# every chunk the pool will fund, held by an account of the test's own
+rec TestHog {
+    borrower: memory.Borrower;
+    account:  buffers.Account;
+    source:   buffers.Source;
+    held:     [1024]buffers.Chunk;
+    count:    usize;
+}
+
+fun test_hog(hog: *TestHog, pool: *memory.Memory) bool {
+    var budgets: memory.Budgets = memory.no_budgets();
+    budgets.lanes[memory.LANE_REQUEST::usize] = pool.budget;
+    memory.borrower(?hog.borrower, pool, 0x484f470000000000, 0, budgets);
+    if (!memory.open(?hog.borrower, ?hog.account)) { ret false; }
+    hog.source = memory.borrowed_source(?hog.borrower);
+    hog.count  = 0;
+    var size: usize = 1048576;
+    for (size >= 256) {
+        for (hog.count < 1024) {
+            val got: buffers.Acquired = buffers.source_acquire(?hog.source, ?hog.account,
+                buffers.Request{bytes: size, align: 0, lane: memory.LANE_REQUEST,
+                secret: false}, false);
+            if (!(sel got.status.ok)) { brk; }
+            hog.held[hog.count] = got.chunk;
+            hog.count           = hog.count + 1;
+        }
+        size = size / 2;
+    }
+    ret hog.count != 0 && hog.count < 1024;
+}
+
+fun test_unhog(hog: *TestHog, pool: *memory.Memory) bool {
+    for (hog.count != 0) {
+        hog.count = hog.count - 1;
+        buffers.source_release(?hog.source, ?hog.account, hog.held[hog.count]);
+    }
+    ret memory.close(pool, ?hog.account);
+}
+
+# a client whose only job is to send the server its first Initial. its records
+# are far past a test frame, so they live here
+var dialer:            assembly.Connection;
+var dialer_storage:    assembly.Storage;
+var dialer_scratch:    assembly.Scratch;
+var dialer_tls:        tls_client.Handshake;
+var dialer_scope:      cancel.Scope;
+var dialer_memory:     memory.Memory;
+var dialer_borrower:   memory.Borrower;
+var dialer_budgets:    memory.Budgets;
+var dialer_config:     assembly.Config;
+var dialer_tls_config: tls_config.ClientConfig;
+var dialer_anchor:     cert.Certificate;
+var dialer_trust:      cert.TrustStore;
+var dialer_entropy:    secret.Entropy;
+var dialer_counter:    u8;
+var dialer_name:       [15]u8;
+var dialer_parameters: [512]u8;
+
+# the client's first flight into `wire`, addressed to the server
+# test_prepare_server describes. its length, or zero
+fun test_dial(tls_server: *TestServer, shared: *assembly.SecretScratch, wire: *u8,
+    capacity: usize, now: time.Instant) usize {
+    if (!memory.make(?dialer_memory, 64 * 1024 * 1024, test_allocator())) { ret 0; }
+    dialer_budgets = memory.no_budgets();
+    memory.borrower(?dialer_borrower, ?dialer_memory, 0x4449414c00000000, memory.LANES,
+        dialer_budgets);
+    dialer_name = [15]u8{'a', 'p', 'i', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.',
+        'c', 'o', 'm'};
+    val local: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
+    val peer:  ip.Endpoint = ip.endpoint(192, 0, 2, 1, 4433);
+    dialer_config                             = assembly.default_config(82, local, peer);
+    dialer_config.local_source                = ?tls_server.peer_id[0];
+    dialer_config.local_source_length         = 8;
+    dialer_config.peer_destination            = ?tls_server.initial_id[0];
+    dialer_config.peer_destination_length     = 8;
+    dialer_config.original_destination        = ?tls_server.initial_id[0];
+    dialer_config.original_destination_length = 8;
+    dialer_config.server_name                 = ?dialer_name[0];
+    dialer_config.server_name_length          = 15;
+    dialer_config.alpn                        = ?tls_server.protocol_bytes[0];
+    dialer_config.alpn_length                 = 2;
+    dialer_config.entropy_context_size        = 1;
+    dialer_config.chunk_reserve               = 0;
+    dialer_config.account_handle              = 0x4449414c00000000;
+    dialer_config.extra_budgets               = ?dialer_budgets.lanes[quic_supply.LANES::usize];
+    dialer_config.extra_lanes                 = memory.LANES::usize - quic_supply.LANES::usize;
+    val encoded: transport_parameters.EncodeResult = assembly.encode_parameters(
+        ?dialer_config, qt.CLIENT, ?dialer_parameters[0], 512);
+    if (!encoded.ok) { ret 0; }
+    dialer_anchor  = test_credentials.anchor();
+    dialer_trust   = cert.TrustStore{anchors: ?dialer_anchor, len: 1};
+    dialer_counter = 91;
+    dialer_entropy = secret.Entropy{context: ?dialer_counter, secret_context: nil,
+        fill_fn: test_credentials.deterministic_entropy, initialized: true};
+    dialer_tls_config.server_name          = contracts.Bytes{data: ?dialer_name[0], len: 15};
+    dialer_tls_config.alpn                 = ?tls_server.protocols[0];
+    dialer_tls_config.alpn_len             = 1;
+    dialer_tls_config.trust                = ?dialer_trust;
+    dialer_tls_config.versions             = ?tls_server.versions[0];
+    dialer_tls_config.version_len          = 1;
+    dialer_tls_config.suites               = ?tls_server.suites[0];
+    dialer_tls_config.suite_len            = 1;
+    dialer_tls_config.groups               = ?tls_server.groups[0];
+    dialer_tls_config.group_len            = 1;
+    dialer_tls_config.signatures           = ?tls_server.signatures[0];
+    dialer_tls_config.signature_len        = 1;
+    dialer_tls_config.client_identity      = nil;
+    dialer_tls_config.entropy              = ?dialer_entropy;
+    dialer_tls_config.entropy_context_size = 1;
+    dialer_tls_config.limits               = tls_config.production_limits();
+    dialer_tls_config.clock                = test_credentials.test_clock();
+    if (!tls_client.init(?dialer_tls, ?dialer_tls_config, assembly.tls_lease(?dialer),
+        tls_client.ExtraExtension{kind: tls_client.QUIC_TRANSPORT_PARAMETERS,
+        data: contracts.Bytes{data: ?dialer_parameters[0], len: encoded.count}},
+        tls_client.QUIC_TRANSPORT_PARAMETERS)
+        || !operation_ok(cancel.make_root(?dialer_scope, opt[time.Instant].none{}))) {
+        ret 0;
+    }
+    val dialed: assembly.InitResult = assembly.init_client(?dialer, ?dialer_config,
+        ?dialer_storage, ?dialer_scratch, shared,
+        memory.borrowed_source(?dialer_borrower), ?dialer_tls, ?dialer_scope, now);
+    if (!dialed.ok) { ret 0; }
+    val first: qt.Generated = qt.generate[binding.Binding](?dialer.driver, ?dialer_scope,
+        wire, capacity, now, 0);
+    if (first.status != qt.STATUS_OK || first.count == 0) { ret 0; }
+    ret first.count;
+}
+
+# a handshake whose flight the pool refused waits on its account, and only the
+# account's wake routed through `funded` reaches storage_ready: memory coming
+# back is not enough on its own, and the flight goes out once the wake arrives
+test "hedge.protocol.quic.runtime: a handshake refused memory resumes on its account's wake" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret 1; }
+    val value:      *Connection = connection_at(controls, index);
+    var tls_server: TestServer;
+    val prepared:   i32         = test_prepare_server(?tls_server, ?fixture, controls, index);
+    if (prepared != 0) { ret prepared; }
+    # nothing set aside, so the handshake draws on the shared pool alone
+    tls_server.config.chunk_reserve = 0;
+    val started:     u64                 = 1000000000;
+    val initialized: assembly.InitResult = assembly.init_server(
+        ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
+        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        memory.borrowed_source(?value.storage.borrower),
+        handshake_at(controls, value.handshake),
+        ?value.storage.scope, clock.from_ns(started));
+    if (!initialized.ok || !value.assembly.initialized) { ret 2; }
+    value.tls_live           = true;
+    value.assembly_attempted = true;
+    var wire: [assembly.MAX_UDP_PAYLOAD]u8;
+    val sent: usize = test_dial(?tls_server, ?controls.pumps[0].secret_scratch, ?wire[0],
+        assembly.MAX_UDP_PAYLOAD, clock.from_ns(started + 500));
+    if (sent == 0) { ret 3; }
+    val driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
+    var input:  qt.Datagram;
+    input.local       = ip.endpoint(192, 0, 2, 1, 4433);
+    input.peer        = ip.endpoint(192, 0, 2, 2, 55000);
+    input.data        = ?wire[0];
+    input.length      = sent;
+    input.received_at = clock.from_ns(started + 800);
+    input.ecn         = 0;
+    val received: qt.OperationResult = qt.receive_datagram[binding.Binding](driver, ?input);
+    if (received.status != qt.STATUS_OK) { ret 4; }
+    # the ClientHello is in. every chunk the pool has left is taken before the
+    # server answers it
+    var hog: TestHog;
+    if (!test_hog(?hog, ?fixture.memory)) { ret 5; }
+    val refused: qt.Generated = qt.generate[binding.Binding](driver, ?value.storage.scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(started + 1000), 0);
+    if (refused.status != qt.STATUS_BLOCKED || !value.assembly.core.send_refused
+        || !memory.waiting(?value.assembly.account)) { ret 6; }
+    # waiting on its account is a registered wait, not a missed wake
+    if (audit(controls, ?runtime, clock.from_ns(started + 1000)) != 0) { ret 7; }
+    if (!test_unhog(?hog, ?fixture.memory))                            { ret 8; }
+    # the memory is back, but the refused flight is retried only by the wake
+    val still: qt.Generated = qt.generate[binding.Binding](driver, ?value.storage.scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(started + 2000), 0);
+    if (still.status != qt.STATUS_BLOCKED) { ret 9; }
+    var owners: [4]u64;
+    if (memory.woken(?fixture.memory, ?owners[0], 4) != 1
+        || owners[0] != timer_owner(index)) { ret 10; }
+    # a wake from the waker queue only queues the record
+    wake(controls, ?runtime, owners[0]);
+    if (!value.ready || !value.assembly.core.send_refused) { ret 11; }
+    unmark_ready(controls, ?runtime, index);
+    funded(controls, ?runtime, owners[0]);
+    if (!value.ready) { ret 12; }
+    unmark_ready(controls, ?runtime, index);
+    val flight: qt.Generated = qt.generate[binding.Binding](driver, ?value.storage.scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(started + 3000), 0);
+    if (flight.status != qt.STATUS_OK || flight.count == 0) { ret 13; }
     ret 0;
 }
