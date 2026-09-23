@@ -244,21 +244,19 @@ sockets_released() {
     test "$open" -le "$idle"
 }
 
-# the next loopback source address a holder binds, so no two holders of one
-# server share an address's ephemeral ports
+# the loopback source address the next holder binds, so no two holders of
+# one server share an address's ephemeral ports. each holder takes the next
 next_source=2
-source_address() {
-    echo "127.0.0.$next_source"
-    next_source=$((next_source + 1))
-}
 
 # starts one holder of `count` HTTP/1.1 connections idle after one served
 # request each, from its own source address
 start_http_holder() {
     local name="$1" count="$2" tls="$3" port="$CLEARTEXT_PORT" flags=()
+    local source="127.0.0.$next_source"
+    next_source=$((next_source + 1))
     if [ "$tls" = 1 ]; then port="$SECURE_PORT"; flags=(--tls); fi
     start_holder "$name" python3 test/load/hold.py --port "$port" \
-        --connections "$count" --timeout 60 --source "$(source_address)" "${flags[@]}"
+        --connections "$count" --timeout 60 --source "$source" "${flags[@]}"
 }
 
 # starts one holder of `count` HTTP/3 connections idle after their handshakes,
@@ -267,11 +265,12 @@ start_http_holder() {
 # lane measures what an idle connection holds, not what a burst admits.
 DIALING=64
 start_quic_holder() {
-    local name="$1" count="$2"
+    local name="$1" count="$2" source="127.0.0.$next_source"
+    next_source=$((next_source + 1))
     start_holder "$name" "$h3load" -address "127.0.0.1:$QUIC_PORT" \
         -connections "$count" -serve=false -dialing "$DIALING" \
         -connect-timeout 60s -idle-timeout 900s -keep-alive "${quic_keepalive}s" \
-        -source "$(source_address)" -hold
+        -source "$source" -hold
 }
 
 # holds `count` more connections over `transport`, split across holders of at
