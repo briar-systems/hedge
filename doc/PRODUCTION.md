@@ -47,6 +47,13 @@ Production grade is an evidence standard. A feature is production grade only whe
 
 No single benchmark becomes the architecture. Performance evidence includes small and large bodies, many idle connections, slow peers, high concurrency, packet loss, TLS handshakes, cache behavior, and application work.
 
+## Multi-core
+
+On Linux each worker listens on its own `SO_REUSEPORT` socket for the life of
+the process. A reuseport socket that closes resets the connections queued on it
+unless the kernel migrates them, so hosts that stop or restart hedge under load
+should set `net.ipv4.tcp_migrate_req=1`.
+
 ## Portability
 
 Each supported target has native CI and release evidence. A platform is not supported because its source compiles elsewhere.

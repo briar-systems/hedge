@@ -27,8 +27,10 @@ build into `.tools/`.
 
 Each of `LOAD_CONNECTIONS` workers owns one connection and issues requests on it
 back to back. The run stops as soon as the median connection has completed
-`LOAD_TARGET` requests, and then every connection must have completed at least
-half of that median.
+`LOAD_TARGET` requests (40 by default), and then every connection must have
+completed at least half of that median. The target outlasts the ramp: hedge's
+workers take their first connections at different moments, which over a
+handful of requests spreads the counts on its own.
 
 The verdict is a ratio taken inside a single run, never a duration. A slow
 machine moves every connection's count together and the ratio does not move, so

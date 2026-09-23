@@ -14,7 +14,11 @@ set -u
 
 binary="${HEDGE_BINARY:-out/linux-x86_64/release/bin/hedge}"
 connections="${LOAD_CONNECTIONS:-256}"
-target="${LOAD_TARGET:-8}"
+# the target is large enough that the ratio outlasts the ramp: workers take
+# their first connections at different moments, and over a handful of
+# requests that alone spreads the counts (#173). a starved connection still
+# stands out at any target
+target="${LOAD_TARGET:-40}"
 # past the 1024 QUIC connections a server with no configured limit used to be
 # capped at, so this cell fails on any build that still preallocates
 quic_connections="${LOAD_QUIC_CONNECTIONS:-1100}"
@@ -117,11 +121,14 @@ fi
 # a configured cap is one process-wide number, whichever transport a
 # connection arrives on. TCP takes part of it, QUIC must be admitted to exactly
 # the rest, and then TCP must be refused because QUIC holds the remainder.
+# exactly is one worker's promise: across workers the cap is never exceeded,
+# but a worker may refuse while another holds allowance it is not using, up to
+# the worker count times a batch, so this cell runs one
 echo
 write_config "$work/capped.toml" \
     "max_connections = $CAP
 max_connections_per_peer = $CAP" \
-    "$CAPPED_CLEARTEXT_PORT" "$CAPPED_SECURE_PORT" "$CAPPED_QUIC_PORT"
+    "$CAPPED_CLEARTEXT_PORT" "$CAPPED_SECURE_PORT" "$CAPPED_QUIC_PORT" "" "" 1
 start_hedge "$work/capped.toml"
 
 start_holder tcp python3 test/load/hold.py --port "$CAPPED_CLEARTEXT_PORT" \

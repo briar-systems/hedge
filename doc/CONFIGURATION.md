@@ -83,6 +83,48 @@ The implemented schema accepts these top-level sections:
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
+## Workers
+
+hedge runs a supervisor and one worker per CPU. The supervisor takes the
+signals, reloads the configuration, drives ACME and maintains the TLS policies.
+Each worker serves connections on a thread of its own, with its own io runtime,
+listeners, timers, buffer pool and proxy pools.
+
+```toml
+[server]
+name = "example"
+workers = 8
+pin_workers = true
+```
+
+- `server.workers` is how many workers serve. It defaults to one per CPU the
+  process may run on, and a process runs at most 256.
+- `server.pin_workers` pins worker `i` to the `i`th CPU the process may run on.
+  It defaults to true. Where pinning is unsupported or refused, the workers run
+  unpinned and startup says so once. A single worker is never pinned.
+- Both are fixed at startup, so a reload that changes either is refused.
+
+How connections reach the workers depends on what the platform can do:
+
+- On Linux every worker binds its own socket for each TCP listener with
+  `SO_REUSEPORT`, and the kernel spreads connections across them.
+- Elsewhere, and for local listeners, the first worker accepts and hands each
+  connection to the least loaded worker serving the same configuration. A
+  worker whose queue of handed connections is full is passed over, and the
+  first worker serves the connection itself.
+- A QUIC listener is served by the first worker until connection IDs route
+  datagrams across workers (#174).
+- While the cache is enabled, one worker serves, until a store worker owns the
+  cache's disk (#286).
+
+The caps stay process-wide. `max_connections`, `max_handshakes` and every
+budget's `concurrency` and `memory_bytes` are held as per-worker allowances
+drawn in batches from one shared pool, so the total never exceeds the cap. A
+worker can refuse while another holds allowance it is not using, which is
+bounded by the worker count times the batch. The per-peer caps are counted
+across every worker. `server.limits.memory_bytes` sizes each worker's buffer
+pool.
+
 ## TLS policies
 
 A `tls` policy names the credentials one listener serves. The single-pair form
@@ -273,7 +315,8 @@ read and write buffers, and each request's parsed head. Nothing is reserved per
 connection up front. Each connection instead opens an account on the pool with
 a budget, and borrows against it as it needs memory.
 
-- `server.limits.memory_bytes` is the pool's total budget. It defaults to
+- `server.limits.memory_bytes` is the pool's total budget, for each worker's
+  pool. It defaults to
   `max_connections` connections' worth, or 256 connections' worth when
   `max_connections` is not set.
 - `server.limits.connection_memory_bytes` is what one connection may hold. It

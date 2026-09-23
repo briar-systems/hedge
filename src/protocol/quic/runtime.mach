@@ -64,6 +64,7 @@ use http.core.message;
 use h3: http.h3.connection;
 
 use process_admission: hedge.admission;
+use hedge.allowance;
 use hedge.budget;
 use hedge.clock;
 use hedge.config.schema;
@@ -177,6 +178,12 @@ pub rec RuntimeConfig {
     # the worker's wake queue. a service waiting on something wakes its
     # connection through it, and the worker hands the wake back through `wake`
     wakes: *hedge_wake.Queue;
+    # the caps this runtime's handshakes share with every worker's: each
+    # address's share of handshakes admitted, and the handshakes in flight.
+    # nil holds them alone, sized from the pump configuration
+    handshakes:      *process_admission.Shared;
+    handshake_slots: *allowance.Pool;
+    worker:          usize;
 }
 
 # a wheel owner is tagged as QUIC so a worker sharing one wheel can route it
@@ -685,6 +692,11 @@ pub rec Runtime {
     max_handshakes:       usize;
     handshakes:           process_admission.Manager;
     handshakes_in_flight: usize;
+    # this worker's allowance of the process's handshakes in flight, from the
+    # shared pool or from `own_slots` when the runtime holds the cap alone
+    handshake_slots: allowance.Share;
+    own_slots:       allowance.Pool;
+    owns_slots:      bool;
     # stamped on each pending initial so a route to a slot the table has
     # since reused is detected as stale
     pending_generation: u64;
@@ -955,6 +967,7 @@ fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
     value.handshake = NO_HANDSHAKE;
     if (runtime.handshakes_in_flight != 0) {
         runtime.handshakes_in_flight = runtime.handshakes_in_flight - 1;
+        allowance.give(?runtime.handshake_slots, 1);
     }
     release_held(runtime, ?value.held);
     # its work is no longer handshake work: what it is marked for moves lists
@@ -983,8 +996,16 @@ fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
     ret true;
 }
 
+# a slot under this runtime's bound and one of the process's, which every
+# worker's handshakes share
+fun leave_slots(runtime: *Runtime) bool {
+    allowance.leave(?runtime.handshake_slots);
+    ret true;
+}
+
 fun handshake_room(runtime: *Runtime) bool {
-    ret runtime.handshakes_in_flight < runtime.max_handshakes;
+    ret runtime.handshakes_in_flight < runtime.max_handshakes
+        && allowance.room(?runtime.handshake_slots);
 }
 
 # whether the oldest deferred Initial could take a slot this turn
@@ -1333,11 +1354,23 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
         config.backing)
         || !routing.make(?runtime.routes, config.backing)
         || !h3_session.make_pool(?runtime.sessions)
-        || !process_admission.make(?runtime.handshakes, config.backing,
-        opt[usize].none{}, opt[usize].none{})
         || !hedge_storage.make_table[HeldDatagram](?runtime.held, config.backing)) {
         ret false;
     }
+    if (config.handshakes != nil) {
+        if (!process_admission.join(?runtime.handshakes, config.backing,
+            config.handshakes, config.worker)) { ret false; }
+    }
+    or (!process_admission.make(?runtime.handshakes, config.backing,
+        opt[usize].none{}, opt[usize].none{})) { ret false; }
+    runtime.owns_slots = config.handshake_slots == nil;
+    if (runtime.owns_slots) {
+        allowance.make_pool(?runtime.own_slots,
+            opt[usize].some{schema.DEFAULT_MAX_HANDSHAKES},
+            schema.DEFAULT_MAX_HANDSHAKES, nil);
+        allowance.join(?runtime.handshake_slots, ?runtime.own_slots, config.worker);
+    }
+    or { allowance.join(?runtime.handshake_slots, config.handshake_slots, config.worker); }
     runtime.chunks            = config.chunks;
     runtime.memory            = config.memory;
     runtime.backing           = config.backing;
@@ -1806,8 +1839,12 @@ fun reap_admission(bank: *AdmissionGeneration) bool {
 
 fun apply_pump_config(runtime: *Runtime, pump: *Pump, config: *PumpConfig) {
     runtime.max_handshakes = config.max_handshakes;
-    process_admission.retune(?runtime.handshakes, opt[usize].none{},
-        config.max_handshakes_per_peer);
+    # a shared cap is the supervisor's to move, once for every worker
+    if (runtime.owns_slots) {
+        allowance.retune(?runtime.own_slots, config.max_handshakes);
+        process_admission.retune(?runtime.handshakes, opt[usize].none{},
+            config.max_handshakes_per_peer);
+    }
     pump.config                   = @config;
     pump.tls_policy               = config.tls_policy;
     pump.plan                     = config.plan;
@@ -1936,18 +1973,18 @@ fun rollback_result(controls: *ControlView, runtime: *Runtime, updates: *PumpUpd
     ret update_result(status, false, !rolled_back);
 }
 
-fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
-    count: usize, require_all: bool,
-    require_policy_identity: bool) UpdateResult {
+# whether every update could be applied as it stands, without applying any.
+# `changed` is written for each update: whether it moves its pump's admission
+# generation. INVALID or BLOCKED refuse, and nothing has changed either way
+fun validate_updates(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
+    count: usize, require_all: bool, require_policy_identity: bool,
+    changed: *bool) Status {
     if (runtime == nil || !runtime.initialized || runtime.stopping
         || count > MAX_PUMPS || (count != 0 && updates == nil)
         || (require_all && count != runtime.pump_count)) {
-        ret update_result(INVALID, false, false);
+        ret INVALID;
     }
-    if (count == 0) { ret update_result(OK, true, false); }
-    var changed: [MAX_PUMPS]bool;
-    var staged:  [MAX_PUMPS]bool;
-    var i:       usize = 0;
+    var i: usize = 0;
     for (i < count) {
         val update: *PumpUpdate = ?updates[i];
         val pump:   *Pump       = pump_for(controls, runtime, update.handle);
@@ -1956,19 +1993,19 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
             || pump.draining || pump.cancelling
             || !limit_holds(update.config.connection_limit,
             pump.active_connections, pump.queued_initials)) {
-            ret update_result(INVALID, false, false);
+            ret INVALID;
         }
         var prior: usize = 0;
         for (prior < i) {
             if (updates[prior].handle.index == update.handle.index) {
-                ret update_result(INVALID, false, false);
+                ret INVALID;
             }
             prior = prior + 1;
         }
         val current: usize                = pump.active_admission;
         val old:     *AdmissionGeneration = ?pump.admissions[current];
         if (!old.live || old.retiring) {
-            ret update_result(INVALID, false, false);
+            ret INVALID;
         }
         changed[i] = update.config.admission_generation != old.source;
         if (changed[i]) {
@@ -1977,12 +2014,32 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
             if (next.live
                 && (!next.retiring || next.active_connections != 0
                 || next.queued_initials != 0)) {
-                ret update_result(BLOCKED, false, false);
+                ret BLOCKED;
             }
         }
         i = i + 1;
     }
-    i = 0;
+    ret OK;
+}
+
+# whether `update_all` would apply every update, asked without applying any, so
+# a reload spread over several workers can refuse before any of them commits
+pub fun check_all(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
+    count: usize) Status {
+    var changed: [MAX_PUMPS]bool;
+    ret validate_updates(controls, runtime, updates, count, true, true, ?changed[0]);
+}
+
+fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
+    count: usize, require_all: bool,
+    require_policy_identity: bool) UpdateResult {
+    var changed: [MAX_PUMPS]bool;
+    var staged:  [MAX_PUMPS]bool;
+    val valid:   Status = validate_updates(controls, runtime, updates, count,
+        require_all, require_policy_identity, ?changed[0]);
+    if (valid != OK) { ret update_result(valid, false, false); }
+    if (count == 0)  { ret update_result(OK, true, false); }
+    var i: usize = 0;
     for (i < count) {
         if (changed[i]) {
             val pump:   *Pump                = ?controls.pumps[updates[i].handle.index];
@@ -2650,9 +2707,13 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     value.call_memory_bytes  = config_snapshot.call_memory_bytes;
     value.request_timeout_ns = config_snapshot.request_timeout_ns;
     value.memory_wait_ns     = config_snapshot.memory_wait_ns;
-    value.handshake          = claim_handshake(controls);
-    if (value.handshake != NO_HANDSHAKE) {
-        runtime.handshakes_in_flight = runtime.handshakes_in_flight + 1;
+    value.handshake          = NO_HANDSHAKE;
+    if (allowance.take(?runtime.handshake_slots, 1)) {
+        value.handshake = claim_handshake(controls);
+        if (value.handshake != NO_HANDSHAKE) {
+            runtime.handshakes_in_flight = runtime.handshakes_in_flight + 1;
+        }
+        or { allowance.give(?runtime.handshake_slots, 1); }
     }
     # the connection's account spans every hedge lane. quic owns its three
     # (send, receive, crypto) and hedge composes its own (io, request) onto the
@@ -4934,6 +4995,7 @@ pub fun release(controls: *ControlView, runtime: *Runtime) Status {
         || !h3_session.destroy_pool(?runtime.sessions)
         || (runtime.handshakes.initialized
         && !process_admission.destroy(?runtime.handshakes))
+        || !leave_slots(runtime)
         || !hedge_storage.destroy_table[HeldDatagram](?runtime.held)) {
         ret FAILED;
     }
