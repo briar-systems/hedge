@@ -47,7 +47,9 @@ pub val MAX_SERVICES:     usize = 32;
 pub val MAX_MIDDLEWARE:   usize = 16;
 pub val MAX_STATIC_ROOTS: usize = 16;
 pub val CACHE_ENTRIES:    usize = 128;
-pub val PLAN_TEXT_BYTES:  usize = 16384;
+# one worker serves today, so the store keeps one shard: exactly the unsharded store
+pub val CACHE_SHARDS:    usize = 1;
+pub val PLAN_TEXT_BYTES: usize = 16384;
 
 pub rec PlanStorage {
     routes:     [MAX_ROUTES]router.CompiledRoute;
@@ -84,6 +86,7 @@ pub val TELEMETRY_CLOSED:     Event = 10;
 rec Planes {
     proxying:     *proxy.Runtime;
     certificates: *acme.Manager;
+    recording:    *http_cache.Recorders;
 }
 
 # one service bank retained by every connection on its plan
@@ -122,6 +125,8 @@ pub rec Runtime {
     graph:               *schema.Graph;
     proxying:            proxy.Runtime;
     caching:             *http_cache.Layer;
+    recorders:           http_cache.Recorders;
+    recording:           *http_cache.Recorders;
     certificates:        *acme.Manager;
     challenge_binding:   handler.Binding;
     alpn_challenge:      tlsalpn.Alpn;
@@ -274,6 +279,9 @@ fun drive_planes(context: ptr, now: time.Instant) bool {
         # renewal is scheduled against certificate validity, which is calendar time
         advanced = acme.poll((planes.certificates)::ptr, clock.wall()) && advanced;
     }
+    if (planes.recording != nil) {
+        advanced = http_cache.drive(planes.recording) && advanced;
+    }
     advanced = hedge_tls.maintain() && advanced;
     ret advanced;
 }
@@ -308,6 +316,11 @@ fun quiesce_planes(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
         val status: acme.Status = acme.quiesce(planes.certificates);
         if (status == acme.PENDING) { ret serve.PLANE_PENDING; }
         if (status != acme.OK)      { ret serve.PLANE_FAILED; }
+    }
+    # a recording that ended with a disk write in flight settles before stop
+    if (planes.recording != nil) {
+        http_cache.drive(planes.recording);
+        if (http_cache.settling(planes.recording)) { ret serve.PLANE_PENDING; }
     }
     ret serve.PLANE_QUIESCED;
 }
@@ -423,6 +436,9 @@ fun clean(runtime: *Runtime, controls: *Controls) StopReport {
         event(runtime, PROXY_CLOSED);
     }
     if (runtime.cache_live) {
+        if (runtime.recording != nil && !http_cache.close_recorders(runtime.recording)) {
+            cleanup_failures = cleanup_failures + 1;
+        }
         if (!http_cache.close(runtime.caching)) { cleanup_failures = cleanup_failures + 1; }
         runtime.cache_live = false;
         event(runtime, CACHE_CLOSED);
@@ -498,7 +514,7 @@ fun build_service_generation(runtime: *Runtime, slot: usize,
     if (runtime.cache_live) {
         if (!http_cache.make_bindings(?current.cache_bindings,
             ?current.cache_binding_storage[0], MAX_SERVICES, runtime.caching,
-            generation_id)) {
+            runtime.recording, generation_id)) {
             close_service_generation(runtime, slot);
             ret StartReport{status: START_RUNTIME,
                 detail: "cache bindings could not be constructed"};
@@ -562,6 +578,7 @@ pub fun start(runtime: *Runtime, controls: *Controls,
     runtime.heap                       = heap;
     runtime.graph                      = configured;
     runtime.caching                    = nil;
+    runtime.recording                  = nil;
     runtime.certificates               = nil;
     runtime.options                    = options;
     runtime.active_generation          = 0;
@@ -605,10 +622,16 @@ pub fun start(runtime: *Runtime, controls: *Controls,
         runtime.caching = layer_memory.ok;
         if (!http_cache.from_config(runtime.caching, ?configured.cache,
             entry_memory.ok, CACHE_ENTRIES,
-            body_memory.ok, configured.cache.memory_bytes, heap)) {
+            body_memory.ok, configured.cache.memory_bytes, CACHE_SHARDS, heap)) {
             ret fail(runtime, controls, START_CONFIG, "cache could not be constructed");
         }
         runtime.cache_live = true;
+        # the worker's recordings live in the runtime, so a memory cache
+        # allocates nothing more for them
+        if (!http_cache.make_recorders(?runtime.recorders, runtime.caching, heap)) {
+            ret fail(runtime, controls, START_RUNTIME, "cache recorders could not be constructed");
+        }
+        runtime.recording = ?runtime.recorders;
     }
 
     if (configured.acme.enabled) {
@@ -739,6 +762,11 @@ pub fun start(runtime: *Runtime, controls: *Controls,
     }
     runtime.planes.proxying     = ?runtime.proxying;
     runtime.planes.certificates = runtime.certificates;
+    runtime.planes.recording    = runtime.recording;
+    if (runtime.recording != nil
+        && !http_cache.attach_waker(runtime.recording, serve.plane_waker(?runtime.serving))) {
+        ret fail(runtime, controls, START_RUNTIME, "cache recorders could not attach their waker");
+    }
     if (!serve.attach_plane_lifecycle(?runtime.serving, (?runtime.planes)::ptr,
         drive_planes, quiesce_planes, plane_deadline)) {
         ret fail(runtime, controls, START_RUNTIME, "service planes could not be attached");
