@@ -132,9 +132,18 @@ launcher=(python3 -c 'import ctypes, os, sys
 ctypes.CDLL(None, use_errno=True).prctl(41, 1, 0, 0, 0)
 os.execv(sys.argv[1], sys.argv[1:])')
 
-# resident bytes of the served process, from the kernel's own rollup
+# resident bytes of the served process, from the kernel's own rollup, with
+# whatever of it the kernel has swapped out counted back in: under memory
+# pressure a page hedge touched can leave the resident set without leaving
+# hedge's footprint, and a figure that fell for that reason would read as a
+# smaller per-connection cost
 resident() {
-    awk '/^Rss:/ { printf "%d", $2 * 1024 }' "/proc/$hedge_pid/smaps_rollup"
+    awk '/^(Rss|Swap):/ { sum += $2 } END { printf "%d", sum * 1024 }' "/proc/$hedge_pid/smaps_rollup"
+}
+
+# the part of that the kernel had swapped out, printed beside each transport
+swapped() {
+    awk '/^Swap:/ { printf "%d", $2 * 1024 }' "/proc/$hedge_pid/smaps_rollup"
 }
 
 # address space and mapping count: what is reserved rather than touched, and
@@ -324,7 +333,7 @@ hold_more() {
 measure() {
     local transport="$1" pin="$2" r0 r1 r2 r3 r4 v3 m3 s0
     local per_low per_high per once projection agree
-    local c0 c1 c3 d0 d1 d3 t0 t1 t3 a1 a3
+    local c0 c1 c3 d0 d1 d3 t0 t1 t3 a1 a3 w3
     local mid=$(( (small + large) / 2 ))
 
     start_scale_server
@@ -357,6 +366,7 @@ measure() {
     fi
     sleep 0.5
     r3="$(resident)"
+    w3="$(swapped)"
     v3="$(mapped)"
     m3="$(mappings)"
     d3="$(descriptors)"
@@ -389,8 +399,8 @@ measure() {
     fi
     printf '%s: resident idle=%d at %d=%d at %d=%d at %d=%d after release=%d\n' \
         "$transport" "$r0" "$small" "$r1" "$mid" "$r2" "$large" "$r3" "$r4"
-    printf '%s: at %d address space=%d MiB in %d mappings\n' \
-        "$transport" "$large" $((v3 / 1048576)) "$m3"
+    printf '%s: at %d address space=%d MiB in %d mappings, %d KiB of the resident figure swapped out\n' \
+        "$transport" "$large" $((v3 / 1048576)) "$m3" $((w3 / 1024))
     printf '%s: bytes/connection over %d..%d=%d over %d..%d=%d (%+d%%) over %d..%d=%d, once=%d KiB\n' \
         "$transport" "$small" "$mid" "$per_low" "$mid" "$large" "$per_high" "$agree" \
         "$small" "$large" "$per" $((once / 1024))
