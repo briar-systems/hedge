@@ -3697,7 +3697,7 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
             h3_session.cancel_session(session);
             value.h3_cancelled = true;
         }
-        if (!drive_h3(controls, runtime, value, now, now_ns)
+        if (!drive_h3(controls, runtime, value, index, now, now_ns)
             || value.h3_session != h3_session.NO_SESSION) { ret BLOCKED; }
     }
     # finishing the close unregisters the transport from the connection scope
@@ -3743,8 +3743,10 @@ fun selected_h3(value: *Connection) bool {
     ret exact_h3(value.policy);
 }
 
+# the session's waker names the connection, which is what the worker routes
+# wakes to, not the session's own index
 fun start_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
-    now: time.Instant, now_ns: u64) bool {
+    connection_index: usize, now: time.Instant, now_ns: u64) bool {
     if (value.h3_started) { ret true; }
     val index: usize = h3_session.acquire(?runtime.sessions,
         controls.sessions);
@@ -3764,7 +3766,7 @@ fun start_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
         value.request_timeout_ns, now_ns,
         memory.borrowed_source(?value.storage.borrower), ?value.assembly.account,
         runtime.chunks, value.call_memory_bytes,
-        hedge_wake.waker(runtime.wakes, timer_owner(index)))) {
+        hedge_wake.waker(runtime.wakes, timer_owner(connection_index)))) {
         if (!h3_session.abandon(?runtime.sessions,
             controls.sessions, index)) {
             value.h3_session    = index;
@@ -3779,14 +3781,15 @@ fun start_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
 }
 
 fun drive_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
-    now: time.Instant, now_ns: u64) bool {
+    index: usize, now: time.Instant, now_ns: u64) bool {
     val transport: qt.Snapshot =
         qt.snapshot[binding.Binding](?value.assembly.driver);
     if (!value.h3_started
         && (value.state == CONNECTION_LIVE
         || value.state == CONNECTION_GRACEFUL)
         && transport.state == qt.ACTIVE) {
-        if (!selected_h3(value) || !start_h3(controls, runtime, value, now, now_ns)) {
+        if (!selected_h3(value)
+            || !start_h3(controls, runtime, value, index, now, now_ns)) {
             ret close_or_cancel_transport(value,
                 h3.H3_GENERAL_PROTOCOL_ERROR, now_ns);
         }
@@ -3926,7 +3929,7 @@ fun progress_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     # an h3 failure must not stop the transport: its queued close still has to
     # reach the wire and its drain timer still has to fire for the connection
     # to be reclaimed
-    val h3_ok: bool = drive_h3(controls, runtime, value, now, now_ns);
+    val h3_ok: bool = drive_h3(controls, runtime, value, index, now, now_ns);
     value.h3_deadline_ns = 0;
     if (value.h3_session != h3_session.NO_SESSION) {
         val session: *h3_session.Session = h3_session.session_at(
@@ -4220,7 +4223,7 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
         observe_transport_close(value, now_ns);
         if (!value.close_started) { ret BLOCKED; }
         if (value.h3_session != h3_session.NO_SESSION) {
-            if (!drive_h3(controls, runtime, value, now, now_ns)
+            if (!drive_h3(controls, runtime, value, index, now, now_ns)
                 || value.h3_session != h3_session.NO_SESSION) { ret BLOCKED; }
         }
         if (send_operations_pending(value)) { ret BLOCKED; }
@@ -4541,6 +4544,8 @@ fun pending_work(controls: *ControlView, runtime: *Runtime, value: *Connection,
         || memory.waiting(?value.assembly.account)) { ret false; }
     val session: *h3_session.Session = h3_session.session_at(
         ?runtime.sessions, controls.sessions, value.h3_session);
+    # a parked service whose named wait moved is re-entered by the next step
+    if (h3_session.stirred(session)) { ret true; }
     ret h3_session.takes_news(session)
         && qt.pending_stream_news[binding.Binding](?value.assembly.driver);
 }
@@ -4648,7 +4653,9 @@ fun wake_pending(runtime: *Runtime, owner: u64) {
     mark_pending_ready(runtime, index);
 }
 
-pub fun wake(controls: *ControlView, runtime: *Runtime, owner: u64) {
+# a wake naming `woken_call` is for that request of the connection's HTTP/3
+# session, whose parked service the session's next step re-enters (#131)
+pub fun wake(controls: *ControlView, runtime: *Runtime, owner: u64, woken_call: u32) {
     if (runtime == nil || !runtime.initialized) { ret; }
     if (owns_pending(owner)) {
         wake_pending(runtime, owner);
@@ -4657,6 +4664,12 @@ pub fun wake(controls: *ControlView, runtime: *Runtime, owner: u64) {
     if (!owns_timer(owner)) { ret; }
     val index: usize = (owner & ~TIMER_MASK)::usize;
     if (index >= hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections)) { ret; }
+    val value: *Connection = connection_at(controls, index);
+    if (value.live && woken_call != hedge_wake.NO_CALL
+        && value.h3_session != h3_session.NO_SESSION && !value.h3_abandoning) {
+        h3_session.stir(h3_session.session_at(?runtime.sessions, controls.sessions,
+            value.h3_session), woken_call);
+    }
     mark_ready(controls, runtime, index);
 }
 
@@ -5696,9 +5709,9 @@ test "hedge.protocol.quic.runtime: a budget release wakes the initial queued beh
     if (wheel.armed_count(?fixture.timers) != 0 || has_ready(?runtime)) { ret 3; }
     if (!budget.release(?budgets, ?running)
         || pending.budget_charge.outcome != budget.ADMITTED) { ret 4; }
-    var owners: [4]u64;
-    if (hedge_wake.take(?fixture.wakes, ?owners[0], 4) != 1 || !owns(owners[0])) { ret 5; }
-    wake(controls, ?runtime, owners[0]);
+    var taken: [4]hedge_wake.Wake;
+    if (hedge_wake.take(?fixture.wakes, ?taken[0], 4) != 1 || !owns(taken[0].owner)) { ret 5; }
+    wake(controls, ?runtime, taken[0].owner, taken[0].call);
     if (!pending.ready || runtime.pending_ready_head != 0) { ret 6; }
     # the pump went away meanwhile, so the woken initial is released, not admitted
     controls.pumps[0].live = false;
@@ -7260,7 +7273,7 @@ test "hedge.protocol.quic.runtime: a handshake refused memory resumes on its acc
     if (memory.woken(?fixture.memory, ?owners[0], 4) != 1
         || owners[0] != timer_owner(index)) { ret 10; }
     # a wake from the waker queue only queues the record
-    wake(controls, ?runtime, owners[0]);
+    wake(controls, ?runtime, owners[0], hedge_wake.NO_CALL);
     if (!value.ready || !value.assembly.core.send_refused) { ret 11; }
     unmark_ready(controls, ?runtime, index);
     funded(controls, ?runtime, owners[0]);
