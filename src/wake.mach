@@ -18,6 +18,9 @@
 use A: std.allocator;
 use std.allocator.page;
 use std.collections.vector;
+use io_runtime: std.io.runtime;
+use std.sync.atomic;
+use std.sync.mutex;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -28,6 +31,22 @@ use std.types.size.usize;
 pub rec Queue {
     wakes:       vector.Vector[Wake];
     initialized: bool;
+    # what other threads posted, and the runtime whose wait a post ends
+    inbox_lock:  mutex.Mutex;
+    inbox_head:  *Posted;
+    inbox_tail:  *Posted;
+    inbox_count: i64;
+    runtime:     *io_runtime.Runtime;
+}
+
+# one wake another thread hands to a worker. it belongs to the poster until it
+# is received: then `settle` runs with `context` on the worker's thread, and the
+# node belongs to whoever `settle` gives it back to
+pub rec Posted {
+    next:    *Posted;
+    waker:   Waker;
+    settle:  fun(ptr);
+    context: ptr;
 }
 
 # one wake as the worker takes it: the owner to run, and the call of that owner
@@ -57,12 +76,21 @@ pub fun no_waker() Waker {
 pub fun make(queue: *Queue, a: *A.Allocator) bool {
     if (queue == nil || a == nil || queue.initialized) { ret false; }
     queue.wakes       = vector.init[Wake](a);
+    queue.inbox_lock  = mutex.make();
+    queue.inbox_head  = nil;
+    queue.inbox_tail  = nil;
+    queue.inbox_count = 0;
+    queue.runtime     = nil;
     queue.initialized = true;
     ret true;
 }
 
+# a queue with nothing posted and not yet received gives up its runtime, and is
+# then destroyed
 pub fun destroy(queue: *Queue) bool {
     if (queue == nil || !queue.initialized) { ret false; }
+    if (atomic.load(?queue.inbox_count) != 0) { ret false; }
+    detach_runtime(queue);
     val released: err[A.Error] = vector.dnit[Wake](?queue.wakes);
     queue.initialized = false;
     ret sel released.ok;
@@ -91,14 +119,83 @@ pub fun wake(value: *Waker) bool {
     ret sel pushed.ok;
 }
 
-pub fun pending(queue: *Queue) bool {
-    ret queue != nil && queue.initialized && queue.wakes.len != 0;
+# the runtime a post wakes: the one the queue's worker waits in
+pub fun attach_runtime(queue: *Queue, runtime: *io_runtime.Runtime) bool {
+    if (queue == nil || !queue.initialized || runtime == nil) { ret false; }
+    queue.runtime = runtime;
+    ret true;
 }
 
-# take up to `capacity` wakes in the order they were made. wakes made while the
-# caller routes these wait for the next take
+# after this returns no post reaches the runtime, so it may be destroyed
+pub fun detach_runtime(queue: *Queue) {
+    if (queue == nil || !queue.initialized) { ret; }
+    mutex.lock(?queue.inbox_lock);
+    queue.runtime = nil;
+    mutex.unlock(?queue.inbox_lock);
+}
+
+# hand `node` to its waker's worker from any thread. false when that worker
+# cannot be reached, and the node is then still the caller's
+pub fun post(node: *Posted) bool {
+    if (node == nil || node.settle::usize == 0 || !valid(?node.waker)) { ret false; }
+    val queue: *Queue = node.waker.queue;
+    mutex.lock(?queue.inbox_lock);
+    val runtime: *io_runtime.Runtime = queue.runtime;
+    if (runtime == nil) {
+        mutex.unlock(?queue.inbox_lock);
+        ret false;
+    }
+    node.next = nil;
+    if (queue.inbox_tail == nil) { queue.inbox_head = node; }
+    or                           { queue.inbox_tail.next = node; }
+    queue.inbox_tail = node;
+    atomic.fetch_add(?queue.inbox_count, 1);
+    # the wake is made under the lock, so the runtime cannot be detached and
+    # destroyed between reading it and waking it
+    io_runtime.wake(runtime);
+    mutex.unlock(?queue.inbox_lock);
+    ret true;
+}
+
+# settle what other threads posted and queue their wakes, on the worker's
+# thread. false when a wake could not be queued, which the caller must treat as
+# a waiter that will never run again
+pub fun receive(queue: *Queue) bool {
+    if (queue == nil || !queue.initialized || atomic.load(?queue.inbox_count) == 0) {
+        ret true;
+    }
+    mutex.lock(?queue.inbox_lock);
+    var node: *Posted = queue.inbox_head;
+    queue.inbox_head = nil;
+    queue.inbox_tail = nil;
+    atomic.store(?queue.inbox_count, 0);
+    mutex.unlock(?queue.inbox_lock);
+    var queued: bool = true;
+    for (node != nil) {
+        val next:   *Posted = node.next;
+        var target: Waker   = node.waker;
+        node.settle(node.context);
+        if (!wake(?target)) { queued = false; }
+        node = next;
+    }
+    ret queued;
+}
+
+# whether another thread posted something not yet received
+pub fun posted(queue: *Queue) bool {
+    ret queue != nil && queue.initialized && atomic.load(?queue.inbox_count) != 0;
+}
+
+pub fun pending(queue: *Queue) bool {
+    ret queue != nil && queue.initialized
+        && (queue.wakes.len != 0 || atomic.load(?queue.inbox_count) != 0);
+}
+
+# take up to `capacity` wakes in the order they were made, after receiving what
+# was posted. wakes made while the caller routes these wait for the next take
 pub fun take(queue: *Queue, output: *Wake, capacity: usize) usize {
     if (queue == nil || !queue.initialized || output == nil) { ret 0; }
+    receive(queue);
     var count: usize = queue.wakes.len;
     if (count > capacity) { count = capacity; }
     var i: usize = 0;

@@ -125,6 +125,10 @@ pub def PlaneQuiesceFun: fun(ptr, time.Instant) PlaneQuiesceStatus;
 # when it has none. the serving loop arms it on the wheel so the poll wait
 # ends when the plane is due rather than on a fixed interval (#182)
 pub def PlaneDeadlineFun: fun(ptr, *u64) bool;
+# whether the plane holds work its next drive would do. the debug audit asks it
+# of a plane that is not due, since such work was left there by a wake that
+# never came (#286)
+pub def PlaneWorkFun: fun(ptr) bool;
 
 # in debug builds the audit runs once every AUDIT_POLLS turns. it is counted in
 # turns and never armed on a timer, so it cannot end a wait itself and hide a
@@ -158,6 +162,7 @@ pub rec Runtime {
     plane:          PlaneFun;
     plane_quiesce:  PlaneQuiesceFun;
     plane_deadline: PlaneDeadlineFun;
+    plane_work:     PlaneWorkFun;
     generation:     u64;
     owner:          listener.Owner;
     # the slot directory grows and a record never moves, so a completion
@@ -279,6 +284,7 @@ pub fun make(
     runtime.plane_ctx      = nil;
     runtime.plane          = (0::usize)::PlaneFun;
     runtime.plane_quiesce  = (0::usize)::PlaneQuiesceFun;
+    runtime.plane_work     = (0::usize)::PlaneWorkFun;
     runtime.served         = 0;
     runtime.accepted       = 0;
     runtime.last_refusal   = prologue.REFUSED_NONE;
@@ -349,6 +355,13 @@ pub fun attach_plane_lifecycle(runtime: *Runtime, context: ptr, plane: PlaneFun,
     runtime.plane_quiesce  = quiesce;
     runtime.plane_deadline = deadline;
     runtime.plane_due      = true;
+    ret true;
+}
+
+# what the debug audit asks the plane, which is optional
+pub fun attach_plane_audit(runtime: *Runtime, work: PlaneWorkFun) bool {
+    if (runtime == nil || work::usize == 0 || runtime.plane::usize == 0) { ret false; }
+    runtime.plane_work = work;
     ret true;
 }
 
@@ -495,9 +508,16 @@ fun fail_start(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
         ret false;
     }
     runtime.state = DRAINING;
-    val stopped: bool = listener.stop(?runtime.owner);
+    val stopped: bool = stop_listener(runtime);
     if (stopped) { runtime.state = STOPPED; }
     ret released && stopped;
+}
+
+# the listener's io runtime is what a post from another thread wakes, so the
+# wake queue lets go of it before the listener destroys it
+fun stop_listener(runtime: *Runtime) bool {
+    hedge_wake.detach_runtime(?runtime.wakes);
+    ret listener.stop(?runtime.owner);
 }
 
 fun start_quic(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64,
@@ -552,6 +572,12 @@ pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation
     diagnostics: *schema.Diagnostics) bool {
     if (runtime == nil || runtime.state != NEW)                          { ret false; }
     if (!listener.start(?runtime.owner, generation, graph, diagnostics)) { ret false; }
+    # another thread's completion (the cache's store worker) reaches this
+    # worker through its wake queue, and ends its wait through this runtime
+    if (!hedge_wake.attach_runtime(?runtime.wakes, ?runtime.owner.runtime)) {
+        fail_start(controls, runtime);
+        ret false;
+    }
     if (runtime.quic != nil && !quic_runtime.bind_admission(runtime.quic,
         listener.admission_manager(?runtime.owner))) {
         fail_start(controls, runtime);
@@ -996,6 +1022,9 @@ fun route_funded(controls: *quic_runtime.ControlView, runtime: *Runtime, owner: 
 # hand every woken owner to the protocol that owns it, whether a waiter woke it
 # or the buffer pool funded its account again
 fun route_wakes(controls: *quic_runtime.ControlView, runtime: *Runtime) {
+    if (!hedge_wake.receive(?runtime.wakes)) {
+        runtime.teardown_failures = runtime.teardown_failures + 1;
+    }
     var owners: [WAKE_BATCH]u64;
     for {
         val funded: usize = hedge_memory.woken(?runtime.memory, ?owners[0], WAKE_BATCH);
@@ -1246,6 +1275,12 @@ pub fun audit(controls: *quic_runtime.ControlView, runtime: *Runtime,
     runtime.audits = runtime.audits + 1;
     var found: usize = audit_list(runtime, ?runtime.current)
         + audit_list(runtime, ?runtime.previous);
+    # a plane with a deadline runs only when due, so work it holds while not due
+    # is work nothing will run
+    if (runtime.plane_deadline::usize != 0 && !runtime.plane_due
+        && runtime.plane_work::usize != 0 && runtime.plane_work(runtime.plane_ctx)) {
+        found = found + 1;
+    }
     if (runtime.quic != nil && !runtime.quic_released) {
         found = found + quic_runtime.audit(controls, runtime.quic, now);
     }
@@ -1364,7 +1399,7 @@ fun run_action(controls: *quic_runtime.ControlView, runtime: *Runtime, action: l
     or {
         ok = release_quic(controls, runtime);
         if (runtime.quic == nil || runtime.quic_released) {
-            if (listener.stop(?runtime.owner)) {
+            if (stop_listener(runtime)) {
                 runtime.state = STOPPED;
             }
             or {
@@ -1626,7 +1661,7 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
         if (runtime.state != STOPPED) {
             val quic_ok: bool = release_quic(controls, runtime);
             if (runtime.quic == nil || runtime.quic_released) {
-                if (!listener.stop(?runtime.owner)) {
+                if (!stop_listener(runtime)) {
                     runtime.teardown_failures = runtime.teardown_failures + 1;
                 }
                 or {
@@ -1692,7 +1727,13 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
                 lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
                 ret false;
             }
-            val idle: bool = listener.dispatched(?runtime.owner) == dispatched;
+            # what another thread completed for the plane is settled here, on
+            # this thread, before the plane looks at it
+            var idle: bool = listener.dispatched(?runtime.owner) == dispatched
+                && !hedge_wake.posted(?runtime.wakes);
+            if (!hedge_wake.receive(?runtime.wakes)) {
+                runtime.teardown_failures = runtime.teardown_failures + 1;
+            }
             if (!idle) { deadline = clock.after_ns(clock.monotonic_ns(), runtime.stop_timeout_ns); }
             val settled: time.Instant = clock.instant();
             if (runtime.plane::usize != 0) {
