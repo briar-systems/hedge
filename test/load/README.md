@@ -236,15 +236,18 @@ fit the runner.
 
 ### Idle CPU, descriptors and timers (#176)
 
-Each step also measures what an idle connection costs in CPU. The lane reads
-the served process's CPU time over `LOAD_SCALE_IDLE_SECONDS` (10) with
-nothing but the held connections, at 0, at the small count and at the large
-count. For QUIC the connections include their keep-alives, one PING every
-`LOAD_SCALE_QUIC_KEEPALIVE` seconds (30) per connection. The cost above idle,
-per connection per second, has to be flat in N: the large step may spend no
-more than the small step's per-connection cost times the large count, within
-`LOAD_SCALE_CPU_TOLERANCE` percent (50) and two clock ticks of measurement
-resolution. A per-event path that walks the live connections costs O(N) per
+Each step also measures what an idle connection costs in CPU. At 0, at the
+small count and at the large count, the lane reads the served process's CPU
+time (each thread's `schedstat`, in nanoseconds) over a window in which it
+does nothing but hold the connections. For TCP and TLS the window is
+`LOAD_SCALE_IDLE_SECONDS` (10). QUIC connections send a keep-alive PING every
+`LOAD_SCALE_QUIC_KEEPALIVE` seconds (15), and a step's connections are
+dialled together, so their PINGs arrive in one burst per period, the first a
+full period after the step. The QUIC window therefore opens one period after
+the step and lasts one whole period. The cost above idle, per connection per
+second, has to be flat in N: the large step may spend no more than the small
+step's per-connection cost times the large count, within
+`LOAD_SCALE_CPU_TOLERANCE` percent (50) plus 2 ms per window of noise. A per-event path that walks the live connections costs O(N) per
 event and O(N²) per second, and it fails here.
 
 Descriptors and timer-wheel entries are counted at each step as well. A TCP or
