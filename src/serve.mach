@@ -131,6 +131,11 @@ pub def PlaneDeadlineFun: fun(ptr, *u64) bool;
 # wake that went missing (#182)
 val AUDIT_POLLS: u64 = 64;
 
+# in debug builds no wait outlasts this, and a turn in which nothing happened is
+# audited at once. a wake that went missing leaves a wait nothing ends, so
+# without the bound no turn would end for the audit to run in (#273)
+val AUDIT_WAIT_MS: i32 = 1000;
+
 # how many fired timer owners one wheel advance hands back at a time
 val FIRE_BATCH: usize = 64;
 
@@ -165,6 +170,9 @@ pub rec Runtime {
     retiring: usize;
     # the wheel entry that ends the previous generation's drain (#182)
     drain_timer: hedge_timer.Handle;
+    # the wheel entry that ends a wait at the shutdown's drain deadline, so the
+    # sequence cancels when it is due rather than on some later event (#273)
+    shutdown_timer: hedge_timer.Handle;
     # the wheel entry the plane's own deadline is armed on, and whether the
     # plane asked to be driven before the next wait
     plane_timer:   hedge_timer.Handle;
@@ -183,6 +191,8 @@ pub rec Runtime {
     rejected:         u64;
     shutdown:         lifecycle.State;
     drain_timeout_ns: u64;
+    # how long a stop waits with no connection closing before it gives up
+    stop_timeout_ns: u64;
     # a fallible teardown call that failed. a return nobody reads is a check
     # that does not exist, which is how a total teardown failure stayed
     # invisible until the shutdown sequence started reporting its outcome.
@@ -276,7 +286,9 @@ pub fun make(
     runtime.refused_memory = 0;
     runtime.shutdown       = lifecycle.make();
     if (!timeout_nanoseconds(graph.timeouts.drain_ms,
-        ?runtime.drain_timeout_ns)) { ret false; }
+        ?runtime.drain_timeout_ns)
+        || !timeout_nanoseconds(graph.timeouts.stop_ms,
+        ?runtime.stop_timeout_ns)) { ret false; }
     runtime.queued            = 0;
     runtime.expired           = 0;
     runtime.polls             = 0;
@@ -291,13 +303,14 @@ pub fun make(
     runtime.current        = empty_list();
     runtime.previous       = empty_list();
     runtime.retiring       = 0;
-    # both entries are claimed at the first deadline they hold, so an idle
-    # worker holds no wheel storage until a plane has one or a reload lands
-    runtime.drain_timer = hedge_timer.no_handle();
-    runtime.plane_timer = hedge_timer.no_handle();
-    runtime.plane_due   = true;
-    runtime.ready_head  = NO_SLOT;
-    runtime.ready_tail  = NO_SLOT;
+    # each entry is claimed at the first deadline it holds, so an idle worker
+    # holds no wheel storage until a plane has one, a reload or a shutdown lands
+    runtime.drain_timer    = hedge_timer.no_handle();
+    runtime.shutdown_timer = hedge_timer.no_handle();
+    runtime.plane_timer    = hedge_timer.no_handle();
+    runtime.plane_due      = true;
+    runtime.ready_head     = NO_SLOT;
+    runtime.ready_tail     = NO_SLOT;
     var i: usize = 0;
     for (i < schema.MAX_LISTENERS) {
         runtime.quic_handle_live[i] = false;
@@ -452,7 +465,11 @@ fun release_quic(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     if (runtime.quic == nil || runtime.quic_released) { ret true; }
     var success:  bool                = quic_runtime.cancel_all(controls, runtime.quic) == quic_runtime.OK;
     var released: quic_runtime.Status = quic_runtime.release(controls, runtime.quic);
+    # a release that stays blocked for the stop deadline fails, rather than
+    # holding the stop in this loop forever (#273)
+    val deadline: u64 = clock.after_ns(clock.monotonic_ns(), runtime.stop_timeout_ns);
     for (released == quic_runtime.BLOCKED) {
+        if (wait_before(deadline) == 0)        { ret false; }
         if (!listener.poll(?runtime.owner, 1)) { ret false; }
         fire_timers(controls, runtime, clock.monotonic_ns());
         if (quic_runtime.advance(controls, runtime.quic, clock.monotonic_ns())
@@ -888,6 +905,9 @@ val TAG_MASK: u64 = 0xffff000000000000;
 # the wheel entry the runtime itself owns for the previous generation's drain;
 # the plane's entry is owned by hedge_wake.PLANE_OWNER, the owner its wakes use
 val DRAIN_OWNER: u64 = 0x5244000000000000;
+# the wheel entry for the shutdown's drain deadline. firing it only ends the
+# wait: the turn's advance_shutdown steps the sequence past the deadline
+val SHUTDOWN_OWNER: u64 = 0x5344000000000000;
 # how many woken owners one routing pass takes at a time
 val WAKE_BATCH: usize = 64;
 
@@ -1059,9 +1079,10 @@ fun run_ready(controls: *quic_runtime.ControlView, runtime: *Runtime, now: time.
     }
 }
 
-# hand every entry now due to the protocol that armed it
-fun fire_timers(controls: *quic_runtime.ControlView, runtime: *Runtime, now_ns: u64) {
+# hand every entry now due to the protocol that armed it. returns how many fired
+fun fire_timers(controls: *quic_runtime.ControlView, runtime: *Runtime, now_ns: u64) usize {
     var owners: [FIRE_BATCH]u64;
+    var total:  usize = 0;
     for {
         val fired: usize = hedge_timer.advance(?runtime.timers, now_ns,
             ?owners[0], FIRE_BATCH);
@@ -1078,8 +1099,10 @@ fun fire_timers(controls: *quic_runtime.ControlView, runtime: *Runtime, now_ns: 
             or (owners[i] == hedge_wake.PLANE_OWNER) { runtime.plane_due = true; }
             i = i + 1;
         }
+        total = total + fired;
         if (fired < FIRE_BATCH) { brk; }
     }
+    ret total;
 }
 
 # the plane runs when its deadline fired, a link or a memory wake named it, or
@@ -1145,10 +1168,17 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
         && quic_runtime.has_ready(runtime.quic))) {
         bounded_timeout = 0;
     }
-    val polled:  bool         = listener.poll(?runtime.owner, bounded_timeout);
-    val now:     time.Instant = clock.instant();
-    var quic_ok: bool         = true;
-    fire_timers(controls, runtime, clock.monotonic_ns());
+    $if ($mach.build.mode == $mach.mode.debug) {
+        bounded_timeout = audit_wait(bounded_timeout);
+    }
+    val dispatched: u64          = listener.dispatched(?runtime.owner);
+    val polled:     bool         = listener.poll(?runtime.owner, bounded_timeout);
+    val now:        time.Instant = clock.instant();
+    var quic_ok:    bool         = true;
+    val fired:      usize        = fire_timers(controls, runtime, clock.monotonic_ns());
+    # nothing completed and nothing came due: whatever holds work now was left
+    # there by a wake that never came
+    val idle: bool = fired == 0 && listener.dispatched(?runtime.owner) == dispatched;
     if (runtime.quic != nil && !runtime.quic_released
         && quic_runtime.advance(controls, runtime.quic, clock.monotonic_ns())
         == quic_runtime.FAILED) {
@@ -1192,8 +1222,15 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
     if (!quic_ok) {
         release_quic(controls, runtime);
     }
-    $if ($mach.build.mode == $mach.mode.debug) { audit_turn(controls, runtime); }
+    $if ($mach.build.mode == $mach.mode.debug) { audit_turn(controls, runtime, idle); }
     ret polled;
+}
+
+# a wait bounded to the audit interval, which debug builds take in place of
+# `timeout_ms` so every wait ends in a turn the audit can run in
+fun audit_wait(timeout_ms: i32) i32 {
+    if (timeout_ms < 0 || timeout_ms > AUDIT_WAIT_MS) { ret AUDIT_WAIT_MS; }
+    ret timeout_ms;
 }
 
 # the sweep that survives only as an assertion (#182). every live slot that is
@@ -1236,9 +1273,11 @@ pub fun audits(runtime: *Runtime) u64 {
     ret runtime.audits;
 }
 
-fun audit_turn(controls: *quic_runtime.ControlView, runtime: *Runtime) {
+# an idle turn is audited at once rather than counted toward AUDIT_POLLS, so a
+# missed wake fails within one audit interval instead of blocking (#273)
+fun audit_turn(controls: *quic_runtime.ControlView, runtime: *Runtime, idle: bool) {
     runtime.polls = runtime.polls + 1;
-    if (runtime.polls % AUDIT_POLLS != 0) { ret; }
+    if (!idle && runtime.polls % AUDIT_POLLS != 0) { ret; }
     # sampled here, since the turn's own instant predates the quic advance
     # and a transport asked about a time before its last call answers false
     if (audit(controls, runtime, clock.instant()) != 0) {
@@ -1361,8 +1400,18 @@ pub fun begin_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, n
     if (runtime == nil || runtime.state == NEW || runtime.state == STOPPED) {
         ret false;
     }
-    run_action(controls, runtime, lifecycle.begin(?runtime.shutdown, now,
-        runtime.drain_timeout_ns));
+    val action: lifecycle.Action = lifecycle.begin(?runtime.shutdown, now,
+        runtime.drain_timeout_ns);
+    if (action == lifecycle.SIGNAL && runtime.drain_timeout_ns != 0) {
+        runtime.shutdown_timer = hedge_timer.claim(?runtime.timers, SHUTDOWN_OWNER);
+        if (runtime.shutdown_timer.index == hedge_timer.NONE
+            || hedge_timer.arm(?runtime.timers, runtime.shutdown_timer,
+            clock.after_ns(clock.to_ns(now), runtime.drain_timeout_ns))
+            != hedge_timer.OK) {
+            runtime.teardown_failures = runtime.teardown_failures + 1;
+        }
+    }
+    run_action(controls, runtime, action);
     advance_shutdown(controls, runtime, now, false);
     ret true;
 }
@@ -1393,7 +1442,9 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
         ret false;
     }
     var drain_timeout_ns: u64 = 0;
-    if (!timeout_nanoseconds(graph.timeouts.drain_ms, ?drain_timeout_ns)) {
+    var stop_timeout_ns:  u64 = 0;
+    if (!timeout_nanoseconds(graph.timeouts.drain_ms, ?drain_timeout_ns)
+        || !timeout_nanoseconds(graph.timeouts.stop_ms, ?stop_timeout_ns)) {
         ret false;
     }
     var next: *BudgetGeneration = ?runtime.budget_generations[0];
@@ -1452,6 +1503,7 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     runtime.configured       = connection.config_from(graph);
     runtime.limits           = connection.message_limits(graph, runtime.configured);
     runtime.drain_timeout_ns = drain_timeout_ns;
+    runtime.stop_timeout_ns  = stop_timeout_ns;
     var armed: bool = true;
     if (runtime.previous.count != 0 && drain_timeout_ns != 0) {
         if (runtime.drain_timer.index == hedge_timer.NONE) {
@@ -1520,6 +1572,12 @@ pub fun draining(runtime: *Runtime) bool {
 
 pub fun idle(runtime: *Runtime) bool {
     ret runtime != nil && live_count(runtime) == 0;
+}
+
+# the drain deadline passed and the remainder was cancelled. waiting for those
+# closes is `stop`'s, which bounds it by the stop deadline (#273)
+pub fun cancelling(runtime: *Runtime) bool {
+    ret runtime != nil && lifecycle.cancelling(?runtime.shutdown);
 }
 
 # the sequence has run to its end, resources included
@@ -1598,25 +1656,50 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     # body completion has crossed the ordinary listener completion path.
     lifecycle.cancel_now(?runtime.shutdown, live_count(runtime));
     run_action(controls, runtime, lifecycle.CANCEL);
-    for (live_count(runtime) != 0) {
-        if (!poll(controls, runtime, -1)) {
+    # the drain gives up once stop_timeout_ns passes with no connection closing,
+    # rather than waiting forever on a close nothing will finish (#273). what is
+    # left open stays for `stalled` to name
+    var live:     usize = live_count(runtime);
+    var deadline: u64   = clock.after_ns(clock.monotonic_ns(), runtime.stop_timeout_ns);
+    for (live != 0) {
+        val left: i32 = wait_before(deadline);
+        if (left == 0) {
             lifecycle.fail(?runtime.shutdown, lifecycle.CANCEL);
             ret false;
+        }
+        if (!poll(controls, runtime, left)) {
+            lifecycle.fail(?runtime.shutdown, lifecycle.CANCEL);
+            ret false;
+        }
+        if (live_count(runtime) != live) {
+            live     = live_count(runtime);
+            deadline = clock.after_ns(clock.monotonic_ns(), runtime.stop_timeout_ns);
         }
     }
     if (runtime.plane_quiesce::usize != 0) {
         var status: PlaneQuiesceStatus = runtime.plane_quiesce(
             runtime.plane_ctx, clock.instant());
+        deadline = clock.after_ns(clock.monotonic_ns(), runtime.stop_timeout_ns);
         for (status == PLANE_PENDING) {
-            if (!listener.poll(?runtime.owner, -1)) {
+            var left: i32 = wait_before(deadline);
+            if (left == 0) {
                 lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
                 ret false;
             }
+            $if ($mach.build.mode == $mach.mode.debug) { left = audit_wait(left); }
+            val dispatched: u64 = listener.dispatched(?runtime.owner);
+            if (!listener.poll(?runtime.owner, left)) {
+                lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
+                ret false;
+            }
+            val idle: bool = listener.dispatched(?runtime.owner) == dispatched;
+            if (!idle) { deadline = clock.after_ns(clock.monotonic_ns(), runtime.stop_timeout_ns); }
             val settled: time.Instant = clock.instant();
             if (runtime.plane::usize != 0) {
                 runtime.plane(runtime.plane_ctx, settled);
             }
             status = runtime.plane_quiesce(runtime.plane_ctx, settled);
+            $if ($mach.build.mode == $mach.mode.debug) { audit_turn(controls, runtime, idle); }
         }
         if (status != PLANE_QUIESCED) {
             lifecycle.fail(?runtime.shutdown, lifecycle.CLOSE);
@@ -1627,6 +1710,64 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
     ret lifecycle.closed(?runtime.shutdown)
         && lifecycle.reason(?runtime.shutdown) != lifecycle.FAILED
         && runtime.teardown_failures == 0;
+}
+
+# the milliseconds a wait may take before the monotonic `deadline`, rounded up so
+# a wait never ends short of it, or 0 once it has passed
+fun wait_before(deadline: u64) i32 {
+    val now: u64 = clock.monotonic_ns();
+    if (now >= deadline) { ret 0; }
+    var left: u64 = (deadline - now + 999999) / 1000000;
+    if (left > 2147483647) { left = 2147483647; }
+    ret left::i32;
+}
+
+# a connection a stop left open, and what its close waits on
+pub rec Stalled {
+    id:       u64;
+    waits_on: str;
+}
+
+# the TCP connections still live, which after a stop that gave up are the ones
+# it could not close. writes at most `capacity` of them to `output` and returns
+# how many there are
+pub fun stalled(runtime: *Runtime, output: *Stalled, capacity: usize) usize {
+    if (runtime == nil) { ret 0; }
+    ret stalled_list(runtime, ?runtime.current, output, capacity, 0)
+        + stalled_list(runtime, ?runtime.previous, output, capacity,
+        runtime.current.count);
+}
+
+fun stalled_list(runtime: *Runtime, list: *LiveList, output: *Stalled,
+    capacity: usize, at: usize) usize {
+    var count: usize = 0;
+    var i:     usize = list.head;
+    for (i != NO_SLOT) {
+        val slot: *Slot = slot_at(runtime, i);
+        if (slot.live) {
+            if (output != nil && at + count < capacity) {
+                output[at + count] = Stalled{id: slot.connection.id, waits_on: stall_reason(slot)};
+            }
+            count = count + 1;
+        }
+        i = slot.next_live;
+    }
+    ret count;
+}
+
+fun stall_reason(slot: *Slot) str {
+    val wait: connection.CloseWait = connection.close_wait(?slot.connection);
+    if (wait != connection.CLOSE_READY) { ret connection.close_wait_text(wait); }
+    if (slot.retiring)                  { ret "its retirement, queued and not yet run"; }
+    if (slot.waiting)                   { ret "a place in its budget's queue"; }
+    ret "its next step, not yet asked to close";
+}
+
+# the QUIC connections still live, which the QUIC runtime counts but does not
+# name
+pub fun stalled_quic(runtime: *Runtime) usize {
+    if (runtime == nil || runtime.quic == nil || runtime.quic_released) { ret 0; }
+    ret quic_runtime.live(runtime.quic);
 }
 
 # zero sizes for a listener with no QUIC socket

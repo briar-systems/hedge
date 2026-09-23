@@ -39,6 +39,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 
 # the shutdown sequence schedules on the monotonic clock, as serve does
 fun monotonic_now() time.Instant {
@@ -302,6 +303,58 @@ test "lifecycle: a stuck handler is cancelled when the deadline passes" {
     ret 0;
 }
 
+# the drain deadline is on the timing wheel, so the serving loop's unbounded
+# wait ends when it is due rather than on the handler's own request timeout, and
+# the loop hands the cancelled remainder to `stop` (#273)
+test "lifecycle: the drain deadline ends an unbounded wait" {
+    var quic_controls: quic_runtime.ControlView;
+    var harness:       Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 300, true);
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) {
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 2;
+    }
+    if (!wire.send(?client, REQUEST)) {
+        tcp.stream_close(?client);
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 3;
+    }
+    var i: usize = 0;
+    for (i < 40) {
+        serve.poll(?quic_controls, ?harness.runtime, 2);
+        i = i + 1;
+    }
+    if (harness.runtime.live == 0) {
+        tcp.stream_close(?client);
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 4;
+    }
+    val began: time.Instant = monotonic_now();
+    if (!serve.begin_shutdown(?quic_controls, ?harness.runtime, began)) {
+        tcp.stream_close(?client);
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 5;
+    }
+    # the loop `main` runs: wait for anything, until drained or cancelling
+    i = 0;
+    for (i < 8 && !serve.drained(?harness.runtime)
+        && !serve.cancelling(?harness.runtime)) {
+        serve.poll(?quic_controls, ?harness.runtime, -1);
+        i = i + 1;
+    }
+    val took: i64 = time.instant_sub(monotonic_now(), began);
+    var code: i32 = 0;
+    if (!serve.cancelling(?harness.runtime) && !serve.drained(?harness.runtime)) { code = 6; }
+    or (took < 300000000 || took > 900000000)                                    { code = 7; }
+    val stopped: bool = serve.stop(?quic_controls, ?harness.runtime);
+    tcp.stream_close(?client);
+    if (code == 0 && !stopped)                                                      { code = 8; }
+    if (code == 0 && serve.shutdown_reason(?harness.runtime) != lifecycle.DEADLINE) { code = 9; }
+    ret code;
+}
+
 test "lifecycle: a slow peer that never sends is cancelled at the deadline" {
     var quic_controls: quic_runtime.ControlView;
     var harness:       Harness;
@@ -418,6 +471,80 @@ test "lifecycle: stop without a deadline ends at once and says so" {
     if (!serve.stop(?quic_controls, ?harness.runtime))                  { ret 9; }
     if (serve.shutdown_reason(?harness.runtime) != lifecycle.IMMEDIATE) { ret 10; }
     ret 0;
+}
+
+# a close that waits on a completion that never comes, with no work the audit
+# could flag, stands for any close nothing finishes: the stop gives up at its
+# deadline, fails the cancel step, and names the connection and its wait (#273)
+test "lifecycle: a stop gives up on a close nothing finishes and names it" {
+    var quic_controls: quic_runtime.ControlView;
+    var harness:       Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    harness.graph.timeouts.stop_ms = 300;
+    if (!start(?harness, 1)) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) {
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 2;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    if (!wire.send(?client, REQUEST) || wire.collect(?harness.runtime, ?client,
+        ?response[0], RESPONSE_BYTES, "served") == 0 || harness.runtime.live != 1) {
+        tcp.stream_close(?client);
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 3;
+    }
+    var index: usize = 0;
+    if (!serve.slot_at(?harness.runtime, 0).live) { index = 1; }
+    val owner: *connection.Connection = serve.slot_connection(?harness.runtime, index);
+    owner.prologue_pending = true;
+    val began:   time.Instant = monotonic_now();
+    val stopped: bool         = serve.stop(?quic_controls, ?harness.runtime);
+    val took:    i64          = time.instant_sub(monotonic_now(), began);
+    var stalled: [2]serve.Stalled;
+    val count:   usize        = serve.stalled(?harness.runtime, ?stalled[0], 2);
+    var code:    i32          = 0;
+    if (stopped)                               { code = 4; }
+    or (took < 300000000 || took > 5000000000) { code = 5; }
+    or (serve.shutdown_reason(?harness.runtime) != lifecycle.FAILED
+        || serve.shutdown_failed_step(?harness.runtime) != lifecycle.CANCEL) { code = 6; }
+    or (count != 1 || stalled[0].id != owner.id
+        || !str_equals(stalled[0].waits_on,
+        connection.close_wait_text(connection.CLOSE_PROLOGUE))) {
+        code = 7;
+    }
+    # released, the close finishes and a second stop completes the sequence
+    owner.prologue_pending = false;
+    serve.stop(?quic_controls, ?harness.runtime);
+    tcp.stream_close(?client);
+    if (code == 0 && !serve.finished(?harness.runtime)) { code = 8; }
+    ret code;
+}
+
+# a debug build bounds every wait to the audit interval and audits a turn in
+# which nothing happened, so a wait nothing would end still returns, and reaches
+# the audit, within the interval (#273)
+test "lifecycle: a debug wait on nothing returns and audits the idle turn" {
+    var quic_controls: quic_runtime.ControlView;
+    var harness:       Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+    var code: i32 = 0;
+    $if ($mach.build.mode == $mach.mode.debug) {
+        val before: u64          = serve.audits(?harness.runtime);
+        val began:  time.Instant = monotonic_now();
+        var i:      usize        = 0;
+        for (i < 3) {
+            serve.poll(?quic_controls, ?harness.runtime, -1);
+            i = i + 1;
+        }
+        val took: i64 = time.instant_sub(monotonic_now(), began);
+        # three waits of at most a second each, whatever ended them
+        if (took > 3500000000)                           { code = 2; }
+        or (serve.audits(?harness.runtime) < before + 2) { code = 3; }
+    }
+    if (!serve.stop(?quic_controls, ?harness.runtime) && code == 0) { code = 4; }
+    ret code;
 }
 
 # every client here is 127.0.0.1, so a per-peer limit is the cap this harness

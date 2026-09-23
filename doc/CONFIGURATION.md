@@ -350,6 +350,15 @@ whose deadline passed with exchanges still running exits 75 and names how many
 were abandoned, because that is not a clean shutdown even though it is a
 complete one. A step of the sequence failing exits 70 and names the step.
 
+Cancelling closes each remaining connection, and the stop waits for those closes
+under `server.timeouts.stop_ms` (default 10000, 10 seconds). The deadline
+starts when the wait does and starts again each time a connection closes, so a
+stop with many connections only fails if none closes for that long. When it passes, the stop gives up
+rather than waiting on a close that never finishes. The process exits 70 and
+prints each TCP connection still open with what its close waits on, and how many
+QUIC connections are still open. The same deadline bounds the wait for the
+service planes to quiesce and for the QUIC runtime's release.
+
 `SIGHUP` reloads the routing graph. The configuration is re-read, validated and
 sealed into a second generation, a new plan is compiled beside the running one,
 and connections accepted after it use the new plan. Connections accepted before
