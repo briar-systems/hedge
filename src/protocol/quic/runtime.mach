@@ -4523,25 +4523,37 @@ fun needs_polling(controls: *ControlView, runtime: *Runtime, value: *Connection)
 }
 
 # whether servicing the connection now would do work nothing else will start:
-# datagrams held for its handshake turn, a pool wake nobody routed, or a
-# teardown that finishes only by being serviced (#182)
-fun pending_work(controls: *ControlView, runtime: *Runtime, value: *Connection) bool {
+# datagrams held for its handshake turn, a pool wake nobody routed, a teardown
+# that finishes only by being serviced (#182), or what the transport says it
+# holds (#261). the transport answers false for a send the pool refused, whose
+# wake drives it. stream news waits for an HTTP/3 session that takes it, and
+# not on an account waiting for the pool, whose wake services the connection
+fun pending_work(controls: *ControlView, runtime: *Runtime, value: *Connection,
+    now: time.Instant) bool {
     if (value.held.count != 0)                                          { ret true; }
     if (value.assembly.account.open && value.assembly.account.is_ready) { ret true; }
-    ret needs_polling(controls, runtime, value);
+    if (needs_polling(controls, runtime, value))                        { ret true; }
+    if (!value.assembly.initialized)                                    { ret false; }
+    if (qt.pending_output[binding.Binding](?value.assembly.driver, now)) { ret true; }
+    if (value.h3_session == h3_session.NO_SESSION
+        || memory.waiting(?value.assembly.account)) { ret false; }
+    val session: *h3_session.Session = h3_session.session_at(
+        ?runtime.sessions, controls.sessions, value.h3_session);
+    ret h3_session.takes_news(session)
+        && qt.pending_stream_news[binding.Binding](?value.assembly.driver);
 }
 
 # the worker's debug audit over this runtime's records: every live connection
-# on neither the ready lists nor the waiting list must hold no work. returns
-# how many do (#182)
-pub fun audit(controls: *ControlView, runtime: *Runtime) usize {
+# on neither the ready lists nor the waiting list must hold no work at `now`.
+# returns how many do (#182)
+pub fun audit(controls: *ControlView, runtime: *Runtime, now: time.Instant) usize {
     if (runtime == nil || !runtime.initialized) { ret 0; }
     var found: usize = 0;
     var i:     usize = runtime.live_head;
     for (i != NO_CONNECTION) {
         val value: *Connection = connection_at(controls, i);
         if (value.live && !value.ready && !value.waiting
-            && pending_work(controls, runtime, value)) { found = found + 1; }
+            && pending_work(controls, runtime, value, now)) { found = found + 1; }
         i = value.next_live;
     }
     ret found;
@@ -5298,94 +5310,109 @@ test "hedge.protocol.quic.runtime: update gracefully retires superseded" {
     ret 0;
 }
 
-test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
-    var fixture:  TestControls;
-    val controls: *ControlView = test_controls(?fixture);
-    var runtime:  Runtime;
-    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 1; }
-    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
-        process_admission.no_lease());
-    if (index != 0) { ret 2; }
-    val value: *Connection = connection_at(controls, index);
+# everything a server connection's assembly takes, kept in one place so the
+# pointers the tls configuration holds stay valid for the test's length
+rec TestServer {
+    owner:             secret.Allocator;
+    chain:             [1]cert.Certificate;
+    key:               keys.PrivateKey;
+    identity:          credentials.Identity;
+    generation:        credentials.Generation;
+    store:             credentials.Store;
+    protocol_bytes:    [2]u8;
+    protocols:         [1]tls_config.ProtocolName;
+    versions:          [1]u16;
+    suites:            [1]tls13.CipherSuite;
+    groups:            [1]tls13.NamedGroup;
+    signatures:        [1]tls13.SignatureScheme;
+    entropy:           secret.Entropy;
+    tls_configuration: tls_config.ServerConfig;
+    tls_clock_source:  tls_clock.Source;
+    conn_budgets:      memory.Budgets;
+    local_id:          [8]u8;
+    peer_id:           [8]u8;
+    initial_id:        [8]u8;
+    config:            assembly.Config;
+    accepted:          quic_listener.Accepted;
+    scratch:           assembly.Scratch;
+}
 
-    var owner:    secret.Allocator = secret.system_allocator();
-    var chain:    [1]cert.Certificate;
-    var key:      keys.PrivateKey;
-    var identity: credentials.Identity;
-    if (!test_credentials.load_credentials(?identity, ?chain[0], ?key,
-        ?owner)) { ret 3; }
-    var generation: credentials.Generation = credentials.empty_generation();
-    var store:      credentials.Store      = credentials.empty_store();
-    if (credentials.initialize(?generation, ?identity, 1, 0, nil,
+# claims the connection's handshake, starts its tls server and makes its scope,
+# leaving assembly.init_server to the caller. 0, or the failing step's code
+fun test_prepare_server(prepared: *TestServer, fixture: *TestControls,
+    controls: *ControlView, index: usize) i32 {
+    val value: *Connection = connection_at(controls, index);
+    prepared.owner = secret.system_allocator();
+    if (!test_credentials.load_credentials(?prepared.identity, ?prepared.chain[0], ?prepared.key,
+        ?prepared.owner)) { ret 3; }
+    prepared.generation = credentials.empty_generation();
+    prepared.store      = credentials.empty_store();
+    if (credentials.initialize(?prepared.generation, ?prepared.identity, 1, 0, nil,
         false) != contracts.OK
-        || credentials.initialize_store(?store, ?generation) != contracts.OK) {
+        || credentials.initialize_store(?prepared.store, ?prepared.generation) != contracts.OK) {
         ret 3;
     }
-    var protocol_bytes: [2]u8                      = [2]u8{'h', '3'};
-    var protocols:      [1]tls_config.ProtocolName = [1]tls_config.ProtocolName{
-        tls_config.ProtocolName{data: ?protocol_bytes[0], len: 2}
+    prepared.protocol_bytes = [2]u8{'h', '3'};
+    prepared.protocols      = [1]tls_config.ProtocolName{
+        tls_config.ProtocolName{data: ?prepared.protocol_bytes[0], len: 2}
     };
-    var versions: [1]u16               = [1]u16{tls13.VERSION};
-    var suites:   [1]tls13.CipherSuite = [1]tls13.CipherSuite{
-        tls13.AES_128_GCM_SHA256
-    };
-    var groups:     [1]tls13.NamedGroup      = [1]tls13.NamedGroup{tls13.X25519};
-    var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
-        tls13.ED25519
-    };
-    var entropy:           secret.Entropy = secret.system_entropy();
-    var tls_configuration: tls_config.ServerConfig;
-    tls_configuration.credentials          = ?store;
-    tls_configuration.alpn                 = ?protocols[0];
+    prepared.versions   = [1]u16{tls13.VERSION};
+    prepared.suites     = [1]tls13.CipherSuite{tls13.AES_128_GCM_SHA256};
+    prepared.groups     = [1]tls13.NamedGroup{tls13.X25519};
+    prepared.signatures = [1]tls13.SignatureScheme{tls13.ED25519};
+    prepared.entropy    = secret.system_entropy();
+    val tls_configuration: *tls_config.ServerConfig = ?prepared.tls_configuration;
+    tls_configuration.credentials          = ?prepared.store;
+    tls_configuration.alpn                 = ?prepared.protocols[0];
     tls_configuration.alpn_len             = 1;
     tls_configuration.require_alpn         = true;
-    tls_configuration.versions             = ?versions[0];
+    tls_configuration.versions             = ?prepared.versions[0];
     tls_configuration.version_len          = 1;
-    tls_configuration.suites               = ?suites[0];
+    tls_configuration.suites               = ?prepared.suites[0];
     tls_configuration.suite_len            = 1;
-    tls_configuration.groups               = ?groups[0];
+    tls_configuration.groups               = ?prepared.groups[0];
     tls_configuration.group_len            = 1;
-    tls_configuration.signatures           = ?signatures[0];
+    tls_configuration.signatures           = ?prepared.signatures[0];
     tls_configuration.signature_len        = 1;
-    tls_configuration.entropy              = ?entropy;
+    tls_configuration.entropy              = ?prepared.entropy;
     tls_configuration.entropy_context_size = 0;
     tls_configuration.limits               = hedge_tls.listener_limits();
-    var tls_clock_source: tls_clock.Source = tls_clock.system();
-    tls_configuration.clock = ?tls_clock_source;
+    prepared.tls_clock_source = tls_clock.system();
+    tls_configuration.clock = ?prepared.tls_clock_source;
     value.handshake         = claim_handshake(controls);
     if (value.handshake == NO_HANDSHAKE) { ret 4; }
-    val engine:       *server.Handshake = handshake_at(controls, value.handshake);
-    var conn_budgets: memory.Budgets    = memory.no_budgets();
+    val engine: *server.Handshake = handshake_at(controls, value.handshake);
+    prepared.conn_budgets = memory.no_budgets();
     memory.borrower(?value.storage.borrower, ?fixture.memory, timer_owner(index),
-        memory.LANES, conn_budgets);
-
-    var local_id:   [8]u8           = [8]u8{1, 2, 3, 4, 5, 6, 7, 8};
-    var peer_id:    [8]u8           = [8]u8{9, 10, 11, 12, 13, 14, 15, 16};
-    var initial_id: [8]u8           = [8]u8{17, 18, 19, 20, 21, 22, 23, 24};
-    val local:      ip.Endpoint     = ip.endpoint(192, 0, 2, 1, 4433);
-    val peer:       ip.Endpoint     = ip.endpoint(192, 0, 2, 2, 55000);
-    var config:     assembly.Config = assembly.default_config(81, local, peer);
-    config.local_source         = ?local_id[0];
+        memory.LANES, prepared.conn_budgets);
+    prepared.local_id   = [8]u8{1, 2, 3, 4, 5, 6, 7, 8};
+    prepared.peer_id    = [8]u8{9, 10, 11, 12, 13, 14, 15, 16};
+    prepared.initial_id = [8]u8{17, 18, 19, 20, 21, 22, 23, 24};
+    val local:  ip.Endpoint     = ip.endpoint(192, 0, 2, 1, 4433);
+    val peer:   ip.Endpoint     = ip.endpoint(192, 0, 2, 2, 55000);
+    val config: *assembly.Config = ?prepared.config;
+    @config = assembly.default_config(81, local, peer);
+    config.local_source         = ?prepared.local_id[0];
     config.local_source_length  = 8;
-    config.alpn                 = ?protocol_bytes[0];
+    config.alpn                 = ?prepared.protocol_bytes[0];
     config.alpn_length          = 2;
     config.entropy_context_size = 0;
     config.account_handle       = timer_owner(index);
-    config.extra_budgets        = ?conn_budgets.lanes[quic_supply.LANES::usize];
+    config.extra_budgets        = ?prepared.conn_budgets.lanes[quic_supply.LANES::usize];
     config.extra_lanes          = memory.LANES::usize - quic_supply.LANES::usize;
-    var accepted: quic_listener.Accepted;
+    val accepted: *quic_listener.Accepted = ?prepared.accepted;
     accepted.action = quic_listener.ACTION_ACCEPT;
-    packet.set_connection_id(?accepted.original_destination, ?initial_id[0], 8);
-    packet.set_connection_id(?accepted.initial_destination, ?initial_id[0], 8);
-    packet.set_connection_id(?accepted.initial_source, ?peer_id[0], 8);
+    packet.set_connection_id(?accepted.original_destination, ?prepared.initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_destination, ?prepared.initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_source, ?prepared.peer_id[0], 8);
     accepted.peer           = peer;
     accepted.version        = packet.VERSION_1;
     accepted.peer_validated = true;
-    if (!assembly.apply_server_acceptance(?config, ?accepted)) { ret 4; }
+    if (!assembly.apply_server_acceptance(config, accepted)) { ret 4; }
     val encoded: transport_parameters.EncodeResult =
-        assembly.encode_parameters(?config, qt.SERVER,
+        assembly.encode_parameters(config, qt.SERVER,
         ?value.storage.local_parameters[0], assembly.PARAMETER_CAPACITY);
-    if (!encoded.ok || !server.init(engine, ?tls_configuration,
+    if (!encoded.ok || !server.init(engine, tls_configuration,
         assembly.tls_lease(?value.assembly),
         server.ExtraExtension{kind: server.QUIC_TRANSPORT_PARAMETERS,
         data: contracts.Bytes{
@@ -5396,13 +5423,29 @@ test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
         || !operation_ok(cancel.make_root(?value.storage.scope,
         opt[time.Instant].none{}))) { ret 5; }
     value.scope_live = true;
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 1; }
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index != 0) { ret 2; }
+    val value: *Connection = connection_at(controls, index);
+
+    var tls_server: TestServer;
+    val prepared:   i32 = test_prepare_server(?tls_server, ?fixture, controls, index);
+    if (prepared != 0) { ret prepared; }
     cancel.cancel(?value.storage.scope);
     # this pump has no storage attached, so the public scratch is the test's
-    var scratch:     assembly.Scratch;
     val initialized: assembly.InitResult = assembly.init_server(
-        ?value.assembly, ?config, ?value.storage.assembly_storage,
-        ?scratch, ?controls.pumps[0].secret_scratch,
-        memory.borrowed_source(?value.storage.borrower), engine,
+        ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
+        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        memory.borrowed_source(?value.storage.borrower),
+        handshake_at(controls, value.handshake),
         ?value.storage.scope, clock.from_ns(1));
     if (initialized.ok) { ret 6; }
     if (initialized.stage != assembly.STAGE_DRIVER) {
@@ -5424,9 +5467,10 @@ test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
         || connection_at(controls, reused).storage == nil) { ret 10; }
     return_connection(controls, ?runtime, reused);
     var retired: *credentials.Generation = nil;
-    if (credentials.withdraw_store(?store, ?retired) != contracts.OK
-        || retired != ?generation || !credentials.reclaimable(?generation)
-        || keys.destroy_private(?key) != contracts.OK) { ret 11; }
+    if (credentials.withdraw_store(?tls_server.store, ?retired) != contracts.OK
+        || retired != ?tls_server.generation
+        || !credentials.reclaimable(?tls_server.generation)
+        || keys.destroy_private(?tls_server.key) != contracts.OK) { ret 11; }
     ret 0;
 }
 
@@ -6698,25 +6742,25 @@ test "hedge.protocol.quic.runtime: the audit finds a record holding work on no l
         process_admission.Lease{index: 0, generation: 1});
     if (index == NO_CONNECTION) { ret 1; }
     val value: *Connection = connection_at(controls, index);
-    if (audit(controls, ?runtime) != 0) { ret 2; }
+    if (audit(controls, ?runtime, clock.instant()) != 0) { ret 2; }
     # a datagram held for a handshake turn nobody queued
     value.held.count = 1;
-    if (audit(controls, ?runtime) != 1) { ret 3; }
+    if (audit(controls, ?runtime, clock.instant()) != 1) { ret 3; }
     mark_ready(controls, ?runtime, index);
-    if (audit(controls, ?runtime) != 0) { ret 4; }
+    if (audit(controls, ?runtime, clock.instant()) != 0) { ret 4; }
     unmark_ready(controls, ?runtime, index);
     value.held.count = 0;
     # a pool wake nobody routed
     value.assembly.account.open     = true;
     value.assembly.account.is_ready = true;
-    if (audit(controls, ?runtime) != 1) { ret 5; }
+    if (audit(controls, ?runtime, clock.instant()) != 1) { ret 5; }
     value.assembly.account.is_ready = false;
     value.assembly.account.open     = false;
     # a teardown that finishes only by being serviced, unless the waiting list holds it
     value.state = CONNECTION_CLEANUP;
-    if (audit(controls, ?runtime) != 1) { ret 6; }
+    if (audit(controls, ?runtime, clock.instant()) != 1) { ret 6; }
     set_waiting(controls, ?runtime, index, true);
-    if (audit(controls, ?runtime) != 0) { ret 7; }
+    if (audit(controls, ?runtime, clock.instant()) != 0) { ret 7; }
     set_waiting(controls, ?runtime, index, false);
     value.state      = CONNECTION_ACCEPTING;
     value.lease_live = false;
@@ -6750,6 +6794,104 @@ fun test_hold(runtime: *Runtime, pump: *Pump, tag: u8, class: usize,
     packet.length   = MIN_INITIAL_BYTES;
     data[0]         = tag;
     ret hold_arrival(runtime, pump, ?packet, test_key(tag), class, now_ns);
+}
+
+# the audit asks the transport what a record holds (#261), through its three
+# documented edges: handshake work pending reads true, a send the pool refused
+# reads false until the account's wake reaches storage_ready, and a recorded
+# cancellation not yet applied reads true. each is work only while no list
+# holds the record
+test "hedge.protocol.quic.runtime: the audit asks the transport what a record holds" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret 1; }
+    val value: *Connection = connection_at(controls, index);
+    var tls_server: TestServer;
+    val prepared:   i32 = test_prepare_server(?tls_server, ?fixture, controls, index);
+    if (prepared != 0) { ret prepared; }
+    val started:     u64                 = 1000000000;
+    val initialized: assembly.InitResult = assembly.init_server(
+        ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
+        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        memory.borrowed_source(?value.storage.borrower),
+        handshake_at(controls, value.handshake),
+        ?value.storage.scope, clock.from_ns(started));
+    if (!initialized.ok || !value.assembly.initialized) { ret 6; }
+    value.tls_live           = true;
+    value.assembly_attempted = true;
+    val driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
+    val now:    time.Instant                = clock.from_ns(started + 1000);
+    # a server whose handshake has not been polled has tls work pending
+    if (!qt.pending_output[binding.Binding](driver, now)
+        || audit(controls, ?runtime, now) != 1) { ret 10; }
+    mark_ready(controls, ?runtime, index);
+    if (!value.ready_handshake || audit(controls, ?runtime, now) != 0) { ret 11; }
+    unmark_ready(controls, ?runtime, index);
+    # polled, the handshake waits for the client's initial and holds nothing
+    var wire: [assembly.MAX_UDP_PAYLOAD]u8;
+    val polled: qt.Generated = qt.generate[binding.Binding](driver, ?value.storage.scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, now, 0);
+    if (polled.status != qt.STATUS_EMPTY) { ret 12; }
+    if (qt.pending_output[binding.Binding](driver, now)
+        || audit(controls, ?runtime, now) != 0) { ret 13; }
+    # a send the pool refused waits on the account's wake, which is no missed wake
+    value.assembly.core.send_refused = true;
+    if (audit(controls, ?runtime, now) != 0) { ret 20; }
+    # once the wake reaches storage_ready the refused work is pending again,
+    # and a record nobody queued with it is a missed wake
+    qt.storage_ready[binding.Binding](driver);
+    if (value.assembly.core.send_refused || !qt.pending_output[binding.Binding](driver, now)
+        || audit(controls, ?runtime, now) != 1) { ret 21; }
+    # the runtime's wake routes storage_ready and queues the record together
+    wake(controls, ?runtime, timer_owner(index));
+    if (!value.ready || audit(controls, ?runtime, now) != 0) { ret 22; }
+    unmark_ready(controls, ?runtime, index);
+    val retried: qt.Generated = qt.generate[binding.Binding](driver, ?value.storage.scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, now, 0);
+    if (retried.status != qt.STATUS_EMPTY || audit(controls, ?runtime, now) != 0) { ret 23; }
+    # stream news is work for an http/3 session that polls its engine
+    val session_index: usize = h3_session.acquire(?runtime.sessions, controls.sessions);
+    if (session_index == h3_session.NO_SESSION) { ret 40; }
+    val session: *h3_session.Session = h3_session.session_at(?runtime.sessions,
+        controls.sessions, session_index);
+    value.h3_session                          = session_index;
+    value.assembly.streams.unaccepted_streams = 1;
+    if (!qt.pending_stream_news[binding.Binding](driver)) { ret 41; }
+    # a session not yet begun takes nothing
+    if (audit(controls, ?runtime, now) != 0) { ret 42; }
+    session.state = h3_session.ACTIVE;
+    if (audit(controls, ?runtime, now) != 1) { ret 43; }
+    # an account waiting on the pool is serviced by its wake
+    val account_open:    bool = value.assembly.account.open;
+    val account_waiting: bool = value.assembly.account.waiting;
+    value.assembly.account.open    = true;
+    value.assembly.account.waiting = true;
+    if (audit(controls, ?runtime, now) != 0) { ret 44; }
+    value.assembly.account.open    = account_open;
+    value.assembly.account.waiting = account_waiting;
+    mark_ready(controls, ?runtime, index);
+    if (audit(controls, ?runtime, now) != 0) { ret 45; }
+    unmark_ready(controls, ?runtime, index);
+    # a failed session no longer polls, and its teardown is what runs it
+    session.state = h3_session.FAILED;
+    if (audit(controls, ?runtime, now) != 0) { ret 46; }
+    session.state                             = h3_session.IDLE;
+    value.assembly.streams.unaccepted_streams = 0;
+    value.h3_session                          = h3_session.NO_SESSION;
+    # a cancellation recorded and not yet applied is work the next call does.
+    # the scope is cancelled from outside the transport, as a pump's or the
+    # runtime's cancellation reaches it, so nothing applies it until then
+    cancel.cancel(?value.storage.scope);
+    if (!qt.pending_output[binding.Binding](driver, now)
+        || audit(controls, ?runtime, now) != 1) { ret 30; }
+    mark_ready(controls, ?runtime, index);
+    if (audit(controls, ?runtime, now) != 0) { ret 31; }
+    unmark_ready(controls, ?runtime, index);
+    ret 0;
 }
 
 test "hedge.protocol.quic.runtime: an unknown initial is held in arrival order and dropped past the socket's worth" {
