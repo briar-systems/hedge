@@ -272,9 +272,11 @@ at the largest N the host allows and state the projection it prints.
 
 ### The measured run for #176
 
-`feat/176` at 7ec5491, release build (sha256 `8daad759…`), linux-x86_64,
-Ryzen 7 5800X3D, loopback, one worker, each run under `agent-heavy
---exclusive` with `vmstat` alongside, QUIC keep-alive 15 s:
+The lanes are from `feat/176` at 627fc1d and 7ec5491. The binary is a release
+build of the source at fe80306 (sha256 `8daad759…`). Later commits change
+only the lanes and a unit test. It ran on linux-x86_64, a Ryzen 7 5800X3D,
+over loopback with one worker. Each run held every heavy slot (`agent-heavy
+--exclusive`) with `vmstat` alongside. The QUIC keep-alive was 15 s.
 
 | transport | span | bytes per idle connection (halves) | CPU per idle connection per second | descriptors, timer entries per connection |
 | --- | --- | ---: | ---: | --- |
