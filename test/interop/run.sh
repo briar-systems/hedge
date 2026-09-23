@@ -399,6 +399,14 @@ check "startup names its serving workers" yes "$([ -n "$workers" ] && echo yes |
 check "disabled cache starts no thread of its own" "$((${workers:-0} + 1))" \
     "$(awk '/^Threads:/ { print $2 }' /proc/"$server_pid"/status)"
 check "disabled cache opens no timer" 0 "$(fd_target_count 'anon_inode:\[timerfd\]')"
+# nothing happens, so no thread of the process runs: the supervisor and every
+# worker sleep until a signal, a connection or a deadline. a tick is 10 ms, so
+# one second may account a stray one
+idle_ticks() { awk '{ print $14 + $15 }' /proc/"$server_pid"/stat; }
+ticks_before="$(idle_ticks)"
+sleep 1
+ticks_spent=$(( $(idle_ticks) - ticks_before ))
+check "an idle server spends no CPU" yes "$([ "$ticks_spent" -le 1 ] && echo yes || echo "no ($ticks_spent ticks)")"
 check "disabled cache opens no cache root" 0 \
     "$(fd_target_count 'hedge-disabled-cache-must-not-open')"
 stop_server
