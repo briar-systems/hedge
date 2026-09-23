@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # concurrent-connection fairness, HTTP/3 service, the shared connection cap,
-# idle memory per connection and a handshake burst, against the release
+# idle memory and CPU per connection, a handshake burst, a ramp, churn,
+# request and handshake rates and QUIC migration, against the release
 # executable the standard phases built
 set -euo pipefail
 
@@ -11,5 +12,11 @@ case "$MACH_CI_LEG" in
         # a burst past the runner's crypto rate: two cores and no AES-NI
         # guarantee, so the burst is kept where a run finishes inside a minute
         LOAD_BURST_WARM=100 LOAD_BURST=1000 test/load/burst.sh
+        # the scale harness's 1k cells (#176): a ramp, a minute of churn, the
+        # request and handshake rates, and QUIC connections surviving a rebind
+        LOAD_RAMP=1000 test/load/ramp.sh
+        LOAD_CHURN_SECONDS=60 LOAD_CHURN_SAMPLE=5 test/load/churn.sh
+        LOAD_RATE_DURATION=5 LOAD_RATE_WARMUP=1 test/load/rate.sh
+        test/load/migrate.sh
         ;;
 esac

@@ -3,11 +3,11 @@
 #
 # #169 section 8's churn cell: for LOAD_CHURN_SECONDS (10 minutes by default)
 # connections arrive at a fixed rate, each carries one request and closes, so
-# the server admits and retires LOAD_CHURN_TLS_RATE (or _H3_RATE) connections a
-# second the whole
-# time. The client (test/load/rate in churn mode) is open-loop, so a slow
-# server shows as missed starts rather than a lower rate, and it samples the
-# served process's resident set and CPU time every LOAD_CHURN_SAMPLE seconds.
+# the server admits and retires LOAD_CHURN_TLS_RATE (or LOAD_CHURN_H3_RATE)
+# connections a second the whole time. The client (test/load/rate in churn
+# mode) is open-loop, so a slow server shows as missed starts rather than a
+# lower rate, and it samples the served process's resident set and CPU time
+# every LOAD_CHURN_SAMPLE seconds.
 #
 # It passes when every connection is served with no failure and no missed
 # start, the resident set over the second half of the run peaks no higher than
