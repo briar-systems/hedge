@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The cache store is safe to share between workers (#285). It is split into shards by the FNV-1a hash of the cache key (`store.make` and `cache.from_config` take the shard count, and the composition passes one, which is exactly the unsharded store). Each shard owns its slots, its share of the body arena and of the memory, disk and entry budgets, and a `std.sync` mutex. The lock is held only across index and arena work: `store.acquire` and `store.release` bracket work on a shard, and functions taking a `*Shard` require it held. A reader pins an entry (`store.pin`, `store.unpin`) before it streams. Eviction, replacement or invalidation of a pinned entry unlinks it from the index at once, and its bytes are freed at its last unpin. Debug builds fill freed arena bytes with `store.POISON`. A hit is answered from a `store.Snapshot` copied into the call's arena under the lock, so a refresh on another worker cannot change fields a response points into. Every disk operation is now a request (`hedge.cache.disk`): a read, a write, a file removal or the startup purge is submitted and completes later, and no request is made with a shard lock held. The inline executor still runs each request on the thread that submits it, and a store worker (#286) replaces only the executor. A queued read answers `body.pending` and wakes the call. A reclaimed disk entry keeps its slot and disk charge until its file is gone. Recordings belong to the worker that makes them: `cache.Recorders` (`make_recorders`, `attach_waker`, `drive`, `settling`, `close_recorders`) holds a worker's recordings and, with a disk root, 32 KiB of staging per recording for disk writes. `cache.Bindings` and `cache.Binding` name the worker's `Recorders`. A recording that ends with a write in flight settles through the composition's plane before stop quiesces.
+
 ## [0.10.0] - 2026-09-23
 
 ### Changed
