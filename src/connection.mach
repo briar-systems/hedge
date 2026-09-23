@@ -134,13 +134,17 @@ pub val STEP_ERROR:    Step = 5;
 
 # storage a connection claims only once it selects a protocol that needs it,
 # owned by the runtime and shared by every connection it drives
+# one worker's connection storage. `worker` names the worker every connection
+# made from it belongs to, which is how its TLS session finds that worker's table
 pub rec Storage {
     h2_sessions: storage.Table[h2.Session];
     chunks:      storage.Chunks;
+    worker:      usize;
 }
 
-pub fun make_storage(shared: *Storage, a: *A.Allocator) bool {
-    if (shared == nil) { ret false; }
+pub fun make_storage(shared: *Storage, a: *A.Allocator, worker: usize) bool {
+    if (shared == nil || worker >= secure.MAX_TABLES) { ret false; }
+    shared.worker = worker;
     ret storage.make_table[h2.Session](?shared.h2_sessions, a)
         && storage.make_chunks(?shared.chunks, a);
 }
@@ -322,7 +326,7 @@ pub rec Connection {
     waker:       hedge_wake.Waker;
     wake_failed: bool;
     tls_policy:  usize;
-    session:     usize;
+    session:     secure.Handle;
     # the h2 session's index in the shared table, or h2.NO_SESSION
     h2_session:             usize;
     shared:                 *Storage;
@@ -387,7 +391,7 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
     }
-    if (owner.session == secure.NO_SESSION
+    if (secure.absent(owner.session)
         && owner.prologue_read < owner.prologue_len && length != 0) {
         ret deliver_staged(owner, scope, buffer, length, index);
     }
@@ -418,7 +422,7 @@ fun submit_readable(context: ptr, scope: *cancel.Scope,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
     }
-    if (owner.session == secure.NO_SESSION && owner.prologue_read < owner.prologue_len) {
+    if (secure.absent(owner.session) && owner.prologue_read < owner.prologue_len) {
         ret ready_staged(owner, scope, index);
     }
     ret net_async.submit_readable(owner.driver, scope, ?owner.stream,
@@ -683,7 +687,7 @@ pub fun make(
     # cleartext, so the connection is refused before it is admitted
     if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
     owner.tls_policy           = policy;
-    owner.session              = secure.NO_SESSION;
+    owner.session              = secure.no_session();
     owner.h2_session           = h2.NO_SESSION;
     owner.shared               = shared;
     owner.handshaking          = false;
@@ -795,7 +799,7 @@ pub fun pending_work(owner: *Connection) bool {
     if (owner.wake_failed) { ret true; }
     # the pool funded the account and nothing has routed its wake
     if (owner.account_live && owner.account.is_ready) { ret true; }
-    if (owner.session != secure.NO_SESSION && secure.pending_work(owner.session)) {
+    if (!secure.absent(owner.session) && secure.pending_work(owner.session)) {
         ret true;
     }
     if (owner.state == NEW) {
@@ -837,7 +841,7 @@ pub fun close_work(owner: *Connection) bool {
     if (!close_waiting(owner))                        { ret false; }
     if (owner.wake_failed)                            { ret true; }
     if (owner.account_live && owner.account.is_ready) { ret true; }
-    if (owner.session != secure.NO_SESSION && secure.pending_work(owner.session)) {
+    if (!secure.absent(owner.session) && secure.pending_work(owner.session)) {
         ret true;
     }
     ret owner.h2_session != h2.NO_SESSION && h2.close_work(h2_of(owner));
@@ -949,7 +953,7 @@ fun refuse(owner: *Connection, reason: prologue.Refusal) Step {
 
 fun start_engine(owner: *Connection, now: time.Instant) Step {
     var adapter: transport.Adapter = owner.adapter;
-    if (owner.session != secure.NO_SESSION) { adapter = secure.adapter(owner.session); }
+    if (!secure.absent(owner.session)) { adapter = secure.adapter(owner.session); }
     if (!transport.adapter_valid(?adapter)) {
         ret refuse(owner, prologue.REFUSED_TRANSPORT);
     }
@@ -1032,7 +1036,7 @@ fun staged_bytes(context: ptr, buffer: *u8, length: usize) usize {
 fun settle_secure(context: ptr, token_context: usize,
     completion: io_runtime.Completion) {
     val owner: *Connection = context::*Connection;
-    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) {
+    if (owner == nil || !owner.initialized || secure.absent(owner.session)) {
         ret;
     }
     var settled: io_runtime.Completion = completion;
@@ -1044,8 +1048,8 @@ fun begin_secure(owner: *Connection, now: time.Instant) Step {
     if (!hedge_tls.prepare(owner.tls_policy)) {
         ret refuse(owner, prologue.REFUSED_TLS);
     }
-    owner.session = secure.acquire();
-    if (owner.session == secure.NO_SESSION) {
+    owner.session = secure.acquire(owner.shared.worker);
+    if (secure.absent(owner.session)) {
         ret refuse(owner, prologue.REFUSED_EXHAUSTED);
     }
     val channel: *secure.Channel = secure.channel(owner.session);
@@ -1690,7 +1694,7 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
     }
     # a secure connection's transport work is driven by this loop rather than by
     # the engine, because exactly one TLS operation may run at a time
-    if (owner.session != secure.NO_SESSION && owner.engine_live) {
+    if (!secure.absent(owner.session) && owner.engine_live) {
         var settled: transport.Completion;
         if (secure.take(owner.session, ?settled)) {
             if (owner.h2_session != h2.NO_SESSION) {
@@ -1716,12 +1720,12 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         # whatever the engine queued in this step has to start now. leaving it
         # for the next completion strands the last frame of a response behind a
         # read the peer will never satisfy, because the peer is waiting for it.
-        if (owner.session != secure.NO_SESSION) { secure.drive(owner.session); }
+        if (!secure.absent(owner.session)) { secure.drive(owner.session); }
         owner.last_step = stepped;
         if (stepped == STEP_DONE || stepped == STEP_ERROR) { owner.state = CLOSING; }
         ret stepped;
     }
-    if (owner.session != secure.NO_SESSION) { secure.drive(owner.session); }
+    if (!secure.absent(owner.session)) { secure.drive(owner.session); }
     if (owner.engine.state == connection.CLOSED || owner.engine.state == connection.FAILED) {
         owner.state = CLOSING;
         ret STEP_DONE;
@@ -1771,7 +1775,7 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
     fin { track_memory(owner, now); }
     # what the engines submit to the secure channel while this runs is started
     # here, and whatever is left unstarted queues the connection again
-    if (owner.session != secure.NO_SESSION) { secure.begin_step(owner.session); }
+    if (!secure.absent(owner.session)) { secure.begin_step(owner.session); }
     fin { end_secure_step(owner); }
     var steps: usize = 0;
     # a connection still moving when its step bound runs out has more to do
@@ -1786,7 +1790,7 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
     }
     # the engines have nothing more to send, so a read may start without a
     # response ever having to wait behind it
-    if (owner.session != secure.NO_SESSION && owner.engine_live
+    if (!secure.absent(owner.session) && owner.engine_live
         && owner.state == ACTIVE && secure.drive(owner.session)) {
         ret STEP_PROGRESS;
     }
@@ -1794,7 +1798,7 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
 }
 
 fun end_secure_step(owner: *Connection) {
-    if (owner.initialized && owner.session != secure.NO_SESSION) {
+    if (owner.initialized && !secure.absent(owner.session)) {
         secure.end_step(owner.session);
     }
 }
@@ -1804,7 +1808,7 @@ fun end_secure_step(owner: *Connection) {
 # connection. the worker queues the connection as well, for an HTTP engine that
 # was blocked on the same account
 pub fun funded(owner: *Connection) {
-    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) { ret; }
+    if (owner == nil || !owner.initialized || secure.absent(owner.session)) { ret; }
     secure.resume(owner.session);
 }
 
@@ -1913,7 +1917,7 @@ fun pump_secure_close(owner: *Connection) bool {
 # socket wakes the connection through settle_secure for the next close to take
 fun close_h1(owner: *Connection) bool {
     for (!close_h1_engine(owner)) {
-        if (owner.session == secure.NO_SESSION || !pump_secure_close(owner)) {
+        if (secure.absent(owner.session) || !pump_secure_close(owner)) {
             ret false;
         }
     }
@@ -1927,7 +1931,7 @@ fun close_h2(owner: *Connection) h2.ReleaseStatus {
     for {
         val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions,
             owner.h2_session);
-        if (released != h2.RELEASE_PENDING || owner.session == secure.NO_SESSION
+        if (released != h2.RELEASE_PENDING || secure.absent(owner.session)
             || !pump_secure_close(owner)) { ret released; }
     }
     ret h2.RELEASE_PENDING;
@@ -1981,13 +1985,13 @@ pub fun close(owner: *Connection) bool {
     # a handshake the cancellation interrupted still runs in the session until
     # its transport operations settle, and releasing it before then would leave
     # its buffers held (#280). each settlement wakes the connection
-    if (owner.session != secure.NO_SESSION) {
+    if (!secure.absent(owner.session)) {
         if (!secure.idle(owner.session)) {
             owner.close_wait = CLOSE_TLS;
             ret false;
         }
         if (!secure.release(owner.session)) { owner.close_failed = true; }
-        owner.session = secure.NO_SESSION;
+        owner.session = secure.no_session();
     }
     owner.handshaking = false;
     # the account cannot close while it still holds the staging chunk, and a
