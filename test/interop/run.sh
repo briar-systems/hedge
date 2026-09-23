@@ -393,9 +393,20 @@ start_server test/interop/cache-disabled.toml || exit 1
 disabled_vmsize="$(awk '/^VmSize:/ { print $2 }' /proc/"$server_pid"/status)"
 check "disabled cache still serves the configured route" 200 \
     "$(curl_code --http1.1 -H 'Host: localhost' http://127.0.0.1:9086/)"
-check "disabled cache starts no worker" 1 \
+# the supervisor and one thread per serving worker, and nothing for a cache
+workers="$(sed -n 's/^hedge: workers \([0-9][0-9]*\)$/\1/p' "$work/server.log")"
+check "startup names its serving workers" yes "$([ -n "$workers" ] && echo yes || echo no)"
+check "disabled cache starts no thread of its own" "$((${workers:-0} + 1))" \
     "$(awk '/^Threads:/ { print $2 }' /proc/"$server_pid"/status)"
 check "disabled cache opens no timer" 0 "$(fd_target_count 'anon_inode:\[timerfd\]')"
+# nothing happens, so no thread of the process runs: the supervisor and every
+# worker sleep until a signal, a connection or a deadline. a tick is 10 ms, so
+# one second may account a stray one
+idle_ticks() { awk '{ print $14 + $15 }' /proc/"$server_pid"/stat; }
+ticks_before="$(idle_ticks)"
+sleep 1
+ticks_spent=$(( $(idle_ticks) - ticks_before ))
+check "an idle server spends no CPU" yes "$([ "$ticks_spent" -le 1 ] && echo yes || echo "no ($ticks_spent ticks)")"
 check "disabled cache opens no cache root" 0 \
     "$(fd_target_count 'hedge-disabled-cache-must-not-open')"
 stop_server
@@ -550,7 +561,7 @@ PY
             readlink "$link" 2>/dev/null | grep -q '/test/interop/reload-v' \
                 && retired_roots=$((retired_roots + 1))
         done
-        [ "$retired_roots" = 1 ] && break
+        [ "$retired_roots" -le "$(sed -n 's/^hedge: workers \([0-9][0-9]*\)$/\1/p' "$work/reload.log")" ] && break
         sleep 0.05
     done
     local repeated=0
@@ -572,11 +583,16 @@ PY
     done
     kill -TERM "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
-    echo "$before/$old/$after/$repeated/$held_roots/$retired_roots"
+    # each worker opens the static root of each generation it serves: while the
+    # held request pins the old generation on its worker, every worker holds the
+    # new root and that one the old as well, and once it retires, one each
+    local workers
+    workers="$(sed -n 's/^hedge: workers \([0-9][0-9]*\)$/\1/p' "$work/reload.log")"
+    echo "$before/$old/$after/$repeated/$((held_roots - ${workers:-0}))/$((retired_roots - ${workers:-0}))"
 }
 
 check "service reload pins the old generation and reclaims twelve replacements" \
-    "404/served/reloaded/12/2/1" "$(reload_rebuilds_services)"
+    "404/served/reloaded/12/1/0" "$(reload_rebuilds_services)"
 
 check "a stop with no work in flight drains cleanly" 0 "$(shutdown_exit idle)"
 check "a stop with a peer mid-request reports the abandoned exchange" 75 \
