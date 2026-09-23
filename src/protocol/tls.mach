@@ -24,6 +24,7 @@ use std.crypto.ct;
 use std.filesystem;
 use io_error: std.io.error;
 use std.io.file;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -152,13 +153,15 @@ pub rec Policy {
     ticket_ring:                 session.KeyRing;
     replay_window:               session.ReplayWindow;
     ticket_key_lifetime_seconds: u32;
-    ticket_rotate_at:            time.Instant;
-    ticket_replay_policy:        session.ReplayPolicy;
-    tickets_per_connection:      u8;
-    tickets_live:                bool;
-    replay_live:                 bool;
-    configuration:               tls_config.ServerConfig;
-    live:                        bool;
+    # when the ticket key is next due, in monotonic nanoseconds. every worker
+    # handshaking under the policy reads it, and one claims each rotation
+    ticket_rotate_ns:       i64;
+    ticket_replay_policy:   session.ReplayPolicy;
+    tickets_per_connection: u8;
+    tickets_live:           bool;
+    replay_live:            bool;
+    configuration:          tls_config.ServerConfig;
+    live:                   bool;
 }
 
 # a policy is secret-welded through its credential store and private keys, so no
@@ -195,7 +198,7 @@ pub fun reset() {
         policies[i].name_len           = 0;
         policies[i].tickets_live       = false;
         policies[i].replay_live        = false;
-        policies[i].ticket_rotate_at   = time.Instant{sec: 0, nsec: 0};
+        policies[i].ticket_rotate_ns   = 0;
         i                              = i + 1;
     }
     policy_count   = 0;
@@ -211,9 +214,20 @@ pub fun policy_at(index: usize) *Policy {
     ret ?policies[index];
 }
 
+# the monotonic nanosecond a ticket key minted at `now` falls due
+fun rotation_after(now: time.Instant, lifetime_seconds: u32) i64 {
+    val due: u64 = clock.after_ns(clock.to_ns(now), lifetime_seconds::u64 * 1000000000);
+    if (due > 0x7fffffffffffffff) { ret 0x7fffffffffffffff; }
+    ret due::i64;
+}
+
 # rotate the ticket key when it is due, before a handshake uses the ring. the
 # rotation schedule is an interval, so it runs on the monotonic clock, and the
-# ring takes both readings of one moment
+# ring takes both readings of one moment.
+#
+# every worker handshakes under the same policy, so the due time is claimed by
+# compare and swap: the one handshake that moves it rotates, and the others
+# carry on with the ring as it stands, whose current key still opens
 # ---
 # index: the policy a connection is about to handshake under
 # ret:   false when the policy is gone, the clocks cannot be read, or a new key
@@ -223,13 +237,19 @@ pub fun prepare(index: usize) bool {
     if (policy == nil)        { ret false; }
     if (!policy.tickets_live) { ret true; }
     var moment: tls_clock.Moment;
-    if (!tls_clock.read(?policy.clock, ?moment))                        { ret false; }
-    if (time.instant_before(moment.monotonic, policy.ticket_rotate_at)) { ret true; }
+    if (!tls_clock.read(?policy.clock, ?moment)) { ret false; }
+    var due: i64 = atomic.load(?policy.ticket_rotate_ns);
+    if (clock.to_ns(moment.monotonic) < due::u64) { ret true; }
+    val claimed: i64 = due;
+    if (!atomic.cas(?policy.ticket_rotate_ns, ?due,
+        rotation_after(moment.monotonic, policy.ticket_key_lifetime_seconds))) {
+        ret true;
+    }
     if (!session.keyring_rotate(?policy.ticket_ring, ?policy.entropy, moment)) {
+        # the claim is handed back, so the next handshake tries again
+        atomic.store(?policy.ticket_rotate_ns, claimed);
         ret false;
     }
-    policy.ticket_rotate_at = clock.after(moment.monotonic,
-        policy.ticket_key_lifetime_seconds::u64 * 1000000000);
     ret true;
 }
 
@@ -498,13 +518,13 @@ fun destroy_resumption(policy: *Policy) {
         session.keyring_destroy(?policy.ticket_ring);
         policy.tickets_live = false;
     }
-    policy.ticket_rotate_at = time.Instant{sec: 0, nsec: 0};
+    policy.ticket_rotate_ns = 0;
 }
 
 fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Status {
     policy.tickets_live           = false;
     policy.replay_live            = false;
-    policy.ticket_rotate_at       = time.Instant{sec: 0, nsec: 0};
+    policy.ticket_rotate_ns       = 0;
     policy.ticket_replay_policy   = session.REPLAY_PERMISSIVE;
     policy.tickets_per_connection = 0;
     if (configured == nil || !configured.enabled) { ret OK; }
@@ -519,8 +539,8 @@ fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Sta
         configured.ticket_lifetime_seconds)) { ret UNSUPPORTED; }
     policy.tickets_live                = true;
     policy.ticket_key_lifetime_seconds = configured.key_lifetime_seconds;
-    policy.ticket_rotate_at            = clock.after(moment.monotonic,
-        configured.key_lifetime_seconds::u64 * 1000000000);
+    atomic.store(?policy.ticket_rotate_ns, rotation_after(moment.monotonic,
+        configured.key_lifetime_seconds));
     policy.tickets_per_connection = configured.tickets_per_connection;
     if (configured.replay_policy == schema.TLS_REPLAY_SINGLE_USE) {
         if (!session.replay_init(?policy.replay_window)) {
@@ -592,7 +612,7 @@ fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
     policy.require_client_auth  = configured.client_auth;
     policy.tickets_live         = false;
     policy.replay_live          = false;
-    policy.ticket_rotate_at     = time.Instant{sec: 0, nsec: 0};
+    policy.ticket_rotate_ns     = 0;
     policy.client_trust.anchors = nil;
     policy.client_trust.len     = 0;
     if (!copy_name(?policy.name[0], ?policy.name_len, name)) { ret INVALID; }
@@ -1198,7 +1218,7 @@ test "tls: configured session keys rotate and retain their exact overlap" {
     var moment: tls_clock.Moment = tls_clock.at(1000, 0);
     policy.clock = tls_clock.frozen(?moment);
     val first:    u64          = session.keyring_generation(?policy.ticket_ring);
-    val boundary: time.Instant = policy.ticket_rotate_at;
+    val boundary: time.Instant = clock.from_ns(atomic.load(?policy.ticket_rotate_ns)::u64);
     moment.monotonic = time.instant_add(boundary, -1);
     if (first == 0 || !prepare(index)
         || session.keyring_generation(?policy.ticket_ring) != first) {
@@ -1209,10 +1229,17 @@ test "tls: configured session keys rotate and retain their exact overlap" {
     if (!prepare(index)
         || session.keyring_generation(?policy.ticket_ring) != first + 1
         || session.keyring_openable(?policy.ticket_ring, boundary) != 2
-        || !time.instant_equal(policy.ticket_rotate_at,
-        time.instant_add(boundary, 60000000000))) {
+        || atomic.load(?policy.ticket_rotate_ns)
+        != clock.to_ns(time.instant_add(boundary, 60000000000))::i64) {
         destroy();
         ret 5;
+    }
+    # the claim moved the due time, so a second handshake at the same moment,
+    # as another worker's would be, finds nothing due and does not rotate again
+    if (!prepare(index)
+        || session.keyring_generation(?policy.ticket_ring) != first + 1) {
+        destroy();
+        ret 7;
     }
     reset();
     if (count() != 0 || policy.tickets_live || policy.replay_live
