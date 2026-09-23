@@ -3,6 +3,7 @@
 use process_admission: hedge.admission;
 use hedge.allowance;
 use hedge.config.schema;
+use hedge.handoff;
 use quic_capacity: hedge.protocol.quic.capacity;
 use hedge.protocol.trust;
 use hedge.spread;
@@ -167,6 +168,8 @@ pub rec OwnedListener {
     accept_pending:     usize;
     connection_limit:   opt[usize];
     active_connections: usize;
+    # accepted by one worker and handed to the least loaded (spread.HANDOFF)
+    hands_off: bool;
     tcp_listener:       tcp.Listener;
     udp_socket:         udp.Socket;
     local_listener:     local_async.Listener;
@@ -410,6 +413,7 @@ fun release_connection_slot(owner: *Owner, index: usize) bool {
             set_index = set_index + 1;
         }
     }
+    handoff.discharge(owner.options.board, owner.options.worker);
     connection.state         = CONNECTION_FREE;
     connection.id            = 0;
     connection.lease         = process_admission.no_lease();
@@ -570,6 +574,7 @@ fun admit_tcp(owner: *Owner, set: *ListenerSet, listener_index: usize, stream: *
         val connection: *Connection = queue_connection(owner, set, listener_index, schema.TRANSPORT_TCP, peer);
         if (connection != nil) {
             connection.tcp_stream = @stream;
+            handoff.charge(owner.options.board, owner.options.worker);
             ret true;
         }
     }
@@ -585,11 +590,137 @@ fun admit_local(owner: *Owner, set: *ListenerSet, listener_index: usize, stream:
         val connection: *Connection = queue_connection(owner, set, listener_index, schema.TRANSPORT_LOCAL, nil);
         if (connection != nil) {
             connection.local_stream = @stream;
+            handoff.charge(owner.options.board, owner.options.worker);
             ret true;
         }
     }
     local_async.submit_stream_close(?owner.local, ?owner.root_scope, stream, lifecycle.ABORTIVE, 0);
     ret false;
+}
+
+# the worker a stream accepted on `set` goes to, or this one. a stream in flight
+# to a worker is charged to it until that worker takes it
+fun route_target(owner: *Owner, set: *ListenerSet) usize {
+    val board: *handoff.Board = owner.options.board;
+    if (!handoff.routes(board)) { ret owner.options.worker; }
+    val target: usize = handoff.least_loaded(board, owner.options.worker, set.generation);
+    if (target != owner.options.worker) { handoff.charge(board, target); }
+    ret target;
+}
+
+# a stream detached and then refused by its target: this worker adopts it back
+# or closes it. false when it was closed
+fun post_or_keep(owner: *Owner, target: usize, arrival: *handoff.Arrival) bool {
+    val board: *handoff.Board = owner.options.board;
+    if (handoff.post(board, target, @arrival)) { ret false; }
+    handoff.discharge(board, target);
+    ret true;
+}
+
+# hand a TCP stream to the least loaded worker. true when the stream is still
+# this worker's to admit
+fun route_tcp(owner: *Owner, set: *ListenerSet, listener_index: usize, stream: *tcp.Stream, peer: *ip.Endpoint) bool {
+    val target: usize = route_target(owner, set);
+    if (target == owner.options.worker) { ret true; }
+    val detached: res[net_async.Detached, io_error.Error] = net_async.detach(?owner.network, stream);
+    if (sel detached.err) {
+        handoff.discharge(owner.options.board, target);
+        ret true;
+    }
+    var arrival: handoff.Arrival;
+    arrival.generation     = set.generation;
+    arrival.listener_index = listener_index;
+    arrival.transport      = schema.TRANSPORT_TCP;
+    arrival.has_peer       = peer != nil;
+    if (peer != nil) { arrival.peer = @peer; }
+    arrival.tcp = detached.ok;
+    if (!post_or_keep(owner, target, ?arrival)) { ret false; }
+    val adopted: res[tcp.Stream, io_error.Error] = net_async.adopt(?owner.network, ?arrival.tcp);
+    if (sel adopted.ok) {
+        @stream = adopted.ok;
+        ret true;
+    }
+    if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    ret false;
+}
+
+# hand a local stream to the least loaded worker. true when the stream is still
+# this worker's to admit
+fun route_local(owner: *Owner, set: *ListenerSet, listener_index: usize, stream: *local_async.Stream) bool {
+    val target: usize = route_target(owner, set);
+    if (target == owner.options.worker) { ret true; }
+    val detached: res[local_async.Detached, io_error.Error] = local_async.detach(?owner.local, stream);
+    if (sel detached.err) {
+        handoff.discharge(owner.options.board, target);
+        ret true;
+    }
+    var arrival: handoff.Arrival;
+    arrival.generation     = set.generation;
+    arrival.listener_index = listener_index;
+    arrival.transport      = schema.TRANSPORT_LOCAL;
+    arrival.has_peer       = false;
+    arrival.local          = detached.ok;
+    if (!post_or_keep(owner, target, ?arrival)) { ret false; }
+    val adopted: res[local_async.Stream, io_error.Error] = local_async.adopt(?owner.local, ?arrival.local);
+    if (sel adopted.ok) {
+        @stream = adopted.ok;
+        ret true;
+    }
+    if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    ret false;
+}
+
+# the set of `generation` this owner still has
+fun set_of_generation(owner: *Owner, generation: u64) *ListenerSet {
+    var i: usize = 0;
+    for (i < 2) {
+        if (owner.sets[i].scope_initialized && owner.sets[i].generation == generation) { ret ?owner.sets[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# adopt and admit every stream another worker handed this one
+fun take_arrivals(owner: *Owner) {
+    val board: *handoff.Board = owner.options.board;
+    if (!handoff.routes(board)) { ret; }
+    var arrival: handoff.Arrival;
+    for (handoff.take(board, owner.options.worker, ?arrival)) {
+        handoff.discharge(board, owner.options.worker);
+        val set: *ListenerSet = set_of_generation(owner, arrival.generation);
+        if (set != nil && arrival.transport == schema.TRANSPORT_TCP) {
+            val adopted: res[tcp.Stream, io_error.Error] = net_async.adopt(?owner.network, ?arrival.tcp);
+            if (sel adopted.ok) {
+                var stream: tcp.Stream   = adopted.ok;
+                var peer:   *ip.Endpoint = nil;
+                if (arrival.has_peer) { peer = ?arrival.peer; }
+                admit_tcp(owner, set, arrival.listener_index, ?stream, peer);
+                cnt;
+            }
+        }
+        or (set != nil && arrival.transport == schema.TRANSPORT_LOCAL) {
+            val adopted: res[local_async.Stream, io_error.Error] = local_async.adopt(?owner.local, ?arrival.local);
+            if (sel adopted.ok) {
+                var stream: local_async.Stream = adopted.ok;
+                admit_local(owner, set, arrival.listener_index, ?stream);
+                cnt;
+            }
+        }
+        if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    }
+}
+
+# this owner takes no more arrivals, and closes the ones still waiting
+fun refuse_arrivals(owner: *Owner) {
+    val board: *handoff.Board = owner.options.board;
+    if (!handoff.routes(board)) { ret; }
+    handoff.publish(board, owner.options.worker, 0);
+    handoff.close_inbox(board, owner.options.worker);
+    var arrival: handoff.Arrival;
+    for (handoff.take(board, owner.options.worker, ?arrival)) {
+        handoff.discharge(board, owner.options.worker);
+        if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    }
 }
 
 fun dispatch_accept(owner: *Owner, context: *CompletionContext, completion: io_runtime.Completion) {
@@ -617,13 +748,17 @@ fun dispatch_accept(owner: *Owner, context: *CompletionContext, completion: io_r
     if (set.pending_accepts > 0)     { set.pending_accepts = set.pending_accepts - 1; }
 
     if (!completion.has_error && context.kind == CONTEXT_ACCEPT_TCP) {
-        admit_tcp(owner, set, context.listener_index, ?accepted, ?slot.peer);
+        if (!listener.hands_off || route_tcp(owner, set, context.listener_index, ?accepted, ?slot.peer)) {
+            admit_tcp(owner, set, context.listener_index, ?accepted, ?slot.peer);
+        }
     }
     or (!completion.has_error && context.kind == CONTEXT_ACCEPT_LOCAL) {
         val accepted: res[local_async.Stream, io_error.Error] = local_async.accepted(?owner.local, completion);
         if (sel accepted.ok) {
             var stream: local_async.Stream = accepted.ok;
-            admit_local(owner, set, context.listener_index, ?stream);
+            if (!listener.hands_off || route_local(owner, set, context.listener_index, ?stream)) {
+                admit_local(owner, set, context.listener_index, ?stream);
+            }
         }
     }
     if (set.state == SET_ACTIVE) { replenish_listener(owner, set, context.listener_index); }
@@ -671,6 +806,7 @@ pub fun begin_drain(owner: *Owner) bool {
     }
     owner.stop_requested = true;
     owner.state          = OWNER_DRAINING;
+    refuse_arrivals(owner);
     if (owner.active_set != NO_INDEX) {
         val set: *ListenerSet = ?owner.sets[owner.active_set];
         if (set.state == SET_ACTIVE) {
@@ -732,6 +868,7 @@ pub fun poll(owner: *Owner, timeout_ms: i32) bool {
         dispatch_completion(owner, completions[i]);
         i = i + 1;
     }
+    take_arrivals(owner);
     drain_process_events(owner);
     replenish(owner);
     ret true;
@@ -795,6 +932,7 @@ fun size_socket_buffer(handle: io_handle.SocketHandle, option: socket.ValueOptio
 fun initialize_owned_listener(listener: *OwnedListener, set_index: usize, listener_index: usize, configured: *schema.Listener, graph: *schema.Graph) {
     listener.state     = LISTENER_UNUSED;
     listener.transport = configured.transport;
+    listener.hands_off = spread.of(configured) == spread.HANDOFF;
     initialize_policy(?listener.policy, configured);
     listener.name               = configured.name;
     listener.configured_address = configured.address;
@@ -1229,13 +1367,14 @@ pub rec StartOptions {
     admission:    *process_admission.Shared;
     worker:       usize;
     wakers:       *allowance.Wakers;
+    board:        *handoff.Board;
     reuse_port:   bool;
     endpoints:    *ip.Endpoint;
 }
 
 pub fun own_options() StartOptions {
     ret StartOptions{owns_process: true, admission: nil, worker: 0, wakers: nil,
-        reuse_port: false, endpoints: nil};
+        board: nil, reuse_port: false, endpoints: nil};
 }
 
 pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
@@ -1340,6 +1479,7 @@ pub fun start_with(owner: *Owner, generation: u64, graph: *schema.Graph,
     }
     owner.active_set = 0;
     owner.generation = generation;
+    handoff.publish(options.board, options.worker, generation);
     ret true;
 }
 
@@ -1373,6 +1513,7 @@ pub fun reload(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics
     val previous_index: usize = owner.active_set;
     owner.active_set = candidate_index;
     owner.generation = generation;
+    handoff.publish(owner.options.board, owner.options.worker, generation);
     val previous: *ListenerSet = ?owner.sets[previous_index];
     previous.state = SET_DRAINING;
     cancel.cancel(?previous.scope);
@@ -1500,6 +1641,7 @@ pub fun stop(owner: *Owner) bool {
         > owner.connection_count) { ret false; }
     owner.state          = OWNER_DRAINING;
     owner.stop_requested = true;
+    refuse_arrivals(owner);
     var success: bool  = true;
     var i:       usize = 0;
     for (i < 2) {

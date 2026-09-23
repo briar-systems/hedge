@@ -1,0 +1,160 @@
+# a listener one worker accepts for all hands its connections to the others
+
+use hedge.config.schema;
+use hedge.handoff;
+use hedge.listener;
+use std.allocator;
+use std.allocator.page;
+use io_error:     std.io.error;
+use io_lifecycle: std.io.lifecycle;
+use local_socket: std.net.local;
+use local_types:  std.net.local.types;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+val CONNECTIONS: usize = 4;
+
+# an abstract socket name this process alone uses, so parallel runs never meet
+fun local_name(output: *u8, capacity: usize) usize {
+    val prefix: str   = "@hedge-handoff-";
+    var length: usize = 0;
+    for (prefix[length] != 0) {
+        output[length] = prefix[length];
+        length         = length + 1;
+    }
+    var digits: [20]u8;
+    var count:  usize = 0;
+    var pid:    u64   = os.getpid()::u64;
+    for (count == 0 || pid != 0) {
+        digits[count] = ('0'::u64 + pid % 10)::u8;
+        pid           = pid / 10;
+        count         = count + 1;
+    }
+    for (count > 0 && length + 1 < capacity) {
+        count          = count - 1;
+        output[length] = digits[count];
+        length         = length + 1;
+    }
+    output[length] = 0;
+    ret length;
+}
+
+fun configure(graph: *schema.Graph, address: str) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "handoff-test");
+    graph.limits.max_connections          = opt[usize].some{16};
+    graph.limits.max_connections_per_peer = opt[usize].some{16};
+    graph.listener_count                  = 1;
+    val local: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?local.name, "local");
+    schema.set_text(?local.address, address);
+    schema.clear_text(?local.tls_policy);
+    schema.clear_text(?local.budget);
+    local.transport    = schema.TRANSPORT_LOCAL;
+    local.protocols    = schema.PROTOCOL_HTTP1;
+    local.backlog      = 16;
+    local.accept_depth = 2;
+}
+
+fun start_worker(owner: *listener.Owner, graph: *schema.Graph, board: *handoff.Board, worker: usize) bool {
+    var diagnostics: schema.Diagnostics;
+    schema.reset_diagnostics(?diagnostics);
+    ret listener.start_with(owner, 1, graph, ?diagnostics,
+        listener.StartOptions{owns_process: worker == 0, admission: nil, worker: worker,
+        wakers: nil, board: board, reuse_port: false, endpoints: nil});
+}
+
+fun page_ok(outcome: err[allocator.Error]) bool {
+    ret sel outcome.ok;
+}
+
+# the connections worker `owner` queued, each closed through its own driver
+fun close_queued(owner: *listener.Owner) usize {
+    var closed: usize = 0;
+    var token:  listener.ConnectionToken;
+    for (listener.take_connection(owner, ?token)) {
+        if (listener.close_connection(owner, token)) { closed = closed + 1; }
+    }
+    ret closed;
+}
+
+test "handoff: a local listener's connections are spread across the workers" {
+    $if ($mach.build.os != $mach.os.linux) {
+        ret 0;
+    }
+    var heap: allocator.Allocator;
+    if (!page_ok(page.make(?heap))) { ret 1; }
+    var board: handoff.Board;
+    if (!handoff.make_board(?board, ?heap, nil, 2)) { ret 2; }
+    var name: [64]u8;
+    val length: usize = local_name(?name[0], 64);
+    var graph: schema.Graph;
+    configure(?graph, ?name[0]);
+    # the first worker binds and accepts, the second binds nothing and is
+    # handed what the first routes to it
+    var first:  listener.Owner;
+    var second: listener.Owner;
+    if (!start_worker(?first, ?graph, ?board, 0)) {
+        handoff.destroy_board(?board);
+        ret 3;
+    }
+    if (!start_worker(?second, ?graph, ?board, 1)) {
+        listener.stop(?first);
+        handoff.destroy_board(?board);
+        ret 4;
+    }
+    var failed: i32 = 0;
+    val remote: res[local_socket.Endpoint, io_error.Error] = local_socket.abstract(?name[1], length - 1);
+    var clients: [CONNECTIONS]local_types.Stream;
+    var opened:  usize = 0;
+    var target:  local_socket.Endpoint;
+    if (sel remote.ok) { target = remote.ok; }
+    or { failed = 5; }
+    for (failed == 0 && opened < CONNECTIONS) {
+        val connected: res[local_types.Stream, io_error.Error] = local_socket.connect(target);
+        if (sel connected.err) {
+            failed = 6;
+            brk;
+        }
+        clients[opened] = connected.ok;
+        opened          = opened + 1;
+    }
+    # every connection is charged to a worker as soon as the first accepts it:
+    # to itself when it keeps it, to the target while it is in flight
+    var polls: usize = 0;
+    for (failed == 0 && handoff.load(?board, 0) + handoff.load(?board, 1) < CONNECTIONS::i64) {
+        if (polls == 32 || !listener.poll(?first, 100)) {
+            failed = 7;
+            brk;
+        }
+        polls = polls + 1;
+    }
+    if (failed == 0 && !listener.poll(?second, 0)) { failed = 8; }
+    # ties rotate and the least loaded wins, so four arrivals split two and two
+    if (failed == 0 && (handoff.load(?board, 0) != 2 || handoff.load(?board, 1) != 2)) { failed = 9; }
+    if (failed == 0 && (listener.snapshot(?first).queued_connections != 2
+        || listener.snapshot(?second).queued_connections != 2)) { failed = 10; }
+    # the second worker's driver owns what it adopted, and closes it
+    if (failed == 0 && (close_queued(?first) != 2 || close_queued(?second) != 2)) { failed = 11; }
+    if (failed == 0 && (handoff.load(?board, 0) != 0 || handoff.load(?board, 1) != 0)) { failed = 12; }
+    var i: usize = 0;
+    for (i < opened) {
+        local_socket.stream_close(?clients[i], io_lifecycle.ABORTIVE);
+        i = i + 1;
+    }
+    val second_stopped: bool = listener.stop(?second);
+    val first_stopped:  bool = listener.stop(?first);
+    val leaked: u64 = listener.snapshot(?first).leaked_descriptors + listener.snapshot(?second).leaked_descriptors;
+    handoff.destroy_board(?board);
+    if (failed != 0) { ret failed; }
+    if (!first_stopped || !second_stopped) { ret 13; }
+    if (leaked != 0) { ret 14; }
+    ret 0;
+}
