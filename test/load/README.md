@@ -167,10 +167,33 @@ within one chunk of N times the per-slot cost, the counts are taken as given
 for every transport, and the 100k projection is the per-connection cost times
 100k plus what the first connections brought once.
 
-What the process gives back after the connections leave is printed and not
-asserted: the record tables release their trailing chunks, and what the
-allocator then returns to the kernel is the allocator's business.
-The QUIC cell does check that they have left first. A connection the client
+What a TCP or TLS server keeps after its connections leave is asserted
+(#235). The lane first waits up to 15 s for hedge's open sockets to fall back
+to the idle count, so every connection has been retired, and then the resident
+set above the idle baseline must be within these named terms, none of which
+grows with the peak:
+
+| term | bytes | why it stays |
+| --- | ---: | --- |
+| telemetry's log queue | 2,099,200 | 256 records of `std.log.sink.QueuedRecord` (8,200 bytes), allocated at start and resident once access-log records have passed through it |
+| std's peak slack | 1,638,400 | one empty chunk above the lowest in io.runtime's slot, timer and deadline tables and net.async's operation, resource, resource map and driver slot tables, kept so a load crossing a chunk boundary never reallocates (mach-std#868, #874) |
+| one `serve.Slot` chunk | 1,433,600 | 128 slots with `connection.Connection` inline, for a connection still being retired at the sample |
+| allowance | 1,048,576 | listener-start tables first touched under load, released pool chunks each class keeps up to its high water, admission leases and the log writer's stack (measured 212 KiB for TCP and 712 KiB for TLS) |
+
+A term that grows with the peak can hide under that bound at 10k, so a second
+fresh server holds only `LOAD_SCALE_SMALL` connections and releases them, and
+what the two servers keep may differ by no more than std's peak slack plus
+128 KiB. At 1k against 10k the difference measures 1.59 MiB, which is the
+slack; std 7.2.0's buffers slot table, which grew with the peak
+(mach-std#878), made it 1.87 to 1.88 MiB over TLS, and the check fails on that build.
+
+Measured page by page on std 7.4.0 (release build, transparent huge pages
+off), a TCP server keeps 2,320, 3,928 and 3,932 KiB after 1k, 10k and 20k
+connections, and a TLS server 2,820, 4,428 and 4,440 KiB, with its address
+space back within 2.5 MiB of idle.
+
+QUIC's after-release figure is printed, not asserted. The QUIC cell checks
+that the connections have left first. A connection the client
 closed stays in its draining period (mach-quic's 3 s drain timeout) before
 hedge releases it, so a sample on a fixed delay after release measured
 connections still draining (#269). The cell reads `hedge_quic_connections`
