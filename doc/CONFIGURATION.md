@@ -108,9 +108,10 @@ How connections reach the workers depends on what the platform can do:
 
 - On Linux every worker binds its own socket for each TCP listener with
   `SO_REUSEPORT`, and the kernel spreads connections across them.
-- Elsewhere, and for local listeners, one worker has to accept and hand each
-  connection to another, which waits on mach-std#891. Until then such a
-  process runs one worker, and startup says why.
+- Elsewhere, and for local listeners, the first worker accepts and hands each
+  connection to the least loaded worker serving the same configuration. A
+  worker whose queue of handed connections is full is passed over, and the
+  first worker serves the connection itself.
 - A QUIC listener is served by the first worker until connection IDs route
   datagrams across workers (#174).
 - While the cache is enabled, one worker serves, until the cache store is shared
