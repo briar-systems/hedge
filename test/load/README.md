@@ -81,7 +81,12 @@ number.
 TCP, can prove a cap on its own with `-expect-connected` and `-hold`, and holds
 idle connections for the scale lane with `-serve=false -hold`. `-dialing N`
 bounds the handshakes in flight, so the scale lane measures held connections
-rather than a handshake burst. The lanes build it into `.tools/` with the Go
+rather than a handshake burst. A held connection sends a keep-alive PING at half its
+`-idle-timeout`, which is what quic-go would cap it at anyway. It used to send
+one every second, and 10,000 connections doing that was 10,000 datagrams a
+second into hedge's socket: the socket dropped 76,396 datagrams while they were
+held, and 2,063 more when the holder closed them, so 1,948 connections never
+saw their CONNECTION_CLOSE and stayed live until their idle timeout (#269). The lanes build it into `.tools/` with the Go
 toolchain on the box, module cache beside it.
 
 ```sh
@@ -165,6 +170,12 @@ for every transport, and the 100k projection is the per-connection cost times
 What the process gives back after the connections leave is printed and not
 asserted: the record tables release their trailing chunks, and what the
 allocator then returns to the kernel is the allocator's business.
+The QUIC cell does check that they have left first. A connection the client
+closed stays in its draining period (mach-quic's 3 s drain timeout) before
+hedge releases it, so a sample on a fixed delay after release measured
+connections still draining (#269). The cell reads `hedge_quic_connections`
+from an admin listener on 127.0.0.1:19116, waits up to 15 s for it to reach
+zero, and fails if it does not, before the after-release sample is taken.
 
 ### The measured run for 0.7.0
 

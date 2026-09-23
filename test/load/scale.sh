@@ -47,6 +47,7 @@ QUIC_PORT=19112
 DEPTH_CLEARTEXT_PORT=19113
 DEPTH_SECURE_PORT=19114
 DEPTH_QUIC_PORT=19115
+ADMIN_PORT=19116
 PROJECTION=100000
 # what hedge advertises and funds per connection by default (max_pipeline_depth)
 DEPTH=2
@@ -83,15 +84,59 @@ mappings() {
 # one server per transport so every baseline is a process that has served
 # nothing. no connection cap, a budget that admits the large count (the pool
 # preallocates nothing, so the budget is a number, not memory), and keep-alive
-# long enough that nothing is retired while it is being counted.
+# long enough that nothing is retired while it is being counted. an admin
+# listener serves the metrics the release check reads.
+export HEDGE_ADMIN_TOKEN=scale-secret
 start_scale_server() {
     write_config "$work/scale.toml" \
         "max_connections_per_peer = $((large * 2))
 memory_bytes = $((large * 4 * 1048576))" \
         "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
         "keep_alive_ms = 900000
-drain_ms = 5000"
+drain_ms = 5000" \
+        "[[listener]]
+name = \"admin\"
+address = \"127.0.0.1:$ADMIN_PORT\"
+protocols = [\"http/1.1\"]
+
+[secret.admin-token]
+provider = \"env\"
+key = \"HEDGE_ADMIN_TOKEN\"
+
+[telemetry]
+metrics = true
+
+[admin]
+enabled = true
+listener = \"admin\"
+auth_secret = \"admin-token\"
+max_response_bytes = 8192"
     start_hedge "$work/scale.toml"
+}
+
+# a metric's value from the admin listener, or `missing`
+metric() {
+    curl -sS -H "Authorization: Bearer $HEDGE_ADMIN_TOKEN" \
+        "http://127.0.0.1:$ADMIN_PORT/metrics" \
+        | awk -v name="$1" '$1 == name { print $2; found = 1 }
+            END { if (!found) print "missing" }'
+}
+
+# waits up to RELEASE_WAIT seconds for hedge to hold no QUIC connection and
+# prints the last count read. a QUIC connection the peer closed is kept through
+# its draining period (RFC 9000 section 10.2, mach-quic's 3 s drain timeout)
+# before it is released, so a sample taken on a fixed delay after release can
+# measure connections still draining rather than what they left behind
+RELEASE_WAIT=15
+quic_released() {
+    local live
+    for _ in $(seq $((RELEASE_WAIT * 10))); do
+        live="$(metric hedge_quic_connections)"
+        if [ "$live" = 0 ]; then break; fi
+        sleep 0.1
+    done
+    echo "$live"
+    test "$live" = 0
 }
 
 # holds `count` HTTP/1.1 connections idle after one served request each
@@ -170,6 +215,11 @@ measure() {
     m3="$(mappings)"
 
     release_holders
+    if [ "$transport" = quic ]; then
+        local live
+        live="$(quic_released)"
+        report $? "quic: hedge holds no QUIC connection after release ($live live)"
+    fi
     sleep 2
     r4="$(resident)"
 
