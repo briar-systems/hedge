@@ -14,7 +14,11 @@ set -u
 
 binary="${HEDGE_BINARY:-out/linux-x86_64/release/bin/hedge}"
 connections="${LOAD_CONNECTIONS:-256}"
-target="${LOAD_TARGET:-8}"
+# the target is large enough that the ratio outlasts the ramp: workers take
+# their first connections at different moments, and over a handful of
+# requests that alone spreads the counts (#173). a starved connection still
+# stands out at any target
+target="${LOAD_TARGET:-40}"
 # past the 1024 QUIC connections a server with no configured limit used to be
 # capped at, so this cell fails on any build that still preallocates
 quic_connections="${LOAD_QUIC_CONNECTIONS:-1100}"
