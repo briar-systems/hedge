@@ -1432,8 +1432,42 @@ pub fun begin_shutdown(controls: *quic_runtime.ControlView, runtime: *Runtime, n
 # the superseded generation stays alive until its last connection is gone, which
 # is what `superseded` reports. releasing its plan before that would pull the
 # route graph out from under a request that is still being served.
-pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64, active_plan: *plan.Plan,
-    graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
+# the budget set a reload would rebuild: whichever the active set is not
+fun spare_budgets(runtime: *Runtime) *BudgetGeneration {
+    if (runtime.active_budgets == ?runtime.budget_generations[0].set) {
+        ret ?runtime.budget_generations[1];
+    }
+    ret ?runtime.budget_generations[0];
+}
+
+# the QUIC pump updates a reload to `generation` would apply, written to
+# `updates`. false when a pump's configuration cannot be derived
+fun quic_updates(runtime: *Runtime, graph: *schema.Graph, generation: u64,
+    active_plan: *plan.Plan, budgets: *budget.Set, updates: *quic_runtime.PumpUpdate,
+    count: *usize) bool {
+    @count = 0;
+    var i: usize = 0;
+    for (i < graph.listener_count) {
+        if (runtime.quic_handle_live[i]) {
+            var config: quic_runtime.PumpConfig;
+            if (!quic_config(runtime, graph, i, generation, active_plan,
+                budgets, ?config)) { ret false; }
+            updates[@count] = quic_runtime.PumpUpdate{
+                handle: runtime.quic_handles[i], config: config
+            };
+            @count = @count + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `reload` would publish this generation, asked without changing
+# anything, so a reload spread over several workers refuses before any of them
+# publishes. what `reload` can still refuse after this answers true is only the
+# allocator or a pump's staging
+pub fun check_reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64,
+    active_plan: *plan.Plan, graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
     if (runtime == nil || active_plan == nil || graph == nil || diagnostics == nil
         || runtime.state != READY || !plan.sealed(active_plan)
         || active_plan.generation != generation
@@ -1453,10 +1487,7 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
         || !timeout_nanoseconds(graph.timeouts.stop_ms, ?stop_timeout_ns)) {
         ret false;
     }
-    var next: *BudgetGeneration = ?runtime.budget_generations[0];
-    if (runtime.active_budgets == ?runtime.budget_generations[0].set) {
-        next = ?runtime.budget_generations[1];
-    }
+    val next: *BudgetGeneration = spare_budgets(runtime);
     # only a connection two reloads old can still hold the set about to be
     # rebuilt, and every such connection is on the previous list
     var i: usize = runtime.previous.head;
@@ -1466,8 +1497,28 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
             && slot.budgets == ?next.set) { ret false; }
         i = slot.next_live;
     }
-    if (runtime.quic_count != 0
-        && quic_runtime.budgets_in_use(controls, runtime.quic, ?next.set)) { ret false; }
+    if (runtime.quic_count != 0) {
+        if (quic_runtime.budgets_in_use(controls, runtime.quic, ?next.set)) { ret false; }
+        var updates:      [schema.MAX_LISTENERS]quic_runtime.PumpUpdate;
+        var update_count: usize = 0;
+        if (!quic_updates(runtime, graph, generation, active_plan, ?next.set,
+            ?updates[0], ?update_count)
+            || quic_runtime.check_all(controls, runtime.quic, ?updates[0], update_count)
+            != quic_runtime.OK) { ret false; }
+    }
+    ret true;
+}
+
+pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64, active_plan: *plan.Plan,
+    graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
+    if (!check_reload(controls, runtime, generation, active_plan, graph, diagnostics)) {
+        ret false;
+    }
+    var drain_timeout_ns: u64 = 0;
+    var stop_timeout_ns:  u64 = 0;
+    timeout_nanoseconds(graph.timeouts.drain_ms, ?drain_timeout_ns);
+    timeout_nanoseconds(graph.timeouts.stop_ms, ?stop_timeout_ns);
+    val next: *BudgetGeneration = spare_budgets(runtime);
     if (!configure_budgets(next, graph)) { ret false; }
     var quic_result: quic_runtime.UpdateResult = quic_runtime.UpdateResult{
         status: quic_runtime.OK, committed: false, rollback_failed: false
@@ -1475,19 +1526,8 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     if (runtime.quic_count != 0) {
         var updates:      [schema.MAX_LISTENERS]quic_runtime.PumpUpdate;
         var update_count: usize = 0;
-        i = 0;
-        for (i < graph.listener_count) {
-            if (runtime.quic_handle_live[i]) {
-                var config: quic_runtime.PumpConfig;
-                if (!quic_config(runtime, graph, i, generation, active_plan,
-                    ?next.set, ?config)) { ret false; }
-                updates[update_count] = quic_runtime.PumpUpdate{
-                    handle: runtime.quic_handles[i], config: config
-                };
-                update_count = update_count + 1;
-            }
-            i = i + 1;
-        }
+        if (!quic_updates(runtime, graph, generation, active_plan, ?next.set,
+            ?updates[0], ?update_count)) { ret false; }
         quic_result = quic_runtime.update_all(controls, runtime.quic,
             ?updates[0], update_count);
         if (!quic_result.committed) {
