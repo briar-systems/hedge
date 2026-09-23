@@ -50,7 +50,9 @@ pub rec Manager {
     leases:    storage.Table[LeaseSlot];
     # address to peer slot, so admitting a peer costs a lookup rather than a
     # scan of everything the pool has ever grown to
-    index:                    map.MapBy[ip.Addr, usize];
+    index: map.MapBy[PeerKey, usize];
+    # the seed this manager's peer index hashes under, drawn when it is made
+    seed:                     u64;
     max_connections:          opt[usize];
     max_connections_per_peer: opt[usize];
     # a process-global monotonic lease generation. a compaction zeroes a reused
@@ -111,24 +113,30 @@ fun address_equal(left: ip.Addr, right: ip.Addr) bool {
     ret true;
 }
 
-# the peer key is what a remote chooses, so the index is seeded once per process
-# and a flood of crafted addresses cannot be made to collide
-var hash_seed:      u64;
-var hash_seed_live: bool;
-
-fun seed() u64 {
-    if (!hash_seed_live) {
-        val filled: err[io_error.Error] = rand.fill((?hash_seed)::*u8, 8);
-        if (sel filled.err) { hash_seed = 0x9e3779b97f4a7c15; }
-        hash_seed_live = true;
-    }
-    ret hash_seed;
+# the peer key is what a remote chooses, so each index hashes it under a seed
+# of its own and a flood of crafted addresses cannot be made to collide. the
+# map's hash sees only the key, so the key carries its manager's seed
+pub rec PeerKey {
+    address: ip.Addr;
+    seed:    u64;
 }
 
-fun hash_address(address: *ip.Addr) u64 {
-    var value:  u64   = seed() ^ 0xcbf29ce484222325;
-    var count:  usize = 4;
-    var octets: *u8   = ?address.v4.octets[0];
+fun draw_seed() u64 {
+    var value:  u64                 = 0;
+    val filled: err[io_error.Error] = rand.fill((?value)::*u8, 8);
+    if (sel filled.err) { ret 0x9e3779b97f4a7c15; }
+    ret value;
+}
+
+fun peer_key(manager: *Manager, address: ip.Addr) PeerKey {
+    ret PeerKey{address: address, seed: manager.seed};
+}
+
+fun hash_key(key: *PeerKey) u64 {
+    val address: *ip.Addr = ?key.address;
+    var value:   u64      = key.seed ^ 0xcbf29ce484222325;
+    var count:   usize    = 4;
+    var octets:  *u8      = ?address.v4.octets[0];
     if (address.is_v6 != 0) {
         count  = 16;
         octets = ?address.v6.octets[0];
@@ -142,8 +150,8 @@ fun hash_address(address: *ip.Addr) u64 {
     ret value;
 }
 
-fun equal_address(left: *ip.Addr, right: *ip.Addr) bool {
-    ret address_equal(@left, @right);
+fun equal_key(left: *PeerKey, right: *PeerKey) bool {
+    ret address_equal(left.address, right.address);
 }
 
 fun limit_valid(limit: opt[usize]) bool {
@@ -169,9 +177,9 @@ pub fun make(manager: *Manager, a: *A.Allocator, max_connections: opt[usize],
     if (!limits_ordered(max_connections, max_connections_per_peer)) { ret false; }
     if (!storage.make_table[PeerSlot](?manager.peers, a)
         || !storage.make_table[LeaseSlot](?manager.leases, a)) { ret false; }
-    manager.allocator = a;
-    manager.index     = map.init_by[ip.Addr, usize](a, hash_address,
-        equal_address);
+    manager.allocator                = a;
+    manager.seed                     = draw_seed();
+    manager.index                    = map.init_by[PeerKey, usize](a, hash_key, equal_key);
     manager.max_connections          = max_connections;
     manager.max_connections_per_peer = max_connections_per_peer;
     manager.lease_generation         = 0;
@@ -196,7 +204,7 @@ pub fun retune(manager: *Manager, max_connections: opt[usize],
 
 pub fun destroy(manager: *Manager) bool {
     if (manager == nil || !manager.initialized || manager.live != 0) { ret false; }
-    val dropped: err[A.Error] = map.dnit_by[ip.Addr, usize](?manager.index);
+    val dropped: err[A.Error] = map.dnit_by[PeerKey, usize](?manager.index);
     var ok:      bool         = sel dropped.ok;
     if (!storage.destroy_table[PeerSlot](?manager.peers))   { ok = false; }
     if (!storage.destroy_table[LeaseSlot](?manager.leases)) { ok = false; }
@@ -233,16 +241,16 @@ pub fun available(manager: *Manager) bool {
 }
 
 fun find_peer(manager: *Manager, address: ip.Addr) usize {
-    var key:   ip.Addr     = address;
-    val found: opt[*usize] = map.get_by[ip.Addr, usize](?manager.index, ?key);
+    var key:   PeerKey     = peer_key(manager, address);
+    val found: opt[*usize] = map.get_by[PeerKey, usize](?manager.index, ?key);
     if (!(sel found.some)) { ret NO_SLOT; }
     ret @found.some;
 }
 
 fun release_peer(manager: *Manager, index: usize) {
     val slot: *PeerSlot = peer_at(manager, index);
-    var key:  ip.Addr   = slot.address;
-    map.remove_by[ip.Addr, usize](?manager.index, ?key);
+    var key:  PeerKey   = peer_key(manager, slot.address);
+    map.remove_by[PeerKey, usize](?manager.index, ?key);
     slot.live  = false;
     slot.count = 0;
     # the entry is gone from the map before the slot returns, so a compaction of
@@ -265,7 +273,8 @@ fun allocate_lease(manager: *Manager, peer: *ip.Endpoint,
             peer_index = claim_peer(manager);
             if (peer_index == NO_SLOT) { ret false; }
             val inserted: res[bool, A.Error] =
-                map.insert_by[ip.Addr, usize](?manager.index, address, peer_index);
+                map.insert_by[PeerKey, usize](?manager.index,
+                peer_key(manager, address), peer_index);
             if (sel inserted.err) {
                 storage.table_release[PeerSlot](?manager.peers, peer_index);
                 ret false;
@@ -524,5 +533,28 @@ test "hedge.admission: a lease into a compacted-away chunk is refused after regr
         i = i + 1;
     }
     if (!destroy(?manager)) { ret 13; }
+    ret 0;
+}
+
+# each manager draws its own seed, so two managers hash one address apart and
+# neither shares state a concurrent make could race on
+test "hedge.admission: every manager hashes peers under a seed of its own" {
+    var a: A.Allocator;
+    page.make(?a);
+    var first:  Manager;
+    var second: Manager;
+    if (!make(?first, ?a, uncapped(), capped(1))
+        || !make(?second, ?a, uncapped(), capped(1))) { ret 1; }
+    if (first.seed == second.seed) { ret 2; }
+    val endpoint: ip.Endpoint = ip.endpoint(192, 0, 2, 7, 443);
+    var left:     PeerKey     = peer_key(?first, endpoint.addr);
+    var right:    PeerKey     = peer_key(?second, endpoint.addr);
+    if (hash_key(?left) == hash_key(?right) || !equal_key(?left, ?right)) { ret 3; }
+    # the per-peer cap still binds under each manager's own seed
+    var held:    Lease;
+    var refused: Lease;
+    if (!acquire(?first, ?endpoint, ?held) || acquire(?first, ?endpoint, ?refused)) { ret 4; }
+    if (!release(?first, held))                                                     { ret 5; }
+    if (!destroy(?first) || !destroy(?second))                                      { ret 6; }
     ret 0;
 }
