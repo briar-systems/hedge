@@ -1,9 +1,9 @@
 # per-connection storage claimed on demand
 #
 # a record claimed here never moves while it is held: io completion contexts,
-# cancellation scopes and body readers keep pointers into it. released records
-# are kept for the next claim, so steady-state serving does not map and unmap
-# storage per connection.
+# cancellation scopes and body readers keep pointers into it. per-connection
+# records live in index-addressed tables on a compacting slab, so the storage
+# they hold follows the live count rather than the peak.
 
 use crypto.contracts;
 use crypto.secret;
@@ -20,87 +20,71 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
-# count is how many T make one claim, so a byte buffer and a record share one pool
-pub rec Recycler[T] {
-    allocator: *A.Allocator;
-    count:     usize;
-    free:      vector.Vector[*T];
-    held:      usize;
-    live:      bool;
-}
-
-pub fun make[T](recycler: *Recycler[T], a: *A.Allocator, count: usize) bool {
-    if (recycler == nil || a == nil || count == 0) { ret false; }
-    recycler.allocator = a;
-    recycler.count     = count;
-    recycler.free      = vector.init[*T](a);
-    recycler.held      = 0;
-    recycler.live      = true;
-    ret true;
-}
-
-# nil when the allocator refuses, which is the only way a claim fails
-pub fun claim[T](recycler: *Recycler[T]) *T {
-    if (recycler == nil || !recycler.live) { ret nil; }
-    val reused: opt[*T] = vector.pop[*T](?recycler.free);
-    if (sel reused.some) {
-        recycler.held = recycler.held + 1;
-        ret reused.some;
-    }
-    val allocated: res[*T, A.Error] = A.allocate[T](recycler.allocator, recycler.count);
-    if (sel allocated.err) { ret nil; }
-    recycler.held = recycler.held + 1;
-    ret allocated.ok;
-}
-
-# a record the free list cannot take is returned to the allocator instead
-pub fun release[T](recycler: *Recycler[T], value: *T) bool {
-    if (recycler == nil || !recycler.live || value == nil || recycler.held == 0) {
-        ret false;
-    }
-    recycler.held = recycler.held - 1;
-    val kept: res[usize, A.Error] = vector.push[*T](?recycler.free, value);
-    if (sel kept.ok) { ret true; }
-    val returned: err[A.Error] = A.deallocate[T](recycler.allocator, value, recycler.count);
-    ret sel returned.ok;
-}
-
-pub fun held[T](recycler: *Recycler[T]) usize {
-    if (recycler == nil) { ret 0; }
-    ret recycler.held;
-}
-
-# every claim must have been released first
-pub fun destroy[T](recycler: *Recycler[T]) bool {
-    if (recycler == nil || !recycler.live || recycler.held != 0) { ret false; }
-    var ok: bool = true;
-    for {
-        val kept: opt[*T] = vector.pop[*T](?recycler.free);
-        if (!(sel kept.some)) { brk; }
-        val returned: err[A.Error] = A.deallocate[T](recycler.allocator, kept.some,
-            recycler.count);
-        if (sel returned.err) { ok = false; }
-    }
-    val freed: err[A.Error] = vector.dnit[*T](?recycler.free);
-    if (sel freed.err) { ok = false; }
-    recycler.live = false;
-    ret ok;
-}
-
 # byte chunks in power-of-two classes from MIN_CHUNK up, each class recycled on
 # its own, so memory claimed per request is reused rather than remapped
 pub val MIN_CHUNK:     usize = 16384;
 pub val CHUNK_CLASSES: usize = 16;
 
+# one size class: released chunks are kept for the next claim of that size
+rec ChunkClass {
+    allocator: *A.Allocator;
+    size:      usize;
+    free:      vector.Vector[*u8];
+    held:      usize;
+}
+
+fun make_class(class: *ChunkClass, a: *A.Allocator, size: usize) {
+    class.allocator = a;
+    class.size      = size;
+    class.free      = vector.init[*u8](a);
+    class.held      = 0;
+}
+
+# nil when the allocator refuses, which is the only way a claim fails
+fun class_claim(class: *ChunkClass) *u8 {
+    val reused: opt[*u8] = vector.pop[*u8](?class.free);
+    if (sel reused.some) {
+        class.held = class.held + 1;
+        ret reused.some;
+    }
+    val allocated: res[*u8, A.Error] = A.allocate[u8](class.allocator, class.size);
+    if (sel allocated.err) { ret nil; }
+    class.held = class.held + 1;
+    ret allocated.ok;
+}
+
+# a chunk the free list cannot take is returned to the allocator instead
+fun class_release(class: *ChunkClass, chunk: *u8) bool {
+    if (chunk == nil || class.held == 0) { ret false; }
+    class.held = class.held - 1;
+    val kept: res[usize, A.Error] = vector.push[*u8](?class.free, chunk);
+    if (sel kept.ok) { ret true; }
+    val returned: err[A.Error] = A.deallocate[u8](class.allocator, chunk, class.size);
+    ret sel returned.ok;
+}
+
+fun class_destroy(class: *ChunkClass) bool {
+    var ok: bool = true;
+    for {
+        val kept: opt[*u8] = vector.pop[*u8](?class.free);
+        if (!(sel kept.some)) { brk; }
+        val returned: err[A.Error] = A.deallocate[u8](class.allocator, kept.some, class.size);
+        if (sel returned.err) { ok = false; }
+    }
+    val freed: err[A.Error] = vector.dnit[*u8](?class.free);
+    if (sel freed.err) { ok = false; }
+    ret ok;
+}
+
 pub rec Chunks {
-    classes: [CHUNK_CLASSES]Recycler[u8];
+    classes: [CHUNK_CLASSES]ChunkClass;
 }
 
 pub fun make_chunks(chunks: *Chunks, a: *A.Allocator) bool {
     if (chunks == nil || a == nil) { ret false; }
     var i: usize = 0;
     for (i < CHUNK_CLASSES) {
-        if (!make[u8](?chunks.classes[i], a, MIN_CHUNK << i)) { ret false; }
+        make_class(?chunks.classes[i], a, MIN_CHUNK << i);
         i = i + 1;
     }
     ret true;
@@ -127,14 +111,14 @@ pub fun claim_chunk(chunks: *Chunks, size: usize) *u8 {
     if (chunks == nil) { ret nil; }
     val index: usize = class_index(size);
     if (index == CHUNK_CLASSES) { ret nil; }
-    ret claim[u8](?chunks.classes[index]);
+    ret class_claim(?chunks.classes[index]);
 }
 
 pub fun release_chunk(chunks: *Chunks, chunk: *u8, size: usize) bool {
     if (chunks == nil) { ret false; }
     val index: usize = class_index(size);
     if (index == CHUNK_CLASSES) { ret false; }
-    ret release[u8](?chunks.classes[index], chunk);
+    ret class_release(?chunks.classes[index], chunk);
 }
 
 # every chunk must have been released first, and nothing is destroyed otherwise
@@ -142,13 +126,13 @@ pub fun destroy_chunks(chunks: *Chunks) bool {
     if (chunks == nil) { ret false; }
     var i: usize = 0;
     for (i < CHUNK_CLASSES) {
-        if (held[u8](?chunks.classes[i]) != 0) { ret false; }
+        if (chunks.classes[i].held != 0) { ret false; }
         i = i + 1;
     }
     var ok: bool = true;
     i = 0;
     for (i < CHUNK_CLASSES) {
-        if (!destroy[u8](?chunks.classes[i])) { ok = false; }
+        if (!class_destroy(?chunks.classes[i])) { ok = false; }
         i = i + 1;
     }
     ret ok;
@@ -946,38 +930,6 @@ pub fun pair_cleanup_pending[P, S](pair: *Pair[P, S]) bool {
 rec Probe {
     value: u64;
     bytes: [64]u8;
-}
-
-test "storage: a released claim is reused and never moves while held" {
-    var a: A.Allocator;
-    page.make(?a);
-    var recycler: Recycler[Probe];
-    if (!make[Probe](?recycler, ?a, 1)) { ret 1; }
-    val first:  *Probe = claim[Probe](?recycler);
-    val second: *Probe = claim[Probe](?recycler);
-    if (first == nil || second == nil || first == second) { ret 2; }
-    first.value = 7;
-    if (held[Probe](?recycler) != 2)        { ret 3; }
-    if (!release[Probe](?recycler, second)) { ret 4; }
-    val third: *Probe = claim[Probe](?recycler);
-    if (third != second || first.value != 7)                                    { ret 5; }
-    if (destroy[Probe](?recycler))                                              { ret 6; }
-    if (!release[Probe](?recycler, first) || !release[Probe](?recycler, third)) { ret 7; }
-    if (release[Probe](?recycler, first))                                       { ret 8; }
-    if (!destroy[Probe](?recycler))                                             { ret 9; }
-    ret 0;
-}
-
-test "storage: a claim spans count records" {
-    var a: A.Allocator;
-    page.make(?a);
-    var recycler: Recycler[u8];
-    if (!make[u8](?recycler, ?a, 32768)) { ret 1; }
-    val buffer: *u8 = claim[u8](?recycler);
-    if (buffer == nil) { ret 2; }
-    buffer[32767] = 1;
-    if (!release[u8](?recycler, buffer) || !destroy[u8](?recycler)) { ret 3; }
-    ret 0;
 }
 
 test "storage: a table grows by chunks and never moves a record" {
