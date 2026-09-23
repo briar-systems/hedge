@@ -393,7 +393,10 @@ start_server test/interop/cache-disabled.toml || exit 1
 disabled_vmsize="$(awk '/^VmSize:/ { print $2 }' /proc/"$server_pid"/status)"
 check "disabled cache still serves the configured route" 200 \
     "$(curl_code --http1.1 -H 'Host: localhost' http://127.0.0.1:9086/)"
-check "disabled cache starts no worker" 1 \
+# the supervisor and one thread per serving worker, and nothing for a cache
+workers="$(sed -n 's/^hedge: workers \([0-9][0-9]*\)$/\1/p' "$work/server.log")"
+check "startup names its serving workers" yes "$([ -n "$workers" ] && echo yes || echo no)"
+check "disabled cache starts no thread of its own" "$((${workers:-0} + 1))" \
     "$(awk '/^Threads:/ { print $2 }' /proc/"$server_pid"/status)"
 check "disabled cache opens no timer" 0 "$(fd_target_count 'anon_inode:\[timerfd\]')"
 check "disabled cache opens no cache root" 0 \

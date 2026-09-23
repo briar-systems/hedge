@@ -13,9 +13,8 @@ use hedge.generation;
 use hedge.hedge;
 use hedge.lifecycle;
 use hedge.listener;
-use quic_runtime: hedge.protocol.quic.runtime;
-use hedge_tls:    hedge.protocol.tls;
 use hedge.serve;
+use hedge.supervisor;
 use std.allocator;
 use std.allocator.fixed;
 use std.allocator.page;
@@ -104,25 +103,14 @@ fun resolve_environment(context: ptr, name: str, output: *u8, capacity: usize) i
     ret got.ok.some::i64;
 }
 
-fun announce_certificate(certificates: *acme.Manager) {
-    val first:    view.View = acme.name(certificates, 0);
-    var rendered: [256]u8;
-    var i:        usize     = 0;
-    for (i < first.len && i < 255) {
-        rendered[i] = first.data[i];
-        i           = i + 1;
-    }
-    rendered[i] = 0;
-    print.printlnf("hedge: certificate ready for {} until {}",
-        (?rendered[0])::str, acme.not_after(certificates)::u64);
-}
-
 fun configuration_path(argc: i64, argv: **u8) str {
     if (argc > 1 && argv[1] != nil) { ret argv[1]::str; }
     ret "hedge.toml";
 }
 
-rec Reloader {
+# where a reload's candidate comes from: the configuration file, sealed into
+# whichever of the two generation slots the active generation is not using
+rec Source {
     heap:        *allocator.Allocator;
     path:        str;
     resolver:    *loader.Resolver;
@@ -130,51 +118,35 @@ rec Reloader {
     generations: *generation.Generation;
     allocators:  *allocator.Allocator;
     states:      *fixed.FixedState;
-    composition: *composition.Runtime;
-    runtime:     *serve.Runtime;
-    slot:        usize;
-    next_id:     u64;
 }
 
-fun reload(state: *Reloader, controls: *composition.Controls,
-    quic_controls: *quic_runtime.ControlView) bool {
-    # only one superseded generation may exist at a time: the spare slot is
-    # still holding the last one until its connections finish
-    if (serve.superseded(quic_controls, state.runtime) != 0) { ret false; }
-    val target: usize                        = 1 - state.slot;
-    val loaded: res[str, filesystem.FsError] = filesystem.read_string(state.heap, state.path);
+fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Generation {
+    val source: *Source = context::*Source;
+    var target: usize   = 0;
+    if (active == ?source.generations[0]) { target = 1; }
+    val loaded: res[str, filesystem.FsError] = filesystem.read_string(source.heap, source.path);
     if (sel loaded.err) {
         print.eprintln("hedge: reload cannot read the configuration");
-        ret false;
+        ret nil;
     }
-    val source:    str                    = loaded.ok;
-    val candidate: *generation.Generation = ?state.generations[target];
-    fixed.reset(?state.states[target]);
-    schema.reset_diagnostics(state.diagnostics);
-    if (!generation.make_candidate(candidate, state.next_id)) { ret false; }
-    if (!loader.build(?candidate.graph, state.diagnostics, ?state.allocators[target],
-        state.path, source, state.resolver, capabilities())) {
-        report_diagnostics(state.diagnostics);
+    val text:      str                    = loaded.ok;
+    val candidate: *generation.Generation = ?source.generations[target];
+    fixed.reset(?source.states[target]);
+    schema.reset_diagnostics(source.diagnostics);
+    if (!generation.make_candidate(candidate, id)) { ret nil; }
+    if (!loader.build(?candidate.graph, source.diagnostics, ?source.allocators[target],
+        source.path, text, source.resolver, capabilities())) {
+        report_diagnostics(source.diagnostics);
         print.eprintln("hedge: reload rejected, configuration is not valid");
-        ret false;
+        ret nil;
     }
-    if (!generation.seal(candidate, state.diagnostics, nil,
+    if (!generation.seal(candidate, source.diagnostics, nil,
         (0::usize)::generation.ConstructFun)) {
-        report_diagnostics(state.diagnostics);
+        report_diagnostics(source.diagnostics);
         print.eprintln("hedge: reload rejected, generation did not seal");
-        ret false;
+        ret nil;
     }
-    val rebuilt: composition.StartReport = composition.reload(state.composition, controls,
-        ?candidate.graph, candidate.id, state.diagnostics);
-    if (rebuilt.status != composition.START_OK) {
-        print.eprint("hedge: reload rejected, service generation failed: ");
-        print.eprintln(rebuilt.detail);
-        ret false;
-    }
-    state.slot    = target;
-    state.next_id = state.next_id + 1;
-    print.eprintln("hedge: reloaded");
-    ret true;
+    ret candidate;
 }
 
 #[symbol("main")]
@@ -225,7 +197,6 @@ fun main(argc: i64, argv: **u8) i64 {
     fixed.make(?config_allocators[0], ?config_states[0], arena_base, CONFIG_ARENA_BYTES);
     fixed.make(?config_allocators[1], ?config_states[1], ?arena_base[CONFIG_ARENA_BYTES],
         CONFIG_ARENA_BYTES);
-    var slot:             usize                  = 0;
     var config_allocator: allocator.Allocator    = config_allocators[0];
     val candidate:        *generation.Generation = ?generation_base[0];
     val diagnostics:      *schema.Diagnostics    = diagnostics_storage.ok;
@@ -255,17 +226,9 @@ fun main(argc: i64, argv: **u8) i64 {
 
     val composed: *composition.Runtime =
         composition_storage.ok;
-    var controls:      composition.Controls;
-    var quic_controls: quic_runtime.ControlView;
-    val quic_required: bool = composition.quic_required(?candidate.graph);
-    if (quic_required && !composition.make_controls(?controls, ?heap)) {
-        print.eprintln("hedge: QUIC control storage allocation failed");
-        ret EXIT_RUNTIME;
-    }
-    composition.controls_view(?controls, ?quic_controls);
-    val started: composition.StartReport = composition.start(composed, ?controls,
+    val started: composition.StartReport = composition.start_process(composed,
         ?heap, ?candidate.graph, candidate.id, diagnostics,
-        composition.default_options());
+        composition.default_options(), 1);
     if (started.status != composition.START_OK) {
         report_diagnostics(diagnostics);
         print.eprint("hedge: startup composition failed: ");
@@ -273,85 +236,66 @@ fun main(argc: i64, argv: **u8) i64 {
         if (started.status == composition.START_CONFIG) { ret EXIT_CONFIG; }
         ret EXIT_RUNTIME;
     }
-    val runtime:      *serve.Runtime = ?composition.worker_at(composed, 0).serving;
-    val certificates: *acme.Manager  = composed.certificates;
-    announce(runtime, ?candidate.graph);
-    if (certificates != nil && acme.certificate_ready(certificates)) {
-        announce_certificate(certificates);
+    var reloads: Source;
+    reloads.heap        = ?heap;
+    reloads.path        = path;
+    reloads.resolver    = ?resolver;
+    reloads.diagnostics = diagnostics;
+    reloads.generations = generation_base;
+    reloads.allocators  = ?config_allocators[0];
+    reloads.states      = ?config_states[0];
+    var supervising: supervisor.Supervisor;
+    if (!supervisor.make(?supervising, composed, ?heap)
+        || !supervisor.attach_reloads(?supervising, candidate,
+        supervisor.Loader{context: (?reloads)::ptr, load: load})) {
+        print.eprintln("hedge: the supervisor could not take the process events");
+        var unwound: composition.StopReport;
+        composition.close(composed, ?unwound);
+        ret EXIT_RUNTIME;
     }
-    # the shutdown sequence runs inside `poll`, deadline included, so a handler
-    # that never finishes ends the process rather than holding it open. `poll`
-    # stops short of releasing the resources it is polling on, so the loop ends
-    # when everything but that is done, or once the drain deadline has
-    # cancelled what remained, and `stop` waits for the closes and performs the
-    # close.
-    var reloader: Reloader;
-    reloader.heap        = ?heap;
-    reloader.path        = path;
-    reloader.resolver    = ?resolver;
-    reloader.diagnostics = diagnostics;
-    reloader.generations = generation_base;
-    reloader.allocators  = ?config_allocators[0];
-    reloader.states      = ?config_states[0];
-    reloader.composition = composed;
-    reloader.runtime     = runtime;
-    reloader.slot        = 0;
-    reloader.next_id     = candidate.id + 1;
-    for (true) {
-        # the wait ends at the wheel's next deadline or on a completion, a
-        # signal or a wake: an idle worker sleeps until something happens
-        serve.poll(?quic_controls, runtime, -1);
-        if (serve.superseded(?quic_controls, runtime) == 0
-            && !composition.reclaim_superseded(composed, ?controls)) {
-            print.eprintln("hedge: superseded service generation could not be released");
-            serve.begin_shutdown(?quic_controls, runtime, clock.instant());
+    # every worker serves, or none does: a worker that failed has been named
+    # and the others stopped
+    val status:  composition.StartStatus = supervisor.start(?supervising);
+    val serving: bool                    = status == composition.START_OK;
+    if (serving) {
+        announce(composed, ?candidate.graph);
+        if (composed.acme_live && acme.certificate_ready(composed.certificates)) {
+            supervisor.announce_certificate(composed.certificates);
         }
-        # a reload request is taken once the previous generation has finished
-        # draining, so the spare slot is free to build into
-        if (runtime.owner.reload_requested
-            && serve.superseded(?quic_controls, runtime) == 0) {
-            listener.clear_reload_request(?runtime.owner);
-            reload(?reloader, ?controls, ?quic_controls);
-        }
-        if (certificates != nil && acme.installation_ready(certificates)) {
-            val installed: hedge_tls.Status = composition.install_certificate(
-                composed, clock.wall());
-            if (installed == hedge_tls.OK) {
-                announce_certificate(certificates);
-            }
-            or (installed != hedge_tls.RETIRED_IN_USE) {
-                print.eprintln("hedge: renewed ACME certificate could not be installed");
-            }
-        }
-        if (serve.drained(runtime) || serve.cancelling(runtime)) { brk; }
+        supervisor.run(?supervising);
     }
-    val stopped: composition.StopReport = composition.stop(composed, ?controls);
-    if (!stopped.stopped) { report_stalled(runtime); }
-    # a failed destroy retains wiped ownership, so this reports rather than leaks
-    var control_release_failed: bool = false;
-    if (quic_required && !composition.release_controls(?controls)) {
-        print.eprintln("hedge: QUIC control storage was not released");
-        control_release_failed = true;
-    }
+    val stopped: composition.StopReport = supervisor.stop(?supervising);
+    if (!stopped.stopped) { report_stalled(composed); }
     if (stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
         print.eprint("hedge: teardown calls failed during shutdown: ");
         report_count((stopped.serve_failures + stopped.cleanup_failures)::usize);
     }
+    if (status == composition.START_CONFIG) { ret EXIT_CONFIG; }
+    if (!serving)                           { ret EXIT_RUNTIME; }
     if (stopped.reason == lifecycle.DEADLINE) {
         print.eprint("hedge: drain deadline expired with connections still active: ");
         report_count(stopped.abandoned);
         ret EXIT_DRAIN_INCOMPLETE;
     }
     if (!stopped.stopped || stopped.reason == lifecycle.FAILED
-        || stopped.cleanup_failures != 0 || control_release_failed) {
+        || stopped.cleanup_failures != 0) {
         print.eprintln("hedge: shutdown did not complete cleanly");
         ret EXIT_RUNTIME;
     }
     ret EXIT_OK;
 }
 
-# name the connections a stop gave up on and what each one's close waits on
-fun report_stalled(runtime: *serve.Runtime) {
+# name the connections a stop gave up on, worker by worker
+fun report_stalled(composed: *composition.Runtime) {
+    var i: usize = 0;
+    for (i < composed.worker_count) {
+        report_worker_stalled(?composition.worker_at(composed, i).serving);
+        i = i + 1;
+    }
+}
+
+# name one worker's connections a stop gave up on and what each one's close waits on
+fun report_worker_stalled(runtime: *serve.Runtime) {
     var stalled: [STALLED_SHOWN]serve.Stalled;
     val count:   usize = serve.stalled(runtime, ?stalled[0], STALLED_SHOWN);
     val quic:    usize = serve.stalled_quic(runtime);
@@ -369,10 +313,12 @@ fun report_stalled(runtime: *serve.Runtime) {
     }
 }
 
-# report every bound endpoint so an operator and a test can both find the port
-fun announce(runtime: *serve.Runtime, graph: *schema.Graph) {
-    var text: [64]u8;
-    var i:    usize = 0;
+# report every bound endpoint so an operator and a test can both find the port,
+# and the workers that serve them
+fun announce(composed: *composition.Runtime, graph: *schema.Graph) {
+    val runtime: *serve.Runtime = ?composition.worker_at(composed, 0).serving;
+    var text:    [64]u8;
+    var i:       usize          = 0;
     for (i < graph.listener_count) {
         val length: usize = serve.bound_endpoint_text(runtime, i, ?text[0], 64);
         if (length != 0) {
@@ -397,5 +343,6 @@ fun announce(runtime: *serve.Runtime, graph: *schema.Graph) {
         print.printlnf("hedge: handshakes in flight at most {}",
             graph.limits.max_handshakes);
     }
+    print.printlnf("hedge: workers {}", composed.worker_count);
     print.println("hedge: ready");
 }

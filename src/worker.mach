@@ -14,16 +14,14 @@
 use crypto.contracts;
 use crypto.secret;
 use hedge.acme.handler;
-use acme:       hedge.acme.manager;
 use http_cache: hedge.cache;
-use hedge.clock;
 use hedge.config.schema;
 use hedge.dispatch.middleware;
 use hedge.dispatch.plan;
+use hedge.generation;
 use hedge.lifecycle;
 use h3_session:   hedge.protocol.h3.session;
 use quic_runtime: hedge.protocol.quic.runtime;
-use hedge_tls:    hedge.protocol.tls;
 use hedge.proxy.upstream;
 use hedge.serve;
 use hedge.service;
@@ -34,6 +32,7 @@ use hedge.telemetry;
 use http.router.router;
 use std.allocator;
 use std.chrono.time;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -76,10 +75,10 @@ pub fun failed(status: StartStatus, detail: str) StartReport {
     ret StartReport{status: status, detail: detail};
 }
 
-# the services a worker's planes drive alongside its connections
+# the services a worker's planes drive alongside its connections. ACME and the
+# TLS policies are the supervisor's
 rec Planes {
-    proxying:     *proxy.Runtime;
-    certificates: *acme.Manager;
+    proxying: *proxy.Runtime;
 }
 
 # one service bank retained by every connection on its plan
@@ -112,8 +111,96 @@ pub rec Inputs {
     challenge: *handler.Binding;
 }
 
+# what the supervisor asks of a worker and what the worker answers. the two
+# are different threads, so every word here is read and written atomically,
+# and a request's arguments are written before the word that posts it.
+# ---
+# shutdown:   set once by the supervisor when the process is to stop
+# request:    a reload step the supervisor posts, REQUEST_NONE once taken
+# request_id: the generation the posted step is for
+# state:      where the worker is, one of STATE_*
+# answer:     the worker's answer to the last step it took, one of ANSWER_*
+# answer_id:  the generation that answer is for
+# superseded: connections of an older generation the worker still serves
+# draining:   the worker began its shutdown sequence
+pub rec Control {
+    shutdown:   i64;
+    request:    i64;
+    request_id: i64;
+    state:      i64;
+    answer:     i64;
+    answer_id:  i64;
+    superseded: i64;
+    draining:   i64;
+}
+
+pub val REQUEST_NONE:    i64 = 0;
+pub val REQUEST_PREPARE: i64 = 1;
+pub val REQUEST_COMMIT:  i64 = 2;
+pub val REQUEST_ABORT:   i64 = 3;
+
+pub val STATE_NEW:      i64 = 0;
+pub val STATE_STARTING: i64 = 1;
+pub val STATE_READY:    i64 = 2;
+pub val STATE_FAILED:   i64 = 3;
+pub val STATE_STOPPED:  i64 = 4;
+
+pub val ANSWER_NONE:      i64 = 0;
+pub val ANSWER_PREPARED:  i64 = 1;
+pub val ANSWER_REFUSED:   i64 = 2;
+pub val ANSWER_COMMITTED: i64 = 3;
+pub val ANSWER_FAILED:    i64 = 4;
+pub val ANSWER_ABORTED:   i64 = 5;
+
+pub fun reset_control(control: *Control) {
+    atomic.store(?control.shutdown, 0);
+    atomic.store(?control.request, REQUEST_NONE);
+    atomic.store(?control.request_id, 0);
+    atomic.store(?control.state, STATE_NEW);
+    atomic.store(?control.answer, ANSWER_NONE);
+    atomic.store(?control.answer_id, 0);
+    atomic.store(?control.superseded, 0);
+    atomic.store(?control.draining, 0);
+}
+
+# post one reload step for `generation_id`
+pub fun post(control: *Control, request: i64, generation_id: u64) {
+    atomic.store(?control.request_id, generation_id::i64);
+    atomic.store(?control.request, request);
+}
+
+# take the posted step, or REQUEST_NONE
+pub fun take(control: *Control, generation_id: *u64) i64 {
+    val request: i64 = atomic.exchange(?control.request, REQUEST_NONE);
+    @generation_id = atomic.load(?control.request_id)::u64;
+    ret request;
+}
+
+pub fun answer(control: *Control, value: i64, generation_id: u64) {
+    atomic.store(?control.answer_id, generation_id::i64);
+    atomic.store(?control.answer, value);
+}
+
+# the answer for `generation_id`, or ANSWER_NONE while there is none yet
+pub fun answered(control: *Control, generation_id: u64) i64 {
+    val value: i64 = atomic.load(?control.answer);
+    if (atomic.load(?control.answer_id)::u64 != generation_id) { ret ANSWER_NONE; }
+    ret value;
+}
+
 pub rec Worker {
-    index:               usize;
+    index:   usize;
+    control: Control;
+    # the configuration generations this worker's connections pin: the one it
+    # serves, and the one it is still draining after a reload, or nil
+    current:     *generation.Generation;
+    previous:    *generation.Generation;
+    diagnostics: schema.Diagnostics;
+    # why a start on the worker's own thread failed, and how its stop went,
+    # both written before the state that reports them
+    failure:             str;
+    failure_status:      StartStatus;
+    report:              StopReport;
     proxying:            proxy.Runtime;
     service_generations: [2]ServiceGeneration;
     plans:               [2]plan.Plan;
@@ -215,7 +302,14 @@ pub fun quic_required(graph: *schema.Graph) bool {
 # a worker that owns nothing yet, so a partial start can be torn down
 pub fun make(worker: *Worker, index: usize, pseudonym: str) bool {
     if (worker == nil) { ret false; }
-    worker.index                      = index;
+    worker.index    = index;
+    worker.current  = nil;
+    worker.previous = nil;
+    reset_control(?worker.control);
+    worker.failure = nil;
+    worker.report  = StopReport{stopped: true,
+        reason:           lifecycle.IMMEDIATE, abandoned: 0, serve_failures: 0,
+        cleanup_failures: 0};
     worker.active_generation          = 0;
     worker.proxy_live                 = false;
     worker.serve_live                 = false;
@@ -223,7 +317,6 @@ pub fun make(worker: *Worker, index: usize, pseudonym: str) bool {
     worker.quic.initialized           = false;
     worker.quic.connection_generation = 0;
     worker.planes.proxying            = nil;
-    worker.planes.certificates        = nil;
     var slot: usize = 0;
     for (slot < 2) {
         worker.service_generations[slot].generation  = 0;
@@ -254,35 +347,16 @@ pub fun make_plan_storage(storage: *plan.Storage, backing: *PlanStorage) bool {
 
 fun drive_planes(context: ptr, now: time.Instant) bool {
     val planes: *Planes = context::*Planes;
-    if (planes == nil) { ret false; }
-    var advanced: bool = true;
-    if (planes.proxying != nil) {
-        advanced = proxy.poll((planes.proxying)::ptr, now) && advanced;
-    }
-    if (planes.certificates != nil) {
-        # renewal is scheduled against certificate validity, which is calendar time
-        advanced = acme.poll((planes.certificates)::ptr, clock.wall()) && advanced;
-    }
-    advanced = hedge_tls.maintain() && advanced;
-    ret advanced;
+    if (planes == nil)          { ret false; }
+    if (planes.proxying == nil) { ret true; }
+    ret proxy.poll((planes.proxying)::ptr, now);
 }
 
 # the earliest deadline across the planes, for the worker's wheel
 fun plane_deadline(context: ptr, at_ns: *u64) bool {
     val planes: *Planes = context::*Planes;
-    if (planes == nil) { ret false; }
-    var found: bool = false;
-    var at:    u64  = 0;
-    if (planes.proxying != nil && proxy.deadline(planes.proxying, ?at)) {
-        @at_ns = at;
-        found  = true;
-    }
-    if (planes.certificates != nil && acme.deadline(planes.certificates, ?at)
-        && (!found || at < @at_ns)) {
-        @at_ns = at;
-        found  = true;
-    }
-    ret found;
+    ret planes != nil && planes.proxying != nil
+        && proxy.deadline(planes.proxying, at_ns);
 }
 
 fun quiesce_planes(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
@@ -292,11 +366,6 @@ fun quiesce_planes(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
         val status: proxy.QuiesceStatus = proxy.quiesce(planes.proxying, now);
         if (status == proxy.QUIESCE_PENDING) { ret serve.PLANE_PENDING; }
         if (status != proxy.QUIESCED)        { ret serve.PLANE_FAILED; }
-    }
-    if (planes.certificates != nil) {
-        val status: acme.Status = acme.quiesce(planes.certificates);
-        if (status == acme.PENDING) { ret serve.PLANE_PENDING; }
-        if (status != acme.OK)      { ret serve.PLANE_FAILED; }
     }
     ret serve.PLANE_QUIESCED;
 }
@@ -417,11 +486,11 @@ pub fun build_service_generation(worker: *Worker, slot: usize,
 }
 
 # bring the worker's serving runtime up on its first generation, which
-# `build_service_generation` has already compiled into slot 0. `certificates` is
-# the process's ACME manager, driven on this worker's planes, or nil
+# `build_service_generation` has already compiled into slot 0. a supervised
+# worker leaves signals and SIGPIPE to its supervisor
 pub fun start(worker: *Worker, controls: *Controls, heap: *allocator.Allocator,
     configured: *schema.Graph, generation_id: u64,
-    observability: *telemetry.Runtime, certificates: *acme.Manager,
+    observability: *telemetry.Runtime, supervised: bool,
     diagnostics: *schema.Diagnostics) StartReport {
     var quic_controls: quic_runtime.ControlView;
     if (worker == nil || heap == nil || configured == nil || diagnostics == nil) {
@@ -430,6 +499,7 @@ pub fun start(worker: *Worker, controls: *Controls, heap: *allocator.Allocator,
     if (!serve.make(?worker.serving, worker.index, ?worker.plans[0], configured, heap)) {
         ret failed(START_RUNTIME, "serving runtime initialization failed");
     }
+    if (supervised) { serve.leave_process(?worker.serving); }
     if (quic_required(configured)) {
         if (!controls_view(controls, ?quic_controls)
             || !quic_runtime.make(?quic_controls, ?worker.quic,
@@ -462,18 +532,10 @@ pub fun start(worker: *Worker, controls: *Controls, heap: *allocator.Allocator,
         serve.plane_waker(?worker.serving), worker.serving.configured.engine)) {
         ret failed(START_RUNTIME, "proxy driver could not be attached");
     }
-    if (certificates != nil && !acme.attach_driver(certificates,
-        ?worker.serving.owner.network, serve.plane_waker(?worker.serving))) {
-        ret failed(START_RUNTIME, "certificate manager could not attach its driver");
-    }
-    worker.planes.proxying     = ?worker.proxying;
-    worker.planes.certificates = certificates;
+    worker.planes.proxying = ?worker.proxying;
     if (!serve.attach_plane_lifecycle(?worker.serving, (?worker.planes)::ptr,
         drive_planes, quiesce_planes, plane_deadline)) {
         ret failed(START_RUNTIME, "service planes could not be attached");
-    }
-    if (certificates != nil) {
-        acme.attach_telemetry(certificates, worker.serving.observability);
     }
     ret ok();
 }

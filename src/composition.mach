@@ -74,8 +74,10 @@ pub fun default_options() Options {
 }
 
 pub rec Runtime {
-    heap:               *allocator.Allocator;
-    graph:              *schema.Graph;
+    heap:  *allocator.Allocator;
+    graph: *schema.Graph;
+    # the generation the process serves, which every worker builds from
+    generation_id:      u64;
     caching:            *http_cache.Layer;
     certificates:       *acme.Manager;
     challenge_binding:  handler.Binding;
@@ -130,47 +132,29 @@ fun inputs(runtime: *Runtime, configured: *schema.Graph) worker.Inputs {
     ret value;
 }
 
-fun build(runtime: *Runtime, slot: usize, configured: *schema.Graph,
-    generation_id: u64, record_events: bool) worker.StartReport {
-    var given: worker.Inputs = inputs(runtime, configured);
-    var i:     usize         = 0;
-    for (i < runtime.worker_count) {
-        val built: worker.StartReport = worker.build_service_generation(
-            ?runtime.workers[i], slot, configured, generation_id, ?given);
-        if (built.status != worker.START_OK) {
-            var j: usize = 0;
-            for (j < i) {
-                worker.close_service_generation(?runtime.workers[j], slot);
-                j = j + 1;
-            }
-            ret built;
-        }
-        i = i + 1;
+fun built_events(runtime: *Runtime, given: *worker.Inputs) {
+    if (given.caching != nil) {
+        event(runtime, CACHE_BINDINGS_READY);
+        event(runtime, CACHE_WRAPPER_READY);
     }
-    if (record_events) {
-        if (given.caching != nil) {
-            event(runtime, CACHE_BINDINGS_READY);
-            event(runtime, CACHE_WRAPPER_READY);
-        }
-        event(runtime, PLAN_READY);
-    }
-    ret worker.ok();
+    event(runtime, PLAN_READY);
 }
 
 fun clean(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
     var report: worker.StopReport = worker.StopReport{stopped: true,
         reason:           lifecycle.IMMEDIATE, abandoned: 0, serve_failures: 0,
         cleanup_failures: 0};
-    var i:      usize = 0;
-    var served: bool  = false;
+    var i: usize = 0;
     for (i < runtime.worker_count) {
-        val current:  *worker.Worker = ?runtime.workers[i];
-        val was_live: bool           = current.serve_live;
-        if (!worker.stop_serving(current, controls, ?report)) { ret report; }
-        if (was_live)                                         { served = true; }
+        if (!stop_worker(runtime, i, controls, ?report)) { ret report; }
         i = i + 1;
     }
-    if (served) { event(runtime, SERVE_STOPPED); }
+    close_process(runtime, ?report);
+    ret report;
+}
+
+fun close_process(runtime: *Runtime, report: *worker.StopReport) {
+    var i: usize = 0;
     if (runtime.telemetry_live) {
         if (!telemetry_production.close(?runtime.observability)) {
             report.cleanup_failures = report.cleanup_failures + 1;
@@ -199,7 +183,7 @@ fun clean(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
     var proxied: bool = false;
     i = 0;
     for (i < runtime.worker_count) {
-        if (worker.close_proxy(?runtime.workers[i], ?report)) { proxied = true; }
+        if (worker.close_proxy(?runtime.workers[i], report)) { proxied = true; }
         i = i + 1;
     }
     if (proxied) { event(runtime, PROXY_CLOSED); }
@@ -212,17 +196,16 @@ fun clean(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
     }
     i = 0;
     for (i < runtime.worker_count) {
-        worker.close_cache_bindings(?runtime.workers[i], ?report);
+        worker.close_cache_bindings(?runtime.workers[i], report);
         i = i + 1;
     }
     var had_static: bool = false;
     i = 0;
     for (i < runtime.worker_count) {
-        if (worker.close_static(?runtime.workers[i], ?report)) { had_static = true; }
+        if (worker.close_static(?runtime.workers[i], report)) { had_static = true; }
         i = i + 1;
     }
     if (had_static) { event(runtime, STATIC_CLOSED); }
-    ret report;
 }
 
 fun fail(runtime: *Runtime, controls: *worker.Controls, status: worker.StartStatus,
@@ -231,21 +214,33 @@ fun fail(runtime: *Runtime, controls: *worker.Controls, status: worker.StartStat
     ret worker.failed(status, detail);
 }
 
-# the number of workers this process runs. until the listeners take
-# SO_REUSEPORT (#287) only one worker can bind a configured address
-fun worker_count(configured: *schema.Graph) usize {
-    ret 1;
-}
-
 pub fun start(runtime: *Runtime, controls: *worker.Controls,
     heap: *allocator.Allocator, configured: *schema.Graph,
     generation_id: u64, diagnostics: *schema.Diagnostics,
     options: Options) worker.StartReport {
-    if (runtime == nil || heap == nil || configured == nil || diagnostics == nil) {
+    val process: worker.StartReport = start_process(runtime, heap, configured,
+        generation_id, diagnostics, options, 1);
+    if (process.status != worker.START_OK) { ret process; }
+    val started: worker.StartReport = start_worker(runtime, 0, controls, false,
+        diagnostics);
+    if (started.status != worker.START_OK) {
+        clean(runtime, controls);
+    }
+    ret started;
+}
+
+# what the process owns, and `workers` workers that own nothing yet. each
+# worker is brought up by `start_worker`, on whichever thread will run it
+pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
+    configured: *schema.Graph, generation_id: u64, diagnostics: *schema.Diagnostics,
+    options: Options, workers: usize) worker.StartReport {
+    if (runtime == nil || heap == nil || configured == nil || diagnostics == nil
+        || generation_id == 0 || workers == 0) {
         ret worker.failed(worker.START_RUNTIME, "composition input is invalid");
     }
     runtime.heap                = heap;
     runtime.graph               = configured;
+    runtime.generation_id       = generation_id;
     runtime.caching             = nil;
     runtime.certificates        = nil;
     runtime.options             = options;
@@ -259,17 +254,16 @@ pub fun start(runtime: *Runtime, controls: *worker.Controls,
     runtime.workers             = nil;
     runtime.worker_count        = 0;
 
-    val count:         usize                                = worker_count(configured);
     val worker_memory: res[*worker.Worker, allocator.Error] =
-        allocator.allocate[worker.Worker](heap, count);
+        allocator.allocate[worker.Worker](heap, workers);
     if (sel worker_memory.err) {
         ret worker.failed(worker.START_RUNTIME, "worker allocation failed");
     }
     runtime.workers = worker_memory.ok;
     var i: usize = 0;
-    for (i < count) {
+    for (i < workers) {
         if (!worker.make(?runtime.workers[i], i, options.pseudonym)) {
-            ret fail(runtime, controls, worker.START_RUNTIME,
+            ret fail(runtime, nil, worker.START_RUNTIME,
                 "proxy runtime could not be constructed");
         }
         runtime.worker_count = i + 1;
@@ -283,14 +277,14 @@ pub fun start(runtime: *Runtime, controls: *worker.Controls,
             allocator.allocate[cache_store.Entry](heap, CACHE_ENTRIES);
         val body_memory: res[*u8, allocator.Error] =
             allocator.allocate[u8](heap, configured.cache.memory_bytes);
-        if (sel layer_memory.err) { ret fail(runtime, controls, worker.START_RUNTIME, "cache allocation failed"); }
-        if (sel entry_memory.err) { ret fail(runtime, controls, worker.START_RUNTIME, "cache allocation failed"); }
-        if (sel body_memory.err)  { ret fail(runtime, controls, worker.START_RUNTIME, "cache allocation failed"); }
+        if (sel layer_memory.err) { ret fail(runtime, nil, worker.START_RUNTIME, "cache allocation failed"); }
+        if (sel entry_memory.err) { ret fail(runtime, nil, worker.START_RUNTIME, "cache allocation failed"); }
+        if (sel body_memory.err)  { ret fail(runtime, nil, worker.START_RUNTIME, "cache allocation failed"); }
         runtime.caching = layer_memory.ok;
         if (!http_cache.from_config(runtime.caching, ?configured.cache,
             entry_memory.ok, CACHE_ENTRIES,
             body_memory.ok, configured.cache.memory_bytes, heap)) {
-            ret fail(runtime, controls, worker.START_CONFIG, "cache could not be constructed");
+            ret fail(runtime, nil, worker.START_CONFIG, "cache could not be constructed");
         }
         runtime.cache_live = true;
     }
@@ -299,13 +293,13 @@ pub fun start(runtime: *Runtime, controls: *worker.Controls,
         val manager_memory: res[*acme.Manager, allocator.Error] =
             allocator.allocate[acme.Manager](heap, 1);
         if (sel manager_memory.err) {
-            ret fail(runtime, controls, worker.START_RUNTIME, "certificate manager allocation failed");
+            ret fail(runtime, nil, worker.START_RUNTIME, "certificate manager allocation failed");
         }
         runtime.certificates = manager_memory.ok;
         var opened: acme.Status = acme.INVALID;
         if (configured.acme.challenge == schema.CHALLENGE_TLS_ALPN_01) {
             if (!tlsalpn.make(?runtime.alpn_challenge)) {
-                ret fail(runtime, controls, worker.START_RUNTIME,
+                ret fail(runtime, nil, worker.START_RUNTIME,
                     "TLS-ALPN challenge state could not be constructed");
             }
             runtime.alpn_challenge_live = true;
@@ -316,28 +310,22 @@ pub fun start(runtime: *Runtime, controls: *worker.Controls,
             opened = acme.open(runtime.certificates, heap, configured);
         }
         if (opened != acme.OK) {
-            ret fail(runtime, controls, worker.START_CONFIG, "certificate manager could not open its state");
+            ret fail(runtime, nil, worker.START_CONFIG, "certificate manager could not open its state");
         }
         runtime.acme_live = true;
         if (configured.acme.challenge == schema.CHALLENGE_HTTP_01 &&
             !handler.bind(?runtime.challenge_binding,
             acme.challenge_table(runtime.certificates))) {
-            ret fail(runtime, controls, worker.START_RUNTIME,
+            ret fail(runtime, nil, worker.START_RUNTIME,
                 "challenge route could not be bound");
         }
     }
 
     if (!telemetry_production.make(?runtime.observability, heap, configured,
         options.telemetry)) {
-        ret fail(runtime, controls, worker.START_CONFIG, "telemetry could not be constructed");
+        ret fail(runtime, nil, worker.START_CONFIG, "telemetry could not be constructed");
     }
     runtime.telemetry_live = true;
-
-    val services_built: worker.StartReport = build(runtime, 0, configured,
-        generation_id, true);
-    if (services_built.status != worker.START_OK) {
-        ret fail(runtime, controls, services_built.status, services_built.detail);
-    }
 
     hedge_tls.reset();
     runtime.tls_live = true;
@@ -349,7 +337,7 @@ pub fun start(runtime: *Runtime, controls: *worker.Controls,
         val policy: *schema.TlsPolicy = schema.find_tls_policy(configured,
             schema.text(?selected.tls_policy));
         if (policy == nil) {
-            ret fail(runtime, controls, worker.START_CONFIG, "listener references an unknown TLS policy");
+            ret fail(runtime, nil, worker.START_CONFIG, "listener references an unknown TLS policy");
         }
         var tls_options: hedge_tls.PublishOptions = hedge_tls.publish_options();
         tls_options.tls_alpn_challenge = configured.acme.enabled &&
@@ -358,46 +346,73 @@ pub fun start(runtime: *Runtime, controls: *worker.Controls,
             schema.text(?configured.acme.listener));
         if (hedge_tls.publish_with_options(schema.text(?selected.name), policy,
             selected.protocols, tls_options) != hedge_tls.OK) {
-            ret fail(runtime, controls, worker.START_CONFIG, "TLS policy could not be published");
+            ret fail(runtime, nil, worker.START_CONFIG, "TLS policy could not be published");
         }
     }
     if (runtime.acme_live) {
         runtime.certificate_policy = hedge_tls.find(
             schema.text(?configured.acme.listener));
         if (runtime.certificate_policy == hedge_tls.NO_POLICY) {
-            ret fail(runtime, controls, worker.START_CONFIG,
+            ret fail(runtime, nil, worker.START_CONFIG,
                 "ACME listener has no published TLS policy");
         }
         if (runtime.alpn_challenge_live &&
             !tlsalpn.bind_listener(?runtime.alpn_challenge,
             runtime.certificate_policy)) {
-            ret fail(runtime, controls, worker.START_CONFIG,
+            ret fail(runtime, nil, worker.START_CONFIG,
                 "TLS-ALPN challenge could not bind its listener");
         }
         if (acme.certificate_ready(runtime.certificates) &&
             hedge_tls.install_acme(runtime.certificate_policy,
             runtime.certificates) != hedge_tls.OK) {
-            ret fail(runtime, controls, worker.START_CONFIG,
+            ret fail(runtime, nil, worker.START_CONFIG,
                 "stored ACME certificate could not be installed");
         }
-    }
-
-    i = 0;
-    for (i < runtime.worker_count) {
-        # ACME is driven on the first worker's planes
-        var certificates: *acme.Manager = nil;
-        if (i == 0 && runtime.acme_live) { certificates = runtime.certificates; }
-        val started: worker.StartReport = worker.start(?runtime.workers[i], controls,
-            heap, configured, generation_id, ?runtime.observability.runtime,
-            certificates, diagnostics);
-        if (started.status != worker.START_OK) {
-            ret fail(runtime, controls, started.status, started.detail);
-        }
-        i = i + 1;
     }
     ret worker.ok();
 }
 
+# build worker `index`'s first service generation and bring its serving runtime
+# up, on the thread that will run it. a supervised worker leaves the process
+# duties to its supervisor. on failure what the worker started is left for
+# `stop_worker` to tear down
+pub fun start_worker(runtime: *Runtime, index: usize, controls: *worker.Controls,
+    supervised: bool, diagnostics: *schema.Diagnostics) worker.StartReport {
+    val current: *worker.Worker = worker_at(runtime, index);
+    if (current == nil || diagnostics == nil) {
+        ret worker.failed(worker.START_RUNTIME, "worker input is invalid");
+    }
+    var given: worker.Inputs      = inputs(runtime, runtime.graph);
+    val built: worker.StartReport = worker.build_service_generation(current, 0,
+        runtime.graph, runtime.generation_id, ?given);
+    if (built.status != worker.START_OK) { ret built; }
+    if (index == 0)                      { built_events(runtime, ?given); }
+    ret worker.start(current, controls, runtime.heap, runtime.graph,
+        runtime.generation_id, ?runtime.observability.runtime, supervised,
+        diagnostics);
+}
+
+# stop worker `index` serving, on the thread that runs it, and release its QUIC
+# runtime. false when it could not stop, which leaves it for a later retry
+pub fun stop_worker(runtime: *Runtime, index: usize, controls: *worker.Controls,
+    report: *worker.StopReport) bool {
+    val current: *worker.Worker = worker_at(runtime, index);
+    if (current == nil || report == nil) { ret false; }
+    val was_live: bool = current.serve_live;
+    if (!worker.stop_serving(current, controls, report)) { ret false; }
+    # the event log is the first worker's, so workers stopping on threads of
+    # their own never write it together
+    if (was_live && index == 0) { event(runtime, SERVE_STOPPED); }
+    ret true;
+}
+
+# what the process owns, torn down once every worker has stopped serving
+pub fun close(runtime: *Runtime, report: *worker.StopReport) {
+    close_process(runtime, report);
+}
+
+# stop every worker and tear the process down, for a process whose workers run
+# on the calling thread
 pub fun stop(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
     if (runtime == nil) {
         ret worker.StopReport{stopped: false, reason: lifecycle.FAILED, abandoned: 0,
@@ -454,36 +469,99 @@ pub fun reclaim_superseded(runtime: *Runtime, controls: *worker.Controls) bool {
     ret ok;
 }
 
-pub fun reload(runtime: *Runtime, controls: *worker.Controls,
+# whether the process may take a reload to `configured` at all: what startup
+# owns is unchanged. the workers' own checks come in `prepare_reload`
+pub fun reload_compatible(runtime: *Runtime, configured: *schema.Graph) bool {
+    ret runtime != nil && configured != nil && plan.reload_compatible(runtime.graph, configured);
+}
+
+# the first step of a reload, on worker `index`'s thread: build the candidate's
+# service generation into the spare slot and ask the serving runtime whether it
+# would publish it. a refusal leaves the worker as it was
+pub fun prepare_reload(runtime: *Runtime, index: usize, controls: *worker.Controls,
     configured: *schema.Graph, generation_id: u64,
     diagnostics: *schema.Diagnostics) worker.StartReport {
-    val first: *worker.Worker = worker_at(runtime, 0);
-    if (first == nil || configured == nil || generation_id == 0
-        || diagnostics == nil || !first.serve_live
-        || generation_id <= first.service_generations[first.active_generation].generation
-        || superseded(runtime, controls) != 0) {
+    var quic_controls: quic_runtime.ControlView;
+    worker.controls_view(controls, ?quic_controls);
+    val current: *worker.Worker = worker_at(runtime, index);
+    if (current == nil || configured == nil || generation_id == 0
+        || diagnostics == nil || !current.serve_live
+        || generation_id <= current.service_generations[current.active_generation].generation
+        || serve.superseded(?quic_controls, ?current.serving) != 0) {
         ret worker.failed(worker.START_RUNTIME, "service generation is not reclaimable");
     }
-    if (!plan.reload_compatible(runtime.graph, configured)) {
-        ret worker.failed(worker.START_CONFIG,
-            "startup-owned configuration changed; restart required");
-    }
-    if (!reclaim_superseded(runtime, controls)) {
+    if (!worker.reclaim_superseded(current, controls)) {
         ret worker.failed(worker.START_RUNTIME,
             "superseded service generation could not be released");
     }
-    val target: usize              = 1 - first.active_generation;
-    val built:  worker.StartReport = build(runtime, target, configured,
-        generation_id, false);
+    val target: usize              = 1 - current.active_generation;
+    var given:  worker.Inputs      = inputs(runtime, configured);
+    val built:  worker.StartReport = worker.build_service_generation(current, target,
+        configured, generation_id, ?given);
     if (built.status != worker.START_OK) { ret built; }
+    if (!serve.check_reload(?quic_controls, ?current.serving, generation_id,
+        ?current.plans[target], configured, diagnostics)) {
+        worker.close_service_generation(current, target);
+        ret worker.failed(worker.START_RUNTIME, "listeners would not republish");
+    }
+    ret worker.ok();
+}
+
+# the second step: publish what `prepare_reload` built
+pub fun commit_reload(runtime: *Runtime, index: usize, controls: *worker.Controls,
+    configured: *schema.Graph, generation_id: u64,
+    diagnostics: *schema.Diagnostics) worker.StartReport {
+    val current: *worker.Worker = worker_at(runtime, index);
+    if (current == nil) { ret worker.failed(worker.START_RUNTIME, "worker input is invalid"); }
+    ret worker.publish(current, controls, configured, generation_id, diagnostics);
+}
+
+# another worker refused: drop what `prepare_reload` built
+pub fun abort_reload(runtime: *Runtime, index: usize) bool {
+    val current: *worker.Worker = worker_at(runtime, index);
+    if (current == nil) { ret false; }
+    ret worker.close_service_generation(current, 1 - current.active_generation);
+}
+
+# a reload the process now serves: what every later worker builds from
+pub fun reloaded(runtime: *Runtime, configured: *schema.Graph, generation_id: u64) {
+    runtime.graph         = configured;
+    runtime.generation_id = generation_id;
+}
+
+# a whole reload of a process whose workers run on the calling thread
+pub fun reload(runtime: *Runtime, controls: *worker.Controls,
+    configured: *schema.Graph, generation_id: u64,
+    diagnostics: *schema.Diagnostics) worker.StartReport {
+    if (runtime == nil || configured == nil || superseded(runtime, controls) != 0) {
+        ret worker.failed(worker.START_RUNTIME, "service generation is not reclaimable");
+    }
+    if (!reload_compatible(runtime, configured)) {
+        ret worker.failed(worker.START_CONFIG,
+            "startup-owned configuration changed; restart required");
+    }
     var i: usize = 0;
     for (i < runtime.worker_count) {
-        val published: worker.StartReport = worker.publish(?runtime.workers[i],
-            controls, configured, generation_id, diagnostics);
+        val prepared: worker.StartReport = prepare_reload(runtime, i, controls,
+            configured, generation_id, diagnostics);
+        if (prepared.status != worker.START_OK) {
+            var j: usize = 0;
+            for (j < i) {
+                abort_reload(runtime, j);
+                j = j + 1;
+            }
+            ret prepared;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < runtime.worker_count) {
+        val published: worker.StartReport = commit_reload(runtime, i, controls,
+            configured, generation_id, diagnostics);
         if (published.status != worker.START_OK) { ret published; }
         i = i + 1;
     }
-    runtime.graph = configured;
+    reloaded(runtime, configured, generation_id);
     ret worker.ok();
 }
 

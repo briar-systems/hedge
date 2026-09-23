@@ -1,0 +1,256 @@
+# the supervisor and its worker threads over real sockets
+#
+# these run the process the way the executable does: workers serve on threads
+# of their own, the supervisor on another, and this thread is only a client.
+# nothing here polls a serving runtime.
+
+use hedge.composition;
+use hedge.config.schema;
+use hedge.generation;
+use hedge.lifecycle;
+use hedge.listener;
+use hedge.supervisor;
+use hedge.test.runtime.wire;
+use hedge.worker;
+use std.allocator;
+use std.allocator.page;
+use io_error: std.io.error;
+use std.net.ip;
+use std.net.tcp;
+use std.sync.atomic;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+val RESPONSE_BYTES: usize = 4096;
+# a read waits wire.READ_TIMEOUT_MS, so this bounds one exchange at ten seconds
+val READ_ROUNDS: usize = 200;
+
+fun page_ok(outcome: err[allocator.Error]) bool {
+    ret sel outcome.ok;
+}
+
+rec Harness {
+    heap:        allocator.Allocator;
+    diagnostics: schema.Diagnostics;
+    generations: *generation.Generation;
+    composed:    *composition.Runtime;
+    supervising: supervisor.Supervisor;
+    thread:      thread.Thread;
+    endpoint:    ip.Endpoint;
+    # what the next reload's candidate answers with, and whether it moves the
+    # listener, which a reload must refuse
+    next_body:     str;
+    move_listener: bool;
+    # the loader runs on the supervisor's thread
+    loads: i64;
+}
+
+fun configure(graph: *schema.Graph, body: str) {
+    schema.reset_graph(graph);
+    schema.set_text(?graph.server_name, "supervision-test");
+    graph.listener_count = 1;
+    val public: *schema.Listener = ?graph.listeners[0];
+    schema.set_text(?public.name, "public");
+    schema.set_text(?public.address, "127.0.0.1:0");
+    schema.clear_text(?public.tls_policy);
+    schema.clear_text(?public.budget);
+    public.transport          = schema.TRANSPORT_TCP;
+    public.protocols          = schema.PROTOCOL_HTTP1;
+    public.backlog            = 16;
+    public.accept_depth       = 2;
+    public.proxy_protocol     = schema.PROXY_OFF;
+    public.trusted_peer_count = 0;
+    graph.host_count          = 1;
+    schema.set_text(?graph.hosts[0].name, "site");
+    schema.set_text(?graph.hosts[0].listener, "public");
+    graph.hosts[0].server_name_count = 1;
+    schema.set_text(?graph.hosts[0].server_names[0], "localhost");
+    graph.service_count = 1;
+    val fixed: *schema.Service = ?graph.services[0];
+    schema.set_text(?fixed.name, "hello");
+    fixed.kind = schema.SERVICE_FIXED;
+    schema.set_text(?fixed.target, body);
+    schema.clear_text(?fixed.budget);
+    schema.set_text(?fixed.content_type, "text/plain");
+    schema.clear_text(?fixed.index);
+    fixed.status      = 200;
+    graph.route_count = 1;
+    schema.set_text(?graph.routes[0].name, "all");
+    schema.set_text(?graph.routes[0].host, "site");
+    schema.set_text(?graph.routes[0].path, "/**");
+    schema.set_text(?graph.routes[0].service, "hello");
+    schema.clear_text(?graph.routes[0].budget);
+    graph.timeouts.drain_ms = 1000;
+}
+
+fun seal(candidate: *generation.Generation, id: u64, body: str,
+    diagnostics: *schema.Diagnostics) bool {
+    if (!generation.make_candidate(candidate, id)) { ret false; }
+    configure(?candidate.graph, body);
+    schema.reset_diagnostics(diagnostics);
+    ret generation.seal(candidate, diagnostics, nil, (0::usize)::generation.ConstructFun);
+}
+
+fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Generation {
+    val harness: *Harness = context::*Harness;
+    var target:  usize    = 0;
+    if (active == ?harness.generations[0]) { target = 1; }
+    val candidate: *generation.Generation = ?harness.generations[target];
+    atomic.fetch_add(?harness.loads, 1);
+    if (!seal(candidate, id, harness.next_body, ?harness.diagnostics)) { ret nil; }
+    if (harness.move_listener) {
+        schema.set_text(?candidate.graph.listeners[0].address, "127.0.0.1:1");
+    }
+    ret candidate;
+}
+
+fun supervise(arg: *u8) {
+    val harness: *Harness = arg::*Harness;
+    supervisor.run(?harness.supervising);
+}
+
+# the process up, its one worker serving on a thread and the supervisor on another
+fun boot(harness: *Harness) bool {
+    if (!page_ok(page.make(?harness.heap))) { ret false; }
+    val generations: res[*generation.Generation, allocator.Error] =
+        allocator.allocate[generation.Generation](?harness.heap, 2);
+    val composed: res[*composition.Runtime, allocator.Error] =
+        allocator.allocate[composition.Runtime](?harness.heap, 1);
+    if (sel generations.err) { ret false; }
+    if (sel composed.err)    { ret false; }
+    harness.generations = generations.ok;
+    harness.composed    = composed.ok;
+    atomic.store(?harness.loads, 0);
+    harness.move_listener = false;
+    harness.next_body     = "hello from two\n";
+    val initial: *generation.Generation = ?harness.generations[0];
+    if (!seal(initial, 1, "hello from one\n", ?harness.diagnostics)) { ret false; }
+    val started: composition.StartReport = composition.start_process(harness.composed,
+        ?harness.heap, ?initial.graph, initial.id, ?harness.diagnostics,
+        composition.default_options(), 1);
+    if (started.status != composition.START_OK) { ret false; }
+    if (!supervisor.make(?harness.supervising, harness.composed, ?harness.heap)
+        || !supervisor.attach_reloads(?harness.supervising, initial,
+        supervisor.Loader{context: (harness)::ptr, load: load})) { ret false; }
+    if (supervisor.start(?harness.supervising) != composition.START_OK) { ret false; }
+    val owned: *listener.OwnedListener = listener.active_listener(
+        ?composition.worker_at(harness.composed, 0).serving.owner, 0);
+    if (owned == nil || !owned.has_bound_endpoint) { ret false; }
+    harness.endpoint = owned.bound_endpoint;
+    val spawned: thread.Operation = thread.spawn_with(supervise, (harness)::*u8,
+        ?harness.thread);
+    ret sel spawned.ok;
+}
+
+fun finish(harness: *Harness) composition.StopReport {
+    supervisor.request_stop(?harness.supervising);
+    thread.join(?harness.thread);
+    ret supervisor.stop(?harness.supervising);
+}
+
+# one request, read without driving anything: the worker's thread serves it
+fun fetch(harness: *Harness, expected: str) bool {
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) { ret false; }
+    if (!wire.send(?client,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")) {
+        tcp.stream_close(?client);
+        ret false;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    var total:    usize = 0;
+    var rounds:   usize = 0;
+    for (rounds < READ_ROUNDS && total + 1 < RESPONSE_BYTES) {
+        val read: res[usize, io_error.Error] = tcp.stream_read(?client,
+            ?response[total], RESPONSE_BYTES - total - 1);
+        if (sel read.ok) {
+            if (read.ok == 0) { brk; }
+            total = total + read.ok;
+        }
+        rounds = rounds + 1;
+    }
+    tcp.stream_close(?client);
+    response[total] = 0;
+    ret wire.starts_with(?response[0], total, "HTTP/1.1 200 OK\r\n")
+        && wire.contains(?response[0], total, expected);
+}
+
+# a reload lands on the worker asynchronously, so the client asks until it
+# answers from the new generation or the budget is spent
+fun fetch_eventually(harness: *Harness, expected: str) bool {
+    var attempts: usize = 0;
+    for (attempts < 100) {
+        if (fetch(harness, expected)) { ret true; }
+        attempts = attempts + 1;
+    }
+    ret false;
+}
+
+# the executable's shape, reload and shutdown included: the worker serves on
+# its own thread, and the supervisor refuses, prepares, commits and stops it
+# from another
+# a worker serves a reload as soon as it commits, which can be before the
+# supervisor has published it, so the client asks until it has
+fun published(harness: *Harness, id: u64) bool {
+    var attempts: usize = 0;
+    for (attempts < 100) {
+        if (generation.snapshot(?harness.supervising.store).active_id == id) { ret true; }
+        fetch(harness, "hello");
+        attempts = attempts + 1;
+    }
+    ret false;
+}
+
+test "supervision: a worker thread serves, reloads and stops as the supervisor asks" {
+    var harness: Harness;
+    if (!boot(?harness)) { ret 1; }
+    if (!fetch(?harness, "hello from one")) {
+        finish(?harness);
+        ret 2;
+    }
+    # a reload that moves a listener is refused and serving goes on
+    harness.move_listener = true;
+    harness.next_body     = "hello from a moved listener\n";
+    supervisor.request_reload(?harness.supervising);
+    var attempts: usize = 0;
+    for (attempts < 100 && atomic.load(?harness.loads) == 0) {
+        fetch(?harness, "hello from one");
+        attempts = attempts + 1;
+    }
+    if (atomic.load(?harness.loads) != 1 || !fetch(?harness, "hello from one")) {
+        finish(?harness);
+        ret 3;
+    }
+    harness.move_listener = false;
+    harness.next_body     = "hello from two\n";
+    supervisor.request_reload(?harness.supervising);
+    if (!fetch_eventually(?harness, "hello from two") || !published(?harness, 3)) {
+        finish(?harness);
+        ret 4;
+    }
+    # a second reload waits for the first generation to drain from the worker,
+    # then seals into the slot it held
+    harness.next_body = "hello from three\n";
+    supervisor.request_reload(?harness.supervising);
+    if (!fetch_eventually(?harness, "hello from three") || !published(?harness, 4)) {
+        finish(?harness);
+        ret 5;
+    }
+    val stopped: composition.StopReport = finish(?harness);
+    if (!stopped.stopped || stopped.serve_failures != 0
+        || stopped.cleanup_failures != 0 || stopped.reason == lifecycle.FAILED) { ret 6; }
+    # the worker pins the generation it now serves, and the process builds
+    # every later worker from it. both were written on other threads, which
+    # the joins have finished
+    val first: *worker.Worker = composition.worker_at(harness.composed, 0);
+    if (first.control.state != worker.STATE_STOPPED
+        || first.current != ?harness.generations[0] || atomic.load(?harness.loads) != 3
+        || harness.composed.generation_id != 4) { ret 7; }
+    ret 0;
+}

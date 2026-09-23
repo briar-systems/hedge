@@ -1,0 +1,805 @@
+# the supervisor: the one thread that owns what belongs to the whole process
+#
+# the supervisor takes the signals, reloads the configuration, drives ACME and
+# installs what it issues, and maintains the TLS policies. every worker runs its
+# serving loop on a thread of its own and never touches any of that. the two
+# talk through each worker's `worker.Control`: the supervisor posts a request
+# and wakes the worker's io runtime, and the worker answers and wakes the
+# supervisor's.
+#
+# a reload is two steps. every worker builds the candidate's services into its
+# spare slot and says whether it would publish them, and only when all of them
+# would does the supervisor ask each to publish, the first worker first. a
+# refusal before anything was published leaves the process as it was. a
+# failure after one worker published cannot be taken back, so it stops the
+# process in order, which is what one worker did on its own before.
+
+use acme: hedge.acme.manager;
+use hedge.clock;
+use hedge.composition;
+use hedge.config.schema;
+use hedge.generation;
+use hedge.lifecycle;
+use hedge.operation;
+use quic_runtime: hedge.protocol.quic.runtime;
+use hedge_tls:    hedge.protocol.tls;
+use hedge.serve;
+use hedge_wake: hedge.wake;
+use hedge.worker;
+use std.allocator;
+use io_error:   std.io.error;
+use io_runtime: std.io.runtime;
+use net_async:  std.net.async;
+use std.print;
+use process_events: std.process.events;
+use std.sync.atomic;
+use std.sync.thread;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+# the operations the supervisor's own runtime carries: ACME's exchanges
+val RUNTIME_CAPACITY: usize = 64;
+# a worker's stack, as large as the main thread's usual one
+val WORKER_STACK_BYTES: usize = 8388608;
+val WAKE_BATCH:         usize = 16;
+
+pub def ReloadState: u8;
+pub val RELOAD_IDLE:       ReloadState = 0;
+pub val RELOAD_PREPARING:  ReloadState = 1;
+pub val RELOAD_COMMITTING: ReloadState = 2;
+pub val RELOAD_ABORTING:   ReloadState = 3;
+
+# seal a candidate generation with this id from the configuration source, into
+# storage other than the active generation's, or nil when it does not seal.
+# the supervisor asks only once no other generation is still in use
+pub def LoadFun: fun(ptr, u64, *generation.Generation) *generation.Generation;
+
+pub rec Loader {
+    context: ptr;
+    load:    LoadFun;
+}
+
+# what one worker thread is handed
+rec Seat {
+    supervisor: *Supervisor;
+    index:      usize;
+}
+
+pub rec Supervisor {
+    composed: *composition.Runtime;
+    heap:     *allocator.Allocator;
+    loader:   Loader;
+    # the generations the process has published, and the one still draining
+    store:        generation.Store;
+    active:       *generation.Generation;
+    previous:     *generation.Generation;
+    next_id:      u64;
+    runtime:      io_runtime.Runtime;
+    network:      net_async.Driver;
+    process:      process_events.Source;
+    wakes:        hedge_wake.Queue;
+    runtime_live: bool;
+    network_live: bool;
+    process_live: bool;
+    wakes_live:   bool;
+    acme_live:    bool;
+    acme_due:     bool;
+    # asked by a signal or by `request_reload` / `request_stop` from any thread
+    reload_requested: i64;
+    stop_requested:   i64;
+    shutdown_sent:    bool;
+    stop_timeout_ns:  u64;
+    seats:            *Seat;
+    threads:          *thread.Thread;
+    spawned:          usize;
+    reload_state:     ReloadState;
+    candidate:        *generation.Generation;
+    # the workers asked to take part in the step under way
+    posted:      usize;
+    commit_next: usize;
+}
+
+fun runtime_ok(outcome: err[io_error.Error]) bool {
+    ret sel outcome.ok;
+}
+
+fun report_diagnostics(diagnostics: *schema.Diagnostics) {
+    var i: usize = 0;
+    for (i < diagnostics.count) {
+        val item: *schema.Diagnostic = ?diagnostics.items[i];
+        print.eprint("hedge: ");
+        print.eprint(schema.text(?item.source));
+        print.eprint(": ");
+        print.eprint(schema.text(?item.path));
+        print.eprint(": ");
+        print.eprintln(schema.text(?item.message));
+        i = i + 1;
+    }
+    if (diagnostics.truncated) { print.eprintln("hedge: diagnostics were truncated"); }
+}
+
+fun worker_of(supervisor: *Supervisor, index: usize) *worker.Worker {
+    ret composition.worker_at(supervisor.composed, index);
+}
+
+fun wake_worker(supervisor: *Supervisor, index: usize) {
+    val current: *worker.Worker = worker_of(supervisor, index);
+    if (current == nil) { ret; }
+    # a worker that has not bound its runtime yet reads its control on its
+    # first turn, and one that has destroyed it has nothing left to wake
+    if (current.serving.owner.runtime_initialized) {
+        io_runtime.wake(?current.serving.owner.runtime);
+    }
+}
+
+fun wake_supervisor(supervisor: *Supervisor) {
+    io_runtime.wake(?supervisor.runtime);
+}
+
+# the process's own io runtime, signals and the driver ACME exchanges run on.
+# nothing here starts a worker
+pub fun make(supervisor: *Supervisor, composed: *composition.Runtime,
+    heap: *allocator.Allocator) bool {
+    if (supervisor == nil || composed == nil || heap == nil) { ret false; }
+    supervisor.composed     = composed;
+    supervisor.heap         = heap;
+    supervisor.loader       = Loader{context: nil, load: (0::usize)::LoadFun};
+    supervisor.previous     = nil;
+    supervisor.active       = nil;
+    supervisor.next_id      = 0;
+    supervisor.runtime_live = false;
+    supervisor.network_live = false;
+    supervisor.process_live = false;
+    supervisor.wakes_live   = false;
+    supervisor.acme_live    = false;
+    supervisor.acme_due     = true;
+    atomic.store(?supervisor.reload_requested, 0);
+    atomic.store(?supervisor.stop_requested, 0);
+    supervisor.shutdown_sent   = false;
+    supervisor.stop_timeout_ns = composed.graph.timeouts.stop_ms * 1000000;
+    supervisor.seats           = nil;
+    supervisor.threads         = nil;
+    supervisor.spawned         = 0;
+    supervisor.reload_state    = RELOAD_IDLE;
+    supervisor.candidate       = nil;
+    supervisor.commit_next     = 0;
+    if (os.ignore_sigpipe() < 0) { ret false; }
+    if (!runtime_ok(io_runtime.make(?supervisor.runtime, heap, RUNTIME_CAPACITY))) {
+        ret false;
+    }
+    supervisor.runtime_live = true;
+    if (!runtime_ok(net_async.make(?supervisor.network, ?supervisor.runtime))) {
+        close_runtime(supervisor);
+        ret false;
+    }
+    supervisor.network_live = true;
+    if (!runtime_ok(process_events.make_runtime(?supervisor.process,
+        ?supervisor.runtime))) {
+        close_runtime(supervisor);
+        ret false;
+    }
+    supervisor.process_live = true;
+    if (!hedge_wake.make(?supervisor.wakes, heap)) {
+        close_runtime(supervisor);
+        ret false;
+    }
+    supervisor.wakes_live = true;
+    if (composed.acme_live) {
+        if (!acme.attach_driver(composed.certificates, ?supervisor.network,
+            hedge_wake.waker(?supervisor.wakes, hedge_wake.PLANE_OWNER))) {
+            close_runtime(supervisor);
+            ret false;
+        }
+        acme.attach_telemetry(composed.certificates, ?composed.observability.runtime);
+        supervisor.acme_live = true;
+    }
+    ret true;
+}
+
+# the process's configuration generations: `initial` is the one it serves, and
+# `loader` seals each one a reload asks for. a supervisor without them refuses
+# every reload
+pub fun attach_reloads(supervisor: *Supervisor, initial: *generation.Generation,
+    loader: Loader) bool {
+    if (supervisor == nil || initial == nil || loader.load::usize == 0
+        || supervisor.active != nil
+        || !generation.make_store(?supervisor.store, initial)) { ret false; }
+    supervisor.loader  = loader;
+    supervisor.active  = initial;
+    supervisor.next_id = initial.id + 1;
+    ret true;
+}
+
+# the supervisor's runtime, its driver and its signals, once nothing runs on them
+fun close_runtime(supervisor: *Supervisor) bool {
+    var ok: bool = true;
+    if (supervisor.process_live) {
+        if (!runtime_ok(process_events.close(?supervisor.process))) { ok = false; }
+        supervisor.process_live = false;
+    }
+    if (supervisor.runtime_live) {
+        # a driver slot is released when its completion is taken, so every
+        # completion is dequeued before the driver is destroyed
+        io_runtime.close(?supervisor.runtime);
+        var completions: [16]io_runtime.Completion;
+        for (io_runtime.pending(?supervisor.runtime) > 0) {
+            val waited: res[usize, io_error.Error] = io_runtime.wait(
+                ?supervisor.runtime, ?completions[0], 16, -1);
+            if (sel waited.err) {
+                ok = false;
+                brk;
+            }
+        }
+    }
+    if (supervisor.network_live) {
+        if (!runtime_ok(net_async.destroy(?supervisor.network))) { ok = false; }
+        supervisor.network_live = false;
+    }
+    if (supervisor.runtime_live) {
+        if (!runtime_ok(io_runtime.destroy(?supervisor.runtime))) { ok = false; }
+        supervisor.runtime_live = false;
+    }
+    if (supervisor.wakes_live) {
+        if (!hedge_wake.destroy(?supervisor.wakes)) { ok = false; }
+        supervisor.wakes_live = false;
+    }
+    ret ok;
+}
+
+# --- the worker's thread ---
+
+fun worker_main(arg: *u8) {
+    val seat:       *Seat                = arg::*Seat;
+    val supervisor: *Supervisor          = seat.supervisor;
+    val composed:   *composition.Runtime = supervisor.composed;
+    val index:      usize                = seat.index;
+    val current:    *worker.Worker       = worker_of(supervisor, index);
+    # the worker's welded QUIC records live on its own stack for its lifetime
+    var controls: worker.Controls;
+    atomic.store(?current.control.state, worker.STATE_STARTING);
+    val quic: bool = worker.quic_required(composed.graph);
+    if (quic && !worker.make_controls(?controls, composed.heap)) {
+        current.failure        = "QUIC control storage allocation failed";
+        current.failure_status = worker.START_RUNTIME;
+        atomic.store(?current.control.state, worker.STATE_FAILED);
+        wake_supervisor(supervisor);
+        ret;
+    }
+    val started: worker.StartReport = composition.start_worker(composed, index,
+        ?controls, true, ?current.diagnostics);
+    if (started.status != worker.START_OK) {
+        current.failure        = started.detail;
+        current.failure_status = started.status;
+        composition.stop_worker(composed, index, ?controls, ?current.report);
+        if (quic) { worker.release_controls(?controls); }
+        atomic.store(?current.control.state, worker.STATE_FAILED);
+        wake_supervisor(supervisor);
+        ret;
+    }
+    atomic.store(?current.control.state, worker.STATE_READY);
+    wake_supervisor(supervisor);
+    serve_until_drained(supervisor, current, ?controls);
+    composition.stop_worker(composed, index, ?controls, ?current.report);
+    if (quic && !worker.release_controls(?controls)) {
+        current.report.cleanup_failures = current.report.cleanup_failures + 1;
+    }
+    atomic.store(?current.control.state, worker.STATE_STOPPED);
+    wake_supervisor(supervisor);
+}
+
+fun take_request(supervisor: *Supervisor, current: *worker.Worker,
+    controls: *worker.Controls) {
+    var id:      u64 = 0;
+    val request: i64 = worker.take(?current.control, ?id);
+    if (request == worker.REQUEST_NONE) { ret; }
+    val composed: *composition.Runtime = supervisor.composed;
+    val index:    usize                = current.index;
+    if (request == worker.REQUEST_PREPARE) {
+        schema.reset_diagnostics(?current.diagnostics);
+        val prepared: worker.StartReport = composition.prepare_reload(composed, index,
+            controls, ?supervisor.candidate.graph, id, ?current.diagnostics);
+        current.failure = prepared.detail;
+        if (prepared.status == worker.START_OK) {
+            worker.answer(?current.control, worker.ANSWER_PREPARED, id);
+        }
+        or { worker.answer(?current.control, worker.ANSWER_REFUSED, id); }
+    }
+    or (request == worker.REQUEST_COMMIT) {
+        val committed: worker.StartReport = composition.commit_reload(composed, index,
+            controls, ?supervisor.candidate.graph, id, ?current.diagnostics);
+        current.failure = committed.detail;
+        if (committed.status == worker.START_OK) {
+            # the connections this worker accepts from now on pin the new
+            # generation, and the old one stays pinned until its last leaves
+            current.previous = current.current;
+            current.current  = supervisor.candidate;
+            generation.pin(current.current);
+            worker.answer(?current.control, worker.ANSWER_COMMITTED, id);
+        }
+        or { worker.answer(?current.control, worker.ANSWER_FAILED, id); }
+    }
+    or (request == worker.REQUEST_ABORT) {
+        composition.abort_reload(composed, index);
+        worker.answer(?current.control, worker.ANSWER_ABORTED, id);
+    }
+    wake_supervisor(supervisor);
+}
+
+# the worker's loop: serve until the shutdown sequence has run to its close,
+# which the thread then performs
+fun serve_until_drained(supervisor: *Supervisor, current: *worker.Worker,
+    controls: *worker.Controls) {
+    var quic_controls: quic_runtime.ControlView;
+    worker.controls_view(controls, ?quic_controls);
+    val runtime: *serve.Runtime = ?current.serving;
+    for (true) {
+        # the wait ends at the wheel's next deadline or on a completion or a
+        # wake, the supervisor's included: an idle worker sleeps
+        serve.poll(?quic_controls, runtime, -1);
+        if (atomic.load(?current.control.shutdown) != 0 && !serve.draining(runtime)) {
+            serve.begin_shutdown(?quic_controls, runtime, clock.instant());
+        }
+        take_request(supervisor, current, controls);
+        val superseded: usize = serve.superseded(?quic_controls, runtime);
+        if (superseded == 0 && current.previous != nil) {
+            # the last connection of the old generation has gone
+            generation.release(current.previous);
+            current.previous = nil;
+            if (!worker.reclaim_superseded(current, controls)) {
+                print.eprintln("hedge: superseded service generation could not be released");
+                serve.begin_shutdown(?quic_controls, runtime, clock.instant());
+            }
+            atomic.store(?current.control.superseded, 0);
+            wake_supervisor(supervisor);
+        }
+        or { atomic.store(?current.control.superseded, superseded::i64); }
+        # a worker that began its own shutdown, on a failure or a signal it
+        # somehow took, stops the whole process
+        if (serve.draining(runtime) && atomic.load(?current.control.draining) == 0) {
+            atomic.store(?current.control.draining, 1);
+            wake_supervisor(supervisor);
+        }
+        if (serve.drained(runtime) || serve.cancelling(runtime)) { brk; }
+    }
+}
+
+# --- the supervisor's own loop ---
+
+fun deliver(supervisor: *Supervisor, timeout_ms: i32) bool {
+    var completions: [16]io_runtime.Completion;
+    val waited:      res[usize, io_error.Error] = io_runtime.wait(?supervisor.runtime,
+        ?completions[0], 16, timeout_ms);
+    if (sel waited.err) { ret false; }
+    var i: usize = 0;
+    for (i < waited.ok) {
+        operation.deliver(completions[i]);
+        i = i + 1;
+    }
+    for (supervisor.process_live) {
+        val next: res[opt[process_events.Event], io_error.Error] =
+            process_events.next(?supervisor.process);
+        if (sel next.err)     { brk; }
+        if (sel next.ok.none) { brk; }
+        if (next.ok.some.kind == process_events.RELOAD) {
+            atomic.store(?supervisor.reload_requested, 1);
+        }
+        or { atomic.store(?supervisor.stop_requested, 1); }
+    }
+    var wakes: [WAKE_BATCH]hedge_wake.Wake;
+    for {
+        val taken: usize = hedge_wake.take(?supervisor.wakes, ?wakes[0], WAKE_BATCH);
+        if (taken != 0)         { supervisor.acme_due = true; }
+        if (taken < WAKE_BATCH) { brk; }
+    }
+    ret true;
+}
+
+# how long the supervisor may wait before ACME is next due, or -1
+fun wait_ms(supervisor: *Supervisor) i32 {
+    if (supervisor.acme_due)   { ret 0; }
+    if (!supervisor.acme_live) { ret -1; }
+    var at: u64 = 0;
+    if (!acme.deadline(supervisor.composed.certificates, ?at)) { ret -1; }
+    val now: u64 = clock.monotonic_ns();
+    if (at <= now) { ret 0; }
+    var left: u64 = (at - now + 999999) / 1000000;
+    if (left > 2147483647) { left = 2147483647; }
+    ret left::i32;
+}
+
+pub fun announce_certificate(certificates: *acme.Manager) {
+    val first:    view.View = acme.name(certificates, 0);
+    var rendered: [256]u8;
+    var i:        usize     = 0;
+    for (i < first.len && i < 255) {
+        rendered[i] = first.data[i];
+        i           = i + 1;
+    }
+    rendered[i] = 0;
+    print.printlnf("hedge: certificate ready for {} until {}",
+        (?rendered[0])::str, acme.not_after(certificates)::u64);
+}
+
+# one ACME step when it is due, and the TLS policies' upkeep
+fun drive_certificates(supervisor: *Supervisor) {
+    val composed: *composition.Runtime = supervisor.composed;
+    if (supervisor.acme_live && (supervisor.acme_due || wait_ms(supervisor) == 0)) {
+        supervisor.acme_due = false;
+        # renewal is scheduled against certificate validity, which is calendar time
+        acme.poll((composed.certificates)::ptr, clock.wall());
+    }
+    hedge_tls.maintain();
+}
+
+# install a certificate ACME has finished issuing
+fun install_certificates(supervisor: *Supervisor) {
+    val composed: *composition.Runtime = supervisor.composed;
+    if (!supervisor.acme_live || !acme.installation_ready(composed.certificates)) { ret; }
+    val installed: hedge_tls.Status = composition.install_certificate(composed,
+        clock.wall());
+    if (installed == hedge_tls.OK) {
+        announce_certificate(composed.certificates);
+    }
+    or (installed != hedge_tls.RETIRED_IN_USE) {
+        print.eprintln("hedge: renewed ACME certificate could not be installed");
+    }
+}
+
+# one turn of the supervisor's own work for a caller that runs the workers on
+# its own thread: take what completed, then drive ACME and the TLS policies.
+# installing what ACME issued is left to the caller
+pub fun drive(supervisor: *Supervisor, timeout_ms: i32) bool {
+    if (supervisor == nil || !supervisor.runtime_live) { ret false; }
+    var wait: i32 = wait_ms(supervisor);
+    if (wait < 0 || (timeout_ms >= 0 && timeout_ms < wait)) { wait = timeout_ms; }
+    if (!deliver(supervisor, wait))                         { ret false; }
+    drive_certificates(supervisor);
+    ret true;
+}
+
+# every worker is asked to finish, once
+fun fan_shutdown(supervisor: *Supervisor) {
+    if (supervisor.shutdown_sent) { ret; }
+    supervisor.shutdown_sent = true;
+    var i: usize = 0;
+    for (i < supervisor.spawned) {
+        atomic.store(?worker_of(supervisor, i).control.shutdown, 1);
+        wake_worker(supervisor, i);
+        i = i + 1;
+    }
+}
+
+fun worker_state(supervisor: *Supervisor, index: usize) i64 {
+    ret atomic.load(?worker_of(supervisor, index).control.state);
+}
+
+fun all_answered(supervisor: *Supervisor, count: usize, id: u64) bool {
+    var i: usize = 0;
+    for (i < count) {
+        if (worker.answered(?worker_of(supervisor, i).control, id) == worker.ANSWER_NONE) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun post_all(supervisor: *Supervisor, request: i64, id: u64) {
+    var i: usize = 0;
+    for (i < supervisor.spawned) {
+        worker.post(?worker_of(supervisor, i).control, request, id);
+        wake_worker(supervisor, i);
+        i = i + 1;
+    }
+}
+
+fun reject(supervisor: *Supervisor, message: str) {
+    print.eprint("hedge: reload rejected, ");
+    print.eprintln(message);
+}
+
+# a reload is taken once the previous generation has drained from every
+# worker, so its storage is free to seal the next one into
+fun begin_reload(supervisor: *Supervisor) {
+    if (supervisor.active == nil) {
+        atomic.store(?supervisor.reload_requested, 0);
+        reject(supervisor, "this process takes no reloads");
+        ret;
+    }
+    if (supervisor.previous != nil) {
+        if (!generation.retire(?supervisor.store, supervisor.previous)) { ret; }
+        supervisor.previous = nil;
+    }
+    atomic.store(?supervisor.reload_requested, 0);
+    val id:        u64                    = supervisor.next_id;
+    val candidate: *generation.Generation = supervisor.loader.load(
+        supervisor.loader.context, id, supervisor.active);
+    if (candidate == nil) { ret; }
+    supervisor.next_id = id + 1;
+    if (!composition.reload_compatible(supervisor.composed, ?candidate.graph)) {
+        generation.reject(?supervisor.store, id, nil);
+        reject(supervisor, "startup-owned configuration changed; restart required");
+        ret;
+    }
+    supervisor.candidate    = candidate;
+    supervisor.reload_state = RELOAD_PREPARING;
+    post_all(supervisor, worker.REQUEST_PREPARE, id);
+}
+
+fun step_reload(supervisor: *Supervisor) {
+    val id: u64 = supervisor.candidate.id;
+    if (supervisor.reload_state == RELOAD_PREPARING) {
+        if (!all_answered(supervisor, supervisor.spawned, id)) { ret; }
+        var refused: usize = supervisor.spawned;
+        var i:       usize = 0;
+        for (i < supervisor.spawned) {
+            if (worker.answered(?worker_of(supervisor, i).control, id)
+                != worker.ANSWER_PREPARED && refused == supervisor.spawned) {
+                refused = i;
+            }
+            i = i + 1;
+        }
+        if (refused != supervisor.spawned) {
+            val refusing: *worker.Worker = worker_of(supervisor, refused);
+            report_diagnostics(?refusing.diagnostics);
+            reject(supervisor, refusing.failure);
+            generation.reject(?supervisor.store, id, ?refusing.diagnostics);
+            supervisor.reload_state = RELOAD_ABORTING;
+            post_all(supervisor, worker.REQUEST_ABORT, id);
+            ret;
+        }
+        supervisor.commit_next  = 0;
+        supervisor.reload_state = RELOAD_COMMITTING;
+        worker.post(?worker_of(supervisor, 0).control, worker.REQUEST_COMMIT, id);
+        wake_worker(supervisor, 0);
+        ret;
+    }
+    if (supervisor.reload_state == RELOAD_COMMITTING) {
+        val next:   *worker.Worker = worker_of(supervisor, supervisor.commit_next);
+        val answer: i64            = worker.answered(?next.control, id);
+        if (answer == worker.ANSWER_PREPARED) { ret; }
+        if (answer == worker.ANSWER_FAILED) {
+            report_diagnostics(?next.diagnostics);
+            if (supervisor.commit_next == 0) {
+                # nothing was published, so the rest drop what they built
+                reject(supervisor, next.failure);
+                generation.reject(?supervisor.store, id, ?next.diagnostics);
+                supervisor.reload_state = RELOAD_ABORTING;
+                var i: usize = 1;
+                for (i < supervisor.spawned) {
+                    worker.post(?worker_of(supervisor, i).control, worker.REQUEST_ABORT, id);
+                    wake_worker(supervisor, i);
+                    i = i + 1;
+                }
+                ret;
+            }
+            print.eprintln("hedge: reload failed after a worker published it, stopping");
+            supervisor.reload_state = RELOAD_IDLE;
+            fan_shutdown(supervisor);
+            ret;
+        }
+        supervisor.commit_next = supervisor.commit_next + 1;
+        if (supervisor.commit_next < supervisor.spawned) {
+            worker.post(?worker_of(supervisor, supervisor.commit_next).control,
+                worker.REQUEST_COMMIT, id);
+            wake_worker(supervisor, supervisor.commit_next);
+            ret;
+        }
+        val published: generation.Publication = generation.publish(?supervisor.store,
+            supervisor.candidate);
+        supervisor.previous = published.previous;
+        supervisor.active   = supervisor.candidate;
+        composition.reloaded(supervisor.composed, ?supervisor.candidate.graph, id);
+        supervisor.reload_state = RELOAD_IDLE;
+        print.eprintln("hedge: reloaded");
+        ret;
+    }
+    if (supervisor.reload_state == RELOAD_ABORTING) {
+        # the first worker answered its commit, not an abort, and asks nothing
+        var i: usize = 0;
+        for (i < supervisor.spawned) {
+            val answer: i64 = worker.answered(?worker_of(supervisor, i).control, id);
+            if (answer == worker.ANSWER_PREPARED || answer == worker.ANSWER_NONE) { ret; }
+            i = i + 1;
+        }
+        supervisor.reload_state = RELOAD_IDLE;
+    }
+}
+
+fun all_stopped(supervisor: *Supervisor) bool {
+    var i: usize = 0;
+    for (i < supervisor.spawned) {
+        val state: i64 = worker_state(supervisor, i);
+        if (state != worker.STATE_STOPPED && state != worker.STATE_FAILED) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun any_draining(supervisor: *Supervisor) bool {
+    var i: usize = 0;
+    for (i < supervisor.spawned) {
+        val current: *worker.Worker = worker_of(supervisor, i);
+        if (atomic.load(?current.control.draining) != 0
+            || atomic.load(?current.control.state) == worker.STATE_STOPPED) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# start a thread for every worker and wait until each is serving or has failed.
+# a worker that failed is named with its diagnostics, and every other one is
+# stopped before this returns false
+pub fun start(supervisor: *Supervisor) worker.StartStatus {
+    val composed: *composition.Runtime                 = supervisor.composed;
+    val count:    usize                                = composed.worker_count;
+    val seats:    res[*Seat, allocator.Error]          = allocator.allocate[Seat](supervisor.heap, count);
+    val threads:  res[*thread.Thread, allocator.Error] =
+        allocator.allocate[thread.Thread](supervisor.heap, count);
+    if (sel seats.err)   { ret worker.START_RUNTIME; }
+    if (sel threads.err) { ret worker.START_RUNTIME; }
+    supervisor.seats   = seats.ok;
+    supervisor.threads = threads.ok;
+    var config: thread.Config;
+    thread.config_default(?config);
+    config.stack_reserve = WORKER_STACK_BYTES;
+    config.name          = "hedge-worker";
+    var i: usize = 0;
+    for (i < count) {
+        val current: *worker.Worker = worker_of(supervisor, i);
+        current.current = supervisor.active;
+        if (supervisor.active != nil) { generation.pin(supervisor.active); }
+        supervisor.seats[i] = Seat{supervisor: supervisor, index: i};
+        val spawned: thread.Operation = thread.spawn_with_config(worker_main,
+            (?supervisor.seats[i])::*u8, ?config, ?supervisor.threads[i]);
+        if (sel spawned.err) {
+            print.eprintln("hedge: a worker thread could not be started");
+            fan_shutdown(supervisor);
+            ret worker.START_RUNTIME;
+        }
+        supervisor.spawned = i + 1;
+        i                  = i + 1;
+    }
+    for (true) {
+        var ready:  usize = 0;
+        var failed: usize = 0;
+        i = 0;
+        for (i < supervisor.spawned) {
+            val state: i64 = worker_state(supervisor, i);
+            if (state == worker.STATE_READY)  { ready = ready + 1; }
+            if (state == worker.STATE_FAILED) { failed = failed + 1; }
+            i = i + 1;
+        }
+        if (ready + failed == supervisor.spawned) {
+            if (failed == 0) { ret worker.START_OK; }
+            var status: worker.StartStatus = worker.START_RUNTIME;
+            i = 0;
+            for (i < supervisor.spawned) {
+                val current: *worker.Worker = worker_of(supervisor, i);
+                if (worker_state(supervisor, i) == worker.STATE_FAILED) {
+                    report_diagnostics(?current.diagnostics);
+                    print.eprint("hedge: startup composition failed: ");
+                    print.eprintln(current.failure);
+                    status = current.failure_status;
+                }
+                i = i + 1;
+            }
+            fan_shutdown(supervisor);
+            ret status;
+        }
+        if (!deliver(supervisor, -1)) {
+            fan_shutdown(supervisor);
+            ret worker.START_RUNTIME;
+        }
+        if (atomic.load(?supervisor.stop_requested) != 0) { fan_shutdown(supervisor); }
+    }
+    ret worker.START_RUNTIME;
+}
+
+# ask for a reload, as a SIGHUP does, from any thread
+pub fun request_reload(supervisor: *Supervisor) {
+    atomic.store(?supervisor.reload_requested, 1);
+    wake_supervisor(supervisor);
+}
+
+# ask the process to stop, as a SIGTERM does, from any thread
+pub fun request_stop(supervisor: *Supervisor) {
+    atomic.store(?supervisor.stop_requested, 1);
+    wake_supervisor(supervisor);
+}
+
+# supervise until every worker has stopped
+pub fun run(supervisor: *Supervisor) {
+    for (!all_stopped(supervisor)) {
+        deliver(supervisor, wait_ms(supervisor));
+        if (atomic.load(?supervisor.stop_requested) != 0 || any_draining(supervisor)) {
+            fan_shutdown(supervisor);
+        }
+        # a reload under way is carried to its end even once the process is
+        # stopping, so what the supervisor records matches what every worker
+        # published. none begins once a stop has been asked for
+        if (supervisor.reload_state != RELOAD_IDLE) { step_reload(supervisor); }
+        if (!supervisor.shutdown_sent) {
+            if (supervisor.reload_state == RELOAD_IDLE
+                && atomic.load(?supervisor.reload_requested) != 0) { begin_reload(supervisor); }
+            drive_certificates(supervisor);
+            install_certificates(supervisor);
+        }
+    }
+}
+
+# the milliseconds a wait may take before the monotonic `deadline`, or 0
+fun wait_before(deadline: u64) i32 {
+    val now: u64 = clock.monotonic_ns();
+    if (now >= deadline) { ret 0; }
+    var left: u64 = (deadline - now + 999999) / 1000000;
+    if (left > 2147483647) { left = 2147483647; }
+    ret left::i32;
+}
+
+# ACME gives up its exchange and releases its socket, which lands on the
+# supervisor's runtime, within the stop deadline
+fun quiesce_certificates(supervisor: *Supervisor) bool {
+    if (!supervisor.acme_live) { ret true; }
+    var status:   acme.Status = acme.quiesce(supervisor.composed.certificates);
+    val deadline: u64         = clock.after_ns(clock.monotonic_ns(),
+        supervisor.stop_timeout_ns);
+    for (status == acme.PENDING) {
+        val left: i32 = wait_before(deadline);
+        if (left == 0 || !deliver(supervisor, left)) { ret false; }
+        status = acme.quiesce(supervisor.composed.certificates);
+    }
+    ret status == acme.OK;
+}
+
+# the supervisor's own teardown for a caller that ran the workers itself and has
+# stopped them: ACME gives up its exchange, then the runtime closes. the process
+# is the caller's to close
+pub fun release(supervisor: *Supervisor) bool {
+    if (supervisor == nil) { ret false; }
+    val quiesced: bool = quiesce_certificates(supervisor);
+    ret close_runtime(supervisor) && quiesced;
+}
+
+# join every worker, tear the process down, and merge what each worker's stop
+# reported into one
+pub fun stop(supervisor: *Supervisor) worker.StopReport {
+    var merged: worker.StopReport = worker.StopReport{stopped: true,
+        reason:           lifecycle.IMMEDIATE, abandoned: 0, serve_failures: 0,
+        cleanup_failures: 0};
+    var i:        usize = 0;
+    var reasoned: bool  = false;
+    for (i < supervisor.spawned) {
+        val joined: thread.Operation = thread.join(?supervisor.threads[i]);
+        if (sel joined.err) { merged.cleanup_failures = merged.cleanup_failures + 1; }
+        val current: *worker.Worker     = worker_of(supervisor, i);
+        val report:  *worker.StopReport = ?current.report;
+        if (!report.stopped) { merged.stopped = false; }
+        merged.abandoned        = merged.abandoned + report.abandoned;
+        merged.serve_failures   = merged.serve_failures + report.serve_failures;
+        merged.cleanup_failures = merged.cleanup_failures + report.cleanup_failures;
+        # the worst reason any worker stopped for is the process's
+        if (!reasoned || report.reason == lifecycle.FAILED
+            || (report.reason == lifecycle.DEADLINE && merged.reason != lifecycle.FAILED)) {
+            merged.reason = report.reason;
+            reasoned      = true;
+        }
+        i = i + 1;
+    }
+    if (!quiesce_certificates(supervisor)) {
+        merged.cleanup_failures = merged.cleanup_failures + 1;
+    }
+    composition.close(supervisor.composed, ?merged);
+    if (!close_runtime(supervisor)) {
+        merged.cleanup_failures = merged.cleanup_failures + 1;
+    }
+    ret merged;
+}
