@@ -1,0 +1,323 @@
+# caps shared by every worker, held as per-worker allowances
+#
+# a process-wide cap (max_connections, max_handshakes, a budget's concurrency or
+# memory) is a `Pool` of units no worker holds yet. each worker takes from it
+# through a `Share`, in batches, by compare and swap, and admits against what it
+# holds with plain arithmetic: nothing on the hot path is shared. a worker
+# returns what it holds above a high-water mark, and the total held and in use
+# never exceeds the cap.
+#
+# the cost is that a worker can refuse while another holds units it is not
+# using, bounded by the number of workers times the batch. such a refusal is
+# counted. a worker that finds both its share and the pool empty is marked
+# starved, and any worker that returns units to a pool wakes every starved one,
+# so a refill is a registered wait like any other: the woken worker retries on
+# its next turn.
+
+use hedge.config.schema;
+use io_runtime: std.io.runtime;
+use std.sync.atomic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+
+# the most workers a process runs, which the per-worker TLS tables bound too
+pub val MAX_WORKERS: usize = 256;
+
+# the most units one refill takes
+pub val MAX_BATCH: usize = 64;
+
+# the workers a pool can wake: each one's io runtime and whether it is waiting
+# for units. a pool with no registry has one taker, which never needs waking
+pub rec Wakers {
+    count:    usize;
+    runtimes: [MAX_WORKERS]i64;
+    starved:  [MAX_WORKERS]i64;
+}
+
+pub fun make_wakers(wakers: *Wakers, count: usize) bool {
+    if (wakers == nil || count == 0 || count > MAX_WORKERS) { ret false; }
+    wakers.count = count;
+    var i: usize = 0;
+    for (i < MAX_WORKERS) {
+        atomic.store(?wakers.runtimes[i], 0);
+        atomic.store(?wakers.starved[i], 0);
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the runtime a worker waits on, registered once it exists
+pub fun register(wakers: *Wakers, worker: usize, runtime: *io_runtime.Runtime) bool {
+    if (wakers == nil || worker >= wakers.count || runtime == nil) { ret false; }
+    atomic.store(?wakers.runtimes[worker], (runtime)::usize::i64);
+    ret true;
+}
+
+# every worker waiting for units gets a turn to take them
+fun wake_starved(wakers: *Wakers) {
+    if (wakers == nil) { ret; }
+    var i: usize = 0;
+    for (i < wakers.count) {
+        if (atomic.exchange(?wakers.starved[i], 0) != 0) {
+            val runtime: *io_runtime.Runtime =
+                atomic.load(?wakers.runtimes[i])::usize::*io_runtime.Runtime;
+            if (runtime != nil) { io_runtime.wake(runtime); }
+        }
+        i = i + 1;
+    }
+}
+
+pub rec Pool {
+    bounded: bool;
+    # the cap, which a reload may move
+    capacity: i64;
+    # units no worker holds
+    free:  i64;
+    batch: i64;
+    # refusals made while other workers held units, which a single shared
+    # counter would not have made
+    refusals: i64;
+    wakers:   *Wakers;
+}
+
+pub rec Share {
+    pool:   *Pool;
+    worker: usize;
+    # units taken from the pool and not in use, and units in use
+    held: i64;
+    used: i64;
+}
+
+# a batch that lets `workers` workers each hold one and leaves half the cap in
+# the pool, at least one unit and at most MAX_BATCH (or the cap, for bytes)
+pub fun batch_for(capacity: usize, workers: usize, most: usize) usize {
+    var count: usize = workers;
+    if (count == 0) { count = 1; }
+    var batch: usize = capacity / (2 * count);
+    if (batch > most) { batch = most; }
+    if (batch == 0)   { batch = 1; }
+    ret batch;
+}
+
+# `capacity` none is no cap: every take succeeds and nothing is counted shared
+pub fun make_pool(pool: *Pool, capacity: opt[usize], batch: usize, wakers: *Wakers) bool {
+    if (pool == nil) { ret false; }
+    pool.bounded  = false;
+    pool.capacity = 0;
+    pool.batch    = 1;
+    pool.wakers   = wakers;
+    atomic.store(?pool.free, 0);
+    atomic.store(?pool.refusals, 0);
+    if (sel capacity.some) {
+        if (capacity.some > 0x7fffffffffffffff || batch == 0) { ret false; }
+        pool.bounded = true;
+        atomic.store(?pool.capacity, capacity.some::i64);
+        atomic.store(?pool.free, capacity.some::i64);
+        pool.batch = batch::i64;
+    }
+    ret true;
+}
+
+# move a bounded pool's cap. a lowered cap takes back what it can from the free
+# units, and what workers hold above it comes back as they release it, so no
+# admission is taken away and no new one exceeds the new cap
+pub fun retune(pool: *Pool, capacity: usize) bool {
+    if (pool == nil || !pool.bounded || capacity > 0x7fffffffffffffff) { ret false; }
+    val old: i64 = atomic.exchange(?pool.capacity, capacity::i64);
+    atomic.fetch_add(?pool.free, capacity::i64 - old);
+    if (capacity::i64 > old) { wake_starved(pool.wakers); }
+    ret true;
+}
+
+pub fun refusals(pool: *Pool) u64 {
+    if (pool == nil) { ret 0; }
+    ret atomic.load(?pool.refusals)::u64;
+}
+
+pub fun join(share: *Share, pool: *Pool, worker: usize) bool {
+    if (share == nil || pool == nil) { ret false; }
+    share.pool   = pool;
+    share.worker = worker;
+    share.held   = 0;
+    share.used   = 0;
+    ret true;
+}
+
+# take units from the pool so `need` are held, a batch at a time. nothing is
+# taken unless the pool can cover the whole need, so a worker short of units
+# does not sit on part of what another could use
+fun refill(share: *Share, need: i64) bool {
+    val pool:    *Pool = share.pool;
+    val missing: i64   = need - share.held;
+    if (missing <= 0) { ret true; }
+    var want: i64 = pool.batch;
+    if (want < missing) { want = missing; }
+    for {
+        var free: i64 = atomic.load(?pool.free);
+        if (free < missing) { ret false; }
+        var got: i64 = want;
+        if (got > free) { got = free; }
+        if (atomic.cas(?pool.free, ?free, free - got)) {
+            share.held = share.held + got;
+            ret true;
+        }
+    }
+    ret false;
+}
+
+# a refill failed: mark the worker to be woken when units come back, then try
+# once more. a worker returning units frees them before it takes the marks, so
+# either that retry finds them or the return finds the mark, and no wake is lost
+fun refill_or_starve(share: *Share, need: i64) bool {
+    val pool: *Pool = share.pool;
+    if (refill(share, need)) { ret true; }
+    val marked: bool = pool.wakers != nil && share.worker < pool.wakers.count;
+    if (marked) { atomic.store(?pool.wakers.starved[share.worker], 1); }
+    if (refill(share, need)) {
+        if (marked) { atomic.store(?pool.wakers.starved[share.worker], 0); }
+        ret true;
+    }
+    # the pool alone could have covered it: some other worker holds the units
+    if (atomic.load(?pool.capacity) - share.used >= need) {
+        atomic.fetch_add(?pool.refusals, 1);
+    }
+    ret false;
+}
+
+# whether one unit could be taken now. a refill it needs is taken, and a worker
+# that cannot have one is marked to be woken when units come back
+pub fun room(share: *Share) bool {
+    if (share == nil || share.pool == nil)     { ret false; }
+    if (!share.pool.bounded || share.held > 0) { ret true; }
+    ret refill_or_starve(share, 1);
+}
+
+# take `units` for use, or refuse and change nothing
+pub fun take(share: *Share, units: usize) bool {
+    if (share == nil || share.pool == nil) { ret false; }
+    val count: i64 = units::i64;
+    if (!share.pool.bounded) {
+        share.used = share.used + count;
+        ret true;
+    }
+    if (share.held < count && !refill_or_starve(share, count)) { ret false; }
+    share.held = share.held - count;
+    share.used = share.used + count;
+    ret true;
+}
+
+# units back from use. what the share holds above twice a batch goes back to
+# the pool, down to one batch, and any starved worker is woken to take it
+pub fun give(share: *Share, units: usize) {
+    if (share == nil || share.pool == nil) { ret; }
+    val count: i64 = units::i64;
+    if (count > share.used)  { share.used = 0; }
+    or                       { share.used = share.used - count; }
+    if (!share.pool.bounded) { ret; }
+    share.held = share.held + count;
+    val pool: *Pool = share.pool;
+    if (share.held > 2 * pool.batch) {
+        val surplus: i64 = share.held - pool.batch;
+        share.held = pool.batch;
+        atomic.fetch_add(?pool.free, surplus);
+        wake_starved(pool.wakers);
+    }
+}
+
+# everything the share holds goes back, as a worker stops
+pub fun leave(share: *Share) {
+    if (share == nil || share.pool == nil || !share.pool.bounded) { ret; }
+    if (share.held != 0) {
+        atomic.fetch_add(?share.pool.free, share.held);
+        share.held = 0;
+        wake_starved(share.pool.wakers);
+    }
+}
+
+# one named budget's two caps, shared by every worker
+pub rec BudgetPool {
+    concurrency: Pool;
+    memory:      Pool;
+}
+
+# every named budget of one configuration generation, in configured order
+pub rec BudgetPools {
+    generation: u64;
+    count:      usize;
+    items:      [schema.MAX_BUDGETS]BudgetPool;
+}
+
+fun limit(value: usize) opt[usize] {
+    if (value == 0) { ret opt[usize].none{}; }
+    ret opt[usize].some{value};
+}
+
+# the pools for `graph`'s budgets under generation `generation`, shared by
+# `workers` workers. a dimension configured as zero is unbounded
+pub fun make_budget_pools(pools: *BudgetPools, graph: *schema.Graph, generation: u64,
+    workers: usize, wakers: *Wakers) bool {
+    if (pools == nil || graph == nil || graph.budget_count > schema.MAX_BUDGETS) { ret false; }
+    var i: usize = 0;
+    for (i < graph.budget_count) {
+        val configured: *schema.Budget = ?graph.budgets[i];
+        val pool:       *BudgetPool    = ?pools.items[i];
+        if (!make_pool(?pool.concurrency, limit(configured.concurrency),
+            batch_for(configured.concurrency, workers, MAX_BATCH), wakers)
+            || !make_pool(?pool.memory, limit(configured.memory_bytes),
+            batch_for(configured.memory_bytes, workers, configured.memory_bytes),
+            wakers)) { ret false; }
+        i = i + 1;
+    }
+    pools.count      = graph.budget_count;
+    pools.generation = generation;
+    ret true;
+}
+
+pub fun in_use(share: *Share) usize {
+    if (share == nil) { ret 0; }
+    ret share.used::usize;
+}
+
+test "allowance: workers never hold more than the cap between them" {
+    var wakers: Wakers;
+    if (!make_wakers(?wakers, 2)) { ret 1; }
+    var pool: Pool;
+    if (!make_pool(?pool, opt[usize].some{5}, batch_for(5, 2, MAX_BATCH), ?wakers)) { ret 2; }
+    var first:  Share;
+    var second: Share;
+    join(?first, ?pool, 0);
+    join(?second, ?pool, 1);
+    var taken: usize = 0;
+    var i:     usize = 0;
+    for (i < 8) {
+        if (take(?first, 1))  { taken = taken + 1; }
+        if (take(?second, 1)) { taken = taken + 1; }
+        i = i + 1;
+    }
+    if (taken != 5 || in_use(?first) + in_use(?second) != 5
+        || atomic.load(?pool.free) != 0) { ret 3; }
+    # the worker that could not take was marked to be woken
+    if (atomic.load(?wakers.starved[0]) + atomic.load(?wakers.starved[1]) == 0) { ret 4; }
+    # what the first gives up comes back through the pool, and the wake takes
+    # the starved worker's mark
+    for (in_use(?first) != 0) { give(?first, 1); }
+    leave(?first);
+    if (atomic.load(?pool.free) + second.held + second.used != 5
+        || atomic.load(?wakers.starved[0]) + atomic.load(?wakers.starved[1]) != 0) { ret 5; }
+    if (!take(?second, 1)) { ret 6; }
+    # a lowered cap takes back free units, and no take exceeds it afterwards
+    if (!retune(?pool, 2)) { ret 7; }
+    var more: usize = 0;
+    for (take(?second, 1)) { more = more + 1; }
+    if (in_use(?second) > 3) { ret 8; }
+    # no cap admits without touching the pool
+    var open:  Pool;
+    var taker: Share;
+    if (!make_pool(?open, opt[usize].none{}, 1, nil)) { ret 9; }
+    join(?taker, ?open, 0);
+    if (!take(?taker, 7000) || atomic.load(?open.free) != 0) { ret 10; }
+    ret 0;
+}

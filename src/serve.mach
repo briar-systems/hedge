@@ -4,6 +4,8 @@
 # it is the only place that knows both the listener plane and the connection
 # plane, and it hands each connection the same immutable plan for its lifetime.
 
+use process_admission: hedge.admission;
+use hedge.allowance;
 use hedge.budget;
 use hedge.clock;
 use hedge.config.lanes;
@@ -145,7 +147,9 @@ pub rec Runtime {
     # whether this runtime takes the process-wide duties (signals, SIGPIPE),
     # which a supervisor holds instead of any of its workers
     owns_process: bool;
-    storage:      connection.Storage;
+    # the caps this worker shares with every other, or none held alone
+    caps:    Caps;
+    storage: connection.Storage;
     # the worker's buffer pool. every connection this worker serves, over any
     # transport, opens its account here, and its wakes land in `wakes`
     memory: hedge_memory.Memory;
@@ -257,6 +261,27 @@ fun configure_budgets(target: *BudgetGeneration, graph: *schema.Graph) bool {
     ret true;
 }
 
+# charge a generation's budgets against the pools every worker shares for it.
+# a runtime holding its caps alone keeps each budget's own
+fun share_budgets(runtime: *Runtime, target: *BudgetGeneration, generation: u64) bool {
+    if (runtime.caps.budgets == nil) { ret true; }
+    var pools: *allowance.BudgetPools = nil;
+    var slot:  usize                  = 0;
+    for (slot < 2) {
+        if (runtime.caps.budgets[slot].generation == generation) {
+            pools = ?runtime.caps.budgets[slot];
+        }
+        slot = slot + 1;
+    }
+    if (pools == nil || pools.count != target.set.count) { ret false; }
+    var i: usize = 0;
+    for (i < target.set.count) {
+        if (!budget.share(?target.set, i, ?pools.items[i], runtime.worker)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
 # `worker` is the index of the worker this runtime serves for, which every
 # connection it makes carries down to its per-worker state
 pub fun make(
@@ -277,6 +302,7 @@ pub fun make(
     }
     runtime.worker         = worker;
     runtime.owns_process   = true;
+    runtime.caps           = no_caps();
     runtime.state          = NEW;
     runtime.generation     = 0;
     runtime.live           = 0;
@@ -308,7 +334,9 @@ pub fun make(
     runtime.quic_storages     = nil;
     runtime.quic_count        = 0;
     runtime.quic_released     = false;
-    if (!configure_budgets(?runtime.budget_generations[0], graph)) { ret false; }
+    if (!configure_budgets(?runtime.budget_generations[0], graph)
+        || !budget.make(?runtime.budget_generations[1].set,
+        ?runtime.budget_generations[1].storage[0], schema.MAX_BUDGETS)) { ret false; }
     runtime.active_budgets = ?runtime.budget_generations[0].set;
     runtime.current        = empty_list();
     runtime.previous       = empty_list();
@@ -326,6 +354,32 @@ pub fun make(
         runtime.quic_handle_live[i] = false;
         i                           = i + 1;
     }
+    ret true;
+}
+
+# the caps every worker of a process shares. each is nil when this runtime
+# holds the configured cap alone, which one worker and the tests do
+pub rec Caps {
+    # max_connections and max_connections_per_peer, across TCP and QUIC
+    connections: *process_admission.Shared;
+    # each address's share of QUIC handshakes admitted, and those in flight
+    handshakes:      *process_admission.Shared;
+    handshake_slots: *allowance.Pool;
+    # each named budget's concurrency and memory, by generation
+    budgets: *allowance.BudgetPools;
+    # where a worker waiting for a cap is woken
+    wakers: *allowance.Wakers;
+}
+
+pub fun no_caps() Caps {
+    ret Caps{connections: nil, handshakes: nil, handshake_slots: nil, budgets: nil,
+        wakers: nil};
+}
+
+# share the process's caps with this runtime, before it starts
+pub fun share_caps(runtime: *Runtime, caps: Caps) bool {
+    if (runtime == nil || runtime.state != NEW) { ret false; }
+    runtime.caps = caps;
     ret true;
 }
 
@@ -567,9 +621,12 @@ fun start_quic(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
 
 pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation: u64, graph: *schema.Graph,
     diagnostics: *schema.Diagnostics) bool {
-    if (runtime == nil || runtime.state != NEW) { ret false; }
+    if (runtime == nil || runtime.state != NEW)                              { ret false; }
+    if (!share_budgets(runtime, ?runtime.budget_generations[0], generation)) { ret false; }
     if (!listener.start_with(?runtime.owner, generation, graph, diagnostics,
-        runtime.owns_process)) { ret false; }
+        listener.StartOptions{owns_process: runtime.owns_process,
+        admission: runtime.caps.connections, worker: runtime.worker,
+        wakers:    runtime.caps.wakers})) { ret false; }
     if (runtime.quic != nil && !quic_runtime.bind_admission(runtime.quic,
         listener.admission_manager(?runtime.owner))) {
         fail_start(controls, runtime);
@@ -618,6 +675,13 @@ pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation
         fail_start(controls, runtime);
         ret false;
     }
+    ret true;
+}
+
+# what this worker holds of the shared budget caps goes back for the others
+fun release_budgets(runtime: *Runtime) bool {
+    budget.leave(?runtime.budget_generations[0].set);
+    budget.leave(?runtime.budget_generations[1].set);
     ret true;
 }
 
@@ -1202,6 +1266,12 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
         == quic_runtime.FAILED) {
         quic_ok = false;
     }
+    # another worker's release may have made room in a budget this one's
+    # waiters share, and the wake that ended this wait was for them
+    if (runtime.caps.budgets != nil) {
+        budget.resume(?runtime.budget_generations[0].set);
+        budget.resume(?runtime.budget_generations[1].set);
+    }
     # the completions just settled may have finished a connection, and a finished
     # connection holds its pool slot until it is retired. admitting before that
     # refuses an arrival for a slot that this turn already freed
@@ -1531,7 +1601,11 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     timeout_nanoseconds(graph.timeouts.drain_ms, ?drain_timeout_ns);
     timeout_nanoseconds(graph.timeouts.stop_ms, ?stop_timeout_ns);
     val next: *BudgetGeneration = spare_budgets(runtime);
-    if (!configure_budgets(next, graph)) { ret false; }
+    # the set being rebuilt is two generations old, so nothing is charged to it
+    budget.leave(?next.set);
+    if (!configure_budgets(next, graph) || !share_budgets(runtime, next, generation)) {
+        ret false;
+    }
     var quic_result: quic_runtime.UpdateResult = quic_runtime.UpdateResult{
         status: quic_runtime.OK, committed: false, rollback_failed: false
     };
@@ -1690,6 +1764,7 @@ pub fun stop(controls: *quic_runtime.ControlView, runtime: *Runtime) bool {
                 or {
                     runtime.state = STOPPED;
                     if (!connection.destroy_storage(?runtime.storage)
+                        || !release_budgets(runtime)
                         || !release_pool(runtime)
                         || !hedge_timer.destroy(?runtime.timers)
                         || !hedge_memory.destroy(?runtime.memory)

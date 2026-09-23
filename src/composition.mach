@@ -9,6 +9,8 @@
 use hedge.acme.handler;
 use acme: hedge.acme.manager;
 use hedge.acme.tlsalpn;
+use process_admission: hedge.admission;
+use hedge.allowance;
 use http_cache:  hedge.cache;
 use cache_store: hedge.cache.store;
 use hedge.config.schema;
@@ -25,6 +27,7 @@ use std.chrono.time;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -85,6 +88,14 @@ pub rec Runtime {
     certificate_policy: usize;
     observability:      telemetry_production.Production;
     options:            Options;
+    # the caps every worker shares, and where a worker waiting for one is woken
+    wakers:          allowance.Wakers;
+    connections:     process_admission.Shared;
+    handshakes:      process_admission.Shared;
+    handshake_slots: allowance.Pool;
+    # each named budget's caps, one bank per generation alternating as plans do
+    budget_pools: [2]allowance.BudgetPools;
+    caps_live:    bool;
     # every worker, allocated at start and owned for the process lifetime
     workers:             *worker.Worker;
     worker_count:        usize;
@@ -130,6 +141,43 @@ fun inputs(runtime: *Runtime, configured: *schema.Graph) worker.Inputs {
         value.challenge = ?runtime.challenge_binding;
     }
     ret value;
+}
+
+# the process's caps, which every worker's admission, QUIC handshakes and
+# budgets draw their allowances from
+fun make_caps(runtime: *Runtime, configured: *schema.Graph, generation_id: u64,
+    workers: usize) bool {
+    val limits: *schema.Limits = ?configured.limits;
+    if (!allowance.make_wakers(?runtime.wakers, workers)
+        || !process_admission.make_shared(?runtime.connections, runtime.heap,
+        limits.max_connections, limits.max_connections_per_peer, workers,
+        ?runtime.wakers)) { ret false; }
+    if (!process_admission.make_shared(?runtime.handshakes, runtime.heap,
+        opt[usize].none{}, limits.max_handshakes_per_peer, workers, ?runtime.wakers)) {
+        process_admission.destroy_shared(?runtime.connections);
+        ret false;
+    }
+    if (!allowance.make_pool(?runtime.handshake_slots,
+        opt[usize].some{limits.max_handshakes},
+        allowance.batch_for(limits.max_handshakes, workers, allowance.MAX_BATCH),
+        ?runtime.wakers)
+        || !allowance.make_budget_pools(?runtime.budget_pools[0], configured,
+        generation_id, workers, ?runtime.wakers)) {
+        process_admission.destroy_shared(?runtime.connections);
+        process_admission.destroy_shared(?runtime.handshakes);
+        ret false;
+    }
+    runtime.budget_pools[1].generation = 0;
+    runtime.budget_pools[1].count      = 0;
+    runtime.caps_live                  = true;
+    ret true;
+}
+
+# what worker `index` shares with the others
+fun caps(runtime: *Runtime) serve.Caps {
+    ret serve.Caps{connections: ?runtime.connections, handshakes: ?runtime.handshakes,
+        handshake_slots: ?runtime.handshake_slots, budgets: ?runtime.budget_pools[0],
+        wakers:          ?runtime.wakers};
 }
 
 fun built_events(runtime: *Runtime, given: *worker.Inputs) {
@@ -206,6 +254,13 @@ fun close_process(runtime: *Runtime, report: *worker.StopReport) {
         i = i + 1;
     }
     if (had_static) { event(runtime, STATIC_CLOSED); }
+    if (runtime.caps_live) {
+        if (!process_admission.destroy_shared(?runtime.connections)
+            || !process_admission.destroy_shared(?runtime.handshakes)) {
+            report.cleanup_failures = report.cleanup_failures + 1;
+        }
+        runtime.caps_live = false;
+    }
 }
 
 fun fail(runtime: *Runtime, controls: *worker.Controls, status: worker.StartStatus,
@@ -259,7 +314,11 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
     if (sel worker_memory.err) {
         ret worker.failed(worker.START_RUNTIME, "worker allocation failed");
     }
-    runtime.workers = worker_memory.ok;
+    runtime.workers   = worker_memory.ok;
+    runtime.caps_live = false;
+    if (!make_caps(runtime, configured, generation_id, workers)) {
+        ret worker.failed(worker.START_CONFIG, "admission caps could not be constructed");
+    }
     var i: usize = 0;
     for (i < workers) {
         if (!worker.make(?runtime.workers[i], i, options.pseudonym)) {
@@ -388,8 +447,8 @@ pub fun start_worker(runtime: *Runtime, index: usize, controls: *worker.Controls
     if (built.status != worker.START_OK) { ret built; }
     if (index == 0)                      { built_events(runtime, ?given); }
     ret worker.start(current, controls, runtime.heap, runtime.graph,
-        runtime.generation_id, ?runtime.observability.runtime, supervised,
-        diagnostics);
+        runtime.generation_id, ?runtime.observability.runtime, caps(runtime),
+        supervised, diagnostics);
 }
 
 # stop worker `index` serving, on the thread that runs it, and release its QUIC
@@ -475,6 +534,17 @@ pub fun reload_compatible(runtime: *Runtime, configured: *schema.Graph) bool {
     ret runtime != nil && configured != nil && plan.reload_compatible(runtime.graph, configured);
 }
 
+# what the process builds for a candidate before any worker prepares it: the
+# pools its budgets share, in the bank the serving generation does not use
+pub fun stage_reload(runtime: *Runtime, configured: *schema.Graph,
+    generation_id: u64) bool {
+    if (runtime == nil || configured == nil || !runtime.caps_live) { ret false; }
+    var slot: usize = 0;
+    if (runtime.budget_pools[0].generation == runtime.generation_id) { slot = 1; }
+    ret allowance.make_budget_pools(?runtime.budget_pools[slot], configured,
+        generation_id, runtime.worker_count, ?runtime.wakers);
+}
+
 # the first step of a reload, on worker `index`'s thread: build the candidate's
 # service generation into the spare slot and ask the serving runtime whether it
 # would publish it. a refusal leaves the worker as it was
@@ -527,6 +597,13 @@ pub fun abort_reload(runtime: *Runtime, index: usize) bool {
 pub fun reloaded(runtime: *Runtime, configured: *schema.Graph, generation_id: u64) {
     runtime.graph         = configured;
     runtime.generation_id = generation_id;
+    # the handshake caps move once for every worker. the connection caps are
+    # startup-owned
+    if (runtime.caps_live) {
+        allowance.retune(?runtime.handshake_slots, configured.limits.max_handshakes);
+        process_admission.retune_shared(?runtime.handshakes, opt[usize].none{},
+            configured.limits.max_handshakes_per_peer);
+    }
 }
 
 # a whole reload of a process whose workers run on the calling thread
@@ -539,6 +616,9 @@ pub fun reload(runtime: *Runtime, controls: *worker.Controls,
     if (!reload_compatible(runtime, configured)) {
         ret worker.failed(worker.START_CONFIG,
             "startup-owned configuration changed; restart required");
+    }
+    if (!stage_reload(runtime, configured, generation_id)) {
+        ret worker.failed(worker.START_RUNTIME, "budget caps could not be constructed");
     }
     var i: usize = 0;
     for (i < runtime.worker_count) {
