@@ -553,7 +553,7 @@ PY
             readlink "$link" 2>/dev/null | grep -q '/test/interop/reload-v' \
                 && retired_roots=$((retired_roots + 1))
         done
-        [ "$retired_roots" = 1 ] && break
+        [ "$retired_roots" -le "$(sed -n 's/^hedge: workers \([0-9][0-9]*\)$/\1/p' "$work/reload.log")" ] && break
         sleep 0.05
     done
     local repeated=0
@@ -575,11 +575,16 @@ PY
     done
     kill -TERM "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
-    echo "$before/$old/$after/$repeated/$held_roots/$retired_roots"
+    # each worker opens the static root of each generation it serves: while the
+    # held request pins the old generation on its worker, every worker holds the
+    # new root and that one the old as well, and once it retires, one each
+    local workers
+    workers="$(sed -n 's/^hedge: workers \([0-9][0-9]*\)$/\1/p' "$work/reload.log")"
+    echo "$before/$old/$after/$repeated/$((held_roots - ${workers:-0}))/$((retired_roots - ${workers:-0}))"
 }
 
 check "service reload pins the old generation and reclaims twelve replacements" \
-    "404/served/reloaded/12/2/1" "$(reload_rebuilds_services)"
+    "404/served/reloaded/12/1/0" "$(reload_rebuilds_services)"
 
 check "a stop with no work in flight drains cleanly" 0 "$(shutdown_exit idle)"
 check "a stop with a peer mid-request reports the abandoned exchange" 75 \

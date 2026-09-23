@@ -217,11 +217,13 @@ prepare_load() {
 # per-peer limit is always raised to the global one or past the load. the
 # optional sixth argument is the body of a [server.timeouts] table, and the
 # optional seventh is appended whole (an admin listener, telemetry).
+# `workers`, when given, fixes the worker count; otherwise one serves per CPU
 write_config() {
-    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}"
+    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}" workers="${8:-}"
     cat > "$path" <<EOF
 [server]
 name = "load"
+${workers:+workers = $workers}
 
 [server.limits]
 $limits

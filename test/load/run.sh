@@ -117,11 +117,14 @@ fi
 # a configured cap is one process-wide number, whichever transport a
 # connection arrives on. TCP takes part of it, QUIC must be admitted to exactly
 # the rest, and then TCP must be refused because QUIC holds the remainder.
+# exactly is one worker's promise: across workers the cap is never exceeded,
+# but a worker may refuse while another holds allowance it is not using, up to
+# the worker count times a batch, so this cell runs one
 echo
 write_config "$work/capped.toml" \
     "max_connections = $CAP
 max_connections_per_peer = $CAP" \
-    "$CAPPED_CLEARTEXT_PORT" "$CAPPED_SECURE_PORT" "$CAPPED_QUIC_PORT"
+    "$CAPPED_CLEARTEXT_PORT" "$CAPPED_SECURE_PORT" "$CAPPED_QUIC_PORT" "" "" 1
 start_hedge "$work/capped.toml"
 
 start_holder tcp python3 test/load/hold.py --port "$CAPPED_CLEARTEXT_PORT" \
