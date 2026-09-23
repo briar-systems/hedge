@@ -7150,7 +7150,7 @@ var dialer_name:       [15]u8;
 var dialer_parameters: [512]u8;
 
 # the client's first flight into `wire`, addressed to the server
-# test_prepare_server describes. its length, or zero
+# test_prepare_server describes and sent on the client. its length, or zero
 fun test_dial(tls_server: *TestServer, shared: *assembly.SecretScratch, wire: *u8,
     capacity: usize, now: time.Instant) usize {
     if (!memory.make(?dialer_memory, 64 * 1024 * 1024, test_allocator())) { ret 0; }
@@ -7215,7 +7215,9 @@ fun test_dial(tls_server: *TestServer, shared: *assembly.SecretScratch, wire: *u
     if (!dialed.ok) { ret 0; }
     val first: qt.Generated = qt.generate[binding.Binding](?dialer.driver, ?dialer_scope,
         wire, capacity, now, 0);
-    if (first.status != qt.STATUS_OK || first.count == 0) { ret 0; }
+    if (first.status != qt.STATUS_OK || first.count == 0
+        || qt.complete_send[binding.Binding](?dialer.driver, first.token, qt.SEND_SENT,
+        first.count, now).status != qt.STATUS_OK) { ret 0; }
     ret first.count;
 }
 
@@ -7288,5 +7290,179 @@ test "hedge.protocol.quic.runtime: a handshake refused memory resumes on its acc
     val flight: qt.Generated = qt.generate[binding.Binding](driver, ?value.storage.scope,
         ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(started + 3000), 0);
     if (flight.status != qt.STATUS_OK || flight.count == 0) { ret 13; }
+    ret 0;
+}
+
+# every datagram `source` has, sent and delivered to `sink`, with the fake clock
+# moving on. false on a transport refusal
+fun test_carry(source: *qt.Driver[binding.Binding], scope: *cancel.Scope,
+    sink: *qt.Driver[binding.Binding], local: ip.Endpoint, peer: ip.Endpoint,
+    now_ns: *u64) bool {
+    var wire:  [assembly.MAX_UDP_PAYLOAD]u8;
+    var guard: usize = 0;
+    for (guard < 64) {
+        @now_ns = @now_ns + 1000;
+        val generated: qt.Generated = qt.generate[binding.Binding](source, scope,
+            ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(@now_ns), 0);
+        if (generated.status == qt.STATUS_EMPTY
+            || generated.status == qt.STATUS_BLOCKED) { ret true; }
+        if (generated.status != qt.STATUS_OK || generated.count == 0) { ret false; }
+        if (qt.complete_send[binding.Binding](source, generated.token, qt.SEND_SENT,
+            generated.count, clock.from_ns(@now_ns)).status != qt.STATUS_OK) { ret false; }
+        var input: qt.Datagram;
+        input.local       = local;
+        input.peer        = peer;
+        input.data        = ?wire[0];
+        input.length      = generated.count;
+        input.received_at = clock.from_ns(@now_ns);
+        input.ecn         = 0;
+        if (qt.receive_datagram[binding.Binding](sink, ?input).status != qt.STATUS_OK) {
+            ret false;
+        }
+        guard = guard + 1;
+    }
+    ret false;
+}
+
+var test_steps_plan:    plan.Plan;
+var test_steps_budgets: budget.Set;
+
+# a session still moving when its step bound runs out is queued for the next
+# turn, which continues it with nothing new arriving (#275). the client's
+# control stream carries more GOAWAY frames than one advance has steps for, and
+# the engine reads them all off the transport at once, so the work left is the
+# engine's own and no transport news or output announces it
+test "hedge.protocol.quic.runtime: an HTTP/3 session out of steps is queued for the next turn" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret 1; }
+    val value:      *Connection = connection_at(controls, index);
+    var tls_server: TestServer;
+    val prepared:   i32         = test_prepare_server(?tls_server, ?fixture, controls, index);
+    if (prepared != 0) { ret prepared; }
+    # an http/3 session draws on the io and request lanes, which a handshake alone does not
+    tls_server.conn_budgets = memory.connection_budgets(16 * 1024 * 1024, 256 * 1024,
+        1024 * 1024, 1024 * 1024, 1024 * 1024, 0);
+    memory.borrower(?value.storage.borrower, ?fixture.memory, timer_owner(index),
+        memory.LANES, tls_server.conn_budgets);
+    var now_ns:      u64                 = 1000000000;
+    val initialized: assembly.InitResult = assembly.init_server(
+        ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
+        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        memory.borrowed_source(?value.storage.borrower),
+        handshake_at(controls, value.handshake),
+        ?value.storage.scope, clock.from_ns(now_ns));
+    if (!initialized.ok || !value.assembly.initialized) { ret 2; }
+    value.tls_live           = true;
+    value.assembly_attempted = true;
+    val server_at: ip.Endpoint = ip.endpoint(192, 0, 2, 1, 4433);
+    val client_at: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
+    var wire:      [assembly.MAX_UDP_PAYLOAD]u8;
+    now_ns = now_ns + 1000;
+    val sent: usize = test_dial(?tls_server, ?controls.pumps[0].secret_scratch, ?wire[0],
+        assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns));
+    if (sent == 0) { ret 3; }
+    val server_driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
+    val client_driver: *qt.Driver[binding.Binding] = ?dialer.driver;
+    var first:         qt.Datagram;
+    first.local       = server_at;
+    first.peer        = client_at;
+    first.data        = ?wire[0];
+    first.length      = sent;
+    first.received_at = clock.from_ns(now_ns);
+    first.ecn         = 0;
+    if (qt.receive_datagram[binding.Binding](server_driver, ?first).status != qt.STATUS_OK) {
+        ret 4;
+    }
+    var round: usize = 0;
+    for (round < 24 && (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE
+        || qt.snapshot[binding.Binding](client_driver).state != qt.ACTIVE)) {
+        if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
+            server_at, ?now_ns)
+            || !test_carry(client_driver, ?dialer_scope, server_driver, server_at,
+            client_at, ?now_ns)) { ret 5; }
+        round = round + 1;
+    }
+    if (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE
+        || qt.snapshot[binding.Binding](client_driver).state != qt.ACTIVE) { ret 6; }
+    if (!assembly.tls_released(?value.assembly)
+        || !release_handshake(controls, ?runtime, index, true, now_ns)) { ret 7; }
+    # the record as admission leaves a connection that negotiated h3
+    var policy:    hedge_tls.Policy;
+    var protocols: [1]tls_config.ProtocolName;
+    var alpn:      [2]u8 = [2]u8{'h', '3'};
+    test_policy(?policy, ?protocols[0], ?alpn[0]);
+    value.state              = CONNECTION_LIVE;
+    value.policy             = ?policy;
+    value.plan               = ?test_steps_plan;
+    value.budgets            = ?test_steps_budgets;
+    value.limits             = message.limits_default();
+    value.max_requests       = 1;
+    value.call_memory_bytes  = 64 * 1024;
+    value.request_timeout_ns = 1000000000;
+    value.peer               = client_at;
+    value.local              = server_at;
+    if (!copy_listener_name(value, "quic-test")) { ret 8; }
+    # the client's control stream: its type, an empty SETTINGS, then GOAWAYs
+    val goaways: usize = 100;
+    if (goaways <= h3_session.MAX_STEPS) { ret 30; }
+    var control: [303]u8;
+    control[0] = 0x00;
+    control[1] = 0x04;
+    control[2] = 0x00;
+    var i: usize = 0;
+    for (i < goaways) {
+        control[3 + 3 * i]     = 0x07;
+        control[3 + 3 * i + 1] = 0x01;
+        control[3 + 3 * i + 2] = 0x00;
+        i                      = i + 1;
+    }
+    val opened: qt.OpenResult = qt.open_stream[binding.Binding](client_driver,
+        qt.UNIDIRECTIONAL);
+    if (opened.status != qt.STATUS_OK
+        || qt.write_stream[binding.Binding](client_driver, opened.stream, ?control[0],
+        3 + 3 * goaways).count != 3 + 3 * goaways) { ret 9; }
+    if (!test_carry(client_driver, ?dialer_scope, server_driver, server_at, client_at,
+        ?now_ns)) { ret 10; }
+    if (!qt.pending_stream_news[binding.Binding](server_driver)) { ret 11; }
+    # the first turn starts the session and spends its bound with GOAWAYs left
+    if (!drive_h3(controls, ?runtime, value, index, clock.from_ns(now_ns), now_ns)
+        || value.h3_session == h3_session.NO_SESSION) { ret 12; }
+    val session: *h3_session.Session = h3_session.session_at(?runtime.sessions,
+        controls.sessions, value.h3_session);
+    if (session == nil || session.state != h3_session.ACTIVE
+        || !h3_session.moving(session)) { ret 13; }
+    if (!value.ready || value.ready_handshake || runtime.ready_head != index) { ret 14; }
+    # nothing the transport holds announces the rest: its news is taken and,
+    # once the server's output is carried, it has nothing to send
+    if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
+        server_at, ?now_ns)) { ret 15; }
+    if (qt.pending_stream_news[binding.Binding](server_driver)
+        || qt.pending_output[binding.Binding](server_driver, clock.from_ns(now_ns))) {
+        ret 16;
+    }
+    # off every list, the record is work the audit finds
+    unmark_ready(controls, ?runtime, index);
+    if (audit(controls, ?runtime, clock.from_ns(now_ns)) != 1) { ret 17; }
+    # the turns after it take the rest with nothing new delivered: each one the
+    # record is queued for, until the session settles and leaves the list
+    mark_ready(controls, ?runtime, index);
+    var turns: usize = 0;
+    for (value.ready && turns < 8) {
+        unmark_ready(controls, ?runtime, index);
+        if (!drive_h3(controls, ?runtime, value, index, clock.from_ns(now_ns), now_ns)) {
+            ret 18;
+        }
+        turns = turns + 1;
+    }
+    if (value.ready || h3_session.moving(session)
+        || session.state != h3_session.ACTIVE) { ret 19; }
+    if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
+        server_at, ?now_ns)
+        || audit(controls, ?runtime, clock.from_ns(now_ns)) != 0) { ret 20; }
     ret 0;
 }
