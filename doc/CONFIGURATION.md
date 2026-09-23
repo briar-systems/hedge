@@ -114,8 +114,8 @@ How connections reach the workers depends on what the platform can do:
   first worker serves the connection itself.
 - A QUIC listener is served by the first worker until connection IDs route
   datagrams across workers (#174).
-- While the cache is enabled, one worker serves, until the cache store is shared
-  between threads (#285).
+- While the cache is enabled, one worker serves, until a store worker owns the
+  cache's disk (#286).
 
 The caps stay process-wide. `max_connections`, `max_handshakes` and every
 budget's `concurrency` and `memory_bytes` are held as per-worker allowances
