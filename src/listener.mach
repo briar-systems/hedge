@@ -5,6 +5,7 @@ use hedge.allowance;
 use hedge.config.schema;
 use quic_capacity: hedge.protocol.quic.capacity;
 use hedge.protocol.trust;
+use hedge.spread;
 use hedge_storage: hedge.storage;
 use A:             std.allocator;
 use std.allocator.page;
@@ -268,6 +269,7 @@ pub rec Owner {
     process:                  process_events.Source;
     root_scope:               cancel.Scope;
     sets:                     [2]ListenerSet;
+    options:                  StartOptions;
 }
 
 fun diagnose(diagnostics: *schema.Diagnostics, code: schema.DiagnosticCode, path: str, message: str) {
@@ -514,7 +516,7 @@ fun submit_accept_slot(owner: *Owner, set: *ListenerSet, listener_index: usize, 
 fun replenish_listener(owner: *Owner, set: *ListenerSet, listener_index: usize) {
     if (set.state != SET_ACTIVE || listener_index >= set.listener_count) { ret; }
     val listener: *OwnedListener = ?set.listeners[listener_index];
-    if (!listener_can_admit(owner, listener)) { ret; }
+    if (listener.state != LISTENER_BOUND || !listener_can_admit(owner, listener)) { ret; }
     var i: usize = 0;
     for (i < listener.accept_depth) {
         if (!listener.accepts[i].active)          { submit_accept_slot(owner, set, listener_index, i); }
@@ -889,14 +891,21 @@ fun prepare_local(owner: *Owner, set: *ListenerSet, listener: *OwnedListener, di
     ret true;
 }
 
-fun prepare_ip(owner: *Owner, listener: *OwnedListener, diagnostics: *schema.Diagnostics) bool {
+fun prepare_ip(owner: *Owner, listener: *OwnedListener, index: usize,
+    diagnostics: *schema.Diagnostics) bool {
     var endpoint: ip.Endpoint;
-    if (!parse_ip_endpoint(schema.text(?listener.configured_address), ?endpoint)) {
+    if (owner.options.endpoints != nil) {
+        endpoint = owner.options.endpoints[index];
+    }
+    or (!parse_ip_endpoint(schema.text(?listener.configured_address), ?endpoint)) {
         diagnose(diagnostics, schema.INVALID_VALUE, schema.text(?listener.name), "listener address is not a valid IP endpoint");
         ret false;
     }
+    val bind: socket.BindOptions = socket.BindOptions{reuse_address: true,
+        reuse_port: owner.options.reuse_port};
     if (listener.transport == schema.TRANSPORT_TCP) {
-        val listening: res[tcp.Listener, io_error.Error] = net_async.listen(endpoint, listener.backlog::i32);
+        val listening: res[tcp.Listener, io_error.Error] = net_async.listen_with(endpoint,
+            tcp.ListenOptions{bind: bind, backlog: listener.backlog::i32});
         if (sel listening.err) {
             diagnose(diagnostics, schema.SOURCE_ERROR, schema.text(?listener.name), "TCP listener bind failed");
             ret false;
@@ -911,7 +920,7 @@ fun prepare_ip(owner: *Owner, listener: *OwnedListener, diagnostics: *schema.Dia
     }
     or (listener.transport == schema.TRANSPORT_QUIC) {
         val bound: res[udp.Socket, io_error.Error] =
-            net_async.bind_datagram(endpoint);
+            net_async.bind_datagram_with(endpoint, bind);
         if (sel bound.err) {
             diagnose(diagnostics, schema.SOURCE_ERROR,
                 schema.text(?listener.name), "UDP listener bind failed");
@@ -1055,12 +1064,17 @@ fun prepare_set(owner: *Owner, set_index: usize, generation: u64, graph: *schema
             drain_set(owner, set);
             ret false;
         }
+        # a listener another worker alone serves stays unbound here
+        if (!spread.binds(?graph.listeners[i], owner.options.worker)) {
+            i = i + 1;
+            cnt;
+        }
         var prepared: bool = false;
         if (listener.transport == schema.TRANSPORT_LOCAL) {
             prepared = prepare_local(owner, set, listener, diagnostics);
         }
         or (listener.transport == schema.TRANSPORT_TCP || listener.transport == schema.TRANSPORT_QUIC) {
-            prepared = prepare_ip(owner, listener, diagnostics);
+            prepared = prepare_ip(owner, listener, i, diagnostics);
         }
         or {
             diagnose(diagnostics, schema.UNSUPPORTED, schema.text(?listener.name), "listener transport is unsupported");
@@ -1080,7 +1094,8 @@ fun submit_initial_accepts(owner: *Owner, set: *ListenerSet, diagnostics: *schem
     var i: usize = 0;
     for (i < set.listener_count) {
         val listener: *OwnedListener = ?set.listeners[i];
-        if (listener.transport == schema.TRANSPORT_TCP || listener.transport == schema.TRANSPORT_LOCAL) {
+        if (listener.state == LISTENER_BOUND
+            && (listener.transport == schema.TRANSPORT_TCP || listener.transport == schema.TRANSPORT_LOCAL)) {
             var slot: usize = 0;
             for (slot < listener.accept_depth) {
                 if (!submit_accept_slot(owner, set, i, slot)) {
@@ -1204,15 +1219,24 @@ fun cleanup_start_failure(owner: *Owner) {
 # the admission caps it shares with other workers' owners. a nil `admission`
 # holds the configured caps alone. `wakers` is where this owner's runtime is
 # registered to be woken when a shared cap has room again
+#
+# worker `worker` binds only the listeners `spread.binds` gives it. with
+# `reuse_port`, every listener each worker binds takes SO_REUSEPORT, so the
+# workers can share its address. `endpoints`, when not nil, is the address
+# each listener was bound to by the first worker, which a later one binds
+# again: a configured port of 0 resolves once, not once per worker
 pub rec StartOptions {
     owns_process: bool;
     admission:    *process_admission.Shared;
     worker:       usize;
     wakers:       *allowance.Wakers;
+    reuse_port:   bool;
+    endpoints:    *ip.Endpoint;
 }
 
 pub fun own_options() StartOptions {
-    ret StartOptions{owns_process: true, admission: nil, worker: 0, wakers: nil};
+    ret StartOptions{owns_process: true, admission: nil, worker: 0, wakers: nil,
+        reuse_port: false, endpoints: nil};
 }
 
 pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
@@ -1222,6 +1246,7 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
 pub fun start_with(owner: *Owner, generation: u64, graph: *schema.Graph,
     diagnostics: *schema.Diagnostics, options: StartOptions) bool {
     val owns_process: bool = options.owns_process;
+    if (owner != nil) { owner.options = options; }
     if (owner == nil || graph == nil || diagnostics == nil || generation == 0 || graph.listener_count == 0 || graph.listener_count > schema.MAX_LISTENERS || !limits_valid(graph)) {
         diagnose(diagnostics, schema.INVALID_VALUE, "server", "runtime configuration is invalid");
         ret false;

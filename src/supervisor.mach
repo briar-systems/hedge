@@ -101,8 +101,10 @@ pub rec Supervisor {
     seats:            *Seat;
     threads:          *thread.Thread;
     spawned:          usize;
-    reload_state:     ReloadState;
-    candidate:        *generation.Generation;
+    # a worker found it could not be pinned, which is said once
+    unpinned:     i64;
+    reload_state: ReloadState;
+    candidate:    *generation.Generation;
     # the workers asked to take part in the step under way
     posted:      usize;
     commit_next: usize;
@@ -257,6 +259,23 @@ fun close_runtime(supervisor: *Supervisor) bool {
 
 # --- the worker's thread ---
 
+# pin this thread, worker `index`'s, to the index'th CPU the process may run
+# on. where pinning is unsupported or refused the workers run unpinned, which
+# is said once
+fun pin(supervisor: *Supervisor, index: usize) {
+    var cpus:   [schema.MAX_WORKERS]usize;
+    var count:  usize               = 0;
+    val found:  err[io_error.Error] = thread.allowed_cpus(?cpus[0], schema.MAX_WORKERS, ?count);
+    var pinned: bool                = false;
+    if ((sel found.ok) && count != 0) {
+        val applied: err[io_error.Error] = thread.pin_current_to(cpus[index % count]);
+        pinned = sel applied.ok;
+    }
+    if (!pinned && atomic.exchange(?supervisor.unpinned, 1) == 0) {
+        print.eprintln("hedge: workers run unpinned, since this platform does not pin threads to CPUs");
+    }
+}
+
 fun worker_main(arg: *u8) {
     val seat:       *Seat                = arg::*Seat;
     val supervisor: *Supervisor          = seat.supervisor;
@@ -266,6 +285,8 @@ fun worker_main(arg: *u8) {
     # the worker's welded QUIC records live on its own stack for its lifetime
     var controls: worker.Controls;
     atomic.store(?current.control.state, worker.STATE_STARTING);
+    # one worker has no other to keep off its CPU, so it is left to the scheduler
+    if (composed.graph.pin_workers && composed.worker_count > 1) { pin(supervisor, index); }
     val quic: bool = worker.quic_required(composed.graph);
     if (quic && !worker.make_controls(?controls, composed.heap)) {
         current.failure        = "QUIC control storage allocation failed";
@@ -646,6 +667,59 @@ fun any_draining(supervisor: *Supervisor) bool {
 # start a thread for every worker and wait until each is serving or has failed.
 # a worker that failed is named with its diagnostics, and every other one is
 # stopped before this returns false
+fun spawn(supervisor: *Supervisor, index: usize, config: *thread.Config) bool {
+    val current: *worker.Worker = worker_of(supervisor, index);
+    current.current = supervisor.active;
+    if (supervisor.active != nil) { generation.pin(supervisor.active); }
+    supervisor.seats[index] = Seat{supervisor: supervisor, index: index};
+    val spawned: thread.Operation = thread.spawn_with_config(worker_main,
+        (?supervisor.seats[index])::*u8, config, ?supervisor.threads[index]);
+    if (sel spawned.err) {
+        print.eprintln("hedge: a worker thread could not be started");
+        ret false;
+    }
+    supervisor.spawned = index + 1;
+    ret true;
+}
+
+# wait until every worker spawned so far serves or has failed. a worker that
+# failed is named with its diagnostics and its status returned
+fun await_started(supervisor: *Supervisor) worker.StartStatus {
+    for (true) {
+        var ready:  usize = 0;
+        var failed: usize = 0;
+        var i:      usize = 0;
+        for (i < supervisor.spawned) {
+            val state: i64 = worker_state(supervisor, i);
+            if (state == worker.STATE_READY)  { ready = ready + 1; }
+            if (state == worker.STATE_FAILED) { failed = failed + 1; }
+            i = i + 1;
+        }
+        if (ready + failed == supervisor.spawned) {
+            if (failed == 0) { ret worker.START_OK; }
+            var status: worker.StartStatus = worker.START_RUNTIME;
+            i = 0;
+            for (i < supervisor.spawned) {
+                val current: *worker.Worker = worker_of(supervisor, i);
+                if (worker_state(supervisor, i) == worker.STATE_FAILED) {
+                    report_diagnostics(?current.diagnostics);
+                    print.eprint("hedge: startup composition failed: ");
+                    print.eprintln(current.failure);
+                    status = current.failure_status;
+                }
+                i = i + 1;
+            }
+            ret status;
+        }
+        if (!deliver(supervisor, -1))                     { ret worker.START_RUNTIME; }
+        if (atomic.load(?supervisor.stop_requested) != 0) { ret worker.START_RUNTIME; }
+    }
+    ret worker.START_RUNTIME;
+}
+
+# start a thread for every worker and wait until each is serving or has failed.
+# the first worker starts alone and resolves every listener's address, and the
+# rest bind beside it. on a failure every worker started is asked to stop
 pub fun start(supervisor: *Supervisor) worker.StartStatus {
     val composed: *composition.Runtime                 = supervisor.composed;
     val count:    usize                                = composed.worker_count;
@@ -660,60 +734,24 @@ pub fun start(supervisor: *Supervisor) worker.StartStatus {
     thread.config_default(?config);
     config.stack_reserve = WORKER_STACK_BYTES;
     config.name          = "hedge-worker";
-    var i: usize = 0;
-    for (i < count) {
-        val current: *worker.Worker = worker_of(supervisor, i);
-        current.current = supervisor.active;
-        if (supervisor.active != nil) { generation.pin(supervisor.active); }
-        supervisor.seats[i] = Seat{supervisor: supervisor, index: i};
-        val spawned: thread.Operation = thread.spawn_with_config(worker_main,
-            (?supervisor.seats[i])::*u8, ?config, ?supervisor.threads[i]);
-        if (sel spawned.err) {
-            print.eprintln("hedge: a worker thread could not be started");
-            fan_shutdown(supervisor);
-            ret worker.START_RUNTIME;
-        }
-        supervisor.spawned = i + 1;
-        i                  = i + 1;
-    }
-    for (true) {
-        var ready:  usize = 0;
-        var failed: usize = 0;
-        i = 0;
-        for (i < supervisor.spawned) {
-            val state: i64 = worker_state(supervisor, i);
-            if (state == worker.STATE_READY)  { ready = ready + 1; }
-            if (state == worker.STATE_FAILED) { failed = failed + 1; }
+    var status: worker.StartStatus = worker.START_RUNTIME;
+    if (spawn(supervisor, 0, ?config)) { status = await_started(supervisor); }
+    if (status == worker.START_OK && count > 1) {
+        composition.record_endpoints(composed);
+        var i: usize = 1;
+        for (i < count && status == worker.START_OK) {
+            if (!spawn(supervisor, i, ?config)) { status = worker.START_RUNTIME; }
             i = i + 1;
         }
-        if (ready + failed == supervisor.spawned) {
-            # the process is ready once every worker serves
-            if (failed == 0) {
-                telemetry.begin_ready(?supervisor.composed.observability.runtime);
-                ret worker.START_OK;
-            }
-            var status: worker.StartStatus = worker.START_RUNTIME;
-            i = 0;
-            for (i < supervisor.spawned) {
-                val current: *worker.Worker = worker_of(supervisor, i);
-                if (worker_state(supervisor, i) == worker.STATE_FAILED) {
-                    report_diagnostics(?current.diagnostics);
-                    print.eprint("hedge: startup composition failed: ");
-                    print.eprintln(current.failure);
-                    status = current.failure_status;
-                }
-                i = i + 1;
-            }
-            fan_shutdown(supervisor);
-            ret status;
-        }
-        if (!deliver(supervisor, -1)) {
-            fan_shutdown(supervisor);
-            ret worker.START_RUNTIME;
-        }
-        if (atomic.load(?supervisor.stop_requested) != 0) { fan_shutdown(supervisor); }
+        if (status == worker.START_OK) { status = await_started(supervisor); }
     }
-    ret worker.START_RUNTIME;
+    if (status != worker.START_OK) {
+        fan_shutdown(supervisor);
+        ret status;
+    }
+    # the process is ready once every worker serves
+    telemetry.begin_ready(?composed.observability.runtime);
+    ret worker.START_OK;
 }
 
 # ask for a reload, as a SIGHUP does, from any thread
