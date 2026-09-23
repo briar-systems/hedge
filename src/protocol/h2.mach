@@ -214,7 +214,7 @@ pub rec Session {
     peer:               message.Endpoint;
     local:              message.Endpoint;
     request_timeout_ns: u64;
-    # the connection's waker, which every stream's call wakes
+    # the connection's waker. a stream's call wakes it naming the stream's slot
     waker:             hedge_wake.Waker;
     chunks:            *storage.Chunks;
     call_memory_bytes: usize;
@@ -894,7 +894,8 @@ fun make_exchange(session: *Session, slot: *Slot, event: engine_h2.Event,
     }
     if (!telemetry_trace.make_root(?slot.trace, false)) { ret false; }
     if (!call.bind(?slot.active_call, ?slot.exchange, ?slot.memory, ?slot.trace,
-        session.plan.generation, session.listener_name, session.waker)) { ret false; }
+        session.plan.generation, session.listener_name,
+        hedge_wake.for_call(session.waker, slot.index::u32))) { ret false; }
     slot.exchange_live = true;
     ret true;
 }
@@ -1271,8 +1272,21 @@ fun apply(session: *Session, event: engine_h2.Event, now: time.Instant) Step {
 # a pending service completes its own suspended operation when it is resumed,
 # so the host only completes what was left outstanding after the service returned
 fun complete_outstanding_body(slot: *Slot) {
-    if (slot.service_pending || slot.body.pending_token == 0) { ret; }
+    if (slot.service_pending) {
+        call.stir(?slot.active_call, call.WAIT_BODY);
+        ret;
+    }
+    if (slot.body.pending_token == 0) { ret; }
     body.complete_reader(slot.request.body, slot.body.pending_token);
+}
+
+# a wake named the call of the stream in slot `index`: its parked service is
+# re-entered on the next step, and no other stream's is
+pub fun stir(session: *Session, index: u32) {
+    if (session == nil || !session.live || index::usize >= MAX_STREAMS) { ret; }
+    val slot: *Slot = slot_at(session, index::usize);
+    if (slot == nil || !slot.live || !slot.exchange_live || !slot.service_pending) { ret; }
+    call.stir(?slot.active_call, call.WAIT_WAKE);
 }
 
 fun return_event(session: *Session, event: engine_h2.Event) {
@@ -1297,7 +1311,9 @@ fun pump_slot(session: *Session, slot: *Slot, now: time.Instant) Step {
     if (slot.cancelling) {
         ret retire_closed_stream(session, slot);
     }
+    # a parked service is entered again only once what it waits on has moved
     if (slot.service_pending) {
+        if (!call.due(?slot.active_call, clock.to_ns(now))) { ret STEP_BLOCKED; }
         val resumed: Step = resume_exchange(session, slot);
         if (resumed != STEP_BLOCKED) { ret resumed; }
         ret STEP_BLOCKED;
@@ -1333,12 +1349,21 @@ fun runnable(session: *Session) bool {
         && session.engine.state != engine_h2.FAILED;
 }
 
-# whether the engine holds work this session must act on now, as the engine
-# answers it: a write, an event, a writable stream or a close. the worker's
-# debug audit asks it of a connection on no queue (#261)
+# whether this session holds work it must act on now: what the engine answers
+# (a write, an event, a writable stream or a close), or a parked service whose
+# named wait moved. the worker's debug audit asks it of a connection on no
+# queue (#261)
 pub fun pending_work(session: *Session) bool {
     if (session == nil || !session.live || !session.engine_started) { ret false; }
-    ret engine_h2.pending_work(?session.engine);
+    if (engine_h2.pending_work(?session.engine))                    { ret true; }
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        val slot: *Slot = slot_at(session, i);
+        if (slot != nil && slot.live && slot.exchange_live && slot.service_pending
+            && call.stirred(?slot.active_call)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 fun earlier(found: bool, candidate: u64, output: *u64) bool {

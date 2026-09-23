@@ -163,9 +163,11 @@ pub rec RequestStorage {
 rec RequestSlot {
     # the request's buffers, borrowed from the request lane while it is live and
     # released when it retires; nil and unheld on an idle slot
-    storage:                       *RequestStorage;
-    storage_chunk:                 buffers.Chunk;
-    storage_held:                  bool;
+    storage:       *RequestStorage;
+    storage_chunk: buffers.Chunk;
+    storage_held:  bool;
+    # the slot's index in its session, which its call's wakes name it by
+    index:                         usize;
     live:                          bool;
     phase:                         RequestPhase;
     id:                            u64;
@@ -238,7 +240,8 @@ pub rec SessionStorage {
     request_timeout_ns:  u64;
     chunks:              *hedge_storage.Chunks;
     call_memory_bytes:   usize;
-    # the QUIC connection's waker, which every request's call wakes
+    # the QUIC connection's waker. a request's call wakes it naming the
+    # request's slot
     waker: hedge_wake.Waker;
 }
 
@@ -274,11 +277,13 @@ fun reset_request(slot: *RequestSlot) {
     val storage: *RequestStorage = slot.storage;
     val chunk:   buffers.Chunk   = slot.storage_chunk;
     val held:    bool            = slot.storage_held;
+    val index:   usize           = slot.index;
     var cleared: RequestSlot;
     @slot                = cleared;
     slot.storage         = storage;
     slot.storage_chunk   = chunk;
     slot.storage_held    = held;
+    slot.index           = index;
     slot.phase           = REQUEST_FREE;
     slot.call_release_ok = true;
     slot.charge          = budget.no_charge();
@@ -654,6 +659,7 @@ fun free_request(session: *Session) *RequestSlot {
             val slot: *RequestSlot = ?session.requests_slots[i];
             if (!borrow_request_storage(session, slot)) { ret nil; }
             reset_request(slot);
+            slot.index = i;
             ret slot;
         }
         i = i + 1;
@@ -1076,7 +1082,8 @@ fun make_exchange(session: *Session, slot: *RequestSlot, event: h3.Event,
         || !telemetry_trace.make_root(?slot.trace, false)
         || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory, ?slot.trace,
         session.storage.plan.generation,
-        (?session.storage.listener_name[0])::str, session.storage.waker)) { ret false; }
+        (?session.storage.listener_name[0])::str,
+        hedge_wake.for_call(session.storage.waker, slot.index::u32))) { ret false; }
     ret true;
 }
 
@@ -1309,7 +1316,11 @@ fun terminal_exchange(slot: *RequestSlot) bool {
 # a pending service completes its own suspended operation when it is resumed,
 # so the host only completes what was left outstanding after the service returned
 fun complete_pending_body(slot: *RequestSlot) bool {
-    if (slot.service_pending || slot.body.pending_token == 0) { ret true; }
+    if (slot.service_pending) {
+        call.stir(?slot.active_call, call.WAIT_BODY);
+        ret true;
+    }
+    if (slot.body.pending_token == 0) { ret true; }
     val completed: body.Progress = body.complete_reader(?slot.body.reader,
         slot.body.pending_token);
     ret completed.status != body.ERROR && completed.status != body.LIMIT_REACHED
@@ -1489,9 +1500,12 @@ fun pump_request(session: *Session, slot: *RequestSlot,
         if (stream.state != h3.STREAM_CLOSED) { ret STEP_BLOCKED; }
         ret settle_request(session, slot);
     }
+    # a parked service is entered again only once what it waits on has moved
     if (slot.service_pending) {
-        val resumed: Step = resume_exchange(session, slot, now);
-        if (resumed != STEP_BLOCKED) { ret resumed; }
+        if (call.due(?slot.active_call, session.now_ns)) {
+            val resumed: Step = resume_exchange(session, slot, now);
+            if (resumed != STEP_BLOCKED) { ret resumed; }
+        }
         ret credited;
     }
     if (!slot.headers_sent) {
@@ -1854,6 +1868,29 @@ pub fun next_deadline(session: *Session, output: *u64) bool {
 pub fun takes_news(session: *Session) bool {
     ret session != nil && session.live
         && (session.state == ACTIVE || session.state == CLOSING);
+}
+
+# a wake named the call of the request in slot `index`: its parked service is
+# re-entered on the next step, and no other request's is
+pub fun stir(session: *Session, index: u32) {
+    if (session == nil || !session.live || index::usize >= MAX_STREAMS) { ret; }
+    val slot: *RequestSlot = ?session.requests_slots[index::usize];
+    if (!slot.live || !slot.exchange_live || !slot.service_pending) { ret; }
+    call.stir(?slot.active_call, call.WAIT_WAKE);
+}
+
+# whether a parked service of this session has had its named wait move, which
+# the next step re-enters
+pub fun stirred(session: *Session) bool {
+    if (session == nil || !session.live) { ret false; }
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        val slot: *RequestSlot = ?session.requests_slots[i];
+        if (slot.live && slot.exchange_live && slot.service_pending
+            && call.stirred(?slot.active_call)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 pub fun awaiting_service(session: *Session) bool {
@@ -2436,6 +2473,71 @@ test "hedge.protocol.h3.session: dispatch owns response and call finalization" {
         || !slot.call_release_ok || session.release_failed
         || !slot.active_call.settled
         || !operation_ok(cancel.destroy(?scope))) { ret 5; }
+    ret 0;
+}
+
+# binds the call of the session's request slot `index` and parks its service on
+# `wait`, as a pending service leaves it
+fun test_parked_request(session: *Session, index: usize, storage: *RequestStorage,
+    scope: *cancel.Scope, chunks: *hedge_storage.Chunks, wakes: *hedge_wake.Queue,
+    wait: call.Wait) bool {
+    val slot: *RequestSlot = ?session.requests_slots[index];
+    test_request_slot(slot, storage);
+    slot.index = index;
+    if (!test_exchange_slot(slot, scope, nil, false)
+        || !call.make_memory(?slot.memory, chunks, hedge_storage.MIN_CHUNK)
+        || !telemetry_trace.make_root(?slot.trace, false)
+        || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory,
+        ?slot.trace, 1, "test", hedge_wake.for_call(hedge_wake.waker(wakes, 1),
+        index::u32))) { ret false; }
+    slot.live            = true;
+    slot.exchange_live   = true;
+    slot.service_pending = true;
+    ret call.park(?slot.active_call, wait, 0) == exchange.SERVICE_PENDING;
+}
+
+test "hedge.protocol.h3.session: a parked request is stirred only by what it waits on" {
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
+        ret 1;
+    }
+    var heap: A.Allocator;
+    page.make(?heap);
+    var wakes:  hedge_wake.Queue;
+    var chunks: hedge_storage.Chunks;
+    if (!hedge_storage.make_chunks(?chunks, ?heap)
+        || !hedge_wake.make(?wakes, ?heap)) { ret 2; }
+    var session: Session;
+    session.live = true;
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        session.requests_slots[i].live = false;
+        i                              = i + 1;
+    }
+    var woken_storage: RequestStorage;
+    var body_storage:  RequestStorage;
+    if (!test_parked_request(?session, 0, ?woken_storage, ?scope, ?chunks, ?wakes,
+        call.WAIT_WAKE)
+        || !test_parked_request(?session, 1, ?body_storage, ?scope, ?chunks, ?wakes,
+        call.WAIT_BODY)) { ret 3; }
+    val woken:  *RequestSlot = ?session.requests_slots[0];
+    val reader: *RequestSlot = ?session.requests_slots[1];
+    # body bytes for the request waiting on a wake leave it parked
+    if (!complete_pending_body(woken) || stirred(?session)) { ret 4; }
+    # a wake naming the request waiting on its body leaves it parked, and one
+    # naming no request of this session stirs nothing
+    stir(?session, 1);
+    stir(?session, 5);
+    if (stirred(?session)) { ret 5; }
+    # the wake its call names re-enters the request waiting on a wake, alone
+    stir(?session, 0);
+    if (!call.stirred(?woken.active_call) || call.stirred(?reader.active_call)) { ret 6; }
+    # and body bytes re-enter the request waiting on its body
+    if (!complete_pending_body(reader) || !call.stirred(?reader.active_call)
+        || !call.due(?reader.active_call, 1)) { ret 7; }
+    call.unpark(?woken.active_call);
+    call.unpark(?reader.active_call);
+    if (stirred(?session) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
     ret 0;
 }
 
