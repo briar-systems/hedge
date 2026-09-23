@@ -10,11 +10,15 @@
   - **`test/load/churn.sh`.** Connect, request and close at a fixed rate for 10 minutes, with a flat resident set and flat CPU per connection.
   - **`test/load/migrate.sh`.** A QUIC connection must survive its client rebinding to a new port.
   - **`test/load/scale.sh`.** It now measures CPU per idle connection per second (asserted flat in N), descriptors and timer entries. It holds from several client processes on their own source addresses, so it reaches 100k, and it counts swapped-out pages in the resident figure.
-  - **Clients.** `hold.py` and `h3load` take a source address and a dial rate. `h3load` takes `-keep-alive` and `-migrate`.
+  - **Clients.** `hold.py` and `h3load` take a source address and a dial rate, and `h3load` takes `-migrate`.
   - **Telemetry.** New gauges `hedge_timers_claimed` and `hedge_timers_armed`. The built-in series count rises to 40, so `telemetry.metric_series` must cover it.
   - **CI.** The light tier runs the ramp, a minute of churn, the rates and migration.
   - **Measurements.** Release build, one worker, on a quiet host. An idle TCP or TLS connection costs no measurable CPU at 1k, 10k or 100k. An idle QUIC connection with a 15 s keep-alive costs 14.8 µs of CPU a second at 1k and 10.4 µs at 30k. Memory per connection is linear: 12,695 bytes for TCP from 10k to 100k, 22,501 for TLS from 1k to 10k, and 102,846 for QUIC from 10k to 30k.
   - **Problems found.** Past these counts the lane found problems, not figures. At 100k TLS connections hedge held only 62,925. After 100k TCP connections leave, the server keeps 84.5 MiB more than after 10k. After 30k QUIC connections close, 12,652 were still live 15 s later. And a QUIC connection does not survive its client rebinding its port.
+
+### Changed
+
+- The QUIC runtime reads a connection's transport deadline once per service pass (part of #274). `refresh_timer` (a `transport.timer` callback and a wheel arm) used to run after each delivered datagram, each `generate` call including the empty one that ends the loop, each settled send, and again at the end of `progress_connection`. Every one of those steps queues the record for a pass that reads the deadline anyway. A keep-alive round (PING in, delayed-ACK timer, ACK out, send settled) now makes 4 reads where it made about 10. On a release build, 5,000 held connections each pinging once a second, measured three times each way with nothing else running: 95.8 µs of CPU per round against 101.7 µs, and 690k user instructions against 706k. #274's profile puts most of the remaining cost in the AES key schedule (mach-crypto#158, mach-quic#230) and in mach-quic's per-callback system call (mach-quic#231). One core still tops out near 10k pings per second, and #274 stays open for those fixes and for a lane cell that pins the rate. `test/load/h3load` takes `-keep-alive`, the PING period, which defaults to half the idle timeout as before.
 
 ## [0.10.0] - 2026-09-23
 
