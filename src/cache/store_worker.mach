@@ -17,13 +17,21 @@
 
 use hedge.cache.disk;
 use hedge.clock;
+use hedge.wake;
+use A: std.allocator;
+use std.allocator.page;
 use std.chrono.time;
+use std.filesystem;
+use io_error:   std.io.error;
+use io_runtime: std.io.runtime;
 use std.sync.condition;
 use std.sync.mutex;
 use std.sync.thread;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -298,4 +306,151 @@ pub fun slow_down(worker: *Worker, delay_ns: u64) {
     mutex.lock(?worker.lock);
     worker.delay_ns = delay_ns;
     mutex.unlock(?worker.lock);
+}
+
+fun ensure_dir(path: str) bool {
+    val found: res[bool, io_error.Error] = filesystem.is_dir(path);
+    if ((sel found.ok) && found.ok) { ret true; }
+    val made: err[io_error.Error] = filesystem.create_dir(path, 493);
+    ret sel made.ok;
+}
+
+fun open_disk(target: *disk.Disk, root: str, pages: *A.Allocator) bool {
+    page.make(pages);
+    @target = disk.closed();
+    if (!ensure_dir("out") || !ensure_dir(root)) { ret false; }
+    ret disk.open(target, root, pages);
+}
+
+fun request_for(op: disk.Op, name: str, data: *u8, length: usize) disk.Request {
+    var request: disk.Request = disk.idle();
+    request.op       = op;
+    request.data     = data;
+    request.length   = length;
+    request.truncate = op == disk.WRITE;
+    var count: usize = 0;
+    for (name[count] != 0) { count = count + 1; }
+    disk.set_name(?request, name::*u8, count);
+    ret request;
+}
+
+test "store worker: requests run in order and each wakes its submitter on its own thread" {
+    var pages:  A.Allocator;
+    var target: disk.Disk;
+    if (!open_disk(?target, "out/store-worker-order", ?pages)) { ret 1; }
+    var runtime: io_runtime.Runtime;
+    val made: err[io_error.Error] = io_runtime.make(?runtime, ?pages, 8);
+    if (sel made.err) { ret 2; }
+    var queue: wake.Queue;
+    if (!wake.make(?queue, ?pages) || !wake.attach_runtime(?queue, ?runtime)) { ret 3; }
+    var worker: Worker = idle();
+    if (!start(?worker, ?target, 2, 1) || !disk.use_executor(?target, executor(?worker))) { ret 4; }
+    if (!disk.admit(?target)) { ret 5; }
+    var written: disk.Request = request_for(disk.WRITE, "order", "hello"::*u8, 5);
+    var buffer:  [8]u8;
+    var read:    disk.Request = request_for(disk.READ, "order", ?buffer[0], 5);
+    written.waker = wake.waker(?queue, 1);
+    read.waker    = wake.waker(?queue, 2);
+    if (disk.submit(?target, ?written) != disk.SUBMIT_QUEUED
+        || disk.submit(?target, ?read) != disk.SUBMIT_QUEUED) { ret 6; }
+    var owners: [4]u64;
+    var seen:   usize = 0;
+    var rounds: usize = 0;
+    var completions: [8]io_runtime.Completion;
+    for (seen < 2 && rounds < 200) {
+        # a completion is published on this thread only, when its wake is taken
+        if (disk.done(?read)) { ret 7; }
+        val waited: res[usize, io_error.Error] = io_runtime.wait(?runtime, ?completions[0], 8, 50);
+        if (sel waited.err) { ret 8; }
+        var taken: [4]wake.Wake;
+        val count: usize = wake.take(?queue, ?taken[0], 4);
+        var i: usize = 0;
+        for (i < count && seen < 4) {
+            owners[seen] = taken[i].owner;
+            seen         = seen + 1;
+            i            = i + 1;
+        }
+        rounds = rounds + 1;
+    }
+    if (seen != 2 || owners[0] != 1 || owners[1] != 2) { ret 9; }
+    if (!disk.done(?written) || !written.ok || !disk.done(?read) || !read.ok
+        || read.produced != 5 || buffer[0] != 'h' || buffer[4] != 'o') { ret 10; }
+    disk.leave(?target);
+    if (!stop(?worker, 1000000000)) { ret 11; }
+    wake.detach_runtime(?queue);
+    wake.destroy(?queue);
+    io_runtime.destroy(?runtime);
+    disk.close(?target);
+    ret 0;
+}
+
+test "store worker: a full queue refuses a stream, and a queued request is never lost" {
+    var pages:  A.Allocator;
+    var target: disk.Disk;
+    if (!open_disk(?target, "out/store-worker-full", ?pages)) { ret 1; }
+    var worker: Worker = idle();
+    if (!start(?worker, ?target, 1, 0) || !disk.use_executor(?target, executor(?worker))) { ret 2; }
+    if (!disk.admit(?target)) { ret 3; }
+    # the only stream is taken, so the next is refused until it leaves
+    if (disk.admit(?target)) { ret 4; }
+    disk.leave(?target);
+    if (!disk.admit(?target)) { ret 5; }
+    pause(?worker);
+    var first:  disk.Request = request_for(disk.WRITE, "full", "a"::*u8, 1);
+    var second: disk.Request = request_for(disk.WRITE, "full", "b"::*u8, 1);
+    if (disk.submit(?target, ?first) != disk.SUBMIT_QUEUED) { ret 6; }
+    # past the bound a request is refused and left idle, for its caller to reuse
+    if (disk.submit(?target, ?second) != disk.SUBMIT_REFUSED || disk.in_flight(?second)) { ret 7; }
+    resume(?worker);
+    disk.leave(?target);
+    if (!stop(?worker, 1000000000)) { ret 8; }
+    if (!disk.done(?first) || !first.ok) { ret 9; }
+    disk.close(?target);
+    ret 0;
+}
+
+test "store worker: stop drains a slow queue and names what a paused one holds" {
+    var pages:  A.Allocator;
+    var target: disk.Disk;
+    if (!open_disk(?target, "out/store-worker-stop", ?pages)) { ret 1; }
+    var worker: Worker = idle();
+    if (!start(?worker, ?target, 4, 4) || !disk.use_executor(?target, executor(?worker))) { ret 2; }
+    slow_down(?worker, 100000000);
+    var writes: [3]disk.Request;
+    writes[0] = request_for(disk.WRITE, "slow-0", "x"::*u8, 1);
+    writes[1] = request_for(disk.WRITE, "slow-1", "x"::*u8, 1);
+    writes[2] = request_for(disk.WRITE, "slow-2", "x"::*u8, 1);
+    var i: usize = 0;
+    for (i < 3) {
+        if (disk.submit(?target, ?writes[i]) != disk.SUBMIT_QUEUED) { ret 3; }
+        i = i + 1;
+    }
+    # each request completes inside the timeout, so the whole queue drains
+    # though together they take longer than it
+    if (!stop(?worker, 200000000)) { ret 4; }
+    i = 0;
+    for (i < 3) {
+        if (!disk.done(?writes[i]) || !writes[i].ok) { ret 5; }
+        i = i + 1;
+    }
+    var held: Worker = idle();
+    if (!start(?held, ?target, 4, 4) || !disk.use_executor(?target, executor(?held))) { ret 6; }
+    pause(?held);
+    var buffer: [4]u8;
+    var read:   disk.Request = request_for(disk.READ, "slow-0", ?buffer[0], 1);
+    var remove: disk.Request = request_for(disk.UNLINK, "slow-1", nil, 0);
+    if (disk.submit(?target, ?read) != disk.SUBMIT_QUEUED
+        || disk.submit(?target, ?remove) != disk.SUBMIT_QUEUED) { ret 7; }
+    if (stop(?held, 20000000)) { ret 8; }
+    # a stopping worker admits no new stream
+    if (disk.admit(?target)) { ret 9; }
+    var named: [4]Outstanding;
+    if (outstanding(?held, ?named[0], 4) != 2) { ret 10; }
+    if (named[0].op != disk.READ || named[0].running || named[0].name_length != 6
+        || named[0].name[5] != '0' || named[1].op != disk.UNLINK || named[1].name[5] != '1') { ret 11; }
+    resume(?held);
+    if (!stop(?held, 1000000000)) { ret 12; }
+    if (!disk.done(?read) || !read.ok || buffer[0] != 'x' || !disk.done(?remove) || !remove.ok) { ret 13; }
+    disk.close(?target);
+    ret 0;
 }
