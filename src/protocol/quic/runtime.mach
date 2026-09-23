@@ -339,14 +339,16 @@ pub rec PendingInitial {
 
 # the welded records are owned by the caller, which grows nothing itself. the
 # runtime grows these tables through the view, and a record never moves once
-# its chunk exists, so a slot's index addresses it for the table's lifetime.
+# its chunk exists, so a slot's index addresses it for the table's lifetime. a
+# connection and an h3 session are each a pair: the welded record and the plain
+# storage it points into sit at one index and are claimed and released together.
 pub rec ControlView {
     pumps:       *Pump;
-    connections: *hedge_storage.SecretTable[Connection];
+    connections: *hedge_storage.Pair[ConnectionStorage, Connection];
     # tls handshake records, held by a connection only until its handshake
     # has handed everything over, then reused
     handshakes: *hedge_storage.SecretTable[server.Handshake];
-    sessions:   *hedge_storage.SecretTable[h3_session.Session];
+    sessions:   *hedge_storage.Pair[h3_session.SessionStorage, h3_session.Session];
 }
 
 pub rec PumpHandle {
@@ -641,16 +643,14 @@ pub rec Snapshot {
 }
 
 pub rec Runtime {
-    # half a megabyte each, claimed as a connection is taken and returned with it
-    connection_storages: hedge_storage.Recycler[ConnectionStorage];
-    pending_initials:    hedge_storage.Table[PendingInitial];
-    routes:              routing.Table;
-    timers:              *wheel.Wheel;
-    wakes:               *hedge_wake.Queue;
-    sessions:            h3_session.Pool;
-    chunks:              *hedge_storage.Chunks;
-    memory:              *memory.Memory;
-    backing:             *A.Allocator;
+    pending_initials: hedge_storage.Table[PendingInitial];
+    routes:           routing.Table;
+    timers:           *wheel.Wheel;
+    wakes:            *hedge_wake.Queue;
+    sessions:         h3_session.Pool;
+    chunks:           *hedge_storage.Chunks;
+    memory:           *memory.Memory;
+    backing:          *A.Allocator;
     # the live connections, so every sweep costs what is live rather than what
     # was configured. an idle QUIC listener sweeps nothing.
     live_head:        usize;
@@ -840,7 +840,7 @@ pub fun view_valid(controls: *ControlView) bool {
 }
 
 pub fun connection_at(controls: *ControlView, index: usize) *Connection {
-    ret hedge_storage.secret_table_at[Connection](controls.connections, index);
+    ret hedge_storage.pair_secret_at[ConnectionStorage, Connection](controls.connections, index);
 }
 
 fun pending_at(runtime: *Runtime, index: usize) *PendingInitial {
@@ -1327,17 +1327,13 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     if (runtime == nil || runtime.initialized || config.chunks == nil
         || config.memory == nil || config.backing == nil || config.timers == nil
         || !view_valid(controls)) { ret false; }
-    if (!hedge_storage.make[ConnectionStorage](?runtime.connection_storages,
-        config.backing, 1)) { ret false; }
     if (!hedge_storage.make_table[PendingInitial](?runtime.pending_initials,
         config.backing)
         || !routing.make(?runtime.routes, config.backing)
-        || !h3_session.make_pool(?runtime.sessions, config.backing,
-        controls.sessions)
+        || !h3_session.make_pool(?runtime.sessions)
         || !process_admission.make(?runtime.handshakes, config.backing,
         opt[usize].none{}, opt[usize].none{})
         || !hedge_storage.make_table[HeldDatagram](?runtime.held, config.backing)) {
-        hedge_storage.destroy[ConnectionStorage](?runtime.connection_storages);
         ret false;
     }
     runtime.chunks            = config.chunks;
@@ -2061,22 +2057,19 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
         || admission_bank >= ADMISSION_BANKS) {
         ret NO_CONNECTION;
     }
-    # the slab welds a chunk on demand and hands back the lowest free index; the
-    # timer and connection storage are claimed alongside and unwound on refusal
-    val index: usize = hedge_storage.secret_table_claim[Connection](controls.connections);
+    # the slab grows both halves' chunks on demand and hands back the lowest free
+    # index, so the connection and its storage are claimed as one; the timer is
+    # claimed alongside and unwound on refusal
+    val index: usize = hedge_storage.pair_claim[ConnectionStorage, Connection](
+        controls.connections);
     if (index == NO_CONNECTION) { ret NO_CONNECTION; }
     val handle: wheel.Handle = wheel.claim(runtime.timers, timer_owner(index));
     if (handle.index == wheel.NONE) {
-        hedge_storage.secret_table_release[Connection](controls.connections, index);
+        hedge_storage.pair_release[ConnectionStorage, Connection](controls.connections, index);
         ret NO_CONNECTION;
     }
     val storage: *ConnectionStorage =
-        hedge_storage.claim[ConnectionStorage](?runtime.connection_storages);
-    if (storage == nil) {
-        wheel.release(runtime.timers, handle);
-        hedge_storage.secret_table_release[Connection](controls.connections, index);
-        ret NO_CONNECTION;
-    }
+        hedge_storage.pair_plain_at[ConnectionStorage, Connection](controls.connections, index);
     # a claimed slot is either reused or a freshly welded (zeroed) chunk, and zero
     # is not the sentinel for the link fields, so normalize it before arming
     val value: *Connection = connection_at(controls, index);
@@ -2181,13 +2174,11 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     value.live = false;
     unlink_live(controls, runtime, index);
     # the scope is destroyed by now, so nothing io holds points into the storage
-    hedge_storage.release[ConnectionStorage](?runtime.connection_storages,
-        value.storage);
     value.storage = nil;
     value.state   = CONNECTION_FREE;
-    # release last: the timer and storage are already back, so a compacted-away
-    # chunk strands nothing. `value` must not be touched after this.
-    hedge_storage.secret_table_release[Connection](controls.connections, index);
+    # release both halves last: the timer is already back, so a compacted-away
+    # chunk strands nothing. neither half may be touched after this.
+    hedge_storage.pair_release[ConnectionStorage, Connection](controls.connections, index);
 }
 
 fun return_connection(controls: *ControlView, runtime: *Runtime, index: usize) bool {
@@ -4602,7 +4593,7 @@ pub fun fire(controls: *ControlView, runtime: *Runtime, owner: u64, now_ns: u64)
     }
     if (!owns_timer(owner)) { ret; }
     val index: usize = (owner & ~TIMER_MASK)::usize;
-    if (index >= hedge_storage.secret_table_capacity[Connection](controls.connections)) { ret; }
+    if (index >= hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections)) { ret; }
     val value: *Connection = connection_at(controls, index);
     if (!value.live) { ret; }
     if (!value.timer_disarmed && value.assembly.initialized
@@ -4648,7 +4639,7 @@ pub fun wake(controls: *ControlView, runtime: *Runtime, owner: u64) {
     }
     if (!owns_timer(owner)) { ret; }
     val index: usize = (owner & ~TIMER_MASK)::usize;
-    if (index >= hedge_storage.secret_table_capacity[Connection](controls.connections)) { ret; }
+    if (index >= hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections)) { ret; }
     # the owner is also the account's wake handle. the pool's wake may be for
     # quic's chunks or for the h3 session's, and both are retried
     val value: *Connection = connection_at(controls, index);
@@ -4895,18 +4886,16 @@ pub fun release(controls: *ControlView, runtime: *Runtime) Status {
     }
     if (runtime.sessions.live != 0 || runtime.pump_count != 0) { ret BLOCKED; }
     # each part is released once, so a refused release retries only what remains
-    if ((runtime.connection_storages.live
-        && !hedge_storage.destroy[ConnectionStorage](?runtime.connection_storages))
-        || !hedge_storage.destroy_table[PendingInitial](?runtime.pending_initials)
+    if (!hedge_storage.destroy_table[PendingInitial](?runtime.pending_initials)
         || (runtime.routes.initialized && !routing.destroy(?runtime.routes))
-        || (runtime.sessions.storages.live && !h3_session.destroy_pool(?runtime.sessions))
+        || !h3_session.destroy_pool(?runtime.sessions)
         || (runtime.handshakes.initialized
         && !process_admission.destroy(?runtime.handshakes))
         || !hedge_storage.destroy_table[HeldDatagram](?runtime.held)) {
         ret FAILED;
     }
-    # every record is back by now, since no connection is live; the secret tables
-    # are owned and destroyed by composition, so nothing to free here
+    # every record is back by now, since no connection is live; the pairs and the
+    # handshake table are owned and destroyed by composition, so nothing to free here
     runtime.admission   = nil;
     runtime.initialized = false;
     ret OK;
@@ -5013,9 +5002,9 @@ fun test_pump_config(generation: u64, policy: *hedge_tls.Policy,
 # the caller-side owner of the runtime's welded records, as composition keeps it
 rec TestControls {
     pumps:       [MAX_PUMPS]Pump;
-    connections: hedge_storage.SecretTable[Connection];
+    connections: hedge_storage.Pair[ConnectionStorage, Connection];
     handshakes:  hedge_storage.SecretTable[server.Handshake];
-    sessions:    hedge_storage.SecretTable[h3_session.Session];
+    sessions:    hedge_storage.Pair[h3_session.SessionStorage, h3_session.Session];
     view:        ControlView;
     chunks:      hedge_storage.Chunks;
     memory:      memory.Memory;
@@ -5024,9 +5013,14 @@ rec TestControls {
 }
 
 fun test_controls(fixture: *TestControls) *ControlView {
-    hedge_storage.make_secret_table[Connection](?fixture.connections, test_allocator());
+    ret test_controls_on(fixture, test_allocator());
+}
+
+# the pairs' plain halves and slab links draw on `a`
+fun test_controls_on(fixture: *TestControls, a: *A.Allocator) *ControlView {
+    hedge_storage.make_pair[ConnectionStorage, Connection](?fixture.connections, a);
     hedge_storage.make_secret_table[server.Handshake](?fixture.handshakes, test_allocator());
-    hedge_storage.make_secret_table[h3_session.Session](?fixture.sessions, test_allocator());
+    hedge_storage.make_pair[h3_session.SessionStorage, h3_session.Session](?fixture.sessions, a);
     hedge_storage.make_chunks(?fixture.chunks, test_allocator());
     wheel.make(?fixture.timers, test_allocator(), 1);
     hedge_wake.make(?fixture.wakes, test_allocator());
@@ -5464,7 +5458,7 @@ test "hedge.protocol.quic.runtime: budget generation remains pinned by quic work
     var first:    budget.Set;
     var second:   budget.Set;
     if (!test_make(?fixture, ?runtime, test_allocator())
-        || hedge_storage.secret_table_claim[Connection](controls.connections) == NO_CONNECTION
+        || hedge_storage.pair_claim[ConnectionStorage, Connection](controls.connections) == NO_CONNECTION
         || !hedge_storage.grow_table[PendingInitial](?runtime.pending_initials)) { ret 90; }
     reset_connection(connection_at(controls, 0));
     reset_pending_initial(?runtime, 0);
@@ -5893,24 +5887,24 @@ test "hedge.protocol.quic.runtime: a connection drains faster than the process" 
 }
 
 # an idle QUIC listener must not be resident in the connection storage it is
-# not using: a slot's storage is half a megabyte, so it exists only while a
-# connection holds it, and a freed slot gives it back
+# not using: a slot's storage exists only while a connection holds it, and a
+# freed slot gives it back with its record
 test "hedge.protocol.quic.runtime: an idle runtime holds no connection storage" {
     var fixture:  TestControls;
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 1; }
-    if (hedge_storage.secret_table_capacity[Connection](controls.connections) != 0 || hedge_storage.secret_table_capacity[h3_session.Session](controls.sessions) != 0
+    if (hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections) != 0 || hedge_storage.pair_capacity[h3_session.SessionStorage, h3_session.Session](controls.sessions) != 0
         || hedge_storage.table_capacity[PendingInitial](?runtime.pending_initials) != 0 || runtime.routes.capacity != 0
         || fixture.timers.entries.slab.capacity != 0
-        || hedge_storage.held[ConnectionStorage](?runtime.connection_storages) != 0) {
+        || hedge_storage.pair_live[ConnectionStorage, Connection](controls.connections) != 0) {
         ret 2;
     }
     val taken: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     val value: *Connection = connection_at(controls, taken);
     if (taken != 0 || value == nil || value.storage == nil
-        || hedge_storage.held[ConnectionStorage](?runtime.connection_storages) != 1
+        || hedge_storage.pair_live[ConnectionStorage, Connection](controls.connections) != 1
         || connection_at(controls, 1).storage != nil) { ret 3; }
     val storage: *ConnectionStorage = value.storage;
     # marks a stale owner left behind, which arming the storage has to clear
@@ -5918,10 +5912,11 @@ test "hedge.protocol.quic.runtime: an idle runtime holds no connection storage" 
     storage.sends[0].context.completion_pending = true;
     storage.published[0].live                   = true;
     return_connection(controls, ?runtime, taken);
-    # releasing the only connection compacts its record away; its half-megabyte
-    # storage returns to the pool for the next claim
+    # releasing the only connection compacts both halves away; the plain chunk is
+    # kept for the next grow, stale, so the next claim must arm it again
     if (connection_at(controls, taken) != nil
-        || hedge_storage.held[ConnectionStorage](?runtime.connection_storages) != 0) { ret 4; }
+        || hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections) != 0
+        || hedge_storage.pair_live[ConnectionStorage, Connection](controls.connections) != 0) { ret 4; }
     val again: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     val rearmed: *Connection = connection_at(controls, again);
@@ -5953,7 +5948,7 @@ test "hedge.protocol.quic.runtime: the pool grows past its first chunk and moves
         i = i + 1;
     }
     if (runtime.live_connections != count || live_walk_length(controls, ?runtime) != count
-        || hedge_storage.secret_table_capacity[Connection](controls.connections) < count) { ret 4; }
+        || hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections) < count) { ret 4; }
     i = 0;
     for (i < count) {
         if (connection_at(controls, i) != records[i]) { ret 5; }
@@ -5965,19 +5960,19 @@ test "hedge.protocol.quic.runtime: the pool grows past its first chunk and moves
         i = i + 1;
     }
     if (runtime.live_connections != 0
-        || hedge_storage.held[ConnectionStorage](?runtime.connection_storages) != 0
+        || hedge_storage.pair_live[ConnectionStorage, Connection](controls.connections) != 0
         || release(controls, ?runtime) != OK) { ret 7; }
     # draining every connection compacted the tables back to nothing; a runtime
     # made again over them grows fresh from zero, lowest index first
     if (!test_make(?fixture, ?runtime, test_allocator())
-        || hedge_storage.secret_table_capacity[Connection](controls.connections) != 0) { ret 8; }
+        || hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections) != 0) { ret 8; }
     i = 0;
     for (i < count) {
         if (acquire_connection(controls, ?runtime, 0, 0,
             process_admission.no_lease()) != i) { ret 9; }
         i = i + 1;
     }
-    if (hedge_storage.secret_table_capacity[Connection](controls.connections) < count) { ret 10; }
+    if (hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections) < count) { ret 10; }
     i = 0;
     for (i < count) {
         return_connection(controls, ?runtime, i);
@@ -5992,19 +5987,24 @@ test "hedge.protocol.quic.runtime: a refused connection storage is a refused slo
     val tracked: err[A.Error] = allocator_testing.make(?t);
     if (sel tracked.err) { ret 1; }
     var fixture:  TestControls;
-    val controls: *ControlView = test_controls(?fixture);
+    val controls: *ControlView = test_controls_on(?fixture, allocator_testing.allocator_of(?t));
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, allocator_testing.allocator_of(?t))) { ret 2; }
     allocator_testing.fail_at_ordinal(?t, allocator_testing.attempt_count(?t) + 1);
     if (acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease()) != NO_CONNECTION
         || runtime.live_connections != 0
-        || hedge_storage.secret_table_capacity[Connection](controls.connections) != 0) { ret 3; }
+        || hedge_storage.pair_capacity[ConnectionStorage, Connection](controls.connections) != 0) { ret 3; }
     allocator_testing.clear_failure(?t);
     val taken: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
-    if (taken != 0 || !return_connection(controls, ?runtime, taken))       { ret 4; }
-    if (release(controls, ?runtime) != OK || allocator_testing.leaked(?t)) { ret 5; }
+    if (taken != 0 || !return_connection(controls, ?runtime, taken)) { ret 4; }
+    # the pairs keep a released chunk for the next grow until they are destroyed
+    if (release(controls, ?runtime) != OK
+        || !hedge_storage.destroy_pair[ConnectionStorage, Connection](?fixture.connections)
+        || !hedge_storage.destroy_pair[h3_session.SessionStorage, h3_session.Session](
+        ?fixture.sessions)
+        || allocator_testing.leaked(?t)) { ret 5; }
     ret 0;
 }
 
