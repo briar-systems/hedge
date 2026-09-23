@@ -166,21 +166,29 @@ curl_h3() {
         "$@" --config "$config"
 }
 
-# the QUIC holder is test/load/h3load, a quic-go client, built into the
-# gitignored tools directory with the module cache beside it so a runner
-# without a Go cache still builds it
-resolve_h3load() {
-    h3load="$root/.tools/h3load"
-    if [ -x "$h3load" ] && [ "$h3load" -nt test/load/h3load/main.go ]; then
+# the Go clients under test/load (h3load, the QUIC holder and dialler, and
+# rate, the closed-loop rate client) are built into the gitignored tools
+# directory with the module cache beside it, so a runner without a Go cache
+# still builds them. resolve_go_tool sets `tool` to the built binary.
+tool=""
+resolve_go_tool() {
+    local name="$1"
+    tool="$root/.tools/$name"
+    if [ -x "$tool" ] && [ "$tool" -nt "test/load/$name/main.go" ]; then
         return 0
     fi
     if ! command -v go >/dev/null 2>&1; then
-        echo "the QUIC scale cells need go to build test/load/h3load"
+        echo "the load lanes need go to build test/load/$name"
         return 1
     fi
     mkdir -p "$root/.tools/gopath"
-    (cd test/load/h3load && GOPATH="$root/.tools/gopath" GOFLAGS=-mod=mod \
-        go build -o "$h3load" .) || return 1
+    (cd "test/load/$name" && GOPATH="$root/.tools/gopath" GOFLAGS=-mod=mod \
+        go build -o "$tool" .) || return 1
+}
+
+resolve_h3load() {
+    resolve_go_tool h3load || return 1
+    h3load="$tool"
 }
 
 # the work directory, an incompressible body so neither side can shorten a
@@ -237,7 +245,7 @@ protocols = ["http/1.1"]
 [[listener]]
 name = "secure"
 address = "127.0.0.1:$secure"
-protocols = ["http/1.1"]
+protocols = ["http/1.1", "h2"]
 tls = "load"
 
 [[listener]]
