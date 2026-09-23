@@ -16,7 +16,9 @@ mach build . --profile release
 `HEDGE_BINARY` qualifies a different build. `LOAD_QUIC_SERVED=0` skips the
 assertions that HTTP/3 transfers were served, leaving admission and refusal
 checked. `LOAD_CONNECTIONS` and `LOAD_TARGET` change the shape of the TCP load, `LOAD_QUIC_CONNECTIONS` and `LOAD_QUIC_RATE`
-the QUIC load. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
+the QUIC load. `LOAD_CACHE=memory` puts the cache in front of the content, and
+`LOAD_CACHE=disk` also keeps the large body on disk, so any lane can be run with the
+cache on. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
 and releases every server and client on every exit path. The QUIC cells use the
 system `curl` when it is built with HTTP/3, and otherwise fetch a pinned static
 build into `.tools/`.
