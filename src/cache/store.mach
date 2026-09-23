@@ -1,32 +1,47 @@
-# the bounded cache store
+# the bounded cache store, shared by every worker
 #
 # Memory and disk have separate, exact byte budgets. An entry is admitted only
 # when its whole representation fits, and a partially written entry is never
 # visible: a reader can only ever see an entry that was completed. Eviction is
 # least-recently-used and runs before admission, so the budget is a bound rather
 # than a target the store drifts above.
+#
+# The store is split into shards by the hash of the cache key. A shard owns its
+# slots, its share of the body arena and of each budget, and one lock. The lock
+# is held only across index and arena work, never across disk I/O: every disk
+# operation is a request (hedge.cache.disk) submitted after the lock is let go.
+# One shard is exactly the store as it was before sharding.
+#
+# A reader pins an entry before it streams from it. Eviction, replacement or
+# invalidation of a pinned entry unlinks it from the index at once, so no new
+# reader finds it, and its bytes are freed only when the last pin is released.
+#
+# Locking contract: a function taking a `*Shard` requires that shard's lock to
+# be held (`acquire` takes it, `release` lets it go). A function taking the
+# store, a pin or a writer takes whatever lock it needs itself.
 
+use hedge.cache.disk;
 use hedge.cache.key;
 use hedge.cache.policy;
+use hedge.wake;
 use http.core.field;
 use http.core.status;
 use std.allocator;
 use std.allocator.page;
 use std.chrono.time;
-use std.collections.vector;
-use std.collections.vector.Vector;
 use std.filesystem;
 use io_error: std.io.error;
-use std.io.file;
+use std.memory;
+use std.sync.atomic;
+use std.sync.mutex;
+use std.sync.thread;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
 use std.types.view;
 
 fun io_ok(outcome: err[io_error.Error]) bool {
@@ -46,9 +61,14 @@ fun fs_ok(outcome: err[filesystem.FsError]) bool {
 }
 
 pub val MAX_ENTRIES:       usize = 256;
+pub val MAX_SHARDS:        usize = 64;
 pub val MAX_STORED_FIELDS: usize = 32;
 pub val MAX_FIELD_BYTES:   usize = 4096;
 pub val NO_ENTRY:          usize = 0xffffffffffffffff;
+
+# what freed arena bytes hold in debug builds, so a read of bytes that no longer
+# belong to the entry being read shows up as a wrong body rather than a quiet one
+pub val POISON: u8 = 0xdb;
 
 pub def Placement: u8;
 pub val IN_MEMORY: Placement = 1;
@@ -59,6 +79,9 @@ pub val EMPTY:   State = 0;
 pub val WRITING: State = 1;
 pub val READY:   State = 2;
 pub val RETIRED: State = 3;
+# a reclaimed disk entry whose file is being removed. the slot and its disk
+# charge come back only once the removal is done
+pub val UNLINKING: State = 4;
 
 pub rec Limits {
     memory_bytes:    usize;
@@ -101,20 +124,21 @@ pub rec Entry {
     revalidating:        bool;
     readers:             usize;
     discard_pending:     bool;
+    # the removal of this entry's file, and whether it still has to be submitted
+    unlink:         disk.Request;
+    unlink_waiting: bool;
 }
 
-pub rec Store {
+pub rec Shard {
+    lock:             mutex.Mutex;
+    store:            *Store;
+    number:           usize;
     entries:          *Entry;
     capacity:         usize;
     body:             *u8;
     body_capacity:    usize;
     body_used:        usize;
     disk_used:        usize;
-    limits:           Limits;
-    root:             file.Root;
-    root_path:        [256]u8;
-    root_path_length: usize;
-    has_root:         bool;
     clock:            u64;
     hits:             u64;
     misses:           u64;
@@ -122,31 +146,40 @@ pub rec Store {
     evictions:        u64;
     rejections:       u64;
     partial_discards: u64;
-    live:             bool;
+    unlinking:        usize;
+    unlinks_waiting:  usize;
+}
+
+pub rec Store {
+    shards:        [MAX_SHARDS]Shard;
+    shard_count:   usize;
+    entries:       *Entry;
+    capacity:      usize;
+    body:          *u8;
+    body_capacity: usize;
+    limits:        Limits;
+    disk:          disk.Disk;
+    has_root:      bool;
+    purge:         disk.Request;
+    sequence:      i64;
+    live:          bool;
 }
 
 # a store that was never enabled owns nothing: no arrays, no root, no counters in
 # motion. `live` is the single fact every entry point checks first.
 pub fun disabled() Store {
     var store: Store;
-    store.entries          = nil;
-    store.capacity         = 0;
-    store.body             = nil;
-    store.body_capacity    = 0;
-    store.body_used        = 0;
-    store.disk_used        = 0;
-    store.limits           = Limits{memory_bytes: 0, disk_bytes: 0, max_entry_bytes: 0, entries: 0};
-    store.has_root         = false;
-    store.root_path[0]     = 0;
-    store.root_path_length = 0;
-    store.clock            = 0;
-    store.hits             = 0;
-    store.misses           = 0;
-    store.stores           = 0;
-    store.evictions        = 0;
-    store.rejections       = 0;
-    store.partial_discards = 0;
-    store.live             = false;
+    store.shard_count   = 0;
+    store.entries       = nil;
+    store.capacity      = 0;
+    store.body          = nil;
+    store.body_capacity = 0;
+    store.limits        = Limits{memory_bytes: 0, disk_bytes: 0, max_entry_bytes: 0, entries: 0};
+    store.disk          = disk.closed();
+    store.has_root      = false;
+    store.purge         = disk.idle();
+    store.sequence      = 0;
+    store.live          = false;
     ret store;
 }
 
@@ -154,18 +187,49 @@ pub fun enabled(store: *Store) bool {
     ret store != nil && store.live;
 }
 
+# a budget's share for one shard. the shares sum to the whole, so the store-wide
+# bound is exact however many shards divide it
+fun share(total: usize, count: usize, number: usize) usize {
+    var part: usize = total / count;
+    if (number < total % count) { part = part + 1; }
+    ret part;
+}
+
+fun share_offset(total: usize, count: usize, number: usize) usize {
+    var offset: usize = 0;
+    var i:      usize = 0;
+    for (i < number) {
+        offset = offset + share(total, count, i);
+        i      = i + 1;
+    }
+    ret offset;
+}
+
+fun memory_budget(shard: *Shard) usize {
+    ret share(shard.store.limits.memory_bytes, shard.store.shard_count, shard.number);
+}
+
+fun disk_budget(shard: *Shard) usize {
+    ret share(shard.store.limits.disk_bytes, shard.store.shard_count, shard.number);
+}
+
 pub fun make(store: *Store, entries: *Entry, capacity: usize, body: *u8,
-    body_capacity: usize, limits: Limits) bool {
+    body_capacity: usize, limits: Limits, shards: usize) bool {
     if (store == nil || entries == nil || capacity == 0 || capacity > MAX_ENTRIES
         || body == nil || body_capacity == 0 || limits.max_entry_bytes == 0
-        || limits.memory_bytes > body_capacity) { ret false; }
-    @store         = disabled();
-    store.entries  = entries;
-    store.capacity = capacity;
-    if (limits.entries != 0 && limits.entries < capacity) { store.capacity = limits.entries; }
+        || limits.memory_bytes > body_capacity || shards == 0 || shards > MAX_SHARDS) {
+        ret false;
+    }
+    @store = disabled();
+    var slots: usize = capacity;
+    if (limits.entries != 0 && limits.entries < capacity) { slots = limits.entries; }
+    if (slots < shards || body_capacity < shards)         { ret false; }
+    store.entries       = entries;
+    store.capacity      = slots;
     store.body          = body;
     store.body_capacity = body_capacity;
     store.limits        = limits;
+    store.shard_count   = shards;
     var i: usize = 0;
     for (i < capacity) {
         entries[i].state           = EMPTY;
@@ -176,106 +240,143 @@ pub fun make(store: *Store, entries: *Entry, capacity: usize, body: *u8,
         entries[i].revalidating    = false;
         entries[i].readers         = 0;
         entries[i].discard_pending = false;
+        entries[i].unlink          = disk.idle();
+        entries[i].unlink_waiting  = false;
         i                          = i + 1;
+    }
+    var s: usize = 0;
+    for (s < shards) {
+        val shard: *Shard = ?store.shards[s];
+        shard.lock             = mutex.make();
+        shard.store            = store;
+        shard.number           = s;
+        shard.entries          = ?entries[share_offset(slots, shards, s)];
+        shard.capacity         = share(slots, shards, s);
+        shard.body             = ?body[share_offset(body_capacity, shards, s)];
+        shard.body_capacity    = share(body_capacity, shards, s);
+        shard.body_used        = 0;
+        shard.disk_used        = 0;
+        shard.clock            = 0;
+        shard.hits             = 0;
+        shard.misses           = 0;
+        shard.stores           = 0;
+        shard.evictions        = 0;
+        shard.rejections       = 0;
+        shard.partial_discards = 0;
+        shard.unlinking        = 0;
+        shard.unlinks_waiting  = 0;
+        s                      = s + 1;
     }
     store.live = true;
     ret true;
 }
 
-# a name this store could have written: `e` and then decimal digits, nothing else
-fun own_file_name(name: str) bool {
-    if (name == nil || name[0] != 'e' || name[1] == 0) { ret false; }
-    var i: usize = 1;
-    for (name[i] != 0) {
-        if (name[i] < '0' || name[i] > '9') { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-# discard whatever a previous process left behind in the cache root
-#
-# `close` removes the files this store wrote, but a process that was killed never
-# reaches it. Those files are charged to no budget and described by no entry, so
-# after a crash the disk bound would not hold and an orphan could only ever be
-# dead weight. Only names this store's own counter could have produced are
-# removed, so a misconfigured root costs nothing that hedge did not write.
-fun purge_root(store: *Store, scratch: *allocator.Allocator) bool {
-    val listed: res[Vector[str], filesystem.FsError] = filesystem.read_dir(scratch,
-        (?store.root_path[0])::str);
-    if (sel listed.err) { ret false; }
-    var names: Vector[str] = listed.ok;
-    var i:     usize       = 0;
-    for (i < names.len) {
-        val held: opt[*str] = vector.get[str](?names, i);
-        if (sel held.some) {
-            val name: str = @held.some;
-            if (own_file_name(name)) { remove_named(store, name); }
-        }
-        i = i + 1;
-    }
-    vector.dnit[str](?names);
-    ret true;
-}
-
-# a disk-backed store keeps large representations outside the memory budget
+# a disk-backed store keeps large representations outside the memory budget.
+# the root is purged of what a killed process left in it before disk placement
+# is used, and that purge is a request like every other disk operation.
 pub fun attach_disk(store: *Store, root_path: str, scratch: *allocator.Allocator) bool {
     if (store == nil || !store.live || store.has_root || root_path == nil) { ret false; }
     if (store.limits.disk_bytes == 0 || scratch == nil)                    { ret false; }
-    val length: usize = str_len(root_path);
-    if (length == 0 || length + 66 >= 256) { ret false; }
-    val opened: err[io_error.Error] = file.root_open(?store.root, root_path);
-    if (sel opened.err) { ret false; }
-    var i: usize = 0;
-    for (i < length) {
-        store.root_path[i] = root_path[i];
-        i                  = i + 1;
-    }
-    store.root_path[length] = 0;
-    store.root_path_length  = length;
-    store.has_root          = true;
-    if (!purge_root(store, scratch)) {
-        file.root_close(?store.root);
-        store.has_root         = false;
-        store.root_path_length = 0;
+    if (!disk.open(?store.disk, root_path, scratch))                       { ret false; }
+    store.purge    = disk.idle();
+    store.purge.op = disk.PURGE;
+    val submitted: disk.Submitted = disk.submit(?store.disk, ?store.purge);
+    if (submitted == disk.SUBMIT_REFUSED
+        || (submitted == disk.SUBMIT_DONE && !store.purge.ok)) {
+        disk.close(?store.disk);
         ret false;
     }
+    store.has_root = true;
     ret true;
 }
 
-pub fun close(store: *Store) bool {
-    if (store == nil || !store.live) { ret false; }
-    var i: usize = 0;
-    for (i < store.capacity) {
-        if (store.entries[i].readers != 0) { ret false; }
+# disk placement is offered only once the root is purged
+pub fun disk_ready(store: *Store) bool {
+    ret store != nil && store.has_root && disk.done(?store.purge) && store.purge.ok;
+}
+
+# the shard a key belongs to: FNV-1a of the key's bytes
+pub fun shard_of(store: *Store, identity: *key.Key) *Shard {
+    if (!enabled(store) || identity == nil || !identity.valid) { ret nil; }
+    var hash: u64   = 0xcbf29ce484222325;
+    var i:    usize = 0;
+    for (i < identity.length) {
+        hash = (hash ^ identity.bytes[i]::u64) * 0x100000001b3;
+        i    = i + 1;
+    }
+    ret ?store.shards[(hash % store.shard_count::u64)::usize];
+}
+
+pub fun shard_at(store: *Store, number: usize) *Shard {
+    if (!enabled(store) || number >= store.shard_count) { ret nil; }
+    ret ?store.shards[number];
+}
+
+# take the lock of the shard a key belongs to
+pub fun acquire(store: *Store, identity: *key.Key) *Shard {
+    val shard: *Shard = shard_of(store, identity);
+    if (shard == nil) { ret nil; }
+    mutex.lock(?shard.lock);
+    ret shard;
+}
+
+pub fun lock(shard: *Shard) {
+    mutex.lock(?shard.lock);
+}
+
+# let a shard's lock go, then submit the file removals its reclaims queued. the
+# removals are submitted here rather than where the reclaim happened so that no
+# disk request is ever made with the lock held
+pub fun release(shard: *Shard) {
+    if (shard.unlinks_waiting == 0) {
+        mutex.unlock(?shard.lock);
+        ret;
+    }
+    var batch: [MAX_ENTRIES]usize;
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < shard.capacity && count < MAX_ENTRIES) {
+        val entry: *Entry = ?shard.entries[i];
+        if (entry.state == UNLINKING && entry.unlink_waiting) {
+            entry.unlink_waiting = false;
+            batch[count]         = i;
+            count                = count + 1;
+        }
         i = i + 1;
     }
+    shard.unlinks_waiting = 0;
+    mutex.unlock(?shard.lock);
+    var refused: usize = 0;
     i = 0;
-    for (i < store.capacity) {
-        if (store.entries[i].state != EMPTY && store.entries[i].placement == ON_DISK) {
-            remove_file(store, ?store.entries[i]);
+    for (i < count) {
+        if (disk.submit(?shard.store.disk, ?shard.entries[batch[i]].unlink)
+            == disk.SUBMIT_REFUSED) {
+            batch[refused] = batch[i];
+            refused        = refused + 1;
         }
-        store.entries[i].state = EMPTY;
-        i                      = i + 1;
+        i = i + 1;
     }
-    if (store.has_root) {
-        file.root_close(?store.root);
-        store.has_root = false;
+    if (refused == 0) { ret; }
+    # a refused removal waits for the next release of this shard to try again
+    mutex.lock(?shard.lock);
+    i = 0;
+    for (i < refused) {
+        shard.entries[batch[i]].unlink_waiting = true;
+        i                                      = i + 1;
     }
-    store.body_used = 0;
-    store.disk_used = 0;
-    store.live      = false;
-    ret true;
+    shard.unlinks_waiting = shard.unlinks_waiting + refused;
+    mutex.unlock(?shard.lock);
 }
 
-fun tick(store: *Store) u64 {
-    store.clock = store.clock + 1;
-    ret store.clock;
+fun tick(shard: *Shard) u64 {
+    shard.clock = shard.clock + 1;
+    ret shard.clock;
 }
 
-fun name_for(entry: *Entry, sequence: u64) {
-    var digits: usize = 1;
-    var scale:  u64   = sequence;
+fun name_for(store: *Store, entry: *Entry) {
+    val sequence: u64   = (atomic.fetch_add(?store.sequence, 1) + 1)::u64;
+    var digits:   usize = 1;
+    var scale:    u64   = sequence;
     for (scale >= 10) {
         scale  = scale / 10;
         digits = digits + 1;
@@ -293,122 +394,165 @@ fun name_for(entry: *Entry, sequence: u64) {
     entry.disk_name_length      = 1 + digits;
 }
 
-# the file name is derived from a counter, never from request data, so no path
-# here is ever chosen by a client
-fun remove_named(store: *Store, name: str) {
-    if (!store.has_root || store.root_path_length == 0 || name == nil) { ret; }
-    var path: [320]u8;
-    var at:   usize = 0;
-    for (at < store.root_path_length) {
-        path[at] = store.root_path[at];
-        at       = at + 1;
-    }
-    path[at] = '/';
-    at       = at + 1;
+# return removed files' slots and disk charges. a slot is reusable only once its
+# file is gone, so the disk bound counts a file until it no longer exists
+fun reap(shard: *Shard) {
+    if (shard.unlinking == 0) { ret; }
     var i: usize = 0;
-    for (name[i] != 0) {
-        if (at + i + 1 >= 320) { ret; }
-        path[at + i] = name[i];
-        i            = i + 1;
+    for (i < shard.capacity) {
+        val entry: *Entry = ?shard.entries[i];
+        if (entry.state == UNLINKING && !entry.unlink_waiting && disk.done(?entry.unlink)) {
+            if (shard.disk_used >= entry.reserved) {
+                shard.disk_used = shard.disk_used - entry.reserved;
+            }
+            or { shard.disk_used = 0; }
+            entry.state     = EMPTY;
+            entry.reserved  = 0;
+            shard.unlinking = shard.unlinking - 1;
+        }
+        i = i + 1;
     }
-    path[at + i] = 0;
-    filesystem.remove_file((?path[0])::str);
-}
-
-fun remove_file(store: *Store, entry: *Entry) {
-    if (entry.disk_name_length == 0) { ret; }
-    remove_named(store, (?entry.disk_name[0])::str);
 }
 
 # reclaim exactly what was reserved for this entry, not what was written into it:
 # an abandoned partial write reserved the whole declared length
-fun reclaim(store: *Store, index: usize) {
-    val entry: *Entry = ?store.entries[index];
-    if (entry.state == EMPTY) { ret; }
-    if (entry.placement == IN_MEMORY) {
-        compact(store, entry.body_offset, entry.reserved);
-    }
-    or {
-        remove_file(store, entry);
-        if (store.disk_used >= entry.reserved) {
-            store.disk_used = store.disk_used - entry.reserved;
-        }
-        or { store.disk_used = 0; }
-    }
-    entry.state           = EMPTY;
+fun reclaim(shard: *Shard, index: usize) {
+    val entry: *Entry = ?shard.entries[index];
+    if (entry.state == EMPTY || entry.state == UNLINKING) { ret; }
     entry.body_length     = 0;
-    entry.reserved        = 0;
     entry.revalidating    = false;
     entry.readers         = 0;
     entry.discard_pending = false;
+    if (entry.placement == IN_MEMORY) {
+        compact(shard, entry.body_offset, entry.reserved);
+        entry.state    = EMPTY;
+        entry.reserved = 0;
+        ret;
+    }
+    if (entry.disk_name_length == 0) {
+        if (shard.disk_used >= entry.reserved) { shard.disk_used = shard.disk_used - entry.reserved; }
+        or                                     { shard.disk_used = 0; }
+        entry.state    = EMPTY;
+        entry.reserved = 0;
+        ret;
+    }
+    entry.unlink    = disk.idle();
+    entry.unlink.op = disk.UNLINK;
+    disk.set_name(?entry.unlink, ?entry.disk_name[0], entry.disk_name_length);
+    entry.state           = UNLINKING;
+    entry.unlink_waiting  = true;
+    shard.unlinking       = shard.unlinking + 1;
+    shard.unlinks_waiting = shard.unlinks_waiting + 1;
 }
 
-fun discard(store: *Store, index: usize) {
-    val entry: *Entry = ?store.entries[index];
-    if (entry.state == EMPTY) { ret; }
-    if (entry.state == READY && entry.readers != 0) {
+fun discard(shard: *Shard, index: usize) {
+    val entry: *Entry = ?shard.entries[index];
+    if (entry.state == EMPTY || entry.state == UNLINKING) { ret; }
+    if ((entry.state == READY || entry.state == RETIRED) && entry.readers != 0) {
         entry.state           = RETIRED;
         entry.revalidating    = false;
         entry.discard_pending = true;
         ret;
     }
-    reclaim(store, index);
+    reclaim(shard, index);
 }
 
 # discard exactly one selected representation after a matched validation makes
 # its stored metadata unusable; sibling variants remain independently valid
-pub fun discard_entry(store: *Store, index: usize) bool {
-    if (entry_at(store, index) == nil) { ret false; }
-    discard(store, index);
+pub fun discard_entry(shard: *Shard, index: usize) bool {
+    if (entry_at(shard, index) == nil) { ret false; }
+    discard(shard, index);
     ret true;
 }
 
 # the memory arena is compacted on release, so the budget is exact rather than
 # a high-water mark that fragmentation would push past
-fun compact(store: *Store, offset: usize, length: usize) {
+fun compact(shard: *Shard, offset: usize, length: usize) {
     if (length == 0) { ret; }
     val tail: usize = offset + length;
-    var i:    usize = tail;
-    for (i < store.body_used) {
-        store.body[i - length] = store.body[i];
-        i                      = i + 1;
+    if (tail < shard.body_used) {
+        memory.raw_move((?shard.body[offset])::ptr, (?shard.body[tail])::ptr,
+            shard.body_used - tail);
     }
-    store.body_used = store.body_used - length;
+    shard.body_used = shard.body_used - length;
+    $if ($mach.build.mode == $mach.mode.debug) {
+        memory.raw_fill((?shard.body[shard.body_used])::ptr, POISON, length);
+    }
     var e: usize = 0;
-    for (e < store.capacity) {
-        val other: *Entry = ?store.entries[e];
-        if (other.state != EMPTY && other.placement == IN_MEMORY && other.body_offset >= tail) {
+    for (e < shard.capacity) {
+        val other: *Entry = ?shard.entries[e];
+        if (other.state != EMPTY && other.state != UNLINKING
+            && other.placement == IN_MEMORY && other.body_offset >= tail) {
             other.body_offset = other.body_offset - length;
         }
         e = e + 1;
     }
 }
 
-fun evict_one(store: *Store) bool {
+fun evict_one(shard: *Shard) bool {
     var oldest: usize = NO_ENTRY;
     var i:      usize = 0;
-    for (i < store.capacity) {
-        val entry: *Entry = ?store.entries[i];
+    for (i < shard.capacity) {
+        val entry: *Entry = ?shard.entries[i];
         if (entry.state == READY && !entry.revalidating
-            && (oldest == NO_ENTRY || entry.used_at < store.entries[oldest].used_at)) {
+            && (oldest == NO_ENTRY || entry.used_at < shard.entries[oldest].used_at)) {
             oldest = i;
         }
         i = i + 1;
     }
     if (oldest == NO_ENTRY) { ret false; }
-    discard(store, oldest);
-    store.evictions = store.evictions + 1;
+    discard(shard, oldest);
+    shard.evictions = shard.evictions + 1;
     ret true;
 }
 
-fun free_slot(store: *Store) usize {
+fun empty_slot(shard: *Shard) usize {
     var i: usize = 0;
-    for (i < store.capacity) {
-        if (store.entries[i].state == EMPTY) { ret i; }
+    for (i < shard.capacity) {
+        if (shard.entries[i].state == EMPTY) { ret i; }
         i = i + 1;
     }
-    if (!evict_one(store)) { ret NO_ENTRY; }
-    ret free_slot(store);
+    ret NO_ENTRY;
+}
+
+# the disk bytes of entries whose files are being removed
+fun leaving(shard: *Shard) usize {
+    if (shard.unlinking == 0) { ret 0; }
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < shard.capacity) {
+        if (shard.entries[i].state == UNLINKING) { total = total + shard.entries[i].reserved; }
+        i = i + 1;
+    }
+    ret total;
+}
+
+# submit the removals this shard's reclaims queued and take back what has
+# finished. the lock is let go for the submissions, so the caller must look
+# again at anything it read before
+fun flush(shard: *Shard) {
+    release(shard);
+    lock(shard);
+    reap(shard);
+}
+
+fun free_slot(shard: *Shard) usize {
+    reap(shard);
+    var flushed: bool  = false;
+    var slot:    usize = empty_slot(shard);
+    for (slot == NO_ENTRY) {
+        # a slot on its way out comes back once its file is removed
+        if (shard.unlinking != 0 && !flushed) {
+            flush(shard);
+            flushed = true;
+        }
+        or {
+            if (!evict_one(shard)) { ret NO_ENTRY; }
+            flushed = false;
+        }
+        slot = empty_slot(shard);
+    }
+    ret slot;
 }
 
 # the next entry at or after `from` whose key is this one
@@ -417,64 +561,257 @@ fun free_slot(store: *Store) usize {
 # store hands back every candidate rather than the first, because only the caller
 # knows which selecting values the current request negotiates to, and answering
 # with the first is how a client is served someone else's representation.
-pub fun find_from(store: *Store, identity: *key.Key, from: usize) usize {
-    if (!enabled(store) || identity == nil || !identity.valid) { ret NO_ENTRY; }
+pub fun find_from(shard: *Shard, identity: *key.Key, from: usize) usize {
+    if (shard == nil || identity == nil || !identity.valid) { ret NO_ENTRY; }
     var i: usize = from;
-    for (i < store.capacity) {
-        val entry: *Entry = ?store.entries[i];
+    for (i < shard.capacity) {
+        val entry: *Entry = ?shard.entries[i];
         if (entry.state == READY && key.equal(?entry.identity, identity)) { ret i; }
         i = i + 1;
     }
     ret NO_ENTRY;
 }
 
-pub fun lookup(store: *Store, identity: *key.Key) usize {
-    ret find_from(store, identity, 0);
+pub fun lookup(shard: *Shard, identity: *key.Key) usize {
+    ret find_from(shard, identity, 0);
 }
 
-pub fun entry_at(store: *Store, index: usize) *Entry {
-    if (!enabled(store) || index >= store.capacity
-        || store.entries[index].state != READY) { ret nil; }
-    ret ?store.entries[index];
+pub fun entry_at(shard: *Shard, index: usize) *Entry {
+    if (shard == nil || index >= shard.capacity
+        || shard.entries[index].state != READY) { ret nil; }
+    ret ?shard.entries[index];
 }
 
-pub fun touch(store: *Store, index: usize) bool {
-    val entry: *Entry = entry_at(store, index);
+pub fun touch(shard: *Shard, index: usize) bool {
+    val entry: *Entry = entry_at(shard, index);
     if (entry == nil) { ret false; }
-    entry.used_at = tick(store);
+    entry.used_at = tick(shard);
     ret true;
 }
 
-pub fun mark_refreshed(store: *Store, index: usize) bool {
-    val entry: *Entry = entry_at(store, index);
+pub fun mark_refreshed(shard: *Shard, index: usize) bool {
+    val entry: *Entry = entry_at(shard, index);
     if (entry == nil) { ret false; }
-    entry.used_at   = tick(store);
+    entry.used_at   = tick(shard);
     entry.stored_at = entry.used_at;
     ret true;
 }
 
-pub fun record_hit(store: *Store) {
-    if (enabled(store)) { store.hits = store.hits + 1; }
+pub fun record_hit(shard: *Shard) {
+    if (shard != nil) { shard.hits = shard.hits + 1; }
 }
 
-pub fun record_miss(store: *Store) {
-    if (enabled(store)) { store.misses = store.misses + 1; }
+pub fun record_miss(shard: *Shard) {
+    if (shard != nil) { shard.misses = shard.misses + 1; }
+}
+
+# --- pinned reading ---
+
+# one reader's hold on an entry. while it is held the entry's slot, bytes and
+# file stay what they were when it was taken, whatever happens to the index
+pub rec Pin {
+    shard: *Shard;
+    index: usize;
+    held:  bool;
+}
+
+pub fun no_pin() Pin {
+    ret Pin{shard: nil, index: NO_ENTRY, held: false};
+}
+
+pub fun pin(shard: *Shard, index: usize) Pin {
+    val entry: *Entry = entry_at(shard, index);
+    if (entry == nil || entry.readers == (-1)::usize) { ret no_pin(); }
+    entry.readers = entry.readers + 1;
+    ret Pin{shard: shard, index: index, held: true};
+}
+
+# release a pin with its shard's lock held. the last pin on a discarded entry
+# frees its bytes here, once
+pub fun unpin_locked(held: *Pin) bool {
+    if (held == nil || !held.held) { ret false; }
+    val shard: *Shard = held.shard;
+    val entry: *Entry = ?shard.entries[held.index];
+    held.held = false;
+    if ((entry.state != READY && entry.state != RETIRED) || entry.readers == 0) {
+        ret false;
+    }
+    entry.readers = entry.readers - 1;
+    if (entry.readers == 0 && entry.state == RETIRED && entry.discard_pending) {
+        reclaim(shard, held.index);
+    }
+    ret true;
+}
+
+pub fun unpin(held: *Pin) bool {
+    if (held == nil || !held.held) { ret false; }
+    val shard: *Shard = held.shard;
+    lock(shard);
+    val released: bool = unpin_locked(held);
+    release(shard);
+    ret released;
+}
+
+# end a revalidation: the entry is no longer being revalidated, and the
+# revalidation's pin on it is let go
+pub fun end_revalidation(held: *Pin) bool {
+    if (held == nil || !held.held) { ret false; }
+    val shard: *Shard = held.shard;
+    lock(shard);
+    val entry: *Entry = ?shard.entries[held.index];
+    if (entry.state == READY) { entry.revalidating = false; }
+    val released: bool = unpin_locked(held);
+    release(shard);
+    ret released;
+}
+
+# the index a held pin names, or NO_ENTRY once its entry has left the index
+pub fun pinned_index(shard: *Shard, held: *Pin) usize {
+    if (held == nil || !held.held || held.shard != shard
+        || entry_at(shard, held.index) == nil) { ret NO_ENTRY; }
+    ret held.index;
+}
+
+pub def ReadStatus: u8;
+pub val READ_DONE:    ReadStatus = 1;
+pub val READ_PENDING: ReadStatus = 2;
+pub val READ_FAILED:  ReadStatus = 3;
+
+fun readable(entry: *Entry) bool {
+    ret entry.state == READY || (entry.state == RETIRED && entry.readers != 0);
+}
+
+# read up to `capacity` body bytes at `offset` through a pin. a memory entry is
+# copied out of the arena under the shard lock. a disk entry is read by
+# `request`, which answers READ_PENDING when it is queued: `waker` is woken
+# once it completes and `read_settled` then gives its result
+pub fun read_body(held: *Pin, offset: usize, output: *u8, capacity: usize,
+    request: *disk.Request, waker: wake.Waker, produced: *usize) ReadStatus {
+    if (produced == nil) { ret READ_FAILED; }
+    @produced = 0;
+    if (held == nil || !held.held || (capacity != 0 && output == nil)) { ret READ_FAILED; }
+    val shard: *Shard = held.shard;
+    lock(shard);
+    val entry: *Entry = ?shard.entries[held.index];
+    if (!readable(entry) || offset > entry.body_length) {
+        release(shard);
+        ret READ_FAILED;
+    }
+    var count: usize = entry.body_length - offset;
+    if (count > capacity) { count = capacity; }
+    if (count == 0) {
+        release(shard);
+        ret READ_DONE;
+    }
+    if (entry.placement == IN_MEMORY) {
+        memory.raw_copy(output::ptr, (?shard.body[entry.body_offset + offset])::ptr, count);
+        release(shard);
+        @produced = count;
+        ret READ_DONE;
+    }
+    if (request == nil || disk.in_flight(request)
+        || !disk.set_name(request, ?entry.disk_name[0], entry.disk_name_length)) {
+        release(shard);
+        ret READ_FAILED;
+    }
+    release(shard);
+    request.op     = disk.READ;
+    request.data   = output;
+    request.length = count;
+    request.offset = offset::u64;
+    request.waker  = waker;
+    val submitted: disk.Submitted = disk.submit(?shard.store.disk, request);
+    if (submitted == disk.SUBMIT_QUEUED)  { ret READ_PENDING; }
+    if (submitted == disk.SUBMIT_REFUSED) { ret READ_FAILED; }
+    ret read_settled(request, produced);
+}
+
+pub fun read_settled(request: *disk.Request, produced: *usize) ReadStatus {
+    if (produced == nil || request == nil) { ret READ_FAILED; }
+    @produced = 0;
+    if (disk.in_flight(request))            { ret READ_PENDING; }
+    if (!disk.done(request) || !request.ok) { ret READ_FAILED; }
+    @produced = request.produced;
+    ret READ_DONE;
+}
+
+# what a response needs from a stored entry, copied while its shard is locked so
+# nothing a response points into changes under it when the entry is refreshed
+pub rec Snapshot {
+    status:              status.Status;
+    metadata:            policy.Metadata;
+    placement:           Placement;
+    body_length:         usize;
+    field_names:         [MAX_STORED_FIELDS]usize;
+    field_name_lengths:  [MAX_STORED_FIELDS]usize;
+    field_values:        [MAX_STORED_FIELDS]usize;
+    field_value_lengths: [MAX_STORED_FIELDS]usize;
+    field_count:         usize;
+    field_length:        usize;
+    field_bytes:         *u8;
+}
+
+# copy an entry's description, and its field bytes into `fields`, which holds at
+# least `entry.field_length` bytes
+pub fun snapshot(entry: *Entry, fields: *u8, output: *Snapshot) bool {
+    if (entry == nil || output == nil || (entry.field_length != 0 && fields == nil)) {
+        ret false;
+    }
+    output.status       = entry.status;
+    output.metadata     = entry.metadata;
+    output.placement    = entry.placement;
+    output.body_length  = entry.body_length;
+    output.field_count  = entry.field_count;
+    output.field_length = entry.field_length;
+    output.field_bytes  = fields;
+    var i: usize = 0;
+    for (i < entry.field_count) {
+        output.field_names[i]         = entry.field_names[i];
+        output.field_name_lengths[i]  = entry.field_name_lengths[i];
+        output.field_values[i]        = entry.field_values[i];
+        output.field_value_lengths[i] = entry.field_value_lengths[i];
+        i                             = i + 1;
+    }
+    if (entry.field_length != 0) {
+        memory.raw_copy(fields::ptr, (?entry.field_bytes[0])::ptr, entry.field_length);
+    }
+    ret true;
 }
 
 # --- writing an entry ---
 
+pub def Written: u8;
+pub val WRITE_DONE:    Written = 1;
+pub val WRITE_PENDING: Written = 2;
+pub val WRITE_FAILED:  Written = 3;
+
+# one entry being recorded. it belongs to whoever records it: nothing else writes
+# its body, and it is published to its shard only by `commit`
 pub rec Writer {
-    store:  *Store;
-    index:  usize;
-    active: bool;
+    store:     *Store;
+    shard:     *Shard;
+    index:     usize;
+    active:    bool;
+    placement: Placement;
+    reserved:  usize;
+    written:   usize;
+    pending:   bool;
+    request:   disk.Request;
 }
 
 fun no_writer() Writer {
-    ret Writer{store: nil, index: NO_ENTRY, active: false};
+    ret Writer{store: nil, shard: nil, index: NO_ENTRY, active: false, placement: IN_MEMORY,
+        reserved: 0, written: 0, pending: false, request: disk.idle()};
 }
 
-fun fits_memory(store: *Store, length: usize) bool {
-    ret store.body_used + length <= store.limits.memory_bytes;
+fun fits_memory(shard: *Shard, length: usize) bool {
+    ret shard.body_used + length <= memory_budget(shard);
+}
+
+fun reject(shard: *Shard) Writer {
+    shard.rejections = shard.rejections + 1;
+    release(shard);
+    ret no_writer();
 }
 
 # open an entry for writing, evicting until it fits or refusing outright
@@ -483,44 +820,40 @@ pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
     placement: Placement) Writer {
     if (!enabled(store) || identity == nil || !identity.valid || dimensions == nil
         || !dimensions.valid) { ret no_writer(); }
-    if (declared_length > store.limits.max_entry_bytes) {
-        store.rejections = store.rejections + 1;
-        ret no_writer();
-    }
     var chosen: Placement = placement;
-    if (chosen == ON_DISK && (!store.has_root || store.limits.disk_bytes == 0)) {
+    if (chosen == ON_DISK && (!disk_ready(store) || store.limits.disk_bytes == 0)) {
         chosen = IN_MEMORY;
     }
+    val shard: *Shard = acquire(store, identity);
+    if (shard == nil)                                   { ret no_writer(); }
+    if (declared_length > store.limits.max_entry_bytes) { ret reject(shard); }
     if (chosen == IN_MEMORY) {
-        if (declared_length > store.limits.memory_bytes) {
-            store.rejections = store.rejections + 1;
-            ret no_writer();
+        if (declared_length > memory_budget(shard) || declared_length > shard.body_capacity) {
+            ret reject(shard);
         }
-        for (!fits_memory(store, declared_length)) {
-            if (!evict_one(store)) {
-                store.rejections = store.rejections + 1;
-                ret no_writer();
-            }
+        for (!fits_memory(shard, declared_length)) {
+            if (!evict_one(shard)) { ret reject(shard); }
         }
     }
     or {
-        if (declared_length > store.limits.disk_bytes) {
-            store.rejections = store.rejections + 1;
-            ret no_writer();
-        }
-        for (store.disk_used + declared_length > store.limits.disk_bytes) {
-            if (!evict_one(store)) {
-                store.rejections = store.rejections + 1;
-                ret no_writer();
+        if (declared_length > disk_budget(shard)) { ret reject(shard); }
+        reap(shard);
+        var flushed: bool = false;
+        for (shard.disk_used + declared_length > disk_budget(shard)) {
+            # a file counts until it is gone, so once what is on its way out
+            # would make room, its removal is submitted and taken back. a
+            # removal still in flight after that refuses the admission
+            if (shard.disk_used - leaving(shard) + declared_length <= disk_budget(shard)) {
+                if (flushed) { ret reject(shard); }
+                flush(shard);
+                flushed = true;
             }
+            or (!evict_one(shard)) { ret reject(shard); }
         }
     }
-    val index: usize = free_slot(store);
-    if (index == NO_ENTRY) {
-        store.rejections = store.rejections + 1;
-        ret no_writer();
-    }
-    val entry: *Entry = ?store.entries[index];
+    val index: usize = free_slot(shard);
+    if (index == NO_ENTRY) { ret reject(shard); }
+    val entry: *Entry = ?shard.entries[index];
     entry.state            = WRITING;
     entry.placement        = chosen;
     entry.identity         = @identity;
@@ -534,27 +867,42 @@ pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
     entry.revalidating     = false;
     entry.readers          = 0;
     entry.discard_pending  = false;
-    entry.used_at          = tick(store);
+    entry.unlink_waiting   = false;
+    entry.used_at          = tick(shard);
     entry.stored_at        = entry.used_at;
     entry.reserved         = declared_length;
+    var writer: Writer = no_writer();
     if (chosen == IN_MEMORY) {
-        entry.body_offset = store.body_used;
-        store.body_used   = store.body_used + declared_length;
+        entry.body_offset = shard.body_used;
+        shard.body_used   = shard.body_used + declared_length;
     }
     or {
         entry.body_offset = 0;
-        name_for(entry, entry.used_at);
-        store.disk_used = store.disk_used + declared_length;
+        name_for(store, entry);
+        shard.disk_used = shard.disk_used + declared_length;
+        disk.set_name(?writer.request, ?entry.disk_name[0], entry.disk_name_length);
     }
-    entry.body_length = 0;
-    ret Writer{store: store, index: index, active: true};
+    release(shard);
+    writer.store     = store;
+    writer.shard     = shard;
+    writer.index     = index;
+    writer.active    = true;
+    writer.placement = chosen;
+    writer.reserved  = declared_length;
+    writer.written   = 0;
+    ret writer;
 }
 
 pub fun add_field(writer: *Writer, name: view.View, value: view.View) bool {
     if (writer == nil || !writer.active) { ret false; }
-    val entry: *Entry = ?writer.store.entries[writer.index];
+    val shard: *Shard = writer.shard;
+    lock(shard);
+    val entry: *Entry = ?shard.entries[writer.index];
     if (entry.field_count >= MAX_STORED_FIELDS
-        || entry.field_length + name.len + value.len > MAX_FIELD_BYTES) { ret false; }
+        || entry.field_length + name.len + value.len > MAX_FIELD_BYTES) {
+        release(shard);
+        ret false;
+    }
     entry.field_names[entry.field_count]        = entry.field_length;
     entry.field_name_lengths[entry.field_count] = name.len;
     var i: usize = 0;
@@ -572,47 +920,64 @@ pub fun add_field(writer: *Writer, name: view.View, value: view.View) bool {
     }
     entry.field_length = entry.field_length + value.len;
     entry.field_count  = entry.field_count + 1;
+    release(shard);
     ret true;
 }
 
-pub fun write_body(writer: *Writer, data: *u8, length: usize) bool {
-    if (writer == nil || !writer.active || (length != 0 && data == nil)) { ret false; }
-    if (length == 0)                                                     { ret true; }
-    val store: *Store = writer.store;
-    val entry: *Entry = ?store.entries[writer.index];
+# append body bytes. a memory entry is written into its shard's arena under the
+# lock. a disk entry's bytes are written by the writer's request: `data` must
+# stay untouched until the write settles, and WRITE_PENDING means `waker` is
+# woken once it has, after which `settle_write` gives the result
+pub fun write_body(writer: *Writer, data: *u8, length: usize, waker: wake.Waker) Written {
+    if (writer == nil || !writer.active || writer.pending || (length != 0 && data == nil)) {
+        ret WRITE_FAILED;
+    }
+    if (length == 0) { ret WRITE_DONE; }
     # the arena belongs to the store, so the store enforces the reservation: a
     # writer that ran past its declared length would otherwise write over the
     # bytes of whichever entry was admitted after it
-    if (length > entry.reserved - entry.body_length) { ret false; }
-    if (entry.placement == IN_MEMORY) {
-        if (entry.body_offset + entry.body_length + length > store.body_capacity) { ret false; }
-        var i: usize = 0;
-        for (i < length) {
-            store.body[entry.body_offset + entry.body_length + i] = data[i];
-            i                                                     = i + 1;
+    if (length > writer.reserved - writer.written) { ret WRITE_FAILED; }
+    if (writer.placement == IN_MEMORY) {
+        val shard: *Shard = writer.shard;
+        lock(shard);
+        val entry: *Entry = ?shard.entries[writer.index];
+        if (entry.state != WRITING
+            || entry.body_offset + writer.written + length > shard.body_capacity) {
+            release(shard);
+            ret WRITE_FAILED;
         }
-        entry.body_length = entry.body_length + length;
-        ret true;
+        memory.raw_copy((?shard.body[entry.body_offset + writer.written])::ptr, data::ptr, length);
+        release(shard);
+        writer.written = writer.written + length;
+        ret WRITE_DONE;
     }
-    # not redundant with `begin`, which is the reason it looks it: `begin` chooses
-    # disk placement only when a root is attached, so today nothing reaches here
-    # without one. That fact lives in another function. `disabled` never assigns
-    # `root`, so if `begin`'s placement rule ever changes this opens a handle that
-    # was never opened. The root is this function's precondition and it checks it.
-    if (!store.has_root) { ret false; }
-    var options: file.OpenOptions = file.write_options(420);
-    if (entry.body_length == 0) { options.truncate = true; }
-    val opened: res[filesystem.File, io_error.Error] = file.open_confined(
-        ?store.root, (?entry.disk_name[0])::str, options);
-    if (sel opened.err) { ret false; }
-    var handle:  filesystem.File            = opened.ok;
-    val written: res[usize, io_error.Error] = file.write_at(handle, data, length,
-        entry.body_length::u64);
-    filesystem.close(?handle);
-    if (sel written.err)      { ret false; }
-    if (written.ok != length) { ret false; }
-    entry.body_length = entry.body_length + length;
-    ret true;
+    writer.request.op       = disk.WRITE;
+    writer.request.data     = data;
+    writer.request.length   = length;
+    writer.request.offset   = writer.written::u64;
+    writer.request.truncate = writer.written == 0;
+    writer.request.waker    = waker;
+    val submitted: disk.Submitted = disk.submit(?writer.store.disk, ?writer.request);
+    if (submitted == disk.SUBMIT_REFUSED) { ret WRITE_FAILED; }
+    writer.pending = true;
+    if (submitted == disk.SUBMIT_QUEUED) { ret WRITE_PENDING; }
+    ret settle_write(writer);
+}
+
+pub fun settle_write(writer: *Writer) Written {
+    if (writer == nil || !writer.active) { ret WRITE_FAILED; }
+    if (!writer.pending)                 { ret WRITE_DONE; }
+    if (disk.in_flight(?writer.request)) { ret WRITE_PENDING; }
+    writer.pending = false;
+    if (!writer.request.ok || writer.request.produced != writer.request.length) {
+        ret WRITE_FAILED;
+    }
+    writer.written = writer.written + writer.request.length;
+    ret WRITE_DONE;
+}
+
+pub fun write_pending(writer: *Writer) bool {
+    ret writer != nil && writer.active && writer.pending;
 }
 
 # drop every other stored entry that is the same representation of the same
@@ -620,16 +985,16 @@ pub fun write_body(writer: *Writer, data: *u8, length: usize) bool {
 #
 # without this a revalidation leaves the response it refreshed in place, and a
 # later lookup can still find and serve the superseded copy.
-fun supersede(store: *Store, keep: usize) {
-    val fresh: *Entry = ?store.entries[keep];
+fun supersede(shard: *Shard, keep: usize) {
+    val fresh: *Entry = ?shard.entries[keep];
     var i:     usize  = 0;
-    for (i < store.capacity) {
+    for (i < shard.capacity) {
         if (i != keep) {
-            val other: *Entry = ?store.entries[i];
+            val other: *Entry = ?shard.entries[i];
             if (other.state == READY && !other.revalidating
                 && key.equal(?other.identity, ?fresh.identity)
                 && key.dimensions_equal(?other.dimensions, ?fresh.dimensions)) {
-                discard(store, i);
+                discard(shard, i);
             }
         }
         i = i + 1;
@@ -637,115 +1002,151 @@ fun supersede(store: *Store, keep: usize) {
 }
 
 # an entry becomes visible only here, and only when its length is exactly what
-# was declared: a partial write is discarded rather than published short
+# was declared: a partial write is discarded rather than published short. a
+# write still in flight must settle first
 pub fun commit(writer: *Writer) bool {
-    if (writer == nil || !writer.active) { ret false; }
-    val store: *Store = writer.store;
-    val entry: *Entry = ?store.entries[writer.index];
+    if (writer == nil || !writer.active || writer.pending) { ret false; }
+    val shard: *Shard = writer.shard;
     writer.active = false;
-    if (entry.body_length != entry.reserved) {
-        discard(store, writer.index);
-        store.partial_discards = store.partial_discards + 1;
+    lock(shard);
+    val entry: *Entry = ?shard.entries[writer.index];
+    entry.body_length = writer.written;
+    if (writer.written != writer.reserved) {
+        discard(shard, writer.index);
+        shard.partial_discards = shard.partial_discards + 1;
+        release(shard);
         ret false;
     }
     entry.state = READY;
-    supersede(store, writer.index);
-    store.stores = store.stores + 1;
+    supersede(shard, writer.index);
+    shard.stores = shard.stores + 1;
+    release(shard);
     ret true;
 }
 
 pub fun abandon(writer: *Writer) bool {
-    if (writer == nil || !writer.active) { ret false; }
-    val store: *Store = writer.store;
+    if (writer == nil || !writer.active || writer.pending) { ret false; }
+    val shard: *Shard = writer.shard;
     writer.active = false;
-    discard(store, writer.index);
-    store.partial_discards = store.partial_discards + 1;
-    ret true;
-}
-
-pub fun read_body(store: *Store, index: usize, offset: usize, output: *u8,
-    capacity: usize, produced: *usize) bool {
-    if (produced == nil) { ret false; }
-    @produced = 0;
-    if (!enabled(store) || index >= store.capacity) { ret false; }
-    val entry: *Entry = ?store.entries[index];
-    if (entry.state != READY && !(entry.state == RETIRED && entry.readers != 0)) {
-        ret false;
-    }
-    if (offset > entry.body_length) { ret false; }
-    var count: usize = entry.body_length - offset;
-    if (count > capacity) { count = capacity; }
-    if (count == 0)       { ret true; }
-    if (entry.placement == IN_MEMORY) {
-        var i: usize = 0;
-        for (i < count) {
-            output[i] = store.body[entry.body_offset + offset + i];
-            i         = i + 1;
-        }
-        @produced = count;
-        ret true;
-    }
-    if (!store.has_root) { ret false; }
-    val opened: res[filesystem.File, io_error.Error] = file.open_confined(
-        ?store.root, (?entry.disk_name[0])::str, file.read_options());
-    if (sel opened.err) { ret false; }
-    var handle: filesystem.File            = opened.ok;
-    val read:   res[usize, io_error.Error] = file.read_at(handle, output, count, offset::u64);
-    filesystem.close(?handle);
-    if (sel read.err) { ret false; }
-    @produced = read.ok;
-    ret true;
-}
-
-pub fun pin(store: *Store, index: usize) bool {
-    val entry: *Entry = entry_at(store, index);
-    if (entry == nil || entry.readers == (-1)::usize) { ret false; }
-    entry.readers = entry.readers + 1;
-    ret true;
-}
-
-pub fun unpin(store: *Store, index: usize) bool {
-    if (!enabled(store) || index >= store.capacity) { ret false; }
-    val entry: *Entry = ?store.entries[index];
-    if ((entry.state != READY && entry.state != RETIRED) || entry.readers == 0) {
-        ret false;
-    }
-    entry.readers = entry.readers - 1;
-    if (entry.readers == 0 && entry.state == RETIRED && entry.discard_pending) {
-        reclaim(store, index);
-    }
+    lock(shard);
+    discard(shard, writer.index);
+    shard.partial_discards = shard.partial_discards + 1;
+    release(shard);
     ret true;
 }
 
 pub fun invalidate(store: *Store, identity: *key.Key) usize {
-    if (!enabled(store) || identity == nil || !identity.valid) { ret 0; }
+    val shard: *Shard = acquire(store, identity);
+    if (shard == nil) { ret 0; }
     var removed: usize = 0;
     var i:       usize = 0;
-    for (i < store.capacity) {
-        val entry: *Entry = ?store.entries[i];
+    for (i < shard.capacity) {
+        val entry: *Entry = ?shard.entries[i];
         if (entry.state == READY && key.equal(?entry.identity, identity)) {
-            discard(store, i);
+            discard(shard, i);
             removed = removed + 1;
         }
         i = i + 1;
     }
+    release(shard);
     ret removed;
 }
 
-pub fun live_entries(store: *Store) usize {
-    if (!enabled(store)) { ret 0; }
-    var total: usize = 0;
-    var i:     usize = 0;
-    for (i < store.capacity) {
-        if (store.entries[i].state == READY) { total = total + 1; }
-        i = i + 1;
+# --- the whole store ---
+
+pub rec Totals {
+    hits:             u64;
+    misses:           u64;
+    stores:           u64;
+    evictions:        u64;
+    rejections:       u64;
+    partial_discards: u64;
+    entries:          usize;
+    memory_bytes:     usize;
+    disk_bytes:       usize;
+}
+
+pub fun totals(store: *Store) Totals {
+    var sum: Totals = Totals{hits: 0, misses: 0, stores: 0, evictions: 0, rejections: 0,
+        partial_discards: 0, entries: 0, memory_bytes: 0, disk_bytes: 0};
+    if (!enabled(store)) { ret sum; }
+    var s: usize = 0;
+    for (s < store.shard_count) {
+        val shard: *Shard = ?store.shards[s];
+        lock(shard);
+        reap(shard);
+        sum.hits             = sum.hits + shard.hits;
+        sum.misses           = sum.misses + shard.misses;
+        sum.stores           = sum.stores + shard.stores;
+        sum.evictions        = sum.evictions + shard.evictions;
+        sum.rejections       = sum.rejections + shard.rejections;
+        sum.partial_discards = sum.partial_discards + shard.partial_discards;
+        sum.memory_bytes     = sum.memory_bytes + shard.body_used;
+        sum.disk_bytes       = sum.disk_bytes + shard.disk_used;
+        var i: usize = 0;
+        for (i < shard.capacity) {
+            if (shard.entries[i].state == READY) { sum.entries = sum.entries + 1; }
+            i = i + 1;
+        }
+        release(shard);
+        s = s + 1;
     }
-    ret total;
+    ret sum;
+}
+
+pub fun live_entries(store: *Store) usize {
+    ret totals(store).entries;
 }
 
 pub fun memory_used(store: *Store) usize {
-    if (!enabled(store)) { ret 0; }
-    ret store.body_used;
+    ret totals(store).memory_bytes;
+}
+
+# close the store, removing every disk file it wrote. refused while a reader
+# holds a pin, and while a file removal has not finished (a later call finishes
+# the close)
+pub fun close(store: *Store) bool {
+    if (!enabled(store)) { ret false; }
+    var s: usize = 0;
+    for (s < store.shard_count) {
+        val shard: *Shard = ?store.shards[s];
+        lock(shard);
+        var i: usize = 0;
+        for (i < shard.capacity) {
+            if (shard.entries[i].state != EMPTY && shard.entries[i].state != UNLINKING
+                && shard.entries[i].readers != 0) {
+                release(shard);
+                ret false;
+            }
+            i = i + 1;
+        }
+        release(shard);
+        s = s + 1;
+    }
+    var finished: bool = true;
+    s = 0;
+    for (s < store.shard_count) {
+        val shard: *Shard = ?store.shards[s];
+        lock(shard);
+        var i: usize = 0;
+        for (i < shard.capacity) {
+            reclaim(shard, i);
+            i = i + 1;
+        }
+        release(shard);
+        lock(shard);
+        reap(shard);
+        if (shard.unlinking != 0) { finished = false; }
+        release(shard);
+        s = s + 1;
+    }
+    if (!finished) { ret false; }
+    if (store.has_root) {
+        disk.close(?store.disk);
+        store.has_root = false;
+    }
+    store.live = false;
+    ret true;
 }
 
 # --- tests ---
@@ -764,7 +1165,7 @@ fun open_store(fixture: *Fixture, memory_bytes: usize, entries: usize) bool {
     limits.memory_bytes    = memory_bytes;
     limits.max_entry_bytes = memory_bytes;
     limits.entries         = entries;
-    ret make(?fixture.store, ?fixture.entries[0], 8, ?fixture.body[0], TEST_BODY, limits);
+    ret make(?fixture.store, ?fixture.entries[0], 8, ?fixture.body[0], TEST_BODY, limits, 1);
 }
 
 fun make_key(identity: *key.Key, text: str) {
@@ -778,39 +1179,74 @@ fun make_key(identity: *key.Key, text: str) {
     identity.length = i;
 }
 
+fun plain_dimensions(dimensions: *key.Dimensions) {
+    dimensions.len   = 0;
+    dimensions.any   = false;
+    dimensions.valid = true;
+}
+
+fun write_now(writer: *Writer, data: *u8, length: usize) bool {
+    ret write_body(writer, data, length, wake.no_waker()) == WRITE_DONE;
+}
+
 fun store_entry(fixture: *Fixture, name: str, payload: str, length: usize) bool {
     var identity: key.Key;
     make_key(?identity, name);
     var dimensions: key.Dimensions;
-    dimensions.len   = 0;
-    dimensions.any   = false;
-    dimensions.valid = true;
+    plain_dimensions(?dimensions);
     var metadata: policy.Metadata = policy.blank();
     metadata.has_lifetime = true;
     metadata.lifetime_ns  = 1000000000;
     var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, length, IN_MEMORY);
-    if (!writer.active)                             { ret false; }
-    if (!write_body(?writer, payload::*u8, length)) { ret false; }
+    if (!writer.active)                            { ret false; }
+    if (!write_now(?writer, payload::*u8, length)) { ret false; }
     ret commit(?writer);
+}
+
+# find a key's first entry and pin it, as a reader does before streaming
+fun pin_key(store: *Store, name: str) Pin {
+    var identity: key.Key;
+    make_key(?identity, name);
+    val shard: *Shard = acquire(store, ?identity);
+    if (shard == nil) { ret no_pin(); }
+    val held: Pin = pin(shard, lookup(shard, ?identity));
+    release(shard);
+    ret held;
+}
+
+fun found(store: *Store, name: str) bool {
+    var identity: key.Key;
+    make_key(?identity, name);
+    val shard: *Shard = acquire(store, ?identity);
+    if (shard == nil) { ret false; }
+    val index: usize = lookup(shard, ?identity);
+    release(shard);
+    ret index != NO_ENTRY;
+}
+
+# read a key's whole body through a pin, the way the cache's body reader does
+fun read_key(store: *Store, name: str, output: *u8, capacity: usize) usize {
+    var held: Pin = pin_key(store, name);
+    if (!held.held) { ret NO_ENTRY; }
+    var request:  disk.Request = disk.idle();
+    var produced: usize        = 0;
+    val status:   ReadStatus   = read_body(?held, 0, output, capacity, ?request,
+        wake.no_waker(), ?produced);
+    unpin(?held);
+    if (status != READ_DONE) { ret NO_ENTRY; }
+    ret produced;
 }
 
 test "cache store: a stored entry is found by its key and read back exactly" {
     var fixture: Fixture;
     if (!open_store(?fixture, 1024, 8))          { ret 1; }
     if (!store_entry(?fixture, "a", "hello", 5)) { ret 2; }
-    var identity: key.Key;
-    make_key(?identity, "a");
-    val index: usize = lookup(?fixture.store, ?identity);
-    if (index == NO_ENTRY) { ret 3; }
-    var output:   [16]u8;
-    var produced: usize = 0;
-    if (!read_body(?fixture.store, index, 0, ?output[0], 16, ?produced) || produced != 5) { ret 4; }
-    if (output[0] != 'h' || output[4] != 'o')                                             { ret 5; }
-    var absent: key.Key;
-    make_key(?absent, "b");
-    if (lookup(?fixture.store, ?absent) != NO_ENTRY) { ret 6; }
-    if (memory_used(?fixture.store) != 5)            { ret 7; }
+    var output: [16]u8;
+    if (read_key(?fixture.store, "a", ?output[0], 16) != 5) { ret 4; }
+    if (output[0] != 'h' || output[4] != 'o')               { ret 5; }
+    if (found(?fixture.store, "b"))                         { ret 6; }
+    if (memory_used(?fixture.store) != 5)                   { ret 7; }
     ret 0;
 }
 
@@ -818,21 +1254,62 @@ test "cache store: discard defers reclamation until the last reader releases" {
     var fixture: Fixture;
     if (!open_store(?fixture, 16, 8)
         || !store_entry(?fixture, "a", "hello", 5)) { ret 1; }
-    var identity: key.Key;
-    make_key(?identity, "a");
-    val index: usize = lookup(?fixture.store, ?identity);
-    if (index == NO_ENTRY || !pin(?fixture.store, index)
-        || !discard_entry(?fixture.store, index)) { ret 2; }
-    if (entry_at(?fixture.store, index) != nil
+    var held: Pin = pin_key(?fixture.store, "a");
+    if (!held.held) { ret 2; }
+    lock(held.shard);
+    val discarded: bool = discard_entry(held.shard, held.index);
+    release(held.shard);
+    if (!discarded) { ret 2; }
+    if (found(?fixture.store, "a")
         || live_entries(?fixture.store) != 0
         || memory_used(?fixture.store) != 5) { ret 3; }
     var output:   [8]u8;
     var produced: usize = 0;
-    if (!read_body(?fixture.store, index, 0, ?output[0], 8, ?produced)
+    if (read_body(?held, 0, ?output[0], 8, nil, wake.no_waker(), ?produced) != READ_DONE
         || produced != 5 || output[0] != 'h' || output[4] != 'o') { ret 4; }
-    if (!unpin(?fixture.store, index)
+    val index: usize = held.index;
+    if (!unpin(?held)
         || memory_used(?fixture.store) != 0
-        || fixture.store.entries[index].state != EMPTY) { ret 5; }
+        || fixture.store.shards[0].entries[index].state != EMPTY) { ret 5; }
+    ret 0;
+}
+
+test "cache store: an evicted pinned entry leaves the index at once and is freed once, at its last unpin" {
+    var fixture: Fixture;
+    # room for two entries of ten, so the third admission has to evict
+    if (!open_store(?fixture, 20, 8))                  { ret 1; }
+    if (!store_entry(?fixture, "a", "aaaaaaaaaa", 10)) { ret 2; }
+    if (!store_entry(?fixture, "b", "bbbbbbbbbb", 10)) { ret 3; }
+    var first:  Pin = pin_key(?fixture.store, "a");
+    var second: Pin = pin_key(?fixture.store, "a");
+    if (!first.held || !second.held) { ret 4; }
+    # "a" is the least recently used, so admitting "c" evicts it while it is read.
+    # its bytes still count, so "b" goes too before "c" fits
+    if (!store_entry(?fixture, "c", "cccccccccc", 10)) { ret 5; }
+    # "a" left the index at once even though it is pinned
+    if (found(?fixture.store, "a") || found(?fixture.store, "b"))               { ret 6; }
+    if (memory_used(?fixture.store) != 20 || live_entries(?fixture.store) != 1) { ret 7; }
+    # a later admission cannot take the pinned bytes either, so it evicts "c"
+    if (!store_entry(?fixture, "d", "dddddddddd", 10) || found(?fixture.store, "c")) { ret 8; }
+    var output:   [16]u8;
+    var produced: usize = 0;
+    if (read_body(?first, 0, ?output[0], 16, nil, wake.no_waker(), ?produced) != READ_DONE
+        || produced != 10 || output[0] != 'a' || output[9] != 'a') { ret 9; }
+    # the first release frees nothing, since another reader holds it
+    if (!unpin(?first) || memory_used(?fixture.store) != 20) { ret 10; }
+    if (read_body(?second, 0, ?output[0], 16, nil, wake.no_waker(), ?produced) != READ_DONE
+        || produced != 10 || output[0] != 'a' || output[9] != 'a') { ret 11; }
+    # the last release frees its ten bytes, once
+    if (!unpin(?second) || memory_used(?fixture.store) != 10)                 { ret 12; }
+    if (unpin(?second) || unpin(?first) || memory_used(?fixture.store) != 10) { ret 13; }
+    # and the entry admitted meanwhile still reads back its own bytes
+    if (read_key(?fixture.store, "d", ?output[0], 16) != 10
+        || output[0] != 'd' || output[9] != 'd') { ret 14; }
+    $if ($mach.build.mode == $mach.mode.debug) {
+        # the freed bytes are poisoned, so a reader that outlived its pin would
+        # see them as a wrong body
+        if (fixture.body[10] != POISON || fixture.body[19] != POISON) { ret 15; }
+    }
     ret 0;
 }
 
@@ -845,19 +1322,18 @@ test "cache store: the memory budget is exact and eviction is least recently use
     # touching the first makes the second the least recently used
     var first: key.Key;
     make_key(?first, "a");
-    touch(?fixture.store, lookup(?fixture.store, ?first));
+    val shard: *Shard = acquire(?fixture.store, ?first);
+    touch(shard, lookup(shard, ?first));
+    release(shard);
     if (!store_entry(?fixture, "c", "cccccccccc", 10))                          { ret 5; }
     if (memory_used(?fixture.store) != 20 || live_entries(?fixture.store) != 2) { ret 6; }
-    if (fixture.store.evictions != 1)                                           { ret 7; }
-    var second: key.Key;
-    make_key(?second, "b");
-    if (lookup(?fixture.store, ?second) != NO_ENTRY) { ret 8; }
-    if (lookup(?fixture.store, ?first) == NO_ENTRY)  { ret 9; }
+    if (totals(?fixture.store).evictions != 1)                                  { ret 7; }
+    if (found(?fixture.store, "b"))                                             { ret 8; }
+    if (!found(?fixture.store, "a"))                                            { ret 9; }
     # the surviving entry still reads back its own bytes after compaction
-    var output:   [16]u8;
-    var produced: usize = 0;
-    read_body(?fixture.store, lookup(?fixture.store, ?first), 0, ?output[0], 16, ?produced);
-    if (produced != 10 || output[0] != 'a' || output[9] != 'a') { ret 10; }
+    var output: [16]u8;
+    if (read_key(?fixture.store, "a", ?output[0], 16) != 10
+        || output[0] != 'a' || output[9] != 'a') { ret 10; }
     ret 0;
 }
 
@@ -867,14 +1343,12 @@ test "cache store: an entry larger than the budget is refused, not partly kept" 
     var identity: key.Key;
     make_key(?identity, "big");
     var dimensions: key.Dimensions;
-    dimensions.len   = 0;
-    dimensions.any   = false;
-    dimensions.valid = true;
+    plain_dimensions(?dimensions);
     var metadata: policy.Metadata = policy.blank();
     val writer:   Writer          = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, 64, IN_MEMORY);
     if (writer.active)                                                         { ret 2; }
-    if (fixture.store.rejections != 1)                                         { ret 3; }
+    if (totals(?fixture.store).rejections != 1)                                { ret 3; }
     if (memory_used(?fixture.store) != 0 || live_entries(?fixture.store) != 0) { ret 4; }
     ret 0;
 }
@@ -885,35 +1359,33 @@ test "cache store: a partial write is discarded and never becomes visible" {
     var identity: key.Key;
     make_key(?identity, "short");
     var dimensions: key.Dimensions;
-    dimensions.len   = 0;
-    dimensions.any   = false;
-    dimensions.valid = true;
+    plain_dimensions(?dimensions);
     var metadata: policy.Metadata = policy.blank();
     var writer:   Writer          = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, 10, IN_MEMORY);
-    if (!writer.active)                      { ret 2; }
-    if (!write_body(?writer, "abc"::*u8, 3)) { ret 3; }
+    if (!writer.active)                     { ret 2; }
+    if (!write_now(?writer, "abc"::*u8, 3)) { ret 3; }
     # committing short must fail rather than publish a truncated representation
-    if (commit(?writer))                               { ret 4; }
-    if (lookup(?fixture.store, ?identity) != NO_ENTRY) { ret 5; }
-    if (fixture.store.partial_discards != 1)           { ret 6; }
+    if (commit(?writer))                              { ret 4; }
+    if (found(?fixture.store, "short"))               { ret 5; }
+    if (totals(?fixture.store).partial_discards != 1) { ret 6; }
     # and the reservation it held is returned in full
     if (memory_used(?fixture.store) != 0) { ret 7; }
     var again: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, 64, IN_MEMORY);
     if (!again.active) { ret 8; }
     abandon(?again);
-    if (memory_used(?fixture.store) != 0 || fixture.store.partial_discards != 2) { ret 9; }
+    if (memory_used(?fixture.store) != 0 || totals(?fixture.store).partial_discards != 2) { ret 9; }
     ret 0;
 }
 
 test "cache store: an entry count bound evicts even when bytes remain" {
     var fixture: Fixture;
-    if (!open_store(?fixture, 1024, 2))                                    { ret 1; }
-    if (!store_entry(?fixture, "a", "a", 1))                               { ret 2; }
-    if (!store_entry(?fixture, "b", "b", 1))                               { ret 3; }
-    if (!store_entry(?fixture, "c", "c", 1))                               { ret 4; }
-    if (live_entries(?fixture.store) != 2 || fixture.store.evictions != 1) { ret 5; }
+    if (!open_store(?fixture, 1024, 2))                                             { ret 1; }
+    if (!store_entry(?fixture, "a", "a", 1))                                        { ret 2; }
+    if (!store_entry(?fixture, "b", "b", 1))                                        { ret 3; }
+    if (!store_entry(?fixture, "c", "c", 1))                                        { ret 4; }
+    if (live_entries(?fixture.store) != 2 || totals(?fixture.store).evictions != 1) { ret 5; }
     ret 0;
 }
 
@@ -924,7 +1396,7 @@ test "cache store: invalidation removes the entry and its charge" {
     var identity: key.Key;
     make_key(?identity, "a");
     if (invalidate(?fixture.store, ?identity) != 1)                            { ret 3; }
-    if (lookup(?fixture.store, ?identity) != NO_ENTRY)                         { ret 4; }
+    if (found(?fixture.store, "a"))                                            { ret 4; }
     if (memory_used(?fixture.store) != 0 || live_entries(?fixture.store) != 0) { ret 5; }
     ret 0;
 }
@@ -960,8 +1432,8 @@ fun store_variant(fixture: *Fixture, name: str, dimension_value: str, payload: s
     metadata.lifetime_ns  = 1000000000;
     var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, length, IN_MEMORY);
-    if (!writer.active)                             { ret false; }
-    if (!write_body(?writer, payload::*u8, length)) { ret false; }
+    if (!writer.active)                            { ret false; }
+    if (!write_now(?writer, payload::*u8, length)) { ret false; }
     ret commit(?writer);
 }
 
@@ -973,16 +1445,25 @@ test "cache store: every representation filed under one key is reachable" {
     if (live_entries(?fixture.store) != 2)              { ret 4; }
     var identity: key.Key;
     make_key(?identity, "a");
+    val shard: *Shard = acquire(?fixture.store, ?identity);
     # both are found by walking, not just whichever the scan reaches first
-    val first: usize = find_from(?fixture.store, ?identity, 0);
-    if (first == NO_ENTRY) { ret 5; }
-    val second: usize = find_from(?fixture.store, ?identity, first + 1);
-    if (second == NO_ENTRY || second == first)                        { ret 6; }
-    if (find_from(?fixture.store, ?identity, second + 1) != NO_ENTRY) { ret 7; }
+    val first: usize = find_from(shard, ?identity, 0);
+    if (first == NO_ENTRY) {
+        release(shard);
+        ret 5;
+    }
+    val second: usize = find_from(shard, ?identity, first + 1);
+    if (second == NO_ENTRY || second == first
+        || find_from(shard, ?identity, second + 1) != NO_ENTRY) {
+        release(shard);
+        ret 6;
+    }
     # and they really are different representations, not one entry counted twice
-    val left:  *Entry = entry_at(?fixture.store, first);
-    val right: *Entry = entry_at(?fixture.store, second);
-    if (key.dimensions_equal(?left.dimensions, ?right.dimensions)) { ret 8; }
+    val left:  *Entry = entry_at(shard, first);
+    val right: *Entry = entry_at(shard, second);
+    val same:  bool   = key.dimensions_equal(?left.dimensions, ?right.dimensions);
+    release(shard);
+    if (same) { ret 8; }
     ret 0;
 }
 
@@ -996,19 +1477,22 @@ test "cache store: a stored representation replaces the one it supersedes" {
     if (live_entries(?fixture.store) != 2)               { ret 5; }
     var identity: key.Key;
     make_key(?identity, "a");
-    var found: usize = find_from(?fixture.store, ?identity, 0);
-    var seen:  usize = 0;
-    for (found != NO_ENTRY) {
-        val entry:    *Entry = entry_at(?fixture.store, found);
+    val shard: *Shard = ?fixture.store.shards[0];
+    var index: usize  = find_from(shard, ?identity, 0);
+    var seen:  usize  = 0;
+    for (index != NO_ENTRY) {
+        val entry:    *Entry = entry_at(shard, index);
+        var held:     Pin    = pin(shard, index);
         var output:   [8]u8;
         var produced: usize  = 0;
-        read_body(?fixture.store, found, 0, ?output[0], 8, ?produced);
+        read_body(?held, 0, ?output[0], 8, nil, wake.no_waker(), ?produced);
+        unpin(?held);
         if (entry.dimensions.items[0].value[0] == 'g') {
             # the superseded copy is gone, so no stale representation survives
             if (produced != 3 || output[0] != 'n') { ret 6; }
         }
         seen  = seen + 1;
-        found = find_from(?fixture.store, ?identity, found + 1);
+        index = find_from(shard, ?identity, index + 1);
     }
     if (seen != 2) { ret 7; }
     # and the replaced entry's bytes were returned to the budget
@@ -1023,20 +1507,18 @@ test "cache store: a disabled store owns nothing and admits nothing" {
         || store.body_capacity != 0 || store.has_root) { ret 2; }
     var identity: key.Key;
     make_key(?identity, "a");
-    if (lookup(?store, ?identity) != NO_ENTRY)                 { ret 3; }
-    if (entry_at(?store, 0) != nil)                            { ret 4; }
-    if (touch(?store, 0))                                      { ret 5; }
-    if (invalidate(?store, ?identity) != 0)                    { ret 6; }
-    if (live_entries(?store) != 0 || memory_used(?store) != 0) { ret 7; }
+    if (acquire(?store, ?identity) != nil || shard_at(?store, 0) != nil) { ret 3; }
+    if (entry_at(nil, 0) != nil)                                         { ret 4; }
+    if (invalidate(?store, ?identity) != 0)                              { ret 6; }
+    if (live_entries(?store) != 0 || memory_used(?store) != 0)           { ret 7; }
     var dimensions: key.Dimensions;
-    dimensions.len   = 0;
-    dimensions.any   = false;
-    dimensions.valid = true;
+    plain_dimensions(?dimensions);
     var metadata: policy.Metadata = policy.blank();
     val writer:   Writer          = begin(?store, ?identity, ?dimensions, metadata, status.OK, 1, IN_MEMORY);
     if (writer.active) { ret 8; }
     # nothing was counted either, so a disabled store does no bookkeeping at all
-    if (store.hits != 0 || store.misses != 0 || store.stores != 0 || store.rejections != 0) { ret 9; }
+    val counted: Totals = totals(?store);
+    if (counted.hits != 0 || counted.misses != 0 || counted.stores != 0 || counted.rejections != 0) { ret 9; }
     ret 0;
 }
 
@@ -1053,7 +1535,7 @@ fun disk_fixture(fixture: *Fixture, root: str, disk_bytes: usize) bool {
     limits.disk_bytes      = disk_bytes;
     limits.max_entry_bytes = 1024;
     limits.entries         = 8;
-    if (!make(?fixture.store, ?fixture.entries[0], 8, ?fixture.body[0], TEST_BODY, limits)) {
+    if (!make(?fixture.store, ?fixture.entries[0], 8, ?fixture.body[0], TEST_BODY, limits, 1)) {
         ret false;
     }
     ret attach_disk(?fixture.store, root, ?fixture.scratch);
@@ -1063,14 +1545,12 @@ fun store_disk_entry(fixture: *Fixture, name: str, payload: str, length: usize) 
     var identity: key.Key;
     make_key(?identity, name);
     var dimensions: key.Dimensions;
-    dimensions.len   = 0;
-    dimensions.any   = false;
-    dimensions.valid = true;
+    plain_dimensions(?dimensions);
     var metadata: policy.Metadata = policy.blank();
     var writer:   Writer          = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, length, ON_DISK);
-    if (!writer.active)                             { ret false; }
-    if (!write_body(?writer, payload::*u8, length)) { ret false; }
+    if (!writer.active)                            { ret false; }
+    if (!write_now(?writer, payload::*u8, length)) { ret false; }
     ret commit(?writer);
 }
 
@@ -1092,6 +1572,26 @@ fun disk_file_exists(root: str, name: str) bool {
     ret present(filesystem.is_file((?path[0])::str));
 }
 
+# the file name of a key's stored entry, copied out
+fun disk_name_of(fixture: *Fixture, name: str, output: *u8) bool {
+    var identity: key.Key;
+    make_key(?identity, name);
+    val shard: *Shard = acquire(?fixture.store, ?identity);
+    val entry: *Entry = entry_at(shard, lookup(shard, ?identity));
+    if (entry == nil || entry.placement != ON_DISK) {
+        release(shard);
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < entry.disk_name_length) {
+        output[i] = entry.disk_name[i];
+        i         = i + 1;
+    }
+    output[i] = 0;
+    release(shard);
+    ret true;
+}
+
 test "cache store: a disk entry is written to a real file and read back exactly" {
     var fixture: Fixture;
     if (!disk_fixture(?fixture, "out/cache-disk-basic", 1024)) { ret 1; }
@@ -1099,25 +1599,17 @@ test "cache store: a disk entry is written to a real file and read back exactly"
         close(?fixture.store);
         ret 2;
     }
-    var identity: key.Key;
-    make_key(?identity, "a");
-    val index: usize = lookup(?fixture.store, ?identity);
-    if (index == NO_ENTRY) {
-        close(?fixture.store);
-        ret 3;
-    }
-    val entry: *Entry = entry_at(?fixture.store, index);
-    if (entry == nil || entry.placement != ON_DISK) {
+    var name: [64]u8;
+    if (!disk_name_of(?fixture, "a", ?name[0])) {
         close(?fixture.store);
         ret 4;
     }
-    if (!disk_file_exists("out/cache-disk-basic", (?entry.disk_name[0])::str)) {
+    if (!disk_file_exists("out/cache-disk-basic", (?name[0])::str)) {
         close(?fixture.store);
         ret 5;
     }
-    var output:   [32]u8;
-    var produced: usize = 0;
-    if (!read_body(?fixture.store, index, 0, ?output[0], 32, ?produced) || produced != 12) {
+    var output: [32]u8;
+    if (read_key(?fixture.store, "a", ?output[0], 32) != 12) {
         close(?fixture.store);
         ret 6;
     }
@@ -1126,7 +1618,7 @@ test "cache store: a disk entry is written to a real file and read back exactly"
         ret 7;
     }
     # the memory budget was untouched: a disk entry costs disk, not memory
-    if (memory_used(?fixture.store) != 0 || fixture.store.disk_used != 12) {
+    if (memory_used(?fixture.store) != 0 || totals(?fixture.store).disk_bytes != 12) {
         close(?fixture.store);
         ret 8;
     }
@@ -1141,21 +1633,16 @@ test "cache store: the disk budget evicts and removes the evicted file" {
         close(?fixture.store);
         ret 2;
     }
-    var first: key.Key;
-    make_key(?first, "a");
-    val first_entry: *Entry = entry_at(?fixture.store, lookup(?fixture.store, ?first));
-    var first_name:  [64]u8;
-    var i:           usize  = 0;
-    for (i < first_entry.disk_name_length) {
-        first_name[i] = first_entry.disk_name[i];
-        i             = i + 1;
+    var first_name: [64]u8;
+    if (!disk_name_of(?fixture, "a", ?first_name[0])) {
+        close(?fixture.store);
+        ret 2;
     }
-    first_name[i] = 0;
     if (!store_disk_entry(?fixture, "b", "bbbbbbbbbb", 10)) {
         close(?fixture.store);
         ret 3;
     }
-    if (fixture.store.disk_used != 20) {
+    if (totals(?fixture.store).disk_bytes != 20) {
         close(?fixture.store);
         ret 4;
     }
@@ -1164,15 +1651,15 @@ test "cache store: the disk budget evicts and removes the evicted file" {
         ret 5;
     }
     # the budget held, so the least recently used entry went
-    if (fixture.store.disk_used != 20 || live_entries(?fixture.store) != 2) {
+    if (totals(?fixture.store).disk_bytes != 20 || live_entries(?fixture.store) != 2) {
         close(?fixture.store);
         ret 6;
     }
-    if (fixture.store.evictions != 1) {
+    if (totals(?fixture.store).evictions != 1) {
         close(?fixture.store);
         ret 7;
     }
-    if (lookup(?fixture.store, ?first) != NO_ENTRY) {
+    if (found(?fixture.store, "a")) {
         close(?fixture.store);
         ret 8;
     }
@@ -1192,16 +1679,11 @@ test "cache store: closing removes every disk file it wrote" {
         close(?fixture.store);
         ret 2;
     }
-    var identity: key.Key;
-    make_key(?identity, "a");
-    val entry: *Entry = entry_at(?fixture.store, lookup(?fixture.store, ?identity));
-    var name:  [64]u8;
-    var i:     usize  = 0;
-    for (i < entry.disk_name_length) {
-        name[i] = entry.disk_name[i];
-        i       = i + 1;
+    var name: [64]u8;
+    if (!disk_name_of(?fixture, "a", ?name[0])) {
+        close(?fixture.store);
+        ret 2;
     }
-    name[i] = 0;
     if (!disk_file_exists("out/cache-disk-close", (?name[0])::str)) {
         close(?fixture.store);
         ret 3;
@@ -1257,23 +1739,18 @@ test "cache store: a writer cannot run past the length it reserved" {
     var identity: key.Key;
     make_key(?identity, "overrun");
     var dimensions: key.Dimensions;
-    dimensions.len   = 0;
-    dimensions.any   = false;
-    dimensions.valid = true;
+    plain_dimensions(?dimensions);
     var metadata: policy.Metadata = policy.blank();
     var writer:   Writer          = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, 4, IN_MEMORY);
-    if (!writer.active)                       { ret 3; }
-    if (!write_body(?writer, "aaaa"::*u8, 4)) { ret 4; }
+    if (!writer.active)                      { ret 3; }
+    if (!write_now(?writer, "aaaa"::*u8, 4)) { ret 4; }
     # one byte past the reservation would land in the next entry's bytes
-    if (write_body(?writer, "X"::*u8, 1)) { ret 5; }
-    if (!commit(?writer))                 { ret 6; }
-    var neighbour: key.Key;
-    make_key(?neighbour, "neighbour");
-    var output:   [8]u8;
-    var produced: usize = 0;
-    read_body(?fixture.store, lookup(?fixture.store, ?neighbour), 0, ?output[0], 8, ?produced);
-    if (produced != 4 || output[0] != 'N' || output[3] != 'N') { ret 7; }
+    if (write_now(?writer, "X"::*u8, 1)) { ret 5; }
+    if (!commit(?writer))                { ret 6; }
+    var output: [8]u8;
+    if (read_key(?fixture.store, "neighbour", ?output[0], 8) != 4
+        || output[0] != 'N' || output[3] != 'N') { ret 7; }
     ret 0;
 }
 
@@ -1289,9 +1766,7 @@ test "cache store: a refused disk write leaves no visible entry" {
     var identity: key.Key;
     make_key(?identity, "denied");
     var dimensions: key.Dimensions;
-    dimensions.len   = 0;
-    dimensions.any   = false;
-    dimensions.valid = true;
+    plain_dimensions(?dimensions);
     var metadata: policy.Metadata = policy.blank();
     var writer:   Writer          = begin(?fixture.store, ?identity, ?dimensions, metadata,
         status.OK, 4, ON_DISK);
@@ -1299,17 +1774,17 @@ test "cache store: a refused disk write leaves no visible entry" {
         close(?fixture.store);
         ret 4;
     }
-    if (write_body(?writer, "aaaa"::*u8, 4)) {
+    if (write_now(?writer, "aaaa"::*u8, 4)) {
         close(?fixture.store);
         ret 5;
     }
     abandon(?writer);
-    if (lookup(?fixture.store, ?identity) != NO_ENTRY) {
+    if (found(?fixture.store, "denied")) {
         close(?fixture.store);
         ret 6;
     }
     # and the reservation it held went back to the disk budget in full
-    if (fixture.store.disk_used != 0) {
+    if (totals(?fixture.store).disk_bytes != 0) {
         close(?fixture.store);
         ret 7;
     }
@@ -1319,4 +1794,306 @@ test "cache store: a refused disk write leaves no visible entry" {
     }
     close(?fixture.store);
     ret 0;
+}
+
+# an executor that holds one request until the test runs it, the shape a store
+# worker has from the submitter's side
+rec Held {
+    disk:    *disk.Disk;
+    request: *disk.Request;
+}
+
+fun submit_held(context: ptr, request: *disk.Request) disk.Submitted {
+    val held: *Held = context::*Held;
+    if (held.request != nil) { ret disk.SUBMIT_REFUSED; }
+    held.request = request;
+    ret disk.SUBMIT_QUEUED;
+}
+
+fun run_held(held: *Held) bool {
+    if (held.request == nil) { ret false; }
+    val request: *disk.Request = held.request;
+    held.request = nil;
+    disk.execute(held.disk, request);
+    ret true;
+}
+
+# a queued write is neither published nor dropped until it settles, a queued
+# read answers pending until it runs, and a queued removal keeps its slot and its
+# disk charge until the file is gone
+test "cache store: queued disk requests hold what they name until they complete" {
+    var fixture: Fixture;
+    if (!disk_fixture(?fixture, "out/cache-disk-queued", 10)) { ret 1; }
+    var held: Held = Held{disk: ?fixture.store.disk, request: nil};
+    disk.use_executor(?fixture.store.disk, disk.Executor{ctx: (?held)::ptr, submit: submit_held});
+    var identity: key.Key;
+    make_key(?identity, "a");
+    var dimensions: key.Dimensions;
+    plain_dimensions(?dimensions);
+    var writer: Writer = begin(?fixture.store, ?identity, ?dimensions, policy.blank(),
+        status.OK, 4, ON_DISK);
+    if (!writer.active)                                                              { ret 2; }
+    if (write_body(?writer, "abcd"::*u8, 4, wake.no_waker()) != WRITE_PENDING)       { ret 3; }
+    if (commit(?writer) || abandon(?writer) || !write_pending(?writer))              { ret 4; }
+    if (settle_write(?writer) != WRITE_PENDING)                                      { ret 5; }
+    if (!run_held(?held) || settle_write(?writer) != WRITE_DONE || !commit(?writer)) { ret 6; }
+    if (!found(?fixture.store, "a"))                                                 { ret 7; }
+    var pinned:   Pin          = pin_key(?fixture.store, "a");
+    var request:  disk.Request = disk.idle();
+    var output:   [8]u8;
+    var produced: usize        = 0;
+    if (read_body(?pinned, 0, ?output[0], 8, ?request, wake.no_waker(), ?produced)
+        != READ_PENDING) { ret 8; }
+    if (read_settled(?request, ?produced) != READ_PENDING) { ret 9; }
+    if (!run_held(?held) || read_settled(?request, ?produced) != READ_DONE
+        || produced != 4 || output[0] != 'a' || output[3] != 'd') { ret 10; }
+    unpin(?pinned);
+    if (invalidate(?fixture.store, ?identity) != 1 || held.request == nil) { ret 11; }
+    # the file is not yet gone, so its bytes still count against the disk bound
+    if (totals(?fixture.store).disk_bytes != 4 || found(?fixture.store, "a")) { ret 12; }
+    if (!run_held(?held) || totals(?fixture.store).disk_bytes != 0)           { ret 13; }
+    disk.use_executor(?fixture.store.disk, disk.inline(?fixture.store.disk));
+    if (!close(?fixture.store)) { ret 14; }
+    ret 0;
+}
+
+# --- concurrency ---
+
+val THREADS:      usize = 8;
+val KEYS:         usize = 12;
+val ROUNDS:       usize = 3000;
+val SHARED_SLOTS: usize = 32;
+val SHARED_BODY:  usize = 1024;
+
+fun body_length_of(k: usize) usize {
+    ret 16 + k * 9;
+}
+
+fun body_byte(k: usize, i: usize) u8 {
+    ret ('a' + ((k * 7 + i) % 26)::u8);
+}
+
+fun key_text(identity: *key.Key, k: usize) {
+    identity.bytes[0] = 'k';
+    identity.bytes[1] = ('a' + k::u8);
+    identity.length   = 2;
+    identity.valid    = true;
+}
+
+rec Worker {
+    store:    *Store;
+    seed:     u64;
+    reads:    usize;
+    records:  usize;
+    failures: usize;
+}
+
+fun next_random(state: *u64) u64 {
+    var x: u64 = @state;
+    x      = x ^ (x << 13);
+    x      = x ^ (x >> 7);
+    x      = x ^ (x << 17);
+    @state = x;
+    ret x;
+}
+
+fun verify_read(worker: *Worker, k: usize) {
+    var identity: key.Key;
+    key_text(?identity, k);
+    val shard: *Shard = acquire(worker.store, ?identity);
+    var held:  Pin    = pin(shard, lookup(shard, ?identity));
+    release(shard);
+    if (!held.held) { ret; }
+    val expected: usize        = body_length_of(k);
+    var output:   [128]u8;
+    var request:  disk.Request = disk.idle();
+    var offset:   usize        = 0;
+    # small chunks, each its own locked read, so evictions land between them
+    for (offset < expected) {
+        var produced: usize = 0;
+        if (read_body(?held, offset, ?output[offset], 13, ?request, wake.no_waker(),
+            ?produced) != READ_DONE || produced == 0) {
+            worker.failures = worker.failures + 1;
+            unpin(?held);
+            ret;
+        }
+        offset = offset + produced;
+    }
+    var trailing: usize = 0;
+    read_body(?held, offset, ?output[offset], 13, ?request, wake.no_waker(), ?trailing);
+    unpin(?held);
+    if (offset != expected || trailing != 0) {
+        worker.failures = worker.failures + 1;
+        ret;
+    }
+    var i: usize = 0;
+    for (i < expected) {
+        if (output[i] != body_byte(k, i)) {
+            worker.failures = worker.failures + 1;
+            ret;
+        }
+        i = i + 1;
+    }
+    worker.reads = worker.reads + 1;
+}
+
+fun record(worker: *Worker, k: usize) {
+    var identity: key.Key;
+    key_text(?identity, k);
+    var dimensions: key.Dimensions;
+    plain_dimensions(?dimensions);
+    var placement: Placement = IN_MEMORY;
+    if (k % 3 == 0) { placement = ON_DISK; }
+    val length: usize  = body_length_of(k);
+    var writer: Writer = begin(worker.store, ?identity, ?dimensions, policy.blank(),
+        status.OK, length, placement);
+    if (!writer.active) { ret; }
+    var bytes: [128]u8;
+    var i:     usize = 0;
+    for (i < length) {
+        bytes[i] = body_byte(k, i);
+        i        = i + 1;
+    }
+    var offset: usize = 0;
+    for (offset < length) {
+        var count: usize = length - offset;
+        if (count > 11) { count = 11; }
+        if (write_body(?writer, ?bytes[offset], count, wake.no_waker()) != WRITE_DONE) {
+            abandon(?writer);
+            worker.failures = worker.failures + 1;
+            ret;
+        }
+        offset = offset + count;
+    }
+    if (commit(?writer)) { worker.records = worker.records + 1; }
+}
+
+fun run_worker(argument: *u8) {
+    val worker: *Worker = argument::*Worker;
+    var round:  usize   = 0;
+    for (round < ROUNDS) {
+        val k:  usize = (next_random(?worker.seed) % KEYS::u64)::usize;
+        val op: u64   = next_random(?worker.seed) % 10;
+        if (op < 6) { verify_read(worker, k); }
+        or (op < 9) { record(worker, k); }
+        or {
+            var identity: key.Key;
+            key_text(?identity, k);
+            invalidate(worker.store, ?identity);
+        }
+        round = round + 1;
+    }
+}
+
+rec Shared {
+    entries: [SHARED_SLOTS]Entry;
+    body:    [SHARED_BODY]u8;
+    store:   Store;
+    scratch: allocator.Allocator;
+    workers: [THREADS]Worker;
+    threads: [THREADS]thread.Thread;
+}
+
+fun run_shared(shared: *Shared) i32 {
+    var i: usize = 0;
+    for (i < THREADS) {
+        shared.workers[i] = Worker{store: ?shared.store, seed: 0x9e3779b97f4a7c15 + i::u64 * 7919,
+            reads: 0, records: 0, failures: 0};
+        i = i + 1;
+    }
+    i = 0;
+    for (i < THREADS) {
+        val spawned: thread.Operation = thread.spawn_with(run_worker,
+            (?shared.workers[i])::*u8, ?shared.threads[i]);
+        if (sel spawned.err) { ret 100; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < THREADS) {
+        val joined: thread.Operation = thread.join(?shared.threads[i]);
+        if (sel joined.err) { ret 101; }
+        i = i + 1;
+    }
+    var reads:    usize = 0;
+    var records:  usize = 0;
+    var failures: usize = 0;
+    i = 0;
+    for (i < THREADS) {
+        reads    = reads + shared.workers[i].reads;
+        records  = records + shared.workers[i].records;
+        failures = failures + shared.workers[i].failures;
+        i        = i + 1;
+    }
+    if (failures != 0) { ret 102; }
+    # the run exercised what it claims to: whole bodies read back, entries
+    # recorded, and eviction under a tight arena
+    if (reads < 1000 || records < 1000)       { ret 103; }
+    if (totals(?shared.store).evictions == 0) { ret 104; }
+    # no pin outlived its reader, so every retired entry's bytes came back and the
+    # arena holds exactly the live entries
+    var used:   usize = 0;
+    var stored: usize = 0;
+    var s:      usize = 0;
+    for (s < shared.store.shard_count) {
+        val shard: *Shard = ?shared.store.shards[s];
+        var e:     usize  = 0;
+        for (e < shard.capacity) {
+            val entry: *Entry = ?shard.entries[e];
+            if (entry.state == RETIRED || entry.state == WRITING || entry.state == UNLINKING
+                || entry.readers != 0) { ret 105; }
+            if (entry.state == READY && entry.placement == IN_MEMORY) { used = used + entry.reserved; }
+            if (entry.state == READY && entry.placement == ON_DISK)   { stored = stored + entry.reserved; }
+            e = e + 1;
+        }
+        $if ($mach.build.mode == $mach.mode.debug) {
+            # every byte past the live ones was freed and poisoned, or never used
+            var b: usize = shard.body_used;
+            for (b < shard.body_capacity) {
+                if (shard.body[b] != POISON && shard.body[b] != 0) { ret 106; }
+                b = b + 1;
+            }
+        }
+        s = s + 1;
+    }
+    val counted: Totals = totals(?shared.store);
+    if (used != counted.memory_bytes || stored != counted.disk_bytes) { ret 107; }
+    ret 0;
+}
+
+fun open_shared(shared: *Shared, disk_root: str) bool {
+    var limits: Limits = default_limits();
+    # four shards of 128 bytes: two or three of the twelve bodies fit each one
+    limits.memory_bytes    = 512;
+    limits.disk_bytes      = 1200;
+    limits.max_entry_bytes = 128;
+    limits.entries         = SHARED_SLOTS;
+    var i: usize = 0;
+    for (i < SHARED_BODY) {
+        shared.body[i] = 0;
+        i              = i + 1;
+    }
+    if (!make(?shared.store, ?shared.entries[0], SHARED_SLOTS, ?shared.body[0], SHARED_BODY,
+        limits, 4)) { ret false; }
+    if (!ensure_dir("out") || !ensure_dir(disk_root) || !page_ok(page.make(?shared.scratch))) {
+        ret false;
+    }
+    ret attach_disk(?shared.store, disk_root, ?shared.scratch);
+}
+
+fun shared_run(disk_root: str) i32 {
+    var pages: allocator.Allocator;
+    if (!page_ok(page.make(?pages))) { ret 1; }
+    val allocated: res[*Shared, allocator.Error] = allocator.allocate[Shared](?pages, 1);
+    if (sel allocated.err) { ret 2; }
+    val shared: *Shared = allocated.ok;
+    if (!open_shared(shared, disk_root)) { ret 3; }
+    val outcome: i32 = run_shared(shared);
+    if (!close(?shared.store) && outcome == 0) { ret 4; }
+    ret outcome;
+}
+
+# memory and disk entries both, so reclaimed files are removed outside the locks
+# while other threads read and record in the same shards
+test "cache store: eight threads read, record and evict shared keys under a tight arena" {
+    ret shared_run("out/cache-store-threads");
 }
