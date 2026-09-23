@@ -60,6 +60,8 @@ fun scope_active(scope: *cancel.Scope) bool {
 
 # concurrent request streams on one connection
 pub val MAX_STREAMS: usize = 8;
+# no session held
+pub val NO_SESSION: usize = storage.NO_INDEX;
 # stream records the engine takes at init, before it borrows another chunk
 pub val INITIAL_STREAMS: usize = 4;
 
@@ -261,9 +263,12 @@ fun slot_release_storage(session: *Session, i: usize) {
     session.slot_held[i] = false;
 }
 
-pub fun acquire(sessions: *storage.Recycler[Session]) *Session {
-    val session: *Session = storage.claim[Session](sessions);
-    if (session == nil) { ret nil; }
+# the session's index in the table, or NO_SESSION when the table cannot grow. a
+# session never moves while it is held, so its pointer is stable within a turn
+pub fun acquire(sessions: *storage.Table[Session]) usize {
+    val index: usize = storage.table_claim[Session](sessions);
+    if (index == storage.NO_INDEX) { ret NO_SESSION; }
+    val session: *Session = storage.table_at[Session](sessions, index);
     session.live              = true;
     session.state             = IDLE;
     session.engine_started    = false;
@@ -282,6 +287,13 @@ pub fun acquire(sessions: *storage.Recycler[Session]) *Session {
         session.slot_held[j] = false;
         j                    = j + 1;
     }
+    ret index;
+}
+
+# a held session, or nil for NO_SESSION or an index no session holds
+pub fun session_at(sessions: *storage.Table[Session], index: usize) *Session {
+    val session: *Session = storage.table_at[Session](sessions, index);
+    if (session == nil || !session.live) { ret nil; }
     ret session;
 }
 
@@ -429,10 +441,11 @@ fun finish_close(session: *Session) {
     engine_h2.progress_close(engine);
 }
 
-# storage returns to the recycler once the session has settled, whether or not
-# a one-shot release failed along the way
-pub fun release_status(sessions: *storage.Recycler[Session], session: *Session) ReleaseStatus {
-    if (session == nil || !session.live) { ret RELEASE_FAILED; }
+# the index returns to the table once the session has settled, whether or not a
+# one-shot release failed along the way. the record must not be touched after
+pub fun release_status(sessions: *storage.Table[Session], index: usize) ReleaseStatus {
+    val session: *Session = session_at(sessions, index);
+    if (session == nil) { ret RELEASE_FAILED; }
     session.now = clock.instant();
     var pending: bool  = false;
     var j:       usize = 0;
@@ -451,7 +464,7 @@ pub fun release_status(sessions: *storage.Recycler[Session], session: *Session) 
     session.state          = CLOSED;
     session.live           = false;
     val failed: bool = session.release_failed;
-    if (!storage.release[Session](sessions, session) || failed) { ret RELEASE_FAILED; }
+    if (!storage.table_release[Session](sessions, index) || failed) { ret RELEASE_FAILED; }
     ret RELEASE_OK;
 }
 
@@ -1738,12 +1751,13 @@ test "h2: request body dispositions retain their distinct ownership" {
 
     var a: A.Allocator;
     page.make(?a);
-    var sessions: storage.Recycler[Session];
-    if (!storage.make[Session](?sessions, ?a, 1)) {
+    var sessions: storage.Table[Session];
+    if (!storage.make_table[Session](?sessions, ?a)) {
         operation_ok(cancel.destroy(?scope));
         ret 5;
     }
-    val session: *Session = acquire(?sessions);
+    val index:   usize    = acquire(?sessions);
+    val session: *Session = session_at(?sessions, index);
     if (session == nil) {
         operation_ok(cancel.destroy(?scope));
         ret 5;
@@ -1756,41 +1770,47 @@ test "h2: request body dispositions retain their distinct ownership" {
     val closed: body.Progress = settle_request_body(session, ?slot);
     if (closed.status != body.CANCELLED || state.finish_calls != 1
         || state.finish_mode != body.CANCEL || !slot.close_disposition) {
-        release_status(?sessions, session);
+        release_status(?sessions, index);
         operation_ok(cancel.destroy(?scope));
         ret 6;
     }
-    if (release_status(?sessions, session) != RELEASE_OK
-        || !storage.destroy[Session](?sessions)
+    if (release_status(?sessions, index) != RELEASE_OK
+        || !storage.destroy_table[Session](?sessions)
         || !operation_ok(cancel.destroy(?scope))) { ret 7; }
     ret 0;
 }
 
-test "h2: sessions are claimed per connection and recycled" {
+test "h2: sessions sit in a table, never move while held and recede when released" {
     var a: A.Allocator;
     page.make(?a);
-    var sessions: storage.Recycler[Session];
-    if (!storage.make[Session](?sessions, ?a, 1)) { ret 1; }
+    var sessions: storage.Table[Session];
+    if (!storage.make_table[Session](?sessions, ?a)) { ret 1; }
     # far past the sixteen sessions the table used to hold
-    var held: [40]*Session;
+    var held: [40]usize;
     var i:    usize = 0;
     for (i < 40) {
         held[i] = acquire(?sessions);
-        if (held[i] == nil || held[i].live == false) { ret 2; }
+        if (held[i] != i || session_at(?sessions, held[i]) == nil) { ret 2; }
         i = i + 1;
     }
-    if (storage.held[Session](?sessions) != 40) { ret 3; }
-    val returned: *Session = held[39];
-    if (release_status(?sessions, returned) != RELEASE_OK)     { ret 4; }
-    if (release_status(?sessions, returned) != RELEASE_FAILED) { ret 5; }
-    held[39] = acquire(?sessions);
-    if (held[39] != returned) { ret 6; }
-    i = 0;
-    for (i < 40) {
+    if (storage.table_live[Session](?sessions) != 40) { ret 3; }
+    val anchor: *Session = session_at(?sessions, held[0]);
+    if (release_status(?sessions, held[39]) != RELEASE_OK) { ret 4; }
+    if (release_status(?sessions, held[39]) != RELEASE_FAILED
+        || session_at(?sessions, held[39]) != nil) { ret 5; }
+    # the released index is the lowest free, so it is the next one handed out
+    if (acquire(?sessions) != held[39]) { ret 6; }
+    i = 40;
+    for (i > 1) {
+        i = i - 1;
         if (release_status(?sessions, held[i]) != RELEASE_OK) { ret 7; }
-        i = i + 1;
     }
-    if (!storage.destroy[Session](?sessions)) { ret 8; }
+    if (session_at(?sessions, held[0]) != anchor
+        || storage.table_capacity[Session](?sessions) != storage.FIRST_CHUNK) { ret 8; }
+    if (release_status(?sessions, held[0]) != RELEASE_OK
+        || storage.table_capacity[Session](?sessions) != 0
+        || release_status(?sessions, NO_SESSION) != RELEASE_FAILED) { ret 9; }
+    if (!storage.destroy_table[Session](?sessions)) { ret 10; }
     ret 0;
 }
 
