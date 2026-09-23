@@ -277,7 +277,8 @@ start_quic_holder() {
 # most per_client connections each that dial at once, and fails unless every
 # one of them was held
 hold_more() {
-    local transport="$1" name="$2" count="$3" part=0 left="$count" take held
+    local transport="$1" name="$2" count="$3" part=0 take held
+    local left="$count"
     local names=() pids=() wants=()
     while [ "$left" -gt 0 ]; do
         take="$left"
