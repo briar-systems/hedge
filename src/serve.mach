@@ -77,11 +77,13 @@ pub rec Slot {
     # accepted and holding a place in its budget's queue, not yet being served
     waiting:   bool;
     token:     listener.ConnectionToken;
-    handle:    *connection.Connection;
     budgets:   *budget.Set;
     charge:    budget.Charge;
     prev_live: usize;
     next_live: usize;
+    # the connection lives in its slot: both are claimed and released together,
+    # and the slot is held until every completion into the record has landed
+    connection: connection.Connection;
 }
 
 # the live slots of one service generation, in admission order. a slot is on
@@ -155,11 +157,10 @@ pub rec Runtime {
     owner:          listener.Owner;
     # the slot directory grows and a record never moves, so a completion
     # context or a body reader may hold a pointer into one for its life
-    slots:       hedge_storage.Table[Slot];
-    connections: hedge_storage.Recycler[connection.Connection];
-    live:        usize;
-    current:     LiveList;
-    previous:    LiveList;
+    slots:    hedge_storage.Table[Slot];
+    live:     usize;
+    current:  LiveList;
+    previous: LiveList;
     # slots whose connection is in teardown: spoken for but about to be free
     retiring: usize;
     # the wheel entry that ends the previous generation's drain (#182)
@@ -253,8 +254,7 @@ pub fun make(
         || !hedge_timer.make(?runtime.timers, a, clock.monotonic_ns())
         || !hedge_wake.make(?runtime.wakes, a)
         || !hedge_memory.make(?runtime.memory, lanes.memory_bytes(?graph.limits), a)
-        || !hedge_storage.make_table[Slot](?runtime.slots, a)
-        || !hedge_storage.make[connection.Connection](?runtime.connections, a, 1)) {
+        || !hedge_storage.make_table[Slot](?runtime.slots, a)) {
         ret false;
     }
     runtime.state          = NEW;
@@ -588,17 +588,18 @@ pub fun start(controls: *quic_runtime.ControlView, runtime: *Runtime, generation
 
 # every slot must have been retired first, which is what `stop` waits for
 fun release_pool(runtime: *Runtime) bool {
-    var ok: bool = hedge_storage.destroy[connection.Connection](?runtime.connections);
-    if (!hedge_storage.destroy_table[Slot](?runtime.slots)) { ok = false; }
+    val ok: bool = hedge_storage.destroy_table[Slot](?runtime.slots);
     runtime.current  = empty_list();
     runtime.previous = empty_list();
     ret ok;
 }
 
-# the connection record a claimed slot holds, or nil when the slot is free
+# the connection record a live slot holds, or nil when the slot is free
 pub fun slot_connection(runtime: *Runtime, index: usize) *connection.Connection {
-    if (runtime == nil || index >= hedge_storage.table_capacity[Slot](?runtime.slots)) { ret nil; }
-    ret hedge_storage.table_at[Slot](?runtime.slots, index).handle;
+    if (runtime == nil) { ret nil; }
+    val slot: *Slot = slot_at(runtime, index);
+    if (slot == nil || !slot.live) { ret nil; }
+    ret ?slot.connection;
 }
 
 pub fun last_refusal(runtime: *Runtime) prologue.Refusal {
@@ -627,7 +628,7 @@ pub fun slot_live(runtime: *Runtime, index: usize) bool {
 
 # the list a live slot belongs to is decided by its connection's generation
 fun list_of(runtime: *Runtime, slot: *Slot) *LiveList {
-    if (slot.handle != nil && slot.handle.generation != runtime.generation) {
+    if (slot.connection.generation != runtime.generation) {
         ret ?runtime.previous;
     }
     ret ?runtime.current;
@@ -692,25 +693,12 @@ fun free_slot(runtime: *Runtime) usize {
     slot.ready_next = NO_SLOT;
     slot.timer      = hedge_timer.claim(?runtime.timers, tcp_owner(index));
     slot.timer_live = slot.timer.index != hedge_timer.NONE;
-    slot.handle     =
-        hedge_storage.claim[connection.Connection](?runtime.connections);
-    if (slot.handle == nil) {
-        if (slot.timer_live) { hedge_timer.release(?runtime.timers, slot.timer); }
-        slot.timer_live = false;
-        hedge_storage.table_release[Slot](?runtime.slots, index);
-        ret NO_SLOT;
-    }
     ret index;
 }
 
 fun return_slot(runtime: *Runtime, index: usize) {
     if (index >= hedge_storage.table_capacity[Slot](?runtime.slots)) { ret; }
     val slot: *Slot = slot_at(runtime, index);
-    if (slot.handle != nil) {
-        hedge_storage.release[connection.Connection](?runtime.connections,
-            slot.handle);
-        slot.handle = nil;
-    }
     # release the wheel entry before the slab can drop this slot's chunk, so a
     # compaction never strands a timer bound to a slot that no longer exists
     if (slot.timer_live) {
@@ -759,13 +747,13 @@ fun admit(runtime: *Runtime, now: time.Instant) usize {
         if (owned != nil && owned.policy.secure) {
             policy = hedge_tls.find(schema.text(?owned.name));
         }
-        if (owned == nil || !connection.make(slot.handle, runtime.next_id, runtime.generation,
+        if (owned == nil || !connection.make(?slot.connection, runtime.next_id, runtime.generation,
             token, source, ?runtime.owner.network, runtime.plan, runtime.active_budgets,
             runtime.configured, runtime.limits, owned, policy,
             ?runtime.storage, ?runtime.memory,
             hedge_wake.waker(?runtime.wakes, tcp_owner(index)), now)) {
             runtime.rejected = runtime.rejected + 1;
-            if (connection.refused_memory(slot.handle)) {
+            if (connection.refused_memory(?slot.connection)) {
                 runtime.refused_memory = runtime.refused_memory + 1;
             }
             if (!listener.close_connection(?runtime.owner, token)) {
@@ -861,16 +849,16 @@ fun retire(runtime: *Runtime, index: usize) {
     }
     # an H2 body or transport cancellation may need a later completion. the
     # listener token and pool slot stay owned until that close phase settles.
-    if (!connection.close(slot.handle)) {
-        if (connection.close_waiting(slot.handle)) { ret; }
+    if (!connection.close(?slot.connection)) {
+        if (connection.close_waiting(?slot.connection)) { ret; }
         runtime.teardown_failures = runtime.teardown_failures + 1;
     }
     if (slot.charge.live) { budget.release(slot.budgets, ?slot.charge); }
     slot.budgets         = nil;
-    runtime.last_refusal = slot.handle.refusal;
-    runtime.served       = runtime.served + slot.handle.requests;
+    runtime.last_refusal = slot.connection.refusal;
+    runtime.served       = runtime.served + slot.connection.requests;
     var returned: bool = false;
-    if (connection.stream_released(slot.handle)) {
+    if (connection.stream_released(?slot.connection)) {
         returned = listener.release_connection(?runtime.owner, slot.token);
     }
     or {
@@ -990,7 +978,7 @@ fun arm_slot(runtime: *Runtime, index: usize) {
     }
     var deadline: u64                = 0;
     var armed:    hedge_timer.Status = hedge_timer.OK;
-    if (connection.next_deadline(slot.handle, ?deadline)) {
+    if (connection.next_deadline(?slot.connection, ?deadline)) {
         armed = hedge_timer.arm(?runtime.timers, slot.timer, deadline);
     }
     or { armed = hedge_timer.disarm(?runtime.timers, slot.timer); }
@@ -1006,14 +994,14 @@ fun drive(runtime: *Runtime, index: usize, now: time.Instant) bool {
     runtime.drives = runtime.drives + 1;
     # a connection of a superseded generation learns it on its own next turn:
     # it finishes what it is doing and closes, and nobody walked to tell it
-    if (!slot.signalled && slot.handle.generation != runtime.generation) {
+    if (!slot.signalled && slot.connection.generation != runtime.generation) {
         slot.signalled = true;
-        if (!connection.begin_graceful(slot.handle)) {
+        if (!connection.begin_graceful(?slot.connection)) {
             runtime.teardown_failures = runtime.teardown_failures + 1;
         }
     }
-    connection.expire(slot.handle, clock.to_ns(now));
-    val progress: connection.Step = connection.advance(slot.handle, now);
+    connection.expire(?slot.connection, clock.to_ns(now));
+    val progress: connection.Step = connection.advance(?slot.connection, now);
     if (progress == connection.STEP_DONE || progress == connection.STEP_ERROR) {
         retire(runtime, index);
         ret true;
@@ -1202,7 +1190,7 @@ fun audit_list(runtime: *Runtime, list: *LiveList) usize {
     for (i != NO_SLOT) {
         val slot: *Slot = slot_at(runtime, i);
         if (slot.live && !slot.ready && !slot.retiring && !slot.waiting
-            && connection.pending_work(slot.handle)) { found = found + 1; }
+            && connection.pending_work(?slot.connection)) { found = found + 1; }
         i = slot.next_live;
     }
     ret found;
@@ -1251,7 +1239,7 @@ fun signal_list(runtime: *Runtime, list: *LiveList) bool {
         val slot: *Slot = slot_at(runtime, i);
         if (slot.live && !slot.signalled) {
             slot.signalled = true;
-            if (!connection.begin_graceful(slot.handle)) { ok = false; }
+            if (!connection.begin_graceful(?slot.connection)) { ok = false; }
             mark_ready(runtime, i);
         }
         i = slot.next_live;
@@ -1626,10 +1614,7 @@ test "serve: the live lists hold exactly the live connection slots, by generatio
     var a: A.Allocator;
     page.make(?a);
     var runtime: Runtime;
-    if (!hedge_storage.make_table[Slot](?runtime.slots, ?a)
-        || !hedge_storage.make[connection.Connection](?runtime.connections, ?a, 1)) {
-        ret 1;
-    }
+    if (!hedge_storage.make_table[Slot](?runtime.slots, ?a)) { ret 1; }
     runtime.current  = empty_list();
     runtime.previous = empty_list();
 
@@ -1678,5 +1663,47 @@ test "serve: the live lists hold exactly the live connection slots, by generatio
     unlink_live(?runtime, ?runtime.previous, third);
     if (runtime.previous.head != NO_SLOT || runtime.previous.tail != NO_SLOT
         || runtime.previous.count != 0) { ret 11; }
+    ret 0;
+}
+
+# the connection record is the slot's, so connections leaving hand back the
+# slot chunks they sat in, and a survivor's record never moves (#235)
+test "serve: a slot carries its connection and departures recede the slot table" {
+    var a: A.Allocator;
+    page.make(?a);
+    var runtime: Runtime;
+    if (!hedge_storage.make_table[Slot](?runtime.slots, ?a)) { ret 1; }
+    runtime.current  = empty_list();
+    runtime.previous = empty_list();
+    val count: usize = 400;
+    var i:     usize = 0;
+    for (i < count) {
+        val index: usize = free_slot(?runtime);
+        if (index != i) { ret 2; }
+        # a claimed slot that is not yet live holds no connection a caller may see
+        if (slot_connection(?runtime, index) != nil) { ret 3; }
+        slot_at(?runtime, index).live = true;
+        if (slot_connection(?runtime, index) != ?slot_at(?runtime, index).connection) { ret 4; }
+        i = i + 1;
+    }
+    val full: usize = hedge_storage.table_chunks[Slot](?runtime.slots);
+    if (full < 3) { ret 5; }
+    val kept: *connection.Connection = slot_connection(?runtime, 0);
+    kept.requests = 9;
+    i             = count;
+    for (i > 1) {
+        i                         = i - 1;
+        slot_at(?runtime, i).live = false;
+        return_slot(?runtime, i);
+        if (slot_connection(?runtime, i) != nil) { ret 6; }
+    }
+    # every chunk above the survivor's is released with the records it held
+    if (hedge_storage.table_chunks[Slot](?runtime.slots) != 1
+        || slot_capacity(?runtime) != hedge_storage.FIRST_CHUNK) { ret 7; }
+    if (slot_connection(?runtime, 0) != kept || kept.requests != 9) { ret 8; }
+    slot_at(?runtime, 0).live = false;
+    return_slot(?runtime, 0);
+    if (slot_capacity(?runtime) != 0 || slot_connection(?runtime, 0) != nil) { ret 9; }
+    if (!hedge_storage.destroy_table[Slot](?runtime.slots))                  { ret 10; }
     ret 0;
 }
