@@ -3,6 +3,7 @@
 use http_cache: hedge.cache;
 use hedge.clock;
 use hedge.composition;
+use hedge.config.lanes;
 use hedge.config.schema;
 use hedge.listener;
 use hedge_memory: hedge.memory;
@@ -20,6 +21,7 @@ use laurel.app;
 use std.allocator;
 use std.allocator.page;
 use std.chrono.time;
+use std.memory.buffers;
 use std.net.ip;
 use std.net.tcp;
 use std.runtime;
@@ -1156,6 +1158,108 @@ test "composition: an idle TLS connection holds no handshake buffer" {
     val lane: hedge_memory.LaneCounters = idle.lanes[hedge_memory.LANE_TLS::usize];
     if (lane.peak < TLS_HANDSHAKE_FOOTPRINT) { ret stall_finish(?stall, 7); }
     if (lane.held != 0)                      { ret stall_finish(?stall, 8); }
+    ret stall_finish(?stall, 0);
+}
+
+# every chunk of the serving pool but what one connection reserves, held by an
+# account of the test's own that never waits, so the next connection is admitted
+# and then refused anything past its reservation
+rec Hog {
+    borrower: hedge_memory.Borrower;
+    account:  buffers.Account;
+    source:   buffers.Source;
+    held:     [1024]buffers.Chunk;
+    count:    usize;
+    pool:     *hedge_memory.Memory;
+    # pump turns the server spent waiting on the pool before the hog let go
+    parked: usize;
+    freed:  bool;
+}
+
+fun hog_room(pool: *hedge_memory.Memory) usize {
+    val used: usize = pool.pool.reserved_total + pool.pool.overflow_used;
+    if (used >= pool.pool.global_budget) { ret 0; }
+    ret pool.pool.global_budget - used;
+}
+
+fun hog_take(hog: *Hog, pool: *hedge_memory.Memory, keep: usize) bool {
+    hog.pool   = pool;
+    hog.count  = 0;
+    hog.parked = 0;
+    hog.freed  = false;
+    var budgets: hedge_memory.Budgets = hedge_memory.no_budgets();
+    budgets.lanes[hedge_memory.LANE_REQUEST::usize] = pool.budget;
+    hedge_memory.borrower(?hog.borrower, pool, 0x484f470000000000, 0, budgets);
+    if (!hedge_memory.open(?hog.borrower, ?hog.account)) { ret false; }
+    hog.source = hedge_memory.borrowed_source(?hog.borrower);
+    var size: usize = 1048576;
+    for (size >= 256) {
+        for (hog.count < 1024 && hog_room(pool) >= size + keep) {
+            val got: buffers.Acquired = buffers.source_acquire(?hog.source, ?hog.account,
+                buffers.Request{bytes: size, align: 0, lane: hedge_memory.LANE_REQUEST,
+                secret: false}, false);
+            if (!(sel got.status.ok)) { ret false; }
+            hog.held[hog.count] = got.chunk;
+            hog.count           = hog.count + 1;
+        }
+        size = size / 2;
+    }
+    ret hog.count != 0 && hog.count < 1024;
+}
+
+fun hog_free(hog: *Hog) bool {
+    if (hog.freed) { ret true; }
+    hog.freed = true;
+    for (hog.count != 0) {
+        hog.count = hog.count - 1;
+        buffers.source_release(?hog.source, ?hog.account, hog.held[hog.count]);
+    }
+    ret hedge_memory.close(hog.pool, ?hog.account);
+}
+
+val HOG_PARKED_TURNS: usize = 16;
+
+# while the server's handshake waits on the pool the hog counts the turns it
+# stays parked, then lets go
+fun hog_pump(context: ptr) {
+    val hog: *Hog = context::*Hog;
+    if (hog.freed)                                    { ret; }
+    if (hedge_memory.snapshot(hog.pool).waiters == 0) { ret; }
+    hog.parked = hog.parked + 1;
+    if (hog.parked >= HOG_PARKED_TURNS) { hog_free(hog); }
+}
+
+# a handshake whose TLS lane the pool refuses parks inside mach-tls, and only
+# the account's wake retries it: the worker routes the pool's wake to
+# `stream.resume` and the retry comes back as a completion (#195). the server
+# makes no progress while the pool is held, and the handshake completes once
+# the memory comes back
+test "composition: a TLS handshake parked for memory resumes on its account's wake" {
+    var stall:  Stall;
+    val opened: i32 = stall_start(?stall, schema.PROTOCOL_HTTP1, LONG_TIMEOUT_MS,
+        "http/1.1");
+    if (opened != 0) { ret stall_finish(?stall, opened); }
+    var hog: Hog;
+    if (!hog_take(?hog, ?stall.harness.runtime.serving.memory, lanes.RESERVE)) {
+        ret stall_finish(?stall, 4);
+    }
+    tlswire.on_pump(stall.client, hog_pump, (?hog)::ptr);
+    val shaken: bool                  = tlswire.handshake(stall.client, stall.harness.endpoint);
+    val freed:  bool                  = hog_free(?hog);
+    val seen:   hedge_memory.Snapshot = hedge_memory.snapshot(?stall.harness.runtime.serving.memory);
+    if (hog.parked < HOG_PARKED_TURNS || !freed)                 { ret stall_finish(?stall, 5); }
+    if (seen.lanes[hedge_memory.LANE_TLS::usize].exhausted == 0) { ret stall_finish(?stall, 6); }
+    if (!shaken)                                                 { ret stall_finish(?stall, 7); }
+    # the resumed connection serves as any other
+    if (!send_text(stall.client, "GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")) {
+        ret stall_finish(?stall, 8);
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length:   usize = tlswire.receive(stall.client, ?response[0], RESPONSE_BYTES,
+        "hello from composition\n");
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) {
+        ret stall_finish(?stall, 9);
+    }
     ret stall_finish(?stall, 0);
 }
 
