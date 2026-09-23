@@ -10,6 +10,16 @@
 #
 # a request and the bytes it names belong to the executor from `submit` until
 # `done` answers true. the caller neither reads nor reuses them in between.
+#
+# a stream of requests (one body read or written in pieces) is admitted before
+# its first request and leaves after its last. admission is the executor's
+# bound: a refused one is the caller's to handle, and a request of an admitted
+# stream is never refused for want of room.
+#
+# an executor that runs a request on another thread publishes it through the
+# request's waker (`complete`): the result is published on the thread that owns
+# the waker, when that thread receives the wake, so the submitter never sees a
+# request done that its wake has not yet reached.
 
 use hedge.wake;
 use std.allocator;
@@ -55,6 +65,10 @@ pub val SUBMIT_QUEUED: Submitted = 2;
 pub val SUBMIT_REFUSED: Submitted = 3;
 
 pub rec Request {
+    # an executor's own link while the request is queued on it
+    next:        *Request;
+    # how a request run off its submitter's thread reaches the submitter
+    posted:      wake.Posted;
     op:          Op;
     name:        [NAME_BYTES]u8;
     name_length: usize;
@@ -71,6 +85,8 @@ pub rec Request {
 pub rec Executor {
     ctx:    ptr;
     submit: fun(ptr, *Request) Submitted;
+    admit:  fun(ptr) bool;
+    leave:  fun(ptr);
 }
 
 pub rec Disk {
@@ -84,6 +100,9 @@ pub rec Disk {
 
 pub fun idle() Request {
     var request: Request;
+    request.next        = nil;
+    request.posted      = wake.Posted{next: nil, waker: wake.no_waker(), settle: settle_posted,
+        context: nil};
     request.op          = 0;
     request.name[0]     = 0;
     request.name_length = 0;
@@ -103,7 +122,7 @@ pub fun closed() Disk {
     disk.root_path[0]     = 0;
     disk.root_path_length = 0;
     disk.scratch          = nil;
-    disk.executor         = Executor{ctx: nil, submit: nil};
+    disk.executor         = Executor{ctx: nil, submit: nil, admit: nil, leave: nil};
     disk.open             = false;
     ret disk;
 }
@@ -168,14 +187,17 @@ pub fun close(disk: *Disk) bool {
     ret true;
 }
 
-# the executor that runs each request on the thread that submits it
+# the executor that runs each request on the thread that submits it. it admits
+# every stream, since a request it runs is done before `submit` returns
 pub fun inline(disk: *Disk) Executor {
-    ret Executor{ctx: (disk)::ptr, submit: submit_inline};
+    ret Executor{ctx: (disk)::ptr, submit: submit_inline, admit: admit_inline,
+        leave: leave_inline};
 }
 
 # replace the executor, which only a disk with nothing in flight may do
 pub fun use_executor(disk: *Disk, executor: Executor) bool {
-    if (disk == nil || !disk.open || executor.submit == nil) { ret false; }
+    if (disk == nil || !disk.open || executor.submit == nil || executor.admit == nil
+        || executor.leave == nil) { ret false; }
     disk.executor = executor;
     ret true;
 }
@@ -184,6 +206,26 @@ fun submit_inline(context: ptr, request: *Request) Submitted {
     val disk: *Disk = context::*Disk;
     execute(disk, request);
     ret SUBMIT_DONE;
+}
+
+fun admit_inline(context: ptr) bool {
+    ret true;
+}
+
+fun leave_inline(context: ptr) {
+}
+
+# admit one stream of requests. false is the executor's refusal: it has no room
+# for another stream, and the caller does without the disk
+pub fun admit(disk: *Disk) bool {
+    if (disk == nil || !disk.open || disk.executor.admit == nil) { ret false; }
+    ret disk.executor.admit(disk.executor.ctx);
+}
+
+# an admitted stream is done, with nothing of it in flight
+pub fun leave(disk: *Disk) {
+    if (disk == nil || disk.executor.leave == nil) { ret; }
+    disk.executor.leave(disk.executor.ctx);
 }
 
 pub fun submit(disk: *Disk, request: *Request) Submitted {
@@ -197,9 +239,17 @@ pub fun submit(disk: *Disk, request: *Request) Submitted {
     ret answer;
 }
 
-# run one request against the root and publish its result. an executor calls
-# this exactly once per accepted request, on whichever thread it runs requests
+# run one request against the root and publish its result, on the submitting
+# thread. an executor calls this, or `run` and then `complete`, exactly once per
+# accepted request
 pub fun execute(disk: *Disk, request: *Request) {
+    if (disk == nil || request == nil) { ret; }
+    run(disk, request);
+    finish(request);
+}
+
+# run one request against the root without publishing it
+pub fun run(disk: *Disk, request: *Request) {
     if (disk == nil || request == nil) { ret; }
     var ok:       bool  = false;
     var produced: usize = 0;
@@ -211,7 +261,32 @@ pub fun execute(disk: *Disk, request: *Request) {
     }
     request.ok       = ok;
     request.produced = produced;
+}
+
+fun finish(request: *Request) {
     atomic.store(?request.phase, DONE);
+}
+
+fun settle_posted(context: ptr) {
+    finish(context::*Request);
+}
+
+# publish a request `run` on a thread other than its submitter's. one with a
+# waker is published on the waker's thread when it receives the wake, and one
+# without is published here. false when the waker's thread could not be
+# reached: the request is then published here and its waiter is not woken
+pub fun complete(request: *Request) bool {
+    if (request == nil) { ret false; }
+    if (!wake.valid(?request.waker)) {
+        finish(request);
+        ret true;
+    }
+    request.posted.waker   = request.waker;
+    request.posted.settle  = settle_posted;
+    request.posted.context = (request)::ptr;
+    if (wake.post(?request.posted)) { ret true; }
+    finish(request);
+    ret false;
 }
 
 fun run_read(disk: *Disk, request: *Request, produced: *usize) bool {

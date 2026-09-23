@@ -1,0 +1,301 @@
+# the thread that owns the cache's disk (#286)
+#
+# every disk request the cache makes (a body read or write, a file removal, the
+# startup purge) runs here, so no serving worker ever waits on the disk. a
+# serving worker submits a request and parks on it: the request is queued, this
+# thread runs it, and its completion reaches the submitting worker through that
+# worker's wake queue, which ends its wait. a request with no waker is
+# published here, and its submitter finds it done when it next looks.
+#
+# the queue is bounded by admission. a stream of requests (one body read or
+# written in pieces) is admitted before its first request, so a full queue is a
+# refused admission the caller handles, and a request of an admitted stream is
+# never refused. removals and the purge draw on a reserve of their own.
+#
+# stop drains the queue. it gives up once its timeout passes with no request
+# completing, and `outstanding` then names what is still queued or running.
+
+use hedge.cache.disk;
+use hedge.clock;
+use std.chrono.time;
+use std.sync.condition;
+use std.sync.mutex;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+# a request stop could not drain, and whether it was running or still queued
+pub rec Outstanding {
+    op:          disk.Op;
+    name:        [disk.NAME_BYTES]u8;
+    name_length: usize;
+    running:     bool;
+}
+
+pub rec Worker {
+    target:        *disk.Disk;
+    lock:          mutex.Mutex;
+    work:          condition.Condition;
+    settled:       condition.Condition;
+    head:          *disk.Request;
+    tail:          *disk.Request;
+    queued:        usize;
+    capacity:      usize;
+    streams:       usize;
+    stream_limit:  usize;
+    running:       bool;
+    running_op:    disk.Op;
+    running_name:  [disk.NAME_BYTES]u8;
+    running_bytes: usize;
+    completed:     u64;
+    unwoken:       u64;
+    stopping:      bool;
+    exited:        bool;
+    # fault injection for tests: a paused worker runs nothing until resumed,
+    # and a delay is added before every request it runs
+    paused:   bool;
+    delay_ns: u64;
+    thread:   thread.Thread;
+    live:     bool;
+}
+
+pub fun idle() Worker {
+    var worker: Worker;
+    worker.target       = nil;
+    worker.head         = nil;
+    worker.tail         = nil;
+    worker.queued       = 0;
+    worker.capacity     = 0;
+    worker.streams      = 0;
+    worker.stream_limit = 0;
+    worker.running      = false;
+    worker.completed    = 0;
+    worker.unwoken      = 0;
+    worker.stopping     = false;
+    worker.exited       = false;
+    worker.paused       = false;
+    worker.delay_ns     = 0;
+    worker.live         = false;
+    ret worker;
+}
+
+# start the thread that runs `target`'s requests. `streams` bounds the admitted
+# streams, and `reserve` the requests outside any stream (removals, the purge)
+# that may be queued beside them
+pub fun start(worker: *Worker, target: *disk.Disk, streams: usize, reserve: usize) bool {
+    if (worker == nil || worker.live || target == nil || streams == 0) { ret false; }
+    @worker = idle();
+    worker.target       = target;
+    worker.lock         = mutex.make();
+    worker.work         = condition.make();
+    worker.settled      = condition.make();
+    worker.stream_limit = streams;
+    worker.capacity     = streams + reserve;
+    var config: thread.Config;
+    thread.config_default(?config);
+    config.name = "hedge-store";
+    val spawned: thread.Operation = thread.spawn_with_config(run_worker, (worker)::*u8,
+        ?config, ?worker.thread);
+    if (sel spawned.err) { ret false; }
+    worker.live = true;
+    ret true;
+}
+
+# the executor that queues requests on this worker
+pub fun executor(worker: *Worker) disk.Executor {
+    ret disk.Executor{ctx: (worker)::ptr, submit: submit_queued, admit: admit_stream,
+        leave: leave_stream};
+}
+
+fun submit_queued(context: ptr, request: *disk.Request) disk.Submitted {
+    val worker: *Worker = context::*Worker;
+    mutex.lock(?worker.lock);
+    if (worker.exited || worker.queued >= worker.capacity) {
+        mutex.unlock(?worker.lock);
+        ret disk.SUBMIT_REFUSED;
+    }
+    request.next = nil;
+    if (worker.tail == nil) { worker.head = request; }
+    or                      { worker.tail.next = request; }
+    worker.tail   = request;
+    worker.queued = worker.queued + 1;
+    condition.signal(?worker.work);
+    mutex.unlock(?worker.lock);
+    ret disk.SUBMIT_QUEUED;
+}
+
+fun admit_stream(context: ptr) bool {
+    val worker: *Worker = context::*Worker;
+    mutex.lock(?worker.lock);
+    val admitted: bool = !worker.stopping && worker.streams < worker.stream_limit;
+    if (admitted) { worker.streams = worker.streams + 1; }
+    mutex.unlock(?worker.lock);
+    ret admitted;
+}
+
+fun leave_stream(context: ptr) {
+    val worker: *Worker = context::*Worker;
+    mutex.lock(?worker.lock);
+    if (worker.streams != 0) { worker.streams = worker.streams - 1; }
+    mutex.unlock(?worker.lock);
+}
+
+fun copy_name(request: *disk.Request, output: *u8) usize {
+    var i: usize = 0;
+    for (i < request.name_length && i + 1 < disk.NAME_BYTES) {
+        output[i] = request.name[i];
+        i         = i + 1;
+    }
+    output[i] = 0;
+    ret i;
+}
+
+# hold the lock until `deadline` passes, however often the wait is woken
+fun wait_out(worker: *Worker, deadline: time.Instant) {
+    for (clock.between_ns(clock.instant(), deadline) != 0) {
+        condition.wait_until(?worker.work, ?worker.lock, deadline);
+    }
+}
+
+fun run_worker(argument: *u8) {
+    val worker: *Worker = argument::*Worker;
+    mutex.lock(?worker.lock);
+    for (true) {
+        for ((worker.head == nil && !worker.stopping) || (worker.head != nil && worker.paused)) {
+            condition.wait(?worker.work, ?worker.lock);
+        }
+        if (worker.head == nil) { brk; }
+        val request: *disk.Request = worker.head;
+        worker.head = request.next;
+        if (worker.head == nil) { worker.tail = nil; }
+        request.next         = nil;
+        worker.queued        = worker.queued - 1;
+        worker.running       = true;
+        worker.running_op    = request.op;
+        worker.running_bytes = copy_name(request, ?worker.running_name[0]);
+        if (worker.delay_ns != 0) { wait_out(worker, clock.after(clock.instant(), worker.delay_ns)); }
+        mutex.unlock(?worker.lock);
+        disk.run(worker.target, request);
+        # the request is its submitter's once this returns, so nothing here
+        # reads it afterwards
+        val reached: bool = disk.complete(request);
+        mutex.lock(?worker.lock);
+        if (!reached) { worker.unwoken = worker.unwoken + 1; }
+        worker.running   = false;
+        worker.completed = worker.completed + 1;
+        condition.broadcast(?worker.settled);
+    }
+    worker.exited = true;
+    condition.broadcast(?worker.settled);
+    mutex.unlock(?worker.lock);
+}
+
+# admit no more streams, drain what is queued and join the thread. false once
+# `timeout_ns` passes with no request completing: the thread is left running
+# what it holds, and `outstanding` names it
+pub fun stop(worker: *Worker, timeout_ns: u64) bool {
+    if (worker == nil || !worker.live) { ret true; }
+    mutex.lock(?worker.lock);
+    worker.stopping = true;
+    condition.broadcast(?worker.work);
+    var seen:     u64          = worker.completed;
+    var deadline: time.Instant = clock.after(clock.instant(), timeout_ns);
+    for (!worker.exited) {
+        # with nothing left the thread is on its way out, which no timeout cuts
+        if (worker.head == nil && !worker.running) {
+            condition.wait(?worker.settled, ?worker.lock);
+        }
+        or { condition.wait_until(?worker.settled, ?worker.lock, deadline); }
+        if (worker.completed != seen) {
+            seen     = worker.completed;
+            deadline = clock.after(clock.instant(), timeout_ns);
+        }
+        or (!worker.exited && clock.between_ns(clock.instant(), deadline) == 0) {
+            mutex.unlock(?worker.lock);
+            ret false;
+        }
+    }
+    mutex.unlock(?worker.lock);
+    val joined: thread.Operation = thread.join(?worker.thread);
+    if (sel joined.err) { ret false; }
+    worker.live = false;
+    ret true;
+}
+
+# the requests still queued or running, at most `capacity` of them written to
+# `output`. returns how many there are
+pub fun outstanding(worker: *Worker, output: *Outstanding, capacity: usize) usize {
+    if (worker == nil || !worker.live) { ret 0; }
+    mutex.lock(?worker.lock);
+    var count: usize = 0;
+    if (worker.running) {
+        if (output != nil && count < capacity) {
+            output[count].op          = worker.running_op;
+            output[count].running     = true;
+            output[count].name_length = worker.running_bytes;
+            var i: usize = 0;
+            for (i <= worker.running_bytes && i < disk.NAME_BYTES) {
+                output[count].name[i] = worker.running_name[i];
+                i                     = i + 1;
+            }
+        }
+        count = count + 1;
+    }
+    var request: *disk.Request = worker.head;
+    for (request != nil) {
+        if (output != nil && count < capacity) {
+            output[count].op          = request.op;
+            output[count].running     = false;
+            output[count].name_length = copy_name(request, ?output[count].name[0]);
+        }
+        count   = count + 1;
+        request = request.next;
+    }
+    mutex.unlock(?worker.lock);
+    ret count;
+}
+
+# how many completions could not reach their submitter's thread and were
+# published without waking it
+pub fun unwoken(worker: *Worker) u64 {
+    if (worker == nil || !worker.live) { ret 0; }
+    mutex.lock(?worker.lock);
+    val count: u64 = worker.unwoken;
+    mutex.unlock(?worker.lock);
+    ret count;
+}
+
+pub fun op_text(op: disk.Op) str {
+    if (op == disk.READ)   { ret "read"; }
+    if (op == disk.WRITE)  { ret "write"; }
+    if (op == disk.UNLINK) { ret "unlink"; }
+    if (op == disk.PURGE)  { ret "purge"; }
+    ret "unknown";
+}
+
+# hold every request until `resume`, for tests of a disk that does not answer
+pub fun pause(worker: *Worker) {
+    if (worker == nil || !worker.live) { ret; }
+    mutex.lock(?worker.lock);
+    worker.paused = true;
+    mutex.unlock(?worker.lock);
+}
+
+pub fun resume(worker: *Worker) {
+    if (worker == nil || !worker.live) { ret; }
+    mutex.lock(?worker.lock);
+    worker.paused = false;
+    condition.broadcast(?worker.work);
+    mutex.unlock(?worker.lock);
+}
+
+# add `delay_ns` before every request, for tests of a slow disk
+pub fun slow_down(worker: *Worker, delay_ns: u64) {
+    if (worker == nil || !worker.live) { ret; }
+    mutex.lock(?worker.lock);
+    worker.delay_ns = delay_ns;
+    mutex.unlock(?worker.lock);
+}

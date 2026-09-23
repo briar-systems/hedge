@@ -10,11 +10,16 @@
 # flight on it, and a recorded entry reaches the shared store only when it is
 # published whole. Nothing here holds a shard lock across disk I/O or past the
 # return of the function that took it.
+#
+# No serving worker touches the disk either. The layer's store worker runs every
+# disk request, and its completion wakes the worker's plane, which settles it
+# and wakes the call that waits on it (#286).
 
 use hedge.cache.disk;
 use hedge.cache.key;
 use hedge.cache.policy;
 use hedge.cache.store;
+use hedge.cache.store_worker;
 use hedge.config.schema;
 use hedge.dispatch.call;
 use directives: hedge.http.cache_control;
@@ -51,10 +56,19 @@ fun wall_now() time.Time {
 pub val MAX_RECORDERS: usize = 16;
 # the bytes one recording stages for its disk writes
 pub val STAGE_BYTES: usize = 32768;
+# the stored bodies one worker reads off the disk at once, and the bytes each
+# reads ahead of its response
+pub val MAX_READS:   usize = 16;
+pub val READ_BYTES:  usize = 16384;
+# the body streams the store worker admits at once across every worker. a
+# stream refused for want of room is a hit served from the origin or a
+# response not stored
+pub val STORE_STREAMS: usize = 64;
 
 pub rec Layer {
     backing: store.Store;
     limits:  policy.Limits;
+    worker:  store_worker.Worker;
     live:    bool;
 }
 
@@ -63,10 +77,37 @@ pub rec Layer {
 pub rec Recorders {
     layer:   *Layer;
     slots:   [MAX_RECORDERS]Recording;
+    reads:   [MAX_READS]ReadSlot;
     staging: *u8;
     source:  *allocator.Allocator;
     waker:   wake.Waker;
     live:    bool;
+}
+
+# one stored body being read off the disk
+#
+# it belongs to the worker, not to the call that reads it, so the request and
+# the bytes it reads into outlive a call that ends while the store worker still
+# runs its read: the slot is then `orphaned`, and the plane frees it once the
+# read settles. it holds the entry's pin and one admitted stream for as long as
+# it is busy
+rec ReadSlot {
+    recorders: *Recorders;
+    busy:      bool;
+    orphaned:  bool;
+    # a read was queued and its completion not yet taken by the reader or
+    # relayed to it
+    awaiting: bool;
+    failed:   bool;
+    pin:      store.Pin;
+    request:  disk.Request;
+    buffer:   *u8;
+    filled:   usize;
+    consumed: usize;
+    # the next offset read off the disk, and where the body the reader wants ends
+    at:     usize;
+    limit:  usize;
+    waiter: wake.Waker;
 }
 
 # what one in-flight response is teeing into the store
@@ -112,17 +153,20 @@ rec RefreshedFields {
 # the body reader that serves a hit out of the store
 # `offset` and `limit` are absolute positions in the stored representation, so a
 # range response reads a window of the same entry rather than a copy of it. the
-# entry is pinned for as long as the reader lives. a disk read that is queued
+# entry is pinned for as long as the reader lives: by `pin` for a body in
+# memory, and by its read slot for one on disk. a disk read that is queued
 # answers pending, and the call's waker brings the reader back to complete it
+# into the output the pending read was given
 rec StoredBody {
-    layer:   *Layer;
-    pin:     store.Pin;
-    offset:  usize;
-    limit:   usize;
-    waker:   wake.Waker;
-    request: disk.Request;
-    token:   u64;
-    reader:  body.Reader;
+    layer:    *Layer;
+    pin:      store.Pin;
+    slot:     *ReadSlot;
+    offset:   usize;
+    limit:    usize;
+    token:    u64;
+    waiting:  *u8;
+    capacity: usize;
+    reader:   body.Reader;
 }
 
 # the stored fields of an entry or of a snapshot of one, read the same way
@@ -192,6 +236,7 @@ pub fun make(layer: *Layer, entries: *store.Entry, capacity: usize, body_storage
     shards: usize) bool {
     if (layer == nil) { ret false; }
     layer.limits = freshness;
+    layer.worker = store_worker.idle();
     if (!store.make(?layer.backing, entries, capacity, body_storage, body_capacity, limits,
         shards)) {
         layer.live = false;
@@ -201,15 +246,40 @@ pub fun make(layer: *Layer, entries: *store.Entry, capacity: usize, body_storage
     ret true;
 }
 
+# give the layer a disk root, whose requests its store worker runs. removals and
+# the startup purge draw on a reserve beside the admitted streams: one removal
+# per entry at most, and the purge
 pub fun attach_disk(layer: *Layer, root_path: str, scratch: *allocator.Allocator) bool {
     if (layer == nil || !layer.live) { ret false; }
-    ret store.attach_disk(?layer.backing, root_path, scratch);
+    if (!store_worker.start(?layer.worker, ?layer.backing.disk, STORE_STREAMS,
+        layer.backing.capacity + 1)) { ret false; }
+    if (!store.attach_disk(?layer.backing, root_path, scratch,
+        store_worker.executor(?layer.worker))) {
+        store_worker.stop(?layer.worker, 0);
+        ret false;
+    }
+    ret true;
 }
 
-pub fun close(layer: *Layer) bool {
+# close the store and stop its worker. the worker drains its queue first, and
+# gives up once `timeout_ns` passes with nothing completing: the close then
+# fails and `stalled` names what the disk still holds
+pub fun close(layer: *Layer, timeout_ns: u64) bool {
     if (layer == nil || !layer.live) { ret false; }
+    # a close refused for removals in flight is finished once the worker has
+    # run them
+    var closed: bool = store.close(?layer.backing);
+    if (!store_worker.stop(?layer.worker, timeout_ns)) { ret false; }
+    if (!closed) { closed = store.close(?layer.backing); }
     layer.live = false;
-    ret store.close(?layer.backing);
+    ret closed;
+}
+
+# the disk requests the store worker still holds, at most `capacity` of them
+# written to `output`. returns how many there are
+pub fun stalled(layer: *Layer, output: *store_worker.Outstanding, capacity: usize) usize {
+    if (layer == nil) { ret 0; }
+    ret store_worker.outstanding(?layer.worker, output, capacity);
 }
 
 pub fun enabled(layer: *Layer) bool {
@@ -260,10 +330,31 @@ pub fun make_recorders(recorders: *Recorders, layer: *Layer, source: *allocator.
     if (layer.backing.has_root) {
         if (source == nil) { ret false; }
         val allocated: res[*u8, allocator.Error] = allocator.allocate[u8](source,
-            MAX_RECORDERS * STAGE_BYTES);
+            staging_bytes());
         if (sel allocated.err) { ret false; }
         recorders.staging = allocated.ok;
         recorders.source  = source;
+    }
+    var r: usize = 0;
+    for (r < MAX_READS) {
+        val slot: *ReadSlot = ?recorders.reads[r];
+        slot.recorders = recorders;
+        slot.busy      = false;
+        slot.orphaned  = false;
+        slot.awaiting  = false;
+        slot.failed    = false;
+        slot.pin       = store.no_pin();
+        slot.request   = disk.idle();
+        slot.buffer    = nil;
+        if (recorders.staging != nil) {
+            slot.buffer = ?recorders.staging[MAX_RECORDERS * STAGE_BYTES + r * READ_BYTES];
+        }
+        slot.filled   = 0;
+        slot.consumed = 0;
+        slot.at       = 0;
+        slot.limit    = 0;
+        slot.waiter   = wake.no_waker();
+        r             = r + 1;
     }
     var i: usize = 0;
     for (i < MAX_RECORDERS) {
@@ -285,7 +376,12 @@ pub fun make_recorders(recorders: *Recorders, layer: *Layer, source: *allocator.
     ret true;
 }
 
-# the waker a queued disk write wakes: the worker's plane, which drives `drive`
+# a worker's disk staging: its recordings' writes, then its reads
+fun staging_bytes() usize {
+    ret MAX_RECORDERS * STAGE_BYTES + MAX_READS * READ_BYTES;
+}
+
+# the waker a queued disk request wakes: the worker's plane, which drives `drive`
 pub fun attach_waker(recorders: *Recorders, waker: wake.Waker) bool {
     if (recorders == nil || !recorders.live) { ret false; }
     recorders.waker = waker;
@@ -293,19 +389,32 @@ pub fun attach_waker(recorders: *Recorders, waker: wake.Waker) bool {
 }
 
 # settle what recordings that already ended still have in flight, publishing or
-# dropping each entry once its last write settles
+# dropping each entry once its last write settles, and hand each settled read
+# to the call that waits on it, or free it when that call has gone
 pub fun drive(recorders: *Recorders) bool {
     if (recorders == nil || !recorders.live) { ret true; }
-    var i: usize = 0;
+    var advanced: bool  = true;
+    var i:        usize = 0;
     for (i < MAX_RECORDERS) {
         val state: *Recording = ?recorders.slots[i];
         if (state.closing) { advance_closing(state); }
         i = i + 1;
     }
-    ret true;
+    i = 0;
+    for (i < MAX_READS) {
+        val slot: *ReadSlot = ?recorders.reads[i];
+        if (slot_settled(slot)) {
+            settle_slot(slot);
+            if (slot.orphaned)              { free_slot(slot); }
+            or (!wake.wake(?slot.waiter)) { advanced = false; }
+        }
+        i = i + 1;
+    }
+    ret advanced;
 }
 
-# whether a recording that ended still waits on a disk write
+# whether a recording that ended still waits on a disk write, or a read on its
+# disk read
 pub fun settling(recorders: *Recorders) bool {
     if (recorders == nil || !recorders.live) { ret false; }
     var i: usize = 0;
@@ -313,7 +422,149 @@ pub fun settling(recorders: *Recorders) bool {
         if (recorders.slots[i].closing) { ret true; }
         i = i + 1;
     }
+    i = 0;
+    for (i < MAX_READS) {
+        if (recorders.reads[i].busy && recorders.reads[i].awaiting) { ret true; }
+        i = i + 1;
+    }
     ret false;
+}
+
+# whether `drive` has work: a disk request that settled and was not yet taken
+# up. the debug audit asks this of a plane that is not due, since such work
+# waits on a wake that already came
+pub fun pending_work(recorders: *Recorders) bool {
+    if (recorders == nil || !recorders.live) { ret false; }
+    var i: usize = 0;
+    for (i < MAX_RECORDERS) {
+        val state: *Recording = ?recorders.slots[i];
+        if (state.closing && store.write_pending(?state.writer)
+            && !disk.in_flight(?state.writer.request)) { ret true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < MAX_READS) {
+        if (slot_settled(?recorders.reads[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun slot_settled(slot: *ReadSlot) bool {
+    ret slot.busy && slot.awaiting && !disk.in_flight(?slot.request);
+}
+
+# --- reading a stored body off the disk ---
+
+# a slot for one stored body, holding the pin taken over from `held` and one
+# admitted stream. nil when the worker has no free slot or the store worker no
+# room for another stream: a refusal the caller answers without the disk
+fun open_slot(recorders: *Recorders, held: *store.Pin, first: usize, limit: usize,
+    waiter: wake.Waker) *ReadSlot {
+    if (recorders == nil || !recorders.live || recorders.staging == nil || held == nil
+        || !held.held) { ret nil; }
+    var found: *ReadSlot = nil;
+    var i:     usize     = 0;
+    for (i < MAX_READS && found == nil) {
+        if (!recorders.reads[i].busy) { found = ?recorders.reads[i]; }
+        i = i + 1;
+    }
+    if (found == nil || !disk.admit(?recorders.layer.backing.disk)) { ret nil; }
+    found.busy     = true;
+    found.orphaned = false;
+    found.awaiting = false;
+    found.failed   = false;
+    found.pin      = @held;
+    held.held      = false;
+    found.request  = disk.idle();
+    found.filled   = 0;
+    found.consumed = 0;
+    found.at       = first;
+    found.limit    = limit;
+    found.waiter   = waiter;
+    ret found;
+}
+
+fun free_slot(slot: *ReadSlot) {
+    store.unpin(?slot.pin);
+    disk.leave(?slot.recorders.layer.backing.disk);
+    slot.busy     = false;
+    slot.orphaned = false;
+    slot.awaiting = false;
+    slot.waiter   = wake.no_waker();
+}
+
+# the reader is done with the slot. a read the store worker still holds names
+# the slot's buffer, so the slot is left to the plane until it settles
+fun release_slot(slot: *ReadSlot) {
+    if (slot == nil || !slot.busy) { ret; }
+    if (slot.awaiting) {
+        slot.orphaned = true;
+        slot.waiter   = wake.no_waker();
+        ret;
+    }
+    free_slot(slot);
+}
+
+# read the next piece of the body into the slot, which holds nothing unread
+fun fill_slot(slot: *ReadSlot) store.ReadStatus {
+    if (slot.failed)           { ret store.READ_FAILED; }
+    if (slot.at >= slot.limit) { ret store.READ_DONE; }
+    var room: usize = slot.limit - slot.at;
+    if (room > READ_BYTES) { room = READ_BYTES; }
+    var produced: usize            = 0;
+    val status:   store.ReadStatus = store.read_body(?slot.pin, slot.at, slot.buffer, room,
+        ?slot.request, slot.recorders.waker, ?produced);
+    if (status == store.READ_PENDING) {
+        slot.awaiting = true;
+        ret status;
+    }
+    ret took(slot, status, produced);
+}
+
+fun took(slot: *ReadSlot, status: store.ReadStatus, produced: usize) store.ReadStatus {
+    if (status != store.READ_DONE || produced == 0) {
+        slot.failed = true;
+        ret store.READ_FAILED;
+    }
+    slot.filled   = produced;
+    slot.consumed = 0;
+    slot.at       = slot.at + produced;
+    ret store.READ_DONE;
+}
+
+# whether the slot holds bytes to hand out, reading more when it holds none
+fun ready_slot(slot: *ReadSlot) store.ReadStatus {
+    if (slot.consumed < slot.filled) { ret store.READ_DONE; }
+    if (slot.failed)                 { ret store.READ_FAILED; }
+    if (slot.awaiting) {
+        if (disk.in_flight(?slot.request)) { ret store.READ_PENDING; }
+        ret settle_slot(slot);
+    }
+    ret fill_slot(slot);
+}
+
+# take a queued read's result into the slot once it has settled
+fun settle_slot(slot: *ReadSlot) store.ReadStatus {
+    slot.awaiting = false;
+    var produced: usize            = 0;
+    val status:   store.ReadStatus = store.read_settled(?slot.request, ?produced);
+    ret took(slot, status, produced);
+}
+
+# hand out up to `capacity` of the slot's bytes. once it is empty the next
+# piece is read ahead while the response writes these
+fun drain_slot(slot: *ReadSlot, output: *u8, capacity: usize) usize {
+    var count: usize = slot.filled - slot.consumed;
+    if (count > capacity) { count = capacity; }
+    memory.raw_copy(output::ptr, (?slot.buffer[slot.consumed])::ptr, count);
+    slot.consumed = slot.consumed + count;
+    if (slot.consumed == slot.filled && slot.at < slot.limit) {
+        slot.filled   = 0;
+        slot.consumed = 0;
+        fill_slot(slot);
+    }
+    ret count;
 }
 
 # refused while a write is still in flight, since its staged bytes are the
@@ -330,8 +581,14 @@ pub fun close_recorders(recorders: *Recorders) bool {
         i           = i + 1;
     }
     if (settling(recorders)) { ret false; }
+    # a read slot a reader still holds is a response still in flight
+    i = 0;
+    for (i < MAX_READS) {
+        if (recorders.reads[i].busy) { ret false; }
+        i = i + 1;
+    }
     if (recorders.staging != nil) {
-        allocator.deallocate[u8](recorders.source, recorders.staging, MAX_RECORDERS * STAGE_BYTES);
+        allocator.deallocate[u8](recorders.source, recorders.staging, staging_bytes());
         recorders.staging = nil;
     }
     recorders.live = false;
@@ -353,15 +610,35 @@ fun stored_progress(state: *StoredBody, status: store.ReadStatus, produced: usiz
     ret body.data(produced);
 }
 
+# hand out what the slot holds into `output`, or answer pending with the output
+# remembered for the completion
+fun slot_progress(state: *StoredBody, status: store.ReadStatus, output: *u8,
+    capacity: usize) body.Progress {
+    if (status == store.READ_PENDING) {
+        state.waiting  = output;
+        state.capacity = capacity;
+    }
+    var produced: usize = 0;
+    if (status == store.READ_DONE) {
+        var room: usize = state.limit - state.offset;
+        if (room > capacity) { room = capacity; }
+        produced = drain_slot(state.slot, output, room);
+    }
+    ret stored_progress(state, status, produced);
+}
+
 fun stored_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
     val state: *StoredBody = context::*StoredBody;
     if (state == nil)                { ret body.failed("stored body has no state", body.REUSE_FORBIDDEN); }
     if (state.offset >= state.limit) { ret body.complete(body.REUSE_ALLOWED); }
+    if (state.slot != nil) {
+        ret slot_progress(state, ready_slot(state.slot), output, capacity);
+    }
     var produced: usize = 0;
     var room:     usize = state.limit - state.offset;
     if (room > capacity) { room = capacity; }
     val status: store.ReadStatus = store.read_body(?state.pin, state.offset, output, room,
-        ?state.request, state.waker, ?produced);
+        nil, wake.no_waker(), ?produced);
     ret stored_progress(state, status, produced);
 }
 
@@ -381,15 +658,23 @@ fun stored_complete(context: ptr, token: u64, trailers: *field.Fields) body.Prog
     if (state == nil || token != state.token) {
         ret body.failed("stored body completion is not its own", body.REUSE_FORBIDDEN);
     }
-    var produced: usize            = 0;
-    val status:   store.ReadStatus = store.read_settled(?state.request, ?produced);
+    if (state.slot == nil || state.waiting == nil) {
+        ret body.failed("stored body has no read in flight", body.REUSE_FORBIDDEN);
+    }
+    val status: store.ReadStatus = ready_slot(state.slot);
     if (status == store.READ_PENDING) { ret body.pending(state.token); }
-    ret stored_progress(state, status, produced);
+    val output: *u8 = state.waiting;
+    state.waiting = nil;
+    ret slot_progress(state, status, output, state.capacity);
 }
 
 fun stored_release(context: ptr) {
     val state: *StoredBody = context::*StoredBody;
     if (state == nil) { ret; }
+    if (state.slot != nil) {
+        release_slot(state.slot);
+        state.slot = nil;
+    }
     store.unpin(?state.pin);
 }
 
@@ -756,9 +1041,11 @@ fun request_header(request: *message.Request, name: str, length: usize) view.Vie
 }
 
 # select an entry to answer from, with its shard held: touch it, count the hit,
-# copy what the response needs into the call's arena and pin it for its body
+# copy what the response needs into the call's arena and pin it for its body.
+# with `defer_disk` a hit that may have to read its body off the disk is left
+# uncounted, since a refused read makes it a miss (`counts_later`)
 fun take_hit(shard: *store.Shard, active: *call.Call, index: usize, snap: *store.Snapshot,
-    held: *store.Pin) bool {
+    held: *store.Pin, defer_disk: bool) bool {
     val entry: *store.Entry = store.entry_at(shard, index);
     if (entry == nil) { ret false; }
     var fields: *u8 = nil;
@@ -770,26 +1057,56 @@ fun take_hit(shard: *store.Shard, active: *call.Call, index: usize, snap: *store
     @held = store.pin(shard, index);
     if (!held.held) { ret false; }
     store.touch(shard, index);
-    store.record_hit(shard);
+    if (!defer_disk || !counts_later(snap)) { store.record_hit(shard); }
     ret true;
 }
 
+fun counts_later(snap: *store.Snapshot) bool {
+    ret snap.placement == store.ON_DISK && snap.body_length != 0;
+}
+
+# count a lookup whose outcome was settled after its shard was let go
+fun count_lookup(shard: *store.Shard, hit: bool) {
+    store.lock(shard);
+    if (hit) { store.record_hit(shard); }
+    or       { store.record_miss(shard); }
+    store.release(shard);
+}
+
+# a read slot on its way to a body reader. whoever holds a lease with a slot in
+# it releases the slot, and a reader that takes the slot over empties the lease
+rec Lease {
+    slot: *ReadSlot;
+}
+
+fun no_lease() Lease {
+    ret Lease{slot: nil};
+}
+
+fun end_lease(lease: *Lease) {
+    if (lease.slot == nil) { ret; }
+    release_slot(lease.slot);
+    lease.slot = nil;
+}
+
 # attach a reader over `[first, last]` of the stored representation. the reader
-# takes the pin over and lets it go when it is released
-fun attach_stored_body(layer: *Layer, active: *call.Call, held: *store.Pin, first: usize,
-    last_exclusive: usize) bool {
+# takes the pin, or the read slot of a body on disk, over and lets it go when it
+# is released
+fun attach_stored_body(layer: *Layer, active: *call.Call, held: *store.Pin, lease: *Lease,
+    first: usize, last_exclusive: usize) bool {
     val a: *allocator.Allocator = call.allocator_of(active);
     if (a == nil) { ret false; }
     val allocated: res[*StoredBody, allocator.Error] = allocator.allocate[StoredBody](a, 1);
     if (sel allocated.err) { ret false; }
     val state: *StoredBody = allocated.ok;
-    state.layer   = layer;
-    state.pin     = store.no_pin();
-    state.offset  = first;
-    state.limit   = last_exclusive;
-    state.waker   = call.waker(active);
-    state.request = disk.idle();
-    state.token   = 0;
+    state.layer    = layer;
+    state.pin      = store.no_pin();
+    state.slot     = nil;
+    state.offset   = first;
+    state.limit    = last_exclusive;
+    state.token    = 0;
+    state.waiting  = nil;
+    state.capacity = 0;
     val response:   *message.Response = call.response(active);
     val configured: message.Limits    = call.limits(active);
     val count:      usize             = last_exclusive - first;
@@ -814,8 +1131,14 @@ fun attach_stored_body(layer: *Layer, active: *call.Call, held: *store.Pin, firs
     if (message.set_body_reader(response, ?state.reader, configured) != message.RESPONSE_OK) {
         ret false;
     }
-    state.pin = @held;
-    held.held = false;
+    if (lease.slot != nil) {
+        state.slot = lease.slot;
+        lease.slot = nil;
+    }
+    or {
+        state.pin = @held;
+        held.held = false;
+    }
     ret true;
 }
 
@@ -835,29 +1158,101 @@ fun prepare_bodyless(active: *call.Call) bool {
     ret true;
 }
 
-# answer from a snapshot, taking the pin over: a body reader keeps it, and every
-# other outcome lets it go before returning
+# what a stored representation answers a request with, decided before any of it
+# is written into the response, so a hit whose body has to come off the disk
+# can still go to the origin when the disk refuses it
+def Answer: u8;
+val ANSWER_PRECONDITION_FAILED: Answer = 1;
+val ANSWER_NOT_MODIFIED:        Answer = 2;
+val ANSWER_UNSATISFIABLE:       Answer = 3;
+val ANSWER_BODYLESS:            Answer = 4;
+val ANSWER_BODY:                Answer = 5;
+
+rec Plan {
+    answer:  Answer;
+    span:    range.Span;
+    partial: bool;
+    # the window of the stored body an ANSWER_BODY sends
+    first:          usize;
+    last_exclusive: usize;
+}
+
+fun plan_snapshot(request: *message.Request, snap: *store.Snapshot) Plan {
+    var plan: Plan = Plan{answer: ANSWER_BODYLESS,
+        span:  range.Span{outcome: range.NO_RANGE, first: 0, last: 0, length: 0},
+        partial: false, first: 0, last_exclusive: 0};
+    val current:      validator.Validators = stored_validators(snapshot_fields(snap));
+    val precondition: validator.Outcome    = validator.evaluate(request, current);
+    if (precondition == validator.PRECONDITION_FAILED) {
+        plan.answer = ANSWER_PRECONDITION_FAILED;
+        ret plan;
+    }
+    if (precondition == validator.NOT_MODIFIED) {
+        plan.answer = ANSWER_NOT_MODIFIED;
+        ret plan;
+    }
+    val bodyless: bool = !status.permits_content(request.method.kind, snap.status)
+        || snap.body_length == 0;
+    if (!bodyless && snap.status == status.OK) {
+        val asked: view.View = request_header(request, field.RANGE, 5);
+        if (asked.data != nil && asked.len != 0 && validator.range_allowed(request, current)) {
+            plan.span = range.resolve(asked, snap.body_length::u64);
+        }
+    }
+    if (plan.span.outcome == range.UNSATISFIABLE) {
+        plan.answer = ANSWER_UNSATISFIABLE;
+        ret plan;
+    }
+    plan.partial = plan.span.outcome == range.SATISFIABLE;
+    if (bodyless) { ret plan; }
+    plan.answer         = ANSWER_BODY;
+    plan.last_exclusive = snap.body_length;
+    if (plan.partial) {
+        plan.first          = plan.span.first::usize;
+        plan.last_exclusive = (plan.span.last + 1)::usize;
+    }
+    ret plan;
+}
+
+# whether answering with `plan` reads the body off the disk
+fun reads_disk(snap: *store.Snapshot, plan: *Plan) bool {
+    ret plan.answer == ANSWER_BODY && snap.placement == store.ON_DISK;
+}
+
+# answer from a snapshot, taking the pin and the lease over: a body reader keeps
+# what it reads through, and every other outcome lets both go before returning
 fun prepare_stored(layer: *Layer, active: *call.Call, snap: *store.Snapshot, held: *store.Pin,
-    now: time.Time) bool {
-    val prepared: bool = prepare_snapshot(layer, active, snap, held, now);
+    lease: *Lease, plan: *Plan, now: time.Time) bool {
+    val prepared: bool = emit_snapshot(layer, active, snap, held, lease, plan, now);
     if (held.held) { store.unpin(held); }
+    end_lease(lease);
     ret prepared;
 }
 
-fun prepare_snapshot(layer: *Layer, active: *call.Call, snap: *store.Snapshot,
-    held: *store.Pin, now: time.Time) bool {
+fun add_content_range(active: *call.Call, text: *u8, length: usize) bool {
+    if (length == 0) { ret false; }
+    val stored_text: *u8 = service.arena_bytes(active, length);
+    if (stored_text == nil) { ret false; }
+    memory.raw_copy(stored_text::ptr, text::ptr, length);
+    ret message.add_field(call.response(active), field.Field{
+        name:      view.view("content-range", 13),
+        value:     view.view(stored_text, length),
+        sensitive: false,
+    }) == field.ADD_OK;
+}
+
+fun emit_snapshot(layer: *Layer, active: *call.Call, snap: *store.Snapshot,
+    held: *store.Pin, lease: *Lease, plan: *Plan, now: time.Time) bool {
     val response: *message.Response = call.response(active);
     val request:  *message.Request  = call.request(active);
     if (response == nil || request == nil) { ret false; }
 
-    val current:      validator.Validators = stored_validators(snapshot_fields(snap));
-    val precondition: validator.Outcome    = validator.evaluate(request, current);
-    if (precondition == validator.PRECONDITION_FAILED) {
+    if (plan.answer == ANSWER_PRECONDITION_FAILED) {
         if (message.set_status(response, status.PRECONDITION_FAILED)
             != message.RESPONSE_OK) { ret false; }
         ret prepare_bodyless(active);
     }
-    if (precondition == validator.NOT_MODIFIED) {
+    if (plan.answer == ANSWER_NOT_MODIFIED) {
         if (message.set_status(response, status.NOT_MODIFIED) != message.RESPONSE_OK) {
             ret false;
         }
@@ -865,95 +1260,150 @@ fun prepare_snapshot(layer: *Layer, active: *call.Call, snap: *store.Snapshot,
         if (!add_age(layer, active, snap, now))              { ret false; }
         ret prepare_bodyless(active);
     }
-
-    val bodyless: bool = !status.permits_content(request.method.kind, snap.status)
-        || snap.body_length == 0;
-    var span: range.Span = range.Span{outcome: range.NO_RANGE, first: 0, last: 0, length: 0};
-    if (!bodyless && snap.status == status.OK) {
-        val asked: view.View = request_header(request, field.RANGE, 5);
-        if (asked.data != nil && asked.len != 0 && validator.range_allowed(request, current)) {
-            span = range.resolve(asked, snap.body_length::u64);
-        }
-    }
-    if (span.outcome == range.UNSATISFIABLE) {
+    if (plan.answer == ANSWER_UNSATISFIABLE) {
         var text:   [range.CONTENT_RANGE_CAPACITY]u8;
         val length: usize = range.format_unsatisfied(snap.body_length::u64, ?text[0],
             range.CONTENT_RANGE_CAPACITY);
         if (message.set_status(response, status.RANGE_NOT_SATISFIABLE) != message.RESPONSE_OK) {
             ret false;
         }
-        val stored_text: *u8 = service.arena_bytes(active, length);
-        if (stored_text == nil) { ret false; }
-        var i: usize = 0;
-        for (i < length) {
-            stored_text[i] = text[i];
-            i              = i + 1;
-        }
-        if (message.add_field(response, field.Field{
-            name:      view.view("content-range", 13),
-            value:     view.view(stored_text, length),
-            sensitive: false,
-        }) != field.ADD_OK) { ret false; }
+        if (!add_content_range(active, ?text[0], length)) { ret false; }
         ret prepare_bodyless(active);
     }
 
-    val partial: bool          = span.outcome == range.SATISFIABLE;
-    var code:    status.Status = snap.status;
-    if (partial) { code = status.PARTIAL_CONTENT; }
+    var code: status.Status = snap.status;
+    if (plan.partial) { code = status.PARTIAL_CONTENT; }
     if (message.set_status(response, code) != message.RESPONSE_OK) {
         ret false;
     }
     if (!copy_stored_fields(snap, response, false, true)) { ret false; }
     if (!add_age(layer, active, snap, now))               { ret false; }
-    if (partial) {
+    if (plan.partial) {
         var text:   [range.CONTENT_RANGE_CAPACITY]u8;
-        val length: usize = range.format_content_range(span, snap.body_length::u64, ?text[0],
-            range.CONTENT_RANGE_CAPACITY);
-        if (length == 0) { ret false; }
-        val stored_text: *u8 = service.arena_bytes(active, length);
-        if (stored_text == nil) { ret false; }
-        var i: usize = 0;
-        for (i < length) {
-            stored_text[i] = text[i];
-            i              = i + 1;
-        }
-        if (message.add_field(response, field.Field{
-            name:      view.view("content-range", 13),
-            value:     view.view(stored_text, length),
-            sensitive: false,
-        }) != field.ADD_OK) { ret false; }
+        val length: usize = range.format_content_range(plan.span, snap.body_length::u64,
+            ?text[0], range.CONTENT_RANGE_CAPACITY);
+        if (!add_content_range(active, ?text[0], length)) { ret false; }
     }
-    if (bodyless) {
+    if (plan.answer == ANSWER_BODYLESS) {
         if (!service.add_field(active, field.CONTENT_LENGTH,
             service.arena_number(active, snap.body_length::u64))) {
             ret false;
         }
         ret prepare_bodyless(active);
     }
-    var first:          usize = 0;
-    var last_exclusive: usize = snap.body_length;
-    if (partial) {
-        first          = span.first::usize;
-        last_exclusive = (span.last + 1)::usize;
+    ret attach_stored_body(layer, active, held, lease, plan.first, plan.last_exclusive);
+}
+
+# a hit whose body comes off the disk, parked on its first read. it lives in the
+# call's arena behind the call's finalizer, and holds the read slot until the
+# read settles and the answer is written, or the call ends first
+rec PendingHit {
+    layer: *Layer;
+    snap:  store.Snapshot;
+    plan:  Plan;
+    lease: Lease;
+    shard: *store.Shard;
+}
+
+fun hit_finalize(context: ptr, active: *call.Call) bool {
+    val pending: *PendingHit = context::*PendingHit;
+    if (pending != nil) { end_lease(?pending.lease); }
+    ret true;
+}
+
+fun commit_stored(layer: *Layer, active: *call.Call, snap: *store.Snapshot, held: *store.Pin,
+    lease: *Lease, plan: *Plan, now: time.Time) exchange.ServiceStatus {
+    if (!prepare_stored(layer, active, snap, held, lease, plan, now)) {
+        ret exchange.SERVICE_FAILED;
     }
-    ret attach_stored_body(layer, active, held, first, last_exclusive);
+    if (!call.resolve_body(active, call.BODY_DRAIN))   { ret exchange.SERVICE_FAILED; }
+    if (service.commit(active) != message.RESPONSE_OK) { ret exchange.SERVICE_FAILED; }
+    ret exchange.SERVICE_COMPLETE;
 }
 
 # answer a hit selected with `shard` held, letting the lock go first
-fun serve_stored(layer: *Layer, shard: *store.Shard, active: *call.Call, index: usize,
+#
+# a body on disk is read before anything is written into the response: its
+# first read is issued here, so a refused one (no free read slot, no room on the
+# store worker, a failed read) is a miss served from the origin rather than a
+# response that fails part way through its body
+fun serve_stored(binding: *Binding, shard: *store.Shard, active: *call.Call, index: usize,
     now: time.Time) exchange.ServiceStatus {
+    val layer: *Layer = binding.layer;
     var snap:  store.Snapshot;
     var held:  store.Pin = store.no_pin();
-    val taken: bool      = take_hit(shard, active, index, ?snap, ?held);
+    val taken: bool      = take_hit(shard, active, index, ?snap, ?held, true);
     store.release(shard);
     if (!taken) {
         if (held.held) { store.unpin(?held); }
         ret exchange.SERVICE_FAILED;
     }
-    if (!prepare_stored(layer, active, ?snap, ?held, now)) { ret exchange.SERVICE_FAILED; }
-    if (!call.resolve_body(active, call.BODY_DRAIN))       { ret exchange.SERVICE_FAILED; }
-    if (service.commit(active) != message.RESPONSE_OK)     { ret exchange.SERVICE_FAILED; }
-    ret exchange.SERVICE_COMPLETE;
+    var plan:  Plan  = plan_snapshot(call.request(active), ?snap);
+    var lease: Lease = no_lease();
+    if (!reads_disk(?snap, ?plan)) {
+        if (counts_later(?snap)) { count_lookup(shard, true); }
+        ret commit_stored(layer, active, ?snap, ?held, ?lease, ?plan, now);
+    }
+    lease.slot = open_slot(binding.recorders, ?held, plan.first, plan.last_exclusive,
+        call.waker(active));
+    if (lease.slot == nil) {
+        store.unpin(?held);
+        count_lookup(shard, false);
+        ret forward_to_inner(binding, active);
+    }
+    val first: store.ReadStatus = fill_slot(lease.slot);
+    if (first == store.READ_DONE) {
+        count_lookup(shard, true);
+        ret commit_stored(layer, active, ?snap, ?held, ?lease, ?plan, now);
+    }
+    if (first == store.READ_FAILED) {
+        end_lease(?lease);
+        count_lookup(shard, false);
+        ret forward_to_inner(binding, active);
+    }
+    val a: *allocator.Allocator = call.allocator_of(active);
+    if (a == nil) {
+        end_lease(?lease);
+        ret exchange.SERVICE_FAILED;
+    }
+    val allocated: res[*PendingHit, allocator.Error] = allocator.allocate[PendingHit](a, 1);
+    if (sel allocated.err) {
+        end_lease(?lease);
+        ret exchange.SERVICE_FAILED;
+    }
+    val pending: *PendingHit = allocated.ok;
+    pending.layer = layer;
+    pending.snap  = snap;
+    pending.plan  = plan;
+    pending.lease = lease;
+    pending.shard = shard;
+    if (!call.attach_finalizer(active, call.Finalizer{ctx: (pending)::ptr,
+        finish: hit_finalize})) {
+        end_lease(?pending.lease);
+        ret exchange.SERVICE_FAILED;
+    }
+    ret call.park(active, call.WAIT_WAKE, 0);
+}
+
+# a hit parked on its first disk read is entered again: it parks again until the
+# read settles, then answers from the store, or from the origin when it failed
+fun resume_hit(binding: *Binding, active: *call.Call,
+    pending: *PendingHit) exchange.ServiceStatus {
+    val first: store.ReadStatus = ready_slot(pending.lease.slot);
+    if (first == store.READ_PENDING) { ret call.park(active, call.WAIT_WAKE, 0); }
+    if (!call.detach_finalizer(active, hit_finalize)) {
+        end_lease(?pending.lease);
+        ret exchange.SERVICE_FAILED;
+    }
+    if (first == store.READ_FAILED) {
+        end_lease(?pending.lease);
+        count_lookup(pending.shard, false);
+        ret forward_to_inner(binding, active);
+    }
+    count_lookup(pending.shard, true);
+    var held: store.Pin = store.no_pin();
+    ret commit_stored(pending.layer, active, ?pending.snap, ?held, ?pending.lease,
+        ?pending.plan, wall_now());
 }
 
 # --- recording a response into the store ---
@@ -1227,7 +1677,7 @@ fun intercept_locked(state: *Recording, shard: *store.Shard, active: *call.Call,
     # a response the origin answered in full is recorded, so the recording stays
     # live for it
     if (!replace) { ret call.INTERCEPT_CONTINUE; }
-    if (!take_hit(shard, active, state.revalidating_index, snap, held)) {
+    if (!take_hit(shard, active, state.revalidating_index, snap, held, false)) {
         ret call.INTERCEPT_FAILED;
     }
     ret call.INTERCEPT_REPLACED;
@@ -1258,9 +1708,23 @@ fun intercept(context: ptr, active: *call.Call) call.Interception {
         ret call.INTERCEPT_CONTINUE;
     }
     stop_recording(state, false);
+    # the origin has answered, so a stored body the disk refuses cannot go back
+    # to it: the exchange fails before anything of the stored answer is sent
+    var plan:  Plan  = plan_snapshot(call.request(active), ?snap);
+    var lease: Lease = no_lease();
+    if (reads_disk(?snap, ?plan)) {
+        lease.slot = open_slot(state.recorders, ?held, plan.first, plan.last_exclusive,
+            call.waker(active));
+        if (lease.slot == nil || fill_slot(lease.slot) == store.READ_FAILED) {
+            end_lease(?lease);
+            if (held.held) { store.unpin(?held); }
+            ret call.INTERCEPT_FAILED;
+        }
+    }
     if (!call.reset_response_for_interceptor(active)
-        || !prepare_stored(state.layer, active, ?snap, ?held, wall_now())) {
+        || !prepare_stored(state.layer, active, ?snap, ?held, ?lease, ?plan, wall_now())) {
         if (held.held) { store.unpin(?held); }
+        end_lease(?lease);
         ret call.INTERCEPT_FAILED;
     }
     ret call.INTERCEPT_REPLACED;
@@ -1385,6 +1849,9 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     if (!enabled(layer) || recorders == nil || !recorders.live) {
         ret forward_to_inner(binding, active);
     }
+    # a hit parked on its first disk read resumes where it parked
+    val pending: *PendingHit = call.finalizer_state(active, hit_finalize)::*PendingHit;
+    if (pending != nil) { ret resume_hit(binding, active, pending); }
     # a resumed call keeps its existing cache selection and resumes only its inner service
     if (owns_recording(recorders, active)) { ret forward_to_inner(binding, active); }
     val request: *message.Request = call.request(active);
@@ -1445,12 +1912,12 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
         if (has_origin_precondition(request)) { ret forward_miss(binding, shard, active); }
         val decision: policy.Reuse = policy.reuse(entry.metadata, request_directives, now);
         if (decision == policy.FRESH || decision == policy.STALE_SERVABLE) {
-            ret serve_stored(layer, shard, active, index, now);
+            ret serve_stored(binding, shard, active, index, now);
         }
         if (decision == policy.REVALIDATE) {
             if (entry.revalidating) {
                 if (policy.servable_on_error(entry.metadata, now)) {
-                    ret serve_stored(layer, shard, active, index, now);
+                    ret serve_stored(binding, shard, active, index, now);
                 }
                 ret forward_miss(binding, shard, active);
             }
@@ -1606,7 +2073,7 @@ pub fun from_config(layer: *Layer, configured: *schema.Cache, entries: *store.En
     }
     if (configured.disk_bytes != 0 && configured.disk_root.len != 0) {
         if (!attach_disk(layer, schema.text(?configured.disk_root), scratch)) {
-            close(layer);
+            close(layer, 0);
             ret false;
         }
     }
