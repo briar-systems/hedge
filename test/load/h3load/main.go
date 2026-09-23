@@ -159,7 +159,7 @@ func dial(ctx context.Context, o *options, w *worker) (*quic.Conn, error) {
 	}, &quic.Config{
 		MaxIdleTimeout:       o.idleTimeout,
 		HandshakeIdleTimeout: o.connectTimeout,
-		KeepAlivePeriod:      time.Second,
+		KeepAlivePeriod:      o.idleTimeout / 2,
 		Tracer:               traceFor,
 	})
 }
