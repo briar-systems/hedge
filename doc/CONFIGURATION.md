@@ -114,8 +114,6 @@ How connections reach the workers depends on what the platform can do:
   first worker serves the connection itself.
 - A QUIC listener is served by the first worker until connection IDs route
   datagrams across workers (#174).
-- While the cache is enabled, one worker serves, until a store worker owns the
-  cache's disk (#286).
 
 The caps stay process-wide. `max_connections`, `max_handshakes` and every
 budget's `concurrency` and `memory_bytes` are held as per-worker allowances
@@ -596,7 +594,7 @@ Size `entries` against the authorities clients actually use, not against the num
 
 A representation larger than a quarter of the memory budget goes to disk when `disk_bytes` and `disk_root` are set. Cache file names come from an internal counter and never from request data. A graceful shutdown removes every file the store wrote; starting up removes any file a killed process left behind, so the disk bound holds across a crash. Only names the store's own counter could have produced are removed.
 
-With a disk root the process starts one store thread that runs every disk read, write and removal, so no serving worker waits on the disk. A worker hands a request to it and serves other connections until the answer comes back. The store thread's queue is bounded at 64 bodies read or written at once. When it is full, a request that would be a disk hit goes to the origin as a miss, and a response that would be written to disk is served without being stored. A disk hit reads its first 16 KiB before the response starts, so a slow or full disk never cuts a response short. Shutdown waits for the queue to drain, giving up once `timeouts.stop_ms` passes with no request completing, and then names every request still outstanding.
+Every worker serves from the one cache. With a disk root the process starts one store thread that runs every disk read, write and removal for all of them, so no serving worker waits on the disk. A worker hands a request to it and serves other connections until the answer comes back. The store thread's queue is bounded at 64 bodies read or written at once. When it is full, a request that would be a disk hit goes to the origin as a miss, and a response that would be written to disk is served without being stored. A disk hit reads its first 16 KiB before the response starts, so a slow or full disk never cuts a response short. Shutdown waits for the queue to drain, giving up once `timeouts.stop_ms` passes with no request completing, and then names every request still outstanding.
 
 `heuristic_percent` is the fraction of a representation's age at its `Last-Modified` that a response with no explicit freshness may be assumed fresh for, capped at one day. It defaults to zero, which means a response that states no freshness of its own is not stored.
 
