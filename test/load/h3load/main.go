@@ -43,6 +43,7 @@ type options struct {
 	connectTimeout time.Duration
 	deadline       time.Duration
 	idleTimeout    time.Duration
+	keepAlive      time.Duration
 	// when set, exactly this many connections must complete their handshake
 	// and the rest must be refused, which is how a configured cap is proven
 	expectConnected int
@@ -159,7 +160,7 @@ func dial(ctx context.Context, o *options, w *worker) (*quic.Conn, error) {
 	}, &quic.Config{
 		MaxIdleTimeout:       o.idleTimeout,
 		HandshakeIdleTimeout: o.connectTimeout,
-		KeepAlivePeriod:      o.idleTimeout / 2,
+		KeepAlivePeriod:      o.keepAlive,
 		Tracer:               traceFor,
 	})
 }
@@ -400,11 +401,15 @@ func main() {
 	flag.DurationVar(&o.connectTimeout, "connect-timeout", 30*time.Second, "per-connection handshake budget")
 	flag.DurationVar(&o.deadline, "deadline", 120*time.Second, "safety deadline for reaching the target")
 	flag.DurationVar(&o.idleTimeout, "idle-timeout", 60*time.Second, "QUIC idle timeout")
+	flag.DurationVar(&o.keepAlive, "keep-alive", 0, "keep-alive PING period, or zero for half the idle timeout")
 	flag.BoolVar(&o.serve, "serve", true, "issue requests on every admitted connection")
 	flag.IntVar(&o.dialing, "dialing", 0, "handshakes in flight at once, or zero for all of them")
 	flag.BoolVar(&o.hold, "hold", false, "after a passing run, print `held N` and keep the connections open until stdin closes")
 	flag.IntVar(&o.expectConnected, "expect-connected", -1, "exact number of connections the server must admit, the rest refused")
 	flag.Parse()
+	if o.keepAlive == 0 {
+		o.keepAlive = o.idleTimeout / 2
+	}
 	if o.connections <= 0 || o.target <= 0 {
 		fmt.Fprintln(os.Stderr, "connections and target must be positive")
 		os.Exit(2)
