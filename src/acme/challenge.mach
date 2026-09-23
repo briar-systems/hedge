@@ -13,6 +13,7 @@ use ch: acme.challenge;
 use acme.identifier;
 use acme.problem;
 use crypto.contracts;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -30,7 +31,12 @@ pub val MAX_NAME_BYTES:         usize = ch.MAX_DNS_NAME_BYTES;
 pub val CHALLENGE_PREFIX:       str   = "/.well-known/acme-challenge/";
 pub val CHALLENGE_PREFIX_BYTES: usize = 28;
 
+# an entry is written by the supervisor, which presents and withdraws, and read
+# by every worker serving the challenge route. `sequence` is odd while a write is
+# under way and moves on every write, so a reader that sees it unchanged and
+# even across its read has read one whole presentation
 rec Entry {
+    sequence:  i64;
     token:     [MAX_TOKEN_BYTES]u8;
     token_len: usize;
     value:     [MAX_VALUE_BYTES]u8;
@@ -51,6 +57,7 @@ pub fun http01_reset(table: *Http01) bool {
     if (table == nil) { ret false; }
     var i: usize = 0;
     for (i < MAX_PRESENTATIONS) {
+        table.entries[i].sequence  = 0;
         table.entries[i].live      = false;
         table.entries[i].token_len = 0;
         table.entries[i].value_len = 0;
@@ -83,20 +90,42 @@ fun same_bytes(first: *u8, first_len: usize, second: *u8,
     ret true;
 }
 
-# resolves one challenge token to the exact body the authority expects
-pub fun http01_answer(table: *Http01, token: view.View,
-    output: *view.View) bool {
-    if (table == nil || output == nil || token.data == nil
+# a write begins: readers from here on see the entry as changing
+fun begin_write(entry: *Entry) {
+    atomic.store(?entry.sequence, atomic.load(?entry.sequence) + 1);
+}
+
+# the write is whole: readers see the entry settled again
+fun end_write(entry: *Entry) {
+    atomic.store(?entry.sequence, atomic.load(?entry.sequence) + 1);
+}
+
+# resolves one challenge token to the exact body the authority expects, copied
+# into `output`, so the answer a worker sends cannot change under it when the
+# supervisor withdraws the presentation mid-response
+pub fun http01_answer(table: *Http01, token: view.View, output: *u8,
+    capacity: usize, length: *usize) bool {
+    if (table == nil || output == nil || length == nil || token.data == nil
         || token.len == 0) { ret false; }
     var i: usize = 0;
     for (i < MAX_PRESENTATIONS) {
-        val entry: *Entry = ?table.entries[i];
-        if (entry.live && same_bytes(?entry.token[0], entry.token_len,
-            token.data, token.len)) {
-            @output = view.view(?entry.value[0], entry.value_len);
-            ret true;
-        }
+        val entry:  *Entry = ?table.entries[i];
+        val before: i64    = atomic.load(?entry.sequence);
         i = i + 1;
+        if ((before & 1) != 0 || !entry.live || entry.value_len > capacity
+            || !same_bytes(?entry.token[0], entry.token_len, token.data, token.len)) {
+            cnt;
+        }
+        val copied: usize = entry.value_len;
+        var j:      usize = 0;
+        for (j < copied) {
+            output[j] = entry.value[j];
+            j         = j + 1;
+        }
+        # a write that overlapped the read leaves nothing trustworthy to send
+        if (atomic.load(?entry.sequence) != before) { cnt; }
+        @length = copied;
+        ret true;
     }
     ret false;
 }
@@ -151,6 +180,7 @@ fun http01_present(context: ptr, subject: identifier.Identifier,
             problem.CHALLENGE, "http-01 presentation table is full")};
     }
     val entry: *Entry = ?table.entries[slot];
+    begin_write(entry);
     i = 0;
     for (i < value.token.len) {
         entry.token[i] = value.token.data[i];
@@ -164,6 +194,7 @@ fun http01_present(context: ptr, subject: identifier.Identifier,
     }
     entry.value_len = key_authorization.len;
     entry.live      = true;
+    end_write(entry);
     table.presented = table.presented + 1;
     ret res[ch.Presentation, problem.Error].ok{ch.Presentation{ctx: (slot + 1)::ptr}};
 }
@@ -177,9 +208,11 @@ fun http01_cleanup(context: ptr,
             "http-01 cleanup does not name a presentation")};
     }
     val entry: *Entry = ?table.entries[slot - 1];
+    begin_write(entry);
     entry.live      = false;
     entry.token_len = 0;
     entry.value_len = 0;
+    end_write(entry);
     table.withdrawn = table.withdrawn + 1;
     ret res[bool, problem.Error].ok{true};
 }
@@ -374,17 +407,31 @@ test "acme challenge: http-01 presents once and withdraws exactly once" {
         test_challenge(ch.HTTP_01), test_view(TEST_AUTHORIZATION)))) { ret 3; }
     if (attempt.present_calls != 1 || table.presented != 1
         || http01_live(?table) != 1) { ret 4; }
-    var answer: view.View;
-    if (!http01_answer(?table, test_view(TEST_TOKEN), ?answer)) { ret 5; }
-    if (!view.view_eq_str(answer, TEST_AUTHORIZATION))          { ret 6; }
-    if (problem.failed(ch.finish(?attempt)))                    { ret 7; }
+    var answer: [MAX_VALUE_BYTES]u8;
+    var length: usize = 0;
+    if (!http01_answer(?table, test_view(TEST_TOKEN), ?answer[0], MAX_VALUE_BYTES,
+        ?length)) { ret 5; }
+    if (!view.view_eq_str(view.view(?answer[0], length), TEST_AUTHORIZATION)) { ret 6; }
+    # the supervisor presents and withdraws while workers answer, so an entry
+    # a write is under way on reads as absent rather than half written, and an
+    # answer larger than the caller holds is not truncated
+    var slot: usize = 0;
+    for (slot < MAX_PRESENTATIONS && !table.entries[slot].live) { slot = slot + 1; }
+    begin_write(?table.entries[slot]);
+    if (http01_answer(?table, test_view(TEST_TOKEN), ?answer[0], MAX_VALUE_BYTES,
+        ?length)) { ret 12; }
+    end_write(?table.entries[slot]);
+    if (http01_answer(?table, test_view(TEST_TOKEN), ?answer[0], length - 1,
+        ?length)) { ret 13; }
+    if (problem.failed(ch.finish(?attempt))) { ret 7; }
     if (attempt.cleanup_calls != 1 || table.withdrawn != 1
         || http01_live(?table) != 0) { ret 8; }
     # the single exit is idempotent: a caller that finishes again on a later
     # path does not reach the provider a second time
-    if (problem.failed(ch.finish(?attempt)))                   { ret 9; }
-    if (attempt.cleanup_calls != 1 || table.withdrawn != 1)    { ret 10; }
-    if (http01_answer(?table, test_view(TEST_TOKEN), ?answer)) { ret 11; }
+    if (problem.failed(ch.finish(?attempt)))                { ret 9; }
+    if (attempt.cleanup_calls != 1 || table.withdrawn != 1) { ret 10; }
+    if (http01_answer(?table, test_view(TEST_TOKEN), ?answer[0], MAX_VALUE_BYTES,
+        ?length)) { ret 11; }
     ret 0;
 }
 
