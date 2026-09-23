@@ -19,6 +19,14 @@
 # regresses toward the old per-connection buffers fails here long before it
 # reaches them.
 #
+# What a transport keeps once every connection has left is asserted for TCP
+# and TLS (#235): nothing hedge holds per connection outlives it, so the
+# after-release resident set is the idle baseline plus the named terms below,
+# none of which grows with the peak. A second fresh server holds only the small
+# count and releases it, and the two after-release figures must agree within
+# the slack the peak left behind, so a term that grows with the peak fails
+# even when the absolute bound has room for it.
+#
 # The resident set is what the operating system charges the process, so it
 # includes hedge's records, its pool chunks and its allocator's pages, and
 # excludes the kernel's socket buffers. Both ends of a step are taken from the
@@ -38,6 +46,39 @@ pin_tcp="${LOAD_SCALE_PIN_TCP:-13956}"
 pin_tls="${LOAD_SCALE_PIN_TLS:-29591}"
 pin_quic="${LOAD_SCALE_PIN_QUIC:-111857}"
 
+# what a TCP or TLS server keeps after its connections leave, above its idle
+# baseline, term by term. measured page by page on std 7.4.0, release build,
+# linux-x86_64, at 1k, 10k and 20k connections (#235), where TCP kept 2,320,
+# 3,928 and 3,932 KiB and TLS 2,820, 4,428 and 4,440 KiB.
+#
+# telemetry's log queue: log_queue_depth (256 by default) records of
+# std.log.sink.QueuedRecord (8,192 bytes of record and its length). it is
+# allocated at start and its pages become resident as access-log records
+# first pass through it, so it is charged once whatever the peak
+KEEP_LOG_QUEUE=$((256 * 8200))
+# the slack a peak leaves in std's tables: one empty chunk above the lowest,
+# kept on purpose so a load crossing a chunk boundary never reallocates
+# (mach-std#868 for io.runtime, #874 for net.async). io.runtime's slots
+# (770,048), timers (98,304) and deadline index (65,536); net.async's linux
+# operations (442,368), resources (147,456) and resource map (32,768), and its
+# driver slots (81,920). a peak within the tables' first chunk leaves none of it
+KEEP_STD_SLACK=$((770048 + 98304 + 65536 + 442368 + 147456 + 32768 + 81920))
+# one serve.Slot chunk (128 slots of connection.Connection inline): a
+# connection still being retired when the sample is taken holds its chunk
+KEEP_SLOT_CHUNK=1433600
+# the rest, measured at 212 KiB for TCP and 712 KiB for TLS: std tables made
+# at listener start and first touched under load, released pool chunks each
+# class keeps up to its HIGH_WATER (memory.mach), admission's lease pages and
+# the log writer's stack as far as it has been touched
+KEEP_ALLOWANCE=1048576
+KEEP_BOUND=$((KEEP_LOG_QUEUE + KEEP_STD_SLACK + KEEP_SLOT_CHUNK + KEEP_ALLOWANCE))
+# the shape check: what large and small connections leave behind may differ
+# only by the slack the larger peak left in std's tables, plus this much for
+# pool chunks retained at one peak and not the other. at 1k against 10k the
+# difference measured 1,589,248 to 1,593,344 bytes, and std 7.2.0's slot table
+# that grew with the peak (mach-std#878) made it 1,974,272 for TLS
+KEEP_SHAPE_MARGIN=131072
+
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 trap cleanup_load EXIT
 
@@ -47,6 +88,7 @@ QUIC_PORT=19112
 DEPTH_CLEARTEXT_PORT=19113
 DEPTH_SECURE_PORT=19114
 DEPTH_QUIC_PORT=19115
+ADMIN_PORT=19116
 PROJECTION=100000
 # what hedge advertises and funds per connection by default (max_pipeline_depth)
 DEPTH=2
@@ -80,45 +122,83 @@ mappings() {
     wc -l < "/proc/$hedge_pid/maps"
 }
 
-# a record table grows in chunks of FIRST_CHUNK << k records (storage.mach), and
-# a secret table wipes a chunk whole when it welds it, so every slot of the
-# newest chunk is resident from the moment the chunk exists. the QUIC figures
-# are therefore taken at counts where every chunk is full, which makes the
-# slope the cost of one welded slot rather than of wherever the count fell in
-# the top chunk, and the 100k projection pays for the capacity 100k needs.
-FIRST_CHUNK=16
-# the chunk-aligned count nearest n
-aligned() {
-    local n="$1" chunk="$FIRST_CHUNK" total=0
-    while [ $((total + chunk)) -le "$n" ]; do
-        total=$((total + chunk))
-        chunk=$((chunk * 2))
-    done
-    if [ $((total + chunk - n)) -lt $((n - total)) ]; then total=$((total + chunk)); fi
-    echo "$total"
-}
-# the capacity a table holds n records in
-capacity() {
-    local n="$1" chunk="$FIRST_CHUNK" total=0
-    while [ "$total" -lt "$n" ]; do
-        total=$((total + chunk))
-        chunk=$((chunk * 2))
-    done
-    echo "$total"
-}
-
 # one server per transport so every baseline is a process that has served
 # nothing. no connection cap, a budget that admits the large count (the pool
 # preallocates nothing, so the budget is a number, not memory), and keep-alive
-# long enough that nothing is retired while it is being counted.
+# long enough that nothing is retired while it is being counted. an admin
+# listener serves the metrics the release check reads.
+export HEDGE_ADMIN_TOKEN=scale-secret
 start_scale_server() {
     write_config "$work/scale.toml" \
         "max_connections_per_peer = $((large * 2))
 memory_bytes = $((large * 4 * 1048576))" \
         "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
         "keep_alive_ms = 900000
-drain_ms = 5000"
+drain_ms = 5000" \
+        "[[listener]]
+name = \"admin\"
+address = \"127.0.0.1:$ADMIN_PORT\"
+protocols = [\"http/1.1\"]
+
+[secret.admin-token]
+provider = \"env\"
+key = \"HEDGE_ADMIN_TOKEN\"
+
+[telemetry]
+metrics = true
+
+[admin]
+enabled = true
+listener = \"admin\"
+auth_secret = \"admin-token\"
+max_response_bytes = 8192"
     start_hedge "$work/scale.toml"
+}
+
+# a metric's value from the admin listener, or `missing`
+metric() {
+    curl -sS -H "Authorization: Bearer $HEDGE_ADMIN_TOKEN" \
+        "http://127.0.0.1:$ADMIN_PORT/metrics" \
+        | awk -v name="$1" '$1 == name { print $2; found = 1 }
+            END { if (!found) print "missing" }'
+}
+
+# waits up to RELEASE_WAIT seconds for hedge to hold no QUIC connection and
+# prints the last count read. a QUIC connection the peer closed is kept through
+# its draining period (RFC 9000 section 10.2, mach-quic's 3 s drain timeout)
+# before it is released, so a sample taken on a fixed delay after release can
+# measure connections still draining rather than what they left behind
+RELEASE_WAIT=15
+quic_released() {
+    local live
+    for _ in $(seq $((RELEASE_WAIT * 10))); do
+        live="$(metric hedge_quic_connections)"
+        if [ "$live" = 0 ]; then break; fi
+        sleep 0.1
+    done
+    echo "$live"
+    test "$live" = 0
+}
+
+# the sockets the served process has open
+sockets() {
+    find "/proc/$hedge_pid/fd" -lname 'socket:*' 2>/dev/null | wc -l
+}
+
+# waits up to RELEASE_WAIT seconds for hedge to have no more sockets open than
+# `idle` and prints the last count read. a TCP or TLS connection whose peer
+# closed is retired once hedge sees the close (TLS after its close_notify
+# exchange), and its socket is closed as it goes, so the count falling back to
+# the idle one is every connection having left
+sockets_released() {
+    local idle="$1" open
+    for _ in $(seq $((RELEASE_WAIT * 10))); do
+        open="$(sockets)"
+        if [ "$open" -le "$idle" ]; then break; fi
+        sleep 0.1
+    done
+    echo "$open"
+    test "$open" -le "$idle"
 }
 
 # holds `count` HTTP/1.1 connections idle after one served request each
@@ -168,21 +248,14 @@ hold_more() {
 # halves of that span are printed beside it: a slope that keeps rising is what
 # a non-linear term looks like. fails on a broken hold or a slope past the pin.
 measure() {
-    local transport="$1" pin="$2" r0 r1 r2 r3 r4 v3 m3
+    local transport="$1" pin="$2" r0 r1 r2 r3 r4 v3 m3 s0
     local per_low per_high per once projection agree
-    local small="$small" large="$large" mid projected="$PROJECTION"
-    if [ "$transport" = quic ]; then
-        small="$(aligned "$small")"
-        large="$(aligned "$large")"
-        mid="$(aligned $(( (small + large) / 2 )))"
-        projected="$(capacity "$PROJECTION")"
-    else
-        mid=$(( (small + large) / 2 ))
-    fi
+    local mid=$(( (small + large) / 2 ))
 
     start_scale_server
     sleep 0.5
     r0="$(resident)"
+    s0="$(sockets)"
     if ! hold_more "$transport" "$transport-small" "$small"; then
         report 1 "$transport: $small connections held (see $transport-small.out)"
         release_holders; stop_hedge; return 1
@@ -205,6 +278,15 @@ measure() {
     m3="$(mappings)"
 
     release_holders
+    if [ "$transport" = quic ]; then
+        local live
+        live="$(quic_released)"
+        report $? "quic: hedge holds no QUIC connection after release ($live live)"
+    else
+        local open
+        open="$(sockets_released "$s0")"
+        report $? "$transport: hedge holds no connection after release ($open sockets open, $s0 at idle)"
+    fi
     sleep 2
     r4="$(resident)"
 
@@ -212,7 +294,7 @@ measure() {
     per_high=$(( (r3 - r2) / (large - mid) ))
     per=$(( (r3 - r1) / (large - small) ))
     once=$(( r1 - r0 - per * small ))
-    projection=$(( r0 + once + per * projected ))
+    projection=$(( r0 + once + per * PROJECTION ))
     if [ "$per_low" -gt 0 ]; then
         agree=$(( (per_high - per_low) * 100 / per_low ))
     else
@@ -225,11 +307,7 @@ measure() {
     printf '%s: bytes/connection over %d..%d=%d over %d..%d=%d (%+d%%) over %d..%d=%d, once=%d KiB\n' \
         "$transport" "$small" "$mid" "$per_low" "$mid" "$large" "$per_high" "$agree" \
         "$small" "$large" "$per" $((once / 1024))
-    printf '%s: projection at %dk=%d MiB' "$transport" $((PROJECTION / 1000)) $((projection / 1048576))
-    if [ "$projected" -ne "$PROJECTION" ]; then
-        printf ' (capacity %d)' "$projected"
-    fi
-    echo
+    printf '%s: projection at %dk=%d MiB\n' "$transport" $((PROJECTION / 1000)) $((projection / 1048576))
 
     if [ "$pin" -gt 0 ]; then
         test "$per" -le $(( pin + pin * tolerance / 100 ))
@@ -237,15 +315,60 @@ measure() {
     else
         echo "unpinned $transport: no LOAD_SCALE_PIN for this transport"
     fi
-    # the recede figure is reported, not gated: the tables release their
-    # trailing chunks, but what the allocator hands back to the kernel is the
-    # allocator's business
     if stop_hedge; then
         report 0 "$transport: hedge stops cleanly after $large connections"
     else
         failed=$((failed + 1))
     fi
+    # QUIC's after-release figure is printed, not gated: #235 names TCP and TLS
+    if [ "$transport" != quic ]; then
+        keeps "$transport" $((r4 - r0))
+    fi
     echo
+}
+
+# what a fresh server keeps above its idle baseline after `count` connections
+# over `transport` have come and gone, or nothing when they could not be held
+# or did not leave
+kept_after() {
+    local transport="$1" count="$2" r0 s0 r4
+    start_scale_server
+    sleep 0.5
+    r0="$(resident)"
+    s0="$(sockets)"
+    if ! hold_more "$transport" "$transport-shape" "$count"; then
+        release_holders; stop_hedge; return 1
+    fi
+    release_holders
+    if ! sockets_released "$s0" >/dev/null; then stop_hedge; return 1; fi
+    sleep 2
+    r4="$(resident)"
+    stop_hedge || return 1
+    echo $((r4 - r0))
+}
+
+# asserts what `transport` kept after `large` connections left: within the
+# named terms of its idle baseline, and within the slack the peak left of what
+# a server that only ever held `small` keeps
+keeps() {
+    local transport="$1" kept="$2" kept_small shape
+    printf '%s: kept after release=%d bound=%d (log queue %d, std slack %d, slot chunk %d, allowance %d)\n' \
+        "$transport" "$kept" "$KEEP_BOUND" "$KEEP_LOG_QUEUE" "$KEEP_STD_SLACK" \
+        "$KEEP_SLOT_CHUNK" "$KEEP_ALLOWANCE"
+    test "$kept" -le "$KEEP_BOUND"
+    report $? "$transport: what $large connections leave behind is within the named terms of idle"
+
+    if ! kept_small="$(kept_after "$transport" "$small")"; then
+        report 1 "$transport: a fresh server holds and releases $small connections (see $transport-shape.out)"
+        return
+    fi
+    shape=$(( kept - kept_small ))
+    if [ "$shape" -lt 0 ]; then shape=$(( -shape )); fi
+    printf '%s: kept after %d=%d after %d=%d, differing by %d (bound %d)\n' \
+        "$transport" "$small" "$kept_small" "$large" "$kept" "$shape" \
+        $(( KEEP_STD_SLACK + KEEP_SHAPE_MARGIN ))
+    test "$shape" -le $(( KEEP_STD_SLACK + KEEP_SHAPE_MARGIN ))
+    report $? "$transport: what connections leave behind does not grow with the peak ($small against $large)"
 }
 
 # DEPTH requests on one HTTP/3 connection, each throttled so they overlap if

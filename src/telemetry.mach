@@ -1,5 +1,6 @@
 # bounded production telemetry surfaces
 
+use hedge.clock;
 use hedge.config.schema;
 use hedge.dispatch.call;
 use hedge_memory:      hedge.memory;
@@ -12,8 +13,6 @@ use http.core.exchange;
 use http.core.field;
 use http.core.message;
 use http.core.method;
-use std.chrono.duration;
-use std.chrono.time;
 use std.log.record;
 use std.log.sink;
 use std.types.bool.bool;
@@ -21,14 +20,9 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.view;
-
-fun wall_now() time.Time {
-    val sampled: time.Clock = time.now();
-    if (sel sampled.ok) { ret sampled.ok; }
-    ret time.Time{sec: 0, nsec: 0};
-}
 
 fun status_enqueued(status: sink.WriteStatus) bool {
     ret sel status.enqueued;
@@ -70,6 +64,8 @@ pub rec Runtime {
     replay_full:       telemetry_metrics.Token;
     # the last QUIC replay refusal total reported, so each report adds the rise
     replay_full_seen: u64;
+    # the admitted QUIC connections hedge holds, from admission until release
+    quic_connections: telemetry_metrics.Token;
     # the QUIC handshake bound: a gauge of what holds a slot, and the running
     # totals of Initials held back, promoted, dropped and refused, plus the
     # Retries a pump dropped at its stateless send ceiling
@@ -249,6 +245,9 @@ pub fun make(
             || !telemetry_metrics.register(?runtime.metrics,
             telemetry_metrics.GAUGE, "hedge_quic_handshakes_in_flight", nil, 0,
             nil, 0, ?runtime.handshakes_in_flight)
+            || !telemetry_metrics.register(?runtime.metrics,
+            telemetry_metrics.GAUGE, "hedge_quic_connections", nil, 0,
+            nil, 0, ?runtime.quic_connections)
             || !telemetry_metrics.register(?runtime.metrics,
             telemetry_metrics.GAUGE, "hedge_quic_handshake_service_ns", nil, 0,
             nil, 0, ?runtime.handshake_service_ns)
@@ -450,10 +449,34 @@ fun protocol_name(version: message.Version) str {
     ret "HTTP/3";
 }
 
-fun failure_code(outcome: exchange.Outcome) str {
-    if (outcome == exchange.OUTCOME_CANCELLED) { ret "cancelled"; }
-    if (outcome == exchange.OUTCOME_TIMED_OUT) { ret "timed_out"; }
+# the engine's closure names why a request ended before the outcome does: a
+# request the connection took with it is not one the caller cancelled
+fun failure_code(completion: *exchange.Completion) str {
+    val cause: exchange.Cause = completion.closure.cause;
+    if (cause == exchange.CAUSE_CONNECTION)  { ret "connection_closed"; }
+    if (cause == exchange.CAUSE_TRANSPORT)   { ret "transport"; }
+    if (cause == exchange.CAUSE_PEER_RESET)  { ret "peer_reset"; }
+    if (cause == exchange.CAUSE_LOCAL_RESET) { ret "local_reset"; }
+    if (cause == exchange.CAUSE_TIMEOUT
+        || completion.outcome == exchange.OUTCOME_TIMED_OUT) { ret "timed_out"; }
+    if (completion.outcome == exchange.OUTCOME_CANCELLED) { ret "cancelled"; }
     ret "failed";
+}
+
+fun request_failure(runtime: *Runtime, completion: *exchange.Completion,
+    trace_id: str) sink.WriteReport {
+    if (!runtime.logs_enabled) { ret sink.suppressed(); }
+    var message: str = completion.error;
+    if (message == nil || message[0] == 0) { message = "request did not complete"; }
+    var fields: [7]record.Field;
+    fields[0] = record.field_string("kind", "error");
+    fields[1] = record.field_string("component", "request");
+    fields[2] = record.field_string("operation", "serve");
+    fields[3] = record.field_string("code", failure_code(completion));
+    fields[4] = record.field_string("trace_id", trace_id);
+    fields[5] = record.field_u64("close_code", completion.closure.code);
+    fields[6] = record.field_u64("transport_error", completion.closure.detail);
+    ret telemetry_log.emit(?runtime.logger, record.ERROR, message, ?fields[0], 7);
 }
 
 fun memory_refusal(runtime: *Runtime, active: *call.Call, trace_id: str) sink.WriteReport {
@@ -476,17 +499,22 @@ fun memory_refusal(runtime: *Runtime, active: *call.Call, trace_id: str) sink.Wr
         "request memory bound was exhausted", ?fields[0], count);
 }
 
+# the request's age on the monotonic clock, in microseconds. a call bound
+# before the stamp existed measures as zero rather than as a clock reading
+fun request_elapsed_us(active: *call.Call, now_ns: u64) u64 {
+    if (active.received_ns == 0 || now_ns < active.received_ns) { ret 0; }
+    ret (now_ns - active.received_ns) / 1000;
+}
+
 fun observe_end(context: ptr, active: *call.Call, complete: bool) {
     val runtime: *Runtime = context::*Runtime;
     if (runtime == nil || !runtime.initialized || active == nil
         || active.exchange == nil) { ret; }
     val request:    *message.Request    = call.request(active);
     val completion: exchange.Completion = active.exchange.completion;
-    var elapsed:    i64                 = time.time_sub(wall_now(), request.metadata.received_at);
-    if (elapsed < 0) { elapsed = 0; }
-    val elapsed_us: u64 = duration.duration_usec(elapsed)::u64;
+    val elapsed_us: u64                 = request_elapsed_us(active, clock.monotonic_ns());
     var trace_id:   [33]u8;
-    var trace_text: str = nil;
+    var trace_text: str                 = nil;
     if (telemetry_trace.format_id(active.telemetry, ?trace_id[0], 33) != 0) {
         trace_text = (?trace_id[0])::str;
     }
@@ -512,11 +540,7 @@ fun observe_end(context: ptr, active: *call.Call, complete: bool) {
         memory_refusal(runtime, active, trace_text);
     }
     if (!complete || completion.outcome != exchange.OUTCOME_OK) {
-        var message: str = completion.error;
-        if (message == nil || message[0] == 0) { message = "request did not complete"; }
-        error(runtime, Failure{component: "request", operation: "serve",
-            code:     failure_code(completion.outcome), message: message,
-            trace_id: trace_text});
+        request_failure(runtime, ?completion, trace_text);
     }
 }
 
@@ -544,6 +568,7 @@ fun report_rise(runtime: *Runtime, token: telemetry_metrics.Token, total: u64,
 # totals since it was made
 pub rec HandshakeReport {
     in_flight:        usize;
+    connections:      usize;
     service_ns:       u64;
     deferred:         u64;
     promoted:         u64;
@@ -590,6 +615,8 @@ pub fun quic_handshakes(runtime: *Runtime, report: HandshakeReport) {
     if (runtime.metrics_enabled) {
         telemetry_metrics.gauge_set(?runtime.metrics, runtime.handshakes_in_flight,
             report.in_flight::i64);
+        telemetry_metrics.gauge_set(?runtime.metrics, runtime.quic_connections,
+            report.connections::i64);
         telemetry_metrics.gauge_set(?runtime.metrics, runtime.handshake_service_ns,
             report.service_ns::i64);
         telemetry_metrics.gauge_set(?runtime.metrics, runtime.handshake_finish_ns,
@@ -938,6 +965,32 @@ test "telemetry: QUIC replay refusals are counted once each" {
     ret 0;
 }
 
+test "telemetry: the live QUIC connection gauge follows each report" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs          = false;
+    graph.telemetry.metrics       = true;
+    graph.telemetry.metric_series = BUILT_IN_METRIC_SERIES;
+    graph.admin.enabled           = false;
+    var series:  [BUILT_IN_METRIC_SERIES]telemetry_metrics.Series;
+    var checks:  [2]telemetry_health.Check;
+    var runtime: Runtime;
+    if (!make(?runtime, ?graph, nil, ?series[0], BUILT_IN_METRIC_SERIES,
+        ?checks[0], 2, nil, test_auth, nil, test_render, test_render,
+        nil, (0::usize)::FlushFun)) { ret 1; }
+    var report: HandshakeReport;
+    report.connections = 3445;
+    quic_handshakes(?runtime, report);
+    var sampled: telemetry_metrics.Sample;
+    if (!telemetry_metrics.sample(?runtime.metrics, runtime.quic_connections, ?sampled)
+        || sampled.signed_value != 3445) { ret 2; }
+    report.connections = 0;
+    quic_handshakes(?runtime, report);
+    if (!telemetry_metrics.sample(?runtime.metrics, runtime.quic_connections, ?sampled)
+        || sampled.signed_value != 0) { ret 3; }
+    ret 0;
+}
+
 test "telemetry: pool lanes report held bytes and add only the rise in refusals" {
     var graph: schema.Graph;
     schema.reset_graph(?graph);
@@ -971,5 +1024,49 @@ test "telemetry: pool lanes report held bytes and add only the rise in refusals"
         || sampled.value != 3) { ret 4; }
     if (!telemetry_metrics.sample(?runtime.metrics, runtime.refused_connections, ?sampled)
         || sampled.value != 5) { ret 5; }
+    ret 0;
+}
+
+test "telemetry: request duration is measured on the monotonic clock" {
+    var active: call.Call;
+    active.received_ns = 5000000000;
+    # a request stamped with a far-off calendar receipt still measures from the
+    # monotonic stamp alone
+    if (request_elapsed_us(?active, 5000000000) != 0)    { ret 1; }
+    if (request_elapsed_us(?active, 5002500000) != 2500) { ret 2; }
+    # the monotonic clock never runs backwards, so a reading before the stamp
+    # is a call bound elsewhere and measures as zero rather than wrapping
+    if (request_elapsed_us(?active, 4999000000) != 0) { ret 3; }
+    active.received_ns = 0;
+    if (request_elapsed_us(?active, 5002500000) != 0) { ret 4; }
+    ret 0;
+}
+
+# the failure code names the engine's closure first: a request a connection
+# took with it, a reset from either side or a transport fault is not a caller
+# cancellation, and only a closure the engine did not make falls back to the
+# outcome (#248)
+test "telemetry: a request failure is coded by the engine's closure before its outcome" {
+    var completion: exchange.Completion;
+    completion.outcome = exchange.OUTCOME_CANCELLED;
+    completion.closure = exchange.no_closure();
+    if (!str_equals(failure_code(?completion), "cancelled")) { ret 1; }
+    completion.closure = exchange.closure(exchange.CAUSE_CALLER, 268, 0);
+    if (!str_equals(failure_code(?completion), "cancelled")) { ret 2; }
+    completion.closure = exchange.closure(exchange.CAUSE_CONNECTION, 0x101, 0);
+    if (!str_equals(failure_code(?completion), "connection_closed")) { ret 3; }
+    completion.closure = exchange.closure(exchange.CAUSE_TRANSPORT, 0x102, 7);
+    if (!str_equals(failure_code(?completion), "transport")) { ret 4; }
+    completion.closure = exchange.closure(exchange.CAUSE_PEER_RESET, 0x10c, 0);
+    if (!str_equals(failure_code(?completion), "peer_reset")) { ret 5; }
+    completion.closure = exchange.closure(exchange.CAUSE_LOCAL_RESET, 0x10c, 0);
+    if (!str_equals(failure_code(?completion), "local_reset")) { ret 6; }
+    completion.closure = exchange.closure(exchange.CAUSE_TIMEOUT, 0, 0);
+    if (!str_equals(failure_code(?completion), "timed_out")) { ret 7; }
+    completion.closure = exchange.no_closure();
+    completion.outcome = exchange.OUTCOME_TIMED_OUT;
+    if (!str_equals(failure_code(?completion), "timed_out")) { ret 8; }
+    completion.outcome = exchange.OUTCOME_FAILED;
+    if (!str_equals(failure_code(?completion), "failed")) { ret 9; }
     ret 0;
 }

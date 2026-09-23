@@ -228,7 +228,9 @@ established, so promoted minus completed minus in flight is what ended early),
 and `hedge_quic_handshakes_expired_total` (promoted handshakes that ended on
 their own deadline, crypto spent and the client told nothing),
 and `hedge_quic_retries_dropped_total` counts the Retries a pump dropped at its
-stateless send ceiling.
+stateless send ceiling. `hedge_quic_connections` is a gauge of the QUIC
+connections the server holds, from admission until the record is released,
+which for a connection the peer closed is after its draining period.
 
 `server.limits.max_pipeline_depth` bounds HTTP/1 requests admitted into one
 connection before earlier responses release their slots. The default and fixed
@@ -347,6 +349,15 @@ The exit status reports which of those happened. A clean drain exits 0. A drain
 whose deadline passed with exchanges still running exits 75 and names how many
 were abandoned, because that is not a clean shutdown even though it is a
 complete one. A step of the sequence failing exits 70 and names the step.
+
+Cancelling closes each remaining connection, and the stop waits for those closes
+under `server.timeouts.stop_ms` (default 10000, 10 seconds). The deadline
+starts when the wait does and starts again each time a connection closes, so a
+stop with many connections only fails if none closes for that long. When it passes, the stop gives up
+rather than waiting on a close that never finishes. The process exits 70 and
+prints each TCP connection still open with what its close waits on, and how many
+QUIC connections are still open. The same deadline bounds the wait for the
+service planes to quiesce and for the QUIC runtime's release.
 
 `SIGHUP` reloads the routing graph. The configuration is re-read, validated and
 sealed into a second generation, a new plan is compiled beside the running one,
@@ -508,7 +519,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 37 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 38 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 

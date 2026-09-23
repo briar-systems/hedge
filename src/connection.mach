@@ -16,6 +16,7 @@ use hedge.dispatch.call;
 use hedge.dispatch.plan;
 use hedge.listener;
 use hedge.memory;
+use hedge.operation;
 use hedge.protocol.h2;
 use hedge.protocol.prologue;
 use hedge.protocol.proxy_protocol;
@@ -105,6 +106,25 @@ pub val CLOSING: State = 3;
 pub val CLOSED:  State = 4;
 pub val FAILED:  State = 5;
 
+# what a close left waiting needs before it can finish, which a stop that gives
+# up names for each connection it leaves open (#273)
+pub def CloseWait: u8;
+pub val CLOSE_READY:    CloseWait = 0;
+pub val CLOSE_BODY:     CloseWait = 1;
+pub val CLOSE_HTTP2:    CloseWait = 2;
+pub val CLOSE_HTTP1:    CloseWait = 3;
+pub val CLOSE_PROLOGUE: CloseWait = 4;
+pub val CLOSE_TLS:      CloseWait = 5;
+
+pub fun close_wait_text(wait: CloseWait) str {
+    if (wait == CLOSE_BODY)     { ret "its exchange's request body to be released"; }
+    if (wait == CLOSE_HTTP2)    { ret "the HTTP/2 release of its transport operations"; }
+    if (wait == CLOSE_HTTP1)    { ret "the HTTP/1 engine's transport close"; }
+    if (wait == CLOSE_PROLOGUE) { ret "its prologue read"; }
+    if (wait == CLOSE_TLS)      { ret "the TLS session's operations to settle"; }
+    ret "nothing";
+}
+
 pub def Step: u8;
 pub val STEP_IDLE:     Step = 1;
 pub val STEP_PROGRESS: Step = 2;
@@ -112,51 +132,23 @@ pub val STEP_BLOCKED:  Step = 3;
 pub val STEP_DONE:     Step = 4;
 pub val STEP_ERROR:    Step = 5;
 
-# each in-flight transport operation carries the owner it belongs to and the
-# transport token that owner must settle when the completion arrives. the owner is
-# not always a served connection: an upstream connection uses the same routing.
-pub def SettleFun: fun(ptr, usize, io_runtime.Completion);
-
-pub rec Operation {
-    owner:         ptr;
-    settle:        SettleFun;
-    token_context: usize;
-}
-
-pub fun bind_operation(operation: *Operation, context: *listener.ConnectionContext,
-    owner: ptr, settle: SettleFun, token_context: usize) bool {
-    if (operation == nil || context == nil || owner == nil || settle::usize == 0) { ret false; }
-    operation.owner         = owner;
-    operation.settle        = settle;
-    operation.token_context = token_context;
-    ret listener.make_connection_context(context, (operation)::usize);
-}
-
-# the listener plane routes every connection-plane completion through here, and
-# each owner settles its own transport
-pub fun complete(context: ptr, owner_context: usize, completion: io_runtime.Completion) {
-    val operation: *Operation = owner_context::*Operation;
-    if (operation == nil || operation.settle::usize == 0) { ret; }
-    operation.settle(operation.owner, operation.token_context, completion);
-}
-
 # storage a connection claims only once it selects a protocol that needs it,
 # owned by the runtime and shared by every connection it drives
 pub rec Storage {
-    h2_sessions: storage.Recycler[h2.Session];
+    h2_sessions: storage.Table[h2.Session];
     chunks:      storage.Chunks;
 }
 
 pub fun make_storage(shared: *Storage, a: *A.Allocator) bool {
     if (shared == nil) { ret false; }
-    ret storage.make[h2.Session](?shared.h2_sessions, a, 1)
+    ret storage.make_table[h2.Session](?shared.h2_sessions, a)
         && storage.make_chunks(?shared.chunks, a);
 }
 
 # every connection must have released what it claimed
 pub fun destroy_storage(shared: *Storage) bool {
     if (shared == nil) { ret false; }
-    val sessions: bool = storage.destroy[h2.Session](?shared.h2_sessions);
+    val sessions: bool = storage.destroy_table[h2.Session](?shared.h2_sessions);
     ret storage.destroy_chunks(?shared.chunks) && sessions;
 }
 
@@ -257,7 +249,7 @@ pub rec Connection {
     channel:            transport.Transport;
     channel_slots:      [TRANSPORT_SLOTS]transport.Slot;
     contexts:           [TRANSPORT_SLOTS]listener.ConnectionContext;
-    operations:         [TRANSPORT_SLOTS]Operation;
+    operations:         [TRANSPORT_SLOTS]operation.Operation;
     operation_root:     cancel.Scope;
     control_scope:      cancel.Scope;
     engine_scope:       cancel.Scope;
@@ -318,7 +310,7 @@ pub rec Connection {
     prologue_read:       usize;
     prologue_pending:    bool;
     prologue_ended:      bool;
-    prologue_operation:  Operation;
+    prologue_operation:  operation.Operation;
     prologue_context:    listener.ConnectionContext;
     prologue_scope:      cancel.Scope;
     prologue_scope_live: bool;
@@ -327,20 +319,21 @@ pub rec Connection {
     prologue_deadline_ns: u64;
     request_deadline_ns:  u64;
     # who the worker wakes when something this connection waits on settles
-    waker:                  hedge_wake.Waker;
-    wake_failed:            bool;
-    tls_policy:             usize;
-    session:                usize;
-    h2_session:             *h2.Session;
+    waker:       hedge_wake.Waker;
+    wake_failed: bool;
+    tls_policy:  usize;
+    session:     usize;
+    # the h2 session's index in the shared table, or h2.NO_SESSION
+    h2_session:             usize;
     shared:                 *Storage;
     handshaking:            bool;
     close_started:          bool;
-    close_pending:          bool;
+    close_wait:             CloseWait;
     close_failed:           bool;
     engine_close_started:   bool;
     exchange_cancelling:    bool;
     exchange_call_released: bool;
-    secure_operation:       Operation;
+    secure_operation:       operation.Operation;
     proxy_scratch:          [PROXY_SCRATCH_BYTES]u8;
 }
 
@@ -353,7 +346,7 @@ fun operation_for(owner: *Connection, token_context: usize) usize {
     if (!transport.context_token(token_context, ?token)) { ret TRANSPORT_SLOTS; }
     val index: usize = token.index::usize;
     if (index >= TRANSPORT_SLOTS) { ret TRANSPORT_SLOTS; }
-    if (!bind_operation(?owner.operations[index], ?owner.contexts[index], (owner)::ptr,
+    if (!operation.bind_operation(?owner.operations[index], ?owner.contexts[index], (owner)::ptr,
         settle, token_context)) { ret TRANSPORT_SLOTS; }
     ret index;
 }
@@ -510,8 +503,8 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
     var settled: transport.Completion;
     if (!translate(?settled, completion, token_context)) { ret; }
     val now: time.Instant = clock.instant();
-    if (owner.h2_session != nil) {
-        val stepped: Step = from_h2(h2.complete_io(owner.h2_session, ?settled, now));
+    if (owner.h2_session != h2.NO_SESSION) {
+        val stepped: Step = from_h2(h2.complete_io(h2_of(owner), ?settled, now));
         if (stepped == STEP_DONE || stepped == STEP_ERROR) {
             owner.state = CLOSING;
             ret;
@@ -691,11 +684,11 @@ pub fun make(
     if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
     owner.tls_policy           = policy;
     owner.session              = secure.NO_SESSION;
-    owner.h2_session           = nil;
+    owner.h2_session           = h2.NO_SESSION;
     owner.shared               = shared;
     owner.handshaking          = false;
     owner.close_started        = false;
-    owner.close_pending        = false;
+    owner.close_wait           = CLOSE_READY;
     owner.close_failed         = false;
     owner.engine_close_started = false;
     owner.state                = NEW;
@@ -792,6 +785,64 @@ fun notify(owner: *Connection) {
     if (!hedge_wake.wake(?owner.waker)) { owner.wake_failed = true; }
 }
 
+# whether the next step would make progress with nothing else happening: the
+# worker's debug audit checks that no connection answering true is left out of
+# every queue (#182). a finished connection waits only to be retired
+pub fun pending_work(owner: *Connection) bool {
+    if (owner == nil || !owner.initialized)          { ret false; }
+    if (owner.state != NEW && owner.state != ACTIVE) { ret true; }
+    # a wake that could not be queued is one the worker never sees
+    if (owner.wake_failed) { ret true; }
+    # the pool funded the account and nothing has routed its wake
+    if (owner.account_live && owner.account.is_ready) { ret true; }
+    if (owner.session != secure.NO_SESSION && secure.pending_work(owner.session)) {
+        ret true;
+    }
+    if (owner.state == NEW) {
+        if (owner.handshaking) { ret secure.handshake_settled(owner.session); }
+        ret !owner.prologue_pending;
+    }
+    if (owner.h2_session != h2.NO_SESSION) { ret h2.pending_work(h2_of(owner)); }
+    if (!owner.engine_live)                { ret false; }
+    # bytes the engine holds to write and has not submitted
+    if (owner.engine.write_length != 0 && !owner.engine.write_pending) { ret true; }
+    # a request the engine handed over, waiting only for its exchange to start
+    if (owner.has_pending && !owner.exchange_live) { ret true; }
+    # a parked service whose named wait moved is re-entered by the next step
+    ret owner.exchange_live && owner.service_pending && call.stirred(?owner.active_call);
+}
+
+# the index an HTTP/1 connection's wakes name its one exchange's call by
+val EXCHANGE_CALL: u32 = 0;
+
+# a wake named `woken_call` of this connection: its parked service is re-entered
+# on the next step. an HTTP/2 connection names the stream's slot
+pub fun stir(owner: *Connection, woken_call: u32) {
+    if (owner == nil || !owner.initialized) { ret; }
+    if (owner.h2_session != h2.NO_SESSION) {
+        h2.stir(h2_of(owner), woken_call);
+        ret;
+    }
+    if (woken_call == EXCHANGE_CALL && owner.exchange_live && owner.service_pending) {
+        call.stir(?owner.active_call, call.WAIT_WAKE);
+    }
+}
+
+# whether a close left waiting would progress with nothing else happening: the
+# question the worker's debug audit asks of a retiring connection (#261). the
+# close waits on the secure channel's operations, or on the HTTP/2 release, so a
+# channel holding work nothing started, or a release that would act on its
+# engine now (#270), is a close nobody will finish
+pub fun close_work(owner: *Connection) bool {
+    if (!close_waiting(owner))                        { ret false; }
+    if (owner.wake_failed)                            { ret true; }
+    if (owner.account_live && owner.account.is_ready) { ret true; }
+    if (owner.session != secure.NO_SESSION && secure.pending_work(owner.session)) {
+        ret true;
+    }
+    ret owner.h2_session != h2.NO_SESSION && h2.close_work(h2_of(owner));
+}
+
 # the earliest monotonic instant this connection must be stepped for a deadline
 # alone. it reflects the state the last step left, so the worker asks again
 # after every step
@@ -814,8 +865,8 @@ pub fun next_deadline(owner: *Connection, output: *u64) bool {
         && call.wait_deadline(?owner.active_call, ?engine_at)) {
         found = earliest(found, engine_at, output);
     }
-    if (owner.h2_session != nil) {
-        if (h2.next_deadline(owner.h2_session, ?engine_at)) {
+    if (owner.h2_session != h2.NO_SESSION) {
+        if (h2.next_deadline(h2_of(owner), ?engine_at)) {
             found = earliest(found, engine_at, output);
         }
     }
@@ -921,10 +972,10 @@ fun start_engine(owner: *Connection, now: time.Instant) Step {
     }
     if (owner.protocol == selection.HTTP2) {
         owner.h2_session = h2.acquire(?owner.shared.h2_sessions);
-        if (owner.h2_session == nil) {
+        if (owner.h2_session == h2.NO_SESSION) {
             ret refuse(owner, prologue.REFUSED_EXHAUSTED);
         }
-        if (!h2.begin(owner.h2_session, ?owner.channel, ?owner.engine_scope,
+        if (!h2.begin(h2_of(owner), ?owner.channel, ?owner.engine_scope,
             owner.plan, owner.budgets, owner.limits, owner.configured.max_streams,
             owner.listener_name,
             owner.secure,
@@ -976,16 +1027,16 @@ fun staged_bytes(context: ptr, buffer: *u8, length: usize) usize {
     ret count;
 }
 
+# a TLS completion is routed into the channel, which queues this connection to
+# take what it settled on its next step
 fun settle_secure(context: ptr, token_context: usize,
     completion: io_runtime.Completion) {
     val owner: *Connection = context::*Connection;
     if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) {
         ret;
     }
-    fin { notify(owner); }
     var settled: io_runtime.Completion = completion;
     secure.accept(owner.session, ?settled);
-    advance(owner, clock.instant());
 }
 
 # TLS reads the wall clock through its policy, never `now` (#190)
@@ -1000,8 +1051,8 @@ fun begin_secure(owner: *Connection, now: time.Instant) Step {
     val channel: *secure.Channel = secure.channel(owner.session);
     if (channel == nil
         || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
-        staged_bytes, ?owner.borrower, ?owner.account)
-        || !bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
+        staged_bytes, ?owner.borrower, ?owner.account, owner.waker)
+        || !operation.bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
         settle_secure, 0)
         || !secure.begin(owner.session, hedge_tls.policy_at(owner.tls_policy),
         ?owner.operation_root, ?owner.prologue_scope)) {
@@ -1053,7 +1104,7 @@ fun submit_prologue_read(owner: *Connection) Step {
     if (owner.prologue_len >= PROLOGUE_BYTES) {
         ret refuse(owner, prologue.REFUSED_OVERFLOW);
     }
-    if (!bind_operation(?owner.prologue_operation, ?owner.prologue_context,
+    if (!operation.bind_operation(?owner.prologue_operation, ?owner.prologue_context,
         (owner)::ptr, settle_prologue, 0)) {
         ret refuse(owner, prologue.REFUSED_TRANSPORT);
     }
@@ -1267,7 +1318,8 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Instant) u8 {
     call.reset_memory(?owner.memory, owner.configured.call_memory_bytes);
     if (!telemetry_trace.make_root(?owner.trace, false)) { ret SETUP_TRACE; }
     if (!call.bind(?owner.active_call, ?owner.exchange, ?owner.memory, ?owner.trace,
-        owner.plan.generation, owner.listener_name, owner.waker)) { ret SETUP_BIND; }
+        owner.plan.generation, owner.listener_name,
+        hedge_wake.for_call(owner.waker, EXCHANGE_CALL))) { ret SETUP_BIND; }
     owner.active_slot            = slot;
     owner.exchange_live          = true;
     owner.exchange_cancelling    = false;
@@ -1502,10 +1554,16 @@ fun pump_response(owner: *Connection, now: time.Instant) Step {
     ret STEP_PROGRESS;
 }
 
+# the h2 session this connection holds, or nil when it holds none
+fun h2_of(owner: *Connection) *h2.Session {
+    if (owner.h2_session == h2.NO_SESSION) { ret nil; }
+    ret h2.session_at(?owner.shared.h2_sessions, owner.h2_session);
+}
+
 fun runnable(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || !owner.engine_live
         || owner.state != ACTIVE) { ret false; }
-    if (owner.h2_session != nil) { ret true; }
+    if (owner.h2_session != h2.NO_SESSION) { ret true; }
     ret owner.engine.state != connection.CLOSED && owner.engine.state != connection.FAILED;
 }
 
@@ -1602,8 +1660,10 @@ fun apply(owner: *Connection, event: connection.Event, now: time.Instant) Step {
     # so the host only completes what was left outstanding after the service returned
     if (event.kind == connection.EVENT_REQUEST_BODY
         || event.kind == connection.EVENT_REQUEST_COMPLETE) {
-        if (owner.exchange_live && !owner.service_pending
-            && owner.request_body.pending_token != 0) {
+        if (owner.exchange_live && owner.service_pending) {
+            call.stir(?owner.active_call, call.WAIT_BODY);
+        }
+        or (owner.exchange_live && owner.request_body.pending_token != 0) {
             body.complete_reader(owner.request.body, owner.request_body.pending_token);
         }
         ret STEP_PROGRESS;
@@ -1633,8 +1693,8 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
     if (owner.session != secure.NO_SESSION && owner.engine_live) {
         var settled: transport.Completion;
         if (secure.take(owner.session, ?settled)) {
-            if (owner.h2_session != nil) {
-                val stepped: Step = from_h2(h2.complete_io(owner.h2_session,
+            if (owner.h2_session != h2.NO_SESSION) {
+                val stepped: Step = from_h2(h2.complete_io(h2_of(owner),
                     ?settled, now));
                 if (stepped == STEP_DONE || stepped == STEP_ERROR) {
                     owner.state = CLOSING;
@@ -1651,8 +1711,8 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         }
     }
     if (owner.state != ACTIVE) { ret STEP_DONE; }
-    if (owner.h2_session != nil) {
-        val stepped: Step = from_h2(h2.step(owner.h2_session, now));
+    if (owner.h2_session != h2.NO_SESSION) {
+        val stepped: Step = from_h2(h2.step(h2_of(owner), now));
         # whatever the engine queued in this step has to start now. leaving it
         # for the next completion strands the last frame of a response behind a
         # read the peer will never satisfy, because the peer is waiting for it.
@@ -1666,10 +1726,14 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         owner.state = CLOSING;
         ret STEP_DONE;
     }
+    # a parked service is entered again only once what it waits on has moved;
+    # until then the connection only keeps its inbound side going
     if (owner.exchange_live && owner.service_pending) {
-        val resumed: Step = resume_service(owner, now);
-        owner.last_step = resumed;
-        if (resumed != STEP_BLOCKED) { ret resumed; }
+        if (call.due(?owner.active_call, clock.to_ns(now))) {
+            val resumed: Step = resume_service(owner, now);
+            owner.last_step = resumed;
+            if (resumed != STEP_BLOCKED) { ret resumed; }
+        }
         val inbound_while_pending: Step = pump_inbound(owner, now);
         owner.last_step = inbound_while_pending;
         ret inbound_while_pending;
@@ -1705,8 +1769,10 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
 pub fun advance(owner: *Connection, now: time.Instant) Step {
     if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
     fin { track_memory(owner, now); }
-    # a wake may be the pool funding what TLS was blocked on
-    if (owner.session != secure.NO_SESSION) { secure.resume(owner.session); }
+    # what the engines submit to the secure channel while this runs is started
+    # here, and whatever is left unstarted queues the connection again
+    if (owner.session != secure.NO_SESSION) { secure.begin_step(owner.session); }
+    fin { end_secure_step(owner); }
     var steps: usize = 0;
     # a connection still moving when its step bound runs out has more to do
     var settled: Step = STEP_PROGRESS;
@@ -1727,6 +1793,21 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
     ret settled;
 }
 
+fun end_secure_step(owner: *Connection) {
+    if (owner.initialized && owner.session != secure.NO_SESSION) {
+        secure.end_step(owner.session);
+    }
+}
+
+# the pool funded this connection's account again: a TLS lane parked for memory
+# is retried, and its retry comes back as a completion that queues the
+# connection. the worker queues the connection as well, for an HTTP engine that
+# was blocked on the same account
+pub fun funded(owner: *Connection) {
+    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) { ret; }
+    secure.resume(owner.session);
+}
+
 pub fun begin_graceful(owner: *Connection) bool {
     if (owner == nil || !owner.initialized) { ret false; }
     # a connection still in its prologue has no engine to signal, so it is
@@ -1735,7 +1816,7 @@ pub fun begin_graceful(owner: *Connection) bool {
         owner.state = CLOSING;
         ret true;
     }
-    if (owner.h2_session != nil) { ret h2.begin_graceful(owner.h2_session); }
+    if (owner.h2_session != h2.NO_SESSION) { ret h2.begin_graceful(h2_of(owner)); }
     # an engine that is already draining or ending needs no signal; only an
     # open engine has something to be asked
     if (owner.engine.state != connection.OPEN) { ret true; }
@@ -1811,17 +1892,50 @@ fun close_h1_engine(owner: *Connection) bool {
     ret true;
 }
 
-fun pump_secure_close(owner: *Connection) {
-    var settled: transport.Completion;
-    if (secure.take(owner.session, ?settled)) {
-        connection.complete_io(?owner.engine, ?settled, clock.instant());
-    }
+# start what the engine queued on the secure channel and take one completion it
+# published into whichever engine runs on it. true when one was taken, which
+# may be what the engine waits on
+fun pump_secure_close(owner: *Connection) bool {
     secure.drive(owner.session);
+    var settled: transport.Completion;
+    if (!secure.take(owner.session, ?settled)) { ret false; }
+    if (owner.h2_session != h2.NO_SESSION) {
+        h2.complete_io(h2_of(owner), ?settled, clock.instant());
+    }
+    or { connection.complete_io(?owner.engine, ?settled, clock.instant()); }
+    ret true;
+}
+
+# a retiring slot is no longer advanced, so closing drives the secure channel
+# itself, for HTTP/1.1 here and for HTTP/2 in `close_h2`. the engine's cancellation queues its transport close on the channel,
+# and nothing starts it but a drive after that queueing (#257). a completion the
+# channel settles without the socket is taken here at once. one that needs the
+# socket wakes the connection through settle_secure for the next close to take
+fun close_h1(owner: *Connection) bool {
+    for (!close_h1_engine(owner)) {
+        if (owner.session == secure.NO_SESSION || !pump_secure_close(owner)) {
+            ret false;
+        }
+    }
+    ret true;
+}
+
+# the HTTP/2 engine's release waits on its transport operations, which over TLS
+# settle into the secure channel. a TLS completion only queues the connection,
+# and a retiring slot is not advanced, so the close takes them itself (#195)
+fun close_h2(owner: *Connection) h2.ReleaseStatus {
+    for {
+        val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions,
+            owner.h2_session);
+        if (released != h2.RELEASE_PENDING || owner.session == secure.NO_SESSION
+            || !pump_secure_close(owner)) { ret released; }
+    }
+    ret h2.RELEASE_PENDING;
 }
 
 pub fun close(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || owner.state == CLOSED) { ret false; }
-    owner.close_pending = false;
+    owner.close_wait = CLOSE_READY;
     if (!owner.close_started) {
         owner.close_started = true;
         owner.state         = CLOSING;
@@ -1834,7 +1948,7 @@ pub fun close(owner: *Connection) bool {
     if (owner.exchange_live) {
         val settled: exchange.FinishStatus = settle_exchange_close(owner);
         if (settled == exchange.FINISH_BODY_PENDING) {
-            owner.close_pending = true;
+            owner.close_wait = CLOSE_BODY;
             ret false;
         }
         if (settled != exchange.FINISH_OK) {
@@ -1843,32 +1957,36 @@ pub fun close(owner: *Connection) bool {
             abandon_exchange_close(owner);
         }
     }
-    if (owner.h2_session != nil) {
-        owner.requests = h2.requests(owner.h2_session);
-        val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions, owner.h2_session);
+    if (owner.h2_session != h2.NO_SESSION) {
+        owner.requests = h2.requests(h2_of(owner));
+        val released: h2.ReleaseStatus = close_h2(owner);
         if (released == h2.RELEASE_PENDING) {
-            owner.close_pending = true;
+            owner.close_wait = CLOSE_HTTP2;
             ret false;
         }
         if (released == h2.RELEASE_FAILED) { owner.close_failed = true; }
-        owner.h2_session  = nil;
+        owner.h2_session  = h2.NO_SESSION;
         owner.engine_live = false;
     }
     or (owner.engine_live) {
-        # a retiring slot is no longer advanced, so the secure channel's
-        # published completion has to be taken here or its close never starts
-        if (owner.session != secure.NO_SESSION) { pump_secure_close(owner); }
-        if (!close_h1_engine(owner)) {
-            owner.close_pending = true;
+        if (!close_h1(owner)) {
+            owner.close_wait = CLOSE_HTTP1;
             ret false;
         }
     }
     if (owner.prologue_pending) {
-        owner.close_pending = true;
+        owner.close_wait = CLOSE_PROLOGUE;
         ret false;
     }
+    # a handshake the cancellation interrupted still runs in the session until
+    # its transport operations settle, and releasing it before then would leave
+    # its buffers held (#280). each settlement wakes the connection
     if (owner.session != secure.NO_SESSION) {
-        secure.release(owner.session);
+        if (!secure.idle(owner.session)) {
+            owner.close_wait = CLOSE_TLS;
+            ret false;
+        }
+        if (!secure.release(owner.session)) { owner.close_failed = true; }
         owner.session = secure.NO_SESSION;
     }
     owner.handshaking = false;
@@ -1900,7 +2018,13 @@ pub fun stream_released(owner: *Connection) bool {
 }
 
 pub fun close_waiting(owner: *Connection) bool {
-    ret owner != nil && owner.initialized && owner.close_pending;
+    ret owner != nil && owner.initialized && owner.close_wait != CLOSE_READY;
+}
+
+# what this connection's waiting close needs, or CLOSE_READY when none waits
+pub fun close_wait(owner: *Connection) CloseWait {
+    if (!close_waiting(owner)) { ret CLOSE_READY; }
+    ret owner.close_wait;
 }
 
 # the operational view of one connection, for tests and telemetry alike

@@ -147,15 +147,16 @@ pub rec Runtime {
     event_count:         usize;
 }
 
-# every welded quic record is owned by a typed secret array or table. Controls
-# is held by main for the process lifetime, never moves, and is never retained
-# by a public record. the tables start empty and the quic runtime grows them.
+# every welded quic record is owned by a typed secret array, table or pair.
+# Controls is held by main for the process lifetime, never moves (a pair's slab
+# points at its own halves), and is never retained by a public record. the
+# tables start empty and the quic runtime grows them.
 pub rec Controls {
     pump_allocator: secret.ArrayAllocator[quic_runtime.Pump];
     pumps:          secret.SecretArray[quic_runtime.Pump];
-    connections:    hedge_storage.SecretTable[quic_runtime.Connection];
+    connections:    hedge_storage.Pair[quic_runtime.ConnectionStorage, quic_runtime.Connection];
     handshakes:     hedge_storage.SecretTable[tls_server.Handshake];
-    sessions:       hedge_storage.SecretTable[h3_session.Session];
+    sessions:       hedge_storage.Pair[h3_session.SessionStorage, h3_session.Session];
     live:           bool;
 }
 
@@ -174,13 +175,13 @@ pub fun make_controls(controls: *Controls, a: *allocator.Allocator) bool {
     if (controls == nil || a == nil || controls.live) { ret false; }
     controls.pump_allocator =
         secret.system_array_allocator[quic_runtime.Pump]();
-    # each secret table owns a slab whose link storage draws on this plain
-    # allocator; the welded records use crypto.secret's own allocator
-    if (!hedge_storage.make_secret_table[quic_runtime.Connection](
+    # each pair and table owns a slab whose link storage, and a pair's plain
+    # half, draw on this allocator; the welded records use crypto.secret's own
+    if (!hedge_storage.make_pair[quic_runtime.ConnectionStorage, quic_runtime.Connection](
         ?controls.connections, a)
         || !hedge_storage.make_secret_table[tls_server.Handshake](
         ?controls.handshakes, a)
-        || !hedge_storage.make_secret_table[h3_session.Session](
+        || !hedge_storage.make_pair[h3_session.SessionStorage, h3_session.Session](
         ?controls.sessions, a)) { ret false; }
     if (secret.init_array[quic_runtime.Pump](?controls.pumps,
         ?controls.pump_allocator, quic_runtime.MAX_PUMPS) != contracts.OK) {
@@ -196,11 +197,11 @@ pub fun make_controls(controls: *Controls, a: *allocator.Allocator) bool {
 pub fun release_controls(controls: *Controls) bool {
     if (controls == nil) { ret false; }
     var released: bool = true;
-    if (!hedge_storage.destroy_secret_table[h3_session.Session](
+    if (!hedge_storage.destroy_pair[h3_session.SessionStorage, h3_session.Session](
         ?controls.sessions)) { released = false; }
     if (!hedge_storage.destroy_secret_table[tls_server.Handshake](
         ?controls.handshakes)) { released = false; }
-    if (!hedge_storage.destroy_secret_table[quic_runtime.Connection](
+    if (!hedge_storage.destroy_pair[quic_runtime.ConnectionStorage, quic_runtime.Connection](
         ?controls.connections)) { released = false; }
     if (secret.destroy_array[quic_runtime.Pump](?controls.pumps)
         != contracts.OK) { released = false; }
@@ -211,12 +212,12 @@ pub fun release_controls(controls: *Controls) bool {
 pub fun controls_cleanup_pending(controls: *Controls) bool {
     if (controls == nil) { ret false; }
     ret secret.array_cleanup_pending[quic_runtime.Pump](?controls.pumps)
-        || hedge_storage.secret_table_cleanup_pending[quic_runtime.Connection](
-        ?controls.connections)
+        || hedge_storage.pair_cleanup_pending[quic_runtime.ConnectionStorage,
+        quic_runtime.Connection](?controls.connections)
         || hedge_storage.secret_table_cleanup_pending[tls_server.Handshake](
         ?controls.handshakes)
-        || hedge_storage.secret_table_cleanup_pending[h3_session.Session](
-        ?controls.sessions);
+        || hedge_storage.pair_cleanup_pending[h3_session.SessionStorage,
+        h3_session.Session](?controls.sessions);
 }
 
 # the view is borrowed by one call and never outlives it
@@ -277,6 +278,24 @@ fun drive_planes(context: ptr, now: time.Instant) bool {
     ret advanced;
 }
 
+# the earliest deadline across the planes, for the worker's wheel
+fun plane_deadline(context: ptr, at_ns: *u64) bool {
+    val planes: *Planes = context::*Planes;
+    if (planes == nil) { ret false; }
+    var found: bool = false;
+    var at:    u64  = 0;
+    if (planes.proxying != nil && proxy.deadline(planes.proxying, ?at)) {
+        @at_ns = at;
+        found  = true;
+    }
+    if (planes.certificates != nil && acme.deadline(planes.certificates, ?at)
+        && (!found || at < @at_ns)) {
+        @at_ns = at;
+        found  = true;
+    }
+    ret found;
+}
+
 fun quiesce_planes(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
     val planes: *Planes = context::*Planes;
     if (planes == nil) { ret serve.PLANE_FAILED; }
@@ -284,6 +303,11 @@ fun quiesce_planes(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
         val status: proxy.QuiesceStatus = proxy.quiesce(planes.proxying, now);
         if (status == proxy.QUIESCE_PENDING) { ret serve.PLANE_PENDING; }
         if (status != proxy.QUIESCED)        { ret serve.PLANE_FAILED; }
+    }
+    if (planes.certificates != nil) {
+        val status: acme.Status = acme.quiesce(planes.certificates);
+        if (status == acme.PENDING) { ret serve.PLANE_PENDING; }
+        if (status != acme.OK)      { ret serve.PLANE_FAILED; }
     }
     ret serve.PLANE_QUIESCED;
 }
@@ -706,13 +730,17 @@ pub fun start(runtime: *Runtime, controls: *Controls,
     runtime.serve_live = true;
     if (!proxy.attach_driver(?runtime.proxying, ?runtime.serving.owner.network,
         ?runtime.serving.memory, runtime.serving.configured.memory_budgets,
-        runtime.serving.configured.engine)) {
+        serve.plane_waker(?runtime.serving), runtime.serving.configured.engine)) {
         ret fail(runtime, controls, START_RUNTIME, "proxy driver could not be attached");
+    }
+    if (runtime.acme_live && !acme.attach_driver(runtime.certificates,
+        ?runtime.serving.owner.network, serve.plane_waker(?runtime.serving))) {
+        ret fail(runtime, controls, START_RUNTIME, "certificate manager could not attach its driver");
     }
     runtime.planes.proxying     = ?runtime.proxying;
     runtime.planes.certificates = runtime.certificates;
     if (!serve.attach_plane_lifecycle(?runtime.serving, (?runtime.planes)::ptr,
-        drive_planes, quiesce_planes)) {
+        drive_planes, quiesce_planes, plane_deadline)) {
         ret fail(runtime, controls, START_RUNTIME, "service planes could not be attached");
     }
     if (runtime.acme_live) {

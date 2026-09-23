@@ -417,7 +417,8 @@ stop_server
 # abandoned live exchanges must not look like a clean one.
 
 shutdown_exit() {
-    # $1 "idle" or "held": whether a peer holds a request open across the signal
+    # $1 "idle", "held" or "held-h3": whether a peer holds a request open across
+    # the signal, and over which transport
     local log="$work/shutdown.log"
     "$binary" test/interop/shutdown.toml > "$log" 2>&1 &
     local pid=$!
@@ -449,6 +450,19 @@ time.sleep(30)
             if grep -q held "$work/holder.log" 2>/dev/null; then break; fi
             sleep 0.1
         done
+    elif [ "$1" = "held-h3" ]; then
+        # an HTTP/3 request whose body never ends: the QUIC connection and its
+        # session are live at the signal, and the drain deadline tears them down
+        # on the real driver. the session has to reach CLOSED for the connection
+        # to be released, so the stop reports the abandoned exchange and no
+        # teardown failure
+        (sleep 30 | curl -sS --http3-only --cacert "$fixtures/root.pem" \
+            --resolve api.example.com:9085:127.0.0.1 -T - -o /dev/null \
+            https://api.example.com:9085/hello >/dev/null 2>&1) &
+        holder=$!
+        # nothing is logged until a request ends, so the request is given time
+        # to arrive: the local handshake takes tens of milliseconds
+        sleep 1.5
     else
         # a client that completes and goes away before the signal
         curl -sS -o /dev/null --max-time 10 -H 'Host: localhost' \
@@ -457,8 +471,15 @@ time.sleep(30)
     kill -TERM "$pid" 2>/dev/null
     local code=0
     wait "$pid"; code=$?
-    if [ -n "$holder" ]; then kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; fi
-    echo "$code"
+    if [ -n "$holder" ]; then
+        pkill -P "$holder" 2>/dev/null
+        kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    fi
+    if grep -q 'teardown calls failed' "$log" 2>/dev/null; then
+        echo "$code/teardown-failed"
+    else
+        echo "$code"
+    fi
 }
 
 # --- reload -------------------------------------------------------------------
@@ -560,6 +581,8 @@ check "service reload pins the old generation and reclaims twelve replacements" 
 check "a stop with no work in flight drains cleanly" 0 "$(shutdown_exit idle)"
 check "a stop with a peer mid-request reports the abandoned exchange" 75 \
     "$(shutdown_exit held)"
+check "a stop with an HTTP/3 peer mid-request releases the session at the drain deadline" 75 \
+    "$(shutdown_exit held-h3)"
 
 echo
 echo "$passed passed, $failed failed"

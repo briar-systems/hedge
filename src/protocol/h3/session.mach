@@ -163,9 +163,11 @@ pub rec RequestStorage {
 rec RequestSlot {
     # the request's buffers, borrowed from the request lane while it is live and
     # released when it retires; nil and unheld on an idle slot
-    storage:                       *RequestStorage;
-    storage_chunk:                 buffers.Chunk;
-    storage_held:                  bool;
+    storage:       *RequestStorage;
+    storage_chunk: buffers.Chunk;
+    storage_held:  bool;
+    # the slot's index in its session, which its call's wakes name it by
+    index:                         usize;
     live:                          bool;
     phase:                         RequestPhase;
     id:                            u64;
@@ -238,7 +240,8 @@ pub rec SessionStorage {
     request_timeout_ns:  u64;
     chunks:              *hedge_storage.Chunks;
     call_memory_bytes:   usize;
-    # the QUIC connection's waker, which every request's call wakes
+    # the QUIC connection's waker. a request's call wakes it naming the
+    # request's slot
     waker: hedge_wake.Waker;
 }
 
@@ -263,22 +266,24 @@ pub rec Session {
     release_failed:    bool;
 }
 
-# welded session pointers are entry-point local and never retained here. the
-# sessions themselves live in the caller's secret table, which the pool grows.
+# welded session pointers are entry-point local and never retained here. each
+# session and its plain storage live at one index of the caller's pair, which
+# the pool grows and releases a session's two halves on together.
 pub rec Pool {
-    storages: hedge_storage.Recycler[SessionStorage];
-    live:     usize;
+    live: usize;
 }
 
 fun reset_request(slot: *RequestSlot) {
     val storage: *RequestStorage = slot.storage;
     val chunk:   buffers.Chunk   = slot.storage_chunk;
     val held:    bool            = slot.storage_held;
+    val index:   usize           = slot.index;
     var cleared: RequestSlot;
     @slot                = cleared;
     slot.storage         = storage;
     slot.storage_chunk   = chunk;
     slot.storage_held    = held;
+    slot.index           = index;
     slot.phase           = REQUEST_FREE;
     slot.call_release_ok = true;
     slot.charge          = budget.no_charge();
@@ -311,20 +316,17 @@ fun release_request_storage(session: *Session, slot: *RequestSlot) {
 }
 
 # a pool claims no storage until a session is taken. the sessions live in the
-# caller's secret table, whose slab tracks free indices, so the pool keeps no
-# free list of its own.
-pub fun make_pool(pool: *Pool, a: *A.Allocator,
-    sessions: *hedge_storage.SecretTable[Session]) bool {
-    if (pool == nil || a == nil || sessions == nil
-        || !hedge_storage.make[SessionStorage](?pool.storages, a, 1)) { ret false; }
+# caller's pair, whose slab tracks free indices, so the pool keeps no free list
+# of its own.
+pub fun make_pool(pool: *Pool) bool {
+    if (pool == nil) { ret false; }
     pool.live = 0;
     ret true;
 }
 
 # every session must have been returned first
 pub fun destroy_pool(pool: *Pool) bool {
-    if (pool == nil || pool.live != 0) { ret false; }
-    ret hedge_storage.destroy[SessionStorage](?pool.storages);
+    ret pool != nil && pool.live == 0;
 }
 
 # put a taken session's storage and request slots into their empty state
@@ -339,19 +341,14 @@ fun arm_session(session: *Session, storage: *SessionStorage) {
     }
 }
 
-pub fun acquire(pool: *Pool, sessions: *hedge_storage.SecretTable[Session]) usize {
+pub fun acquire(pool: *Pool, sessions: *hedge_storage.Pair[SessionStorage, Session]) usize {
     if (pool == nil || sessions == nil) { ret NO_SESSION; }
-    # the slab grows the welded chunk on demand and hands back the lowest free
-    # index; the megabyte storage is claimed alongside and released with it
-    val index: usize = hedge_storage.secret_table_claim[Session](sessions);
+    # the slab grows both halves' chunks on demand and hands back the lowest free
+    # index, so the session and its storage are claimed as one
+    val index: usize = hedge_storage.pair_claim[SessionStorage, Session](sessions);
     if (index == hedge_storage.NO_INDEX) { ret NO_SESSION; }
-    val storage: *SessionStorage = hedge_storage.claim[SessionStorage](?pool.storages);
-    if (storage == nil) {
-        hedge_storage.secret_table_release[Session](sessions, index);
-        ret NO_SESSION;
-    }
-    val session: *Session = hedge_storage.secret_table_at[Session](sessions, index);
-    arm_session(session, storage);
+    val session: *Session = hedge_storage.pair_secret_at[SessionStorage, Session](sessions, index);
+    arm_session(session, hedge_storage.pair_plain_at[SessionStorage, Session](sessions, index));
     session.live           = true;
     session.state          = IDLE;
     session.release_failed = false;
@@ -361,17 +358,17 @@ pub fun acquire(pool: *Pool, sessions: *hedge_storage.SecretTable[Session]) usiz
     ret index;
 }
 
-pub fun session_at(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
+pub fun session_at(pool: *Pool, sessions: *hedge_storage.Pair[SessionStorage, Session],
     index: usize) *Session {
     if (pool == nil) { ret nil; }
-    val session: *Session = hedge_storage.secret_table_at[Session](sessions, index);
+    val session: *Session = hedge_storage.pair_secret_at[SessionStorage, Session](sessions, index);
     if (session == nil || !session.live) { ret nil; }
     ret session;
 }
 
-fun return_session(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
+fun return_session(pool: *Pool, sessions: *hedge_storage.Pair[SessionStorage, Session],
     index: usize) {
-    val session: *Session        = hedge_storage.secret_table_at[Session](sessions, index);
+    val session: *Session        = hedge_storage.pair_secret_at[SessionStorage, Session](sessions, index);
     val storage: *SessionStorage = session.storage;
     storage.plan             = nil;
     storage.budgets          = nil;
@@ -387,17 +384,15 @@ fun return_session(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
         release_request_storage(session, ?session.requests_slots[i]);
         i = i + 1;
     }
-    # held storage is only ever refused back when its free would also fail
-    hedge_storage.release[SessionStorage](?pool.storages, storage);
     var cleared: Session;
     @session      = cleared;
     session.state = IDLE;
-    # release before compaction so a reclaimed chunk strands no live storage
-    hedge_storage.secret_table_release[Session](sessions, index);
+    # both halves go last, together: a released trailing chunk strands nothing
+    hedge_storage.pair_release[SessionStorage, Session](sessions, index);
     if (pool.live != 0) { pool.live = pool.live - 1; }
 }
 
-pub fun abandon(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
+pub fun abandon(pool: *Pool, sessions: *hedge_storage.Pair[SessionStorage, Session],
     index: usize) bool {
     val session: *Session = session_at(pool, sessions, index);
     if (session == nil || session.state != IDLE
@@ -413,10 +408,10 @@ pub fun abandon(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
 test "hedge.protocol.h3.session: abandon retains a live child scope" {
     var pool_heap: A.Allocator;
     page.make(?pool_heap);
-    var sessions: hedge_storage.SecretTable[Session];
+    var sessions: hedge_storage.Pair[SessionStorage, Session];
     var pool:     Pool;
-    if (!hedge_storage.make_secret_table[Session](?sessions, ?pool_heap)
-        || !make_pool(?pool, ?pool_heap, ?sessions)) { ret 1; }
+    if (!hedge_storage.make_pair[SessionStorage, Session](?sessions, ?pool_heap)
+        || !make_pool(?pool)) { ret 1; }
     val index:   usize    = acquire(?pool, ?sessions);
     val session: *Session = session_at(?pool, ?sessions, index);
     var root:    cancel.Scope;
@@ -439,10 +434,10 @@ test "hedge.protocol.h3.session: abandon retains a live child scope" {
 test "hedge.protocol.h3.session: retained start scope blocks mutation" {
     var pool_heap: A.Allocator;
     page.make(?pool_heap);
-    var sessions: hedge_storage.SecretTable[Session];
+    var sessions: hedge_storage.Pair[SessionStorage, Session];
     var pool:     Pool;
-    if (!hedge_storage.make_secret_table[Session](?sessions, ?pool_heap)
-        || !make_pool(?pool, ?pool_heap, ?sessions)) { ret 1; }
+    if (!hedge_storage.make_pair[SessionStorage, Session](?sessions, ?pool_heap)
+        || !make_pool(?pool)) { ret 1; }
     val index:   usize    = acquire(?pool, ?sessions);
     val session: *Session = session_at(?pool, ?sessions, index);
     var root:    cancel.Scope;
@@ -664,6 +659,7 @@ fun free_request(session: *Session) *RequestSlot {
             val slot: *RequestSlot = ?session.requests_slots[i];
             if (!borrow_request_storage(session, slot)) { ret nil; }
             reset_request(slot);
+            slot.index = i;
             ret slot;
         }
         i = i + 1;
@@ -1086,7 +1082,8 @@ fun make_exchange(session: *Session, slot: *RequestSlot, event: h3.Event,
         || !telemetry_trace.make_root(?slot.trace, false)
         || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory, ?slot.trace,
         session.storage.plan.generation,
-        (?session.storage.listener_name[0])::str, session.storage.waker)) { ret false; }
+        (?session.storage.listener_name[0])::str,
+        hedge_wake.for_call(session.storage.waker, slot.index::u32))) { ret false; }
     ret true;
 }
 
@@ -1319,7 +1316,11 @@ fun terminal_exchange(slot: *RequestSlot) bool {
 # a pending service completes its own suspended operation when it is resumed,
 # so the host only completes what was left outstanding after the service returned
 fun complete_pending_body(slot: *RequestSlot) bool {
-    if (slot.service_pending || slot.body.pending_token == 0) { ret true; }
+    if (slot.service_pending) {
+        call.stir(?slot.active_call, call.WAIT_BODY);
+        ret true;
+    }
+    if (slot.body.pending_token == 0) { ret true; }
     val completed: body.Progress = body.complete_reader(?slot.body.reader,
         slot.body.pending_token);
     ret completed.status != body.ERROR && completed.status != body.LIMIT_REACHED
@@ -1499,9 +1500,12 @@ fun pump_request(session: *Session, slot: *RequestSlot,
         if (stream.state != h3.STREAM_CLOSED) { ret STEP_BLOCKED; }
         ret settle_request(session, slot);
     }
+    # a parked service is entered again only once what it waits on has moved
     if (slot.service_pending) {
-        val resumed: Step = resume_exchange(session, slot, now);
-        if (resumed != STEP_BLOCKED) { ret resumed; }
+        if (call.due(?slot.active_call, session.now_ns)) {
+            val resumed: Step = resume_exchange(session, slot, now);
+            if (resumed != STEP_BLOCKED) { ret resumed; }
+        }
         ret credited;
     }
     if (!slot.headers_sent) {
@@ -1783,6 +1787,8 @@ pub fun step(session: *Session, now: time.Instant,
     ret applied;
 }
 
+# a session still moving when its step bound runs out answers STEP_PROGRESS:
+# it has more to do, and its host queues it for another turn
 pub fun advance(session: *Session, now: time.Instant,
     monotonic_ns: u64) Step {
     if (session == nil || !session.live) { ret STEP_ERROR; }
@@ -1792,7 +1798,7 @@ pub fun advance(session: *Session, now: time.Instant,
         if (progress != STEP_PROGRESS) { ret progress; }
         count = count + 1;
     }
-    ret STEP_BLOCKED;
+    ret STEP_PROGRESS;
 }
 
 pub fun begin_graceful(session: *Session) bool {
@@ -1859,11 +1865,47 @@ pub fun next_deadline(session: *Session, output: *u64) bool {
     ret found;
 }
 
+# whether the session polls its engine, which takes every stream the transport
+# has news of. a failed or closed session no longer does
+pub fun takes_news(session: *Session) bool {
+    ret session != nil && session.live
+        && (session.state == ACTIVE || session.state == CLOSING);
+}
+
+# a wake named the call of the request in slot `index`: its parked service is
+# re-entered on the next step, and no other request's is
+pub fun stir(session: *Session, index: u32) {
+    if (session == nil || !session.live || index::usize >= MAX_STREAMS) { ret; }
+    val slot: *RequestSlot = ?session.requests_slots[index::usize];
+    if (!slot.live || !slot.exchange_live || !slot.service_pending) { ret; }
+    call.stir(?slot.active_call, call.WAIT_WAKE);
+}
+
+# whether a parked service of this session has had its named wait move, which
+# the next step re-enters
+pub fun stirred(session: *Session) bool {
+    if (session == nil || !session.live) { ret false; }
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        val slot: *RequestSlot = ?session.requests_slots[i];
+        if (slot.live && slot.exchange_live && slot.service_pending
+            && call.stirred(?slot.active_call)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the session's last advance ran out of steps while still moving, so
+# its next step has work to do
+pub fun moving(session: *Session) bool {
+    ret session != nil && session.live && session.last_step == STEP_PROGRESS;
+}
+
 pub fun awaiting_service(session: *Session) bool {
     ret session.state == CLOSED || active_requests(session) != 0;
 }
 
-pub fun release_status(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
+pub fun release_status(pool: *Pool, sessions: *hedge_storage.Pair[SessionStorage, Session],
     index: usize) ReleaseStatus {
     val session: *Session = session_at(pool, sessions, index);
     if (session == nil || session.state != CLOSED
@@ -1884,7 +1926,7 @@ pub fun release_status(pool: *Pool, sessions: *hedge_storage.SecretTable[Session
     ret RELEASE_OK;
 }
 
-pub fun release(pool: *Pool, sessions: *hedge_storage.SecretTable[Session],
+pub fun release(pool: *Pool, sessions: *hedge_storage.Pair[SessionStorage, Session],
     index: usize) bool {
     ret release_status(pool, sessions, index) == RELEASE_OK;
 }
@@ -1921,22 +1963,21 @@ pub fun snapshot(session: *Session) Snapshot {
 test "hedge.protocol.h3.session: pool ownership grows, compacts, and holds live records still" {
     var heap: A.Allocator;
     page.make(?heap);
-    var sessions: hedge_storage.SecretTable[Session];
+    var sessions: hedge_storage.Pair[SessionStorage, Session];
     var pool:     Pool;
-    if (!hedge_storage.make_secret_table[Session](?sessions, ?heap)
-        || !make_pool(?pool, ?heap, ?sessions) || pool.live != 0
-        || hedge_storage.secret_table_capacity[Session](?sessions) != 0
-        || hedge_storage.held[SessionStorage](?pool.storages) != 0) { ret 1; }
+    if (!hedge_storage.make_pair[SessionStorage, Session](?sessions, ?heap)
+        || !make_pool(?pool) || pool.live != 0
+        || hedge_storage.pair_capacity[SessionStorage, Session](?sessions) != 0) { ret 1; }
     val first: usize    = acquire(?pool, ?sessions);
     val taken: *Session = session_at(?pool, ?sessions, first);
     if (first != 0 || pool.live != 1 || taken == nil || taken.storage == nil
-        || hedge_storage.secret_table_capacity[Session](?sessions)
+        || hedge_storage.pair_capacity[SessionStorage, Session](?sessions)
         != hedge_storage.FIRST_CHUNK) { ret 2; }
     # releasing the only session compacts the welded chunk away
     if (!abandon(?pool, ?sessions, first) || pool.live != 0
         || session_at(?pool, ?sessions, first) != nil
-        || hedge_storage.held[SessionStorage](?pool.storages) != 0
-        || hedge_storage.secret_table_capacity[Session](?sessions) != 0) { ret 3; }
+        || hedge_storage.pair_live[SessionStorage, Session](?sessions) != 0
+        || hedge_storage.pair_capacity[SessionStorage, Session](?sessions) != 0) { ret 3; }
     # a reclaimed index reads as a fresh, armed session
     val second: usize    = acquire(?pool, ?sessions);
     val again:  *Session = session_at(?pool, ?sessions, second);
@@ -1959,7 +2000,7 @@ test "hedge.protocol.h3.session: pool ownership grows, compacts, and holds live 
         i = i + 1;
     }
     if (pool.live != count
-        || hedge_storage.secret_table_capacity[Session](?sessions) < count) { ret 7; }
+        || hedge_storage.pair_capacity[SessionStorage, Session](?sessions) < count) { ret 7; }
     i = 0;
     for (i < count) {
         if (!abandon(?pool, ?sessions, held[i])) { ret 8; }
@@ -1967,9 +2008,9 @@ test "hedge.protocol.h3.session: pool ownership grows, compacts, and holds live 
     }
     # draining every session compacts the table back to nothing
     if (pool.live != 0
-        || hedge_storage.secret_table_capacity[Session](?sessions) != 0
+        || hedge_storage.pair_capacity[SessionStorage, Session](?sessions) != 0
         || !destroy_pool(?pool)
-        || !hedge_storage.destroy_secret_table[Session](?sessions)) { ret 9; }
+        || !hedge_storage.destroy_pair[SessionStorage, Session](?sessions)) { ret 9; }
     ret 0;
 }
 
@@ -2440,6 +2481,71 @@ test "hedge.protocol.h3.session: dispatch owns response and call finalization" {
         || !slot.call_release_ok || session.release_failed
         || !slot.active_call.settled
         || !operation_ok(cancel.destroy(?scope))) { ret 5; }
+    ret 0;
+}
+
+# binds the call of the session's request slot `index` and parks its service on
+# `wait`, as a pending service leaves it
+fun test_parked_request(session: *Session, index: usize, storage: *RequestStorage,
+    scope: *cancel.Scope, chunks: *hedge_storage.Chunks, wakes: *hedge_wake.Queue,
+    wait: call.Wait) bool {
+    val slot: *RequestSlot = ?session.requests_slots[index];
+    test_request_slot(slot, storage);
+    slot.index = index;
+    if (!test_exchange_slot(slot, scope, nil, false)
+        || !call.make_memory(?slot.memory, chunks, hedge_storage.MIN_CHUNK)
+        || !telemetry_trace.make_root(?slot.trace, false)
+        || !call.bind(?slot.active_call, ?slot.exchange, ?slot.memory,
+        ?slot.trace, 1, "test", hedge_wake.for_call(hedge_wake.waker(wakes, 1),
+        index::u32))) { ret false; }
+    slot.live            = true;
+    slot.exchange_live   = true;
+    slot.service_pending = true;
+    ret call.park(?slot.active_call, wait, 0) == exchange.SERVICE_PENDING;
+}
+
+test "hedge.protocol.h3.session: a parked request is stirred only by what it waits on" {
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) {
+        ret 1;
+    }
+    var heap: A.Allocator;
+    page.make(?heap);
+    var wakes:  hedge_wake.Queue;
+    var chunks: hedge_storage.Chunks;
+    if (!hedge_storage.make_chunks(?chunks, ?heap)
+        || !hedge_wake.make(?wakes, ?heap)) { ret 2; }
+    var session: Session;
+    session.live = true;
+    var i: usize = 0;
+    for (i < MAX_STREAMS) {
+        session.requests_slots[i].live = false;
+        i                              = i + 1;
+    }
+    var woken_storage: RequestStorage;
+    var body_storage:  RequestStorage;
+    if (!test_parked_request(?session, 0, ?woken_storage, ?scope, ?chunks, ?wakes,
+        call.WAIT_WAKE)
+        || !test_parked_request(?session, 1, ?body_storage, ?scope, ?chunks, ?wakes,
+        call.WAIT_BODY)) { ret 3; }
+    val woken:  *RequestSlot = ?session.requests_slots[0];
+    val reader: *RequestSlot = ?session.requests_slots[1];
+    # body bytes for the request waiting on a wake leave it parked
+    if (!complete_pending_body(woken) || stirred(?session)) { ret 4; }
+    # a wake naming the request waiting on its body leaves it parked, and one
+    # naming no request of this session stirs nothing
+    stir(?session, 1);
+    stir(?session, 5);
+    if (stirred(?session)) { ret 5; }
+    # the wake its call names re-enters the request waiting on a wake, alone
+    stir(?session, 0);
+    if (!call.stirred(?woken.active_call) || call.stirred(?reader.active_call)) { ret 6; }
+    # and body bytes re-enter the request waiting on its body
+    if (!complete_pending_body(reader) || !call.stirred(?reader.active_call)
+        || !call.due(?reader.active_call, 1)) { ret 7; }
+    call.unpark(?woken.active_call);
+    call.unpark(?reader.active_call);
+    if (stirred(?session) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
     ret 0;
 }
 
