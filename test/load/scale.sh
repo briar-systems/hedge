@@ -30,10 +30,10 @@
 # Each step also measures what an idle connection costs in CPU: the served
 # process's CPU time over LOAD_SCALE_IDLE_SECONDS with nothing but the held
 # connections (and QUIC's keep-alives, one every LOAD_SCALE_QUIC_KEEPALIVE per
-# connection), less what the server spends idle with none. That cost per
-# connection per second must be flat in N: the large step may spend no more
-# than the small step's per-connection cost times large, within
-# LOAD_SCALE_CPU_TOLERANCE percent and two clock ticks of resolution. A
+# connection, over a window of one whole period), less what the server spends
+# idle with none. That cost per connection per second must be flat in N: the
+# large step may spend no more than the small step's per-connection cost times
+# large, within LOAD_SCALE_CPU_TOLERANCE percent and 2 ms a window of noise. A
 # per-event path that walks the live connections is O(N) per event and O(N^2)
 # per second, and fails here. Descriptors and timer-wheel entries are counted
 # at each step too: a TCP or TLS connection holds exactly one descriptor and a
@@ -60,7 +60,7 @@ transports="${LOAD_SCALE_TRANSPORTS:-tcp tls quic}"
 tolerance="${LOAD_SCALE_TOLERANCE:-25}"
 idle_seconds="${LOAD_SCALE_IDLE_SECONDS:-10}"
 cpu_tolerance="${LOAD_SCALE_CPU_TOLERANCE:-50}"
-quic_keepalive="${LOAD_SCALE_QUIC_KEEPALIVE:-30}"
+quic_keepalive="${LOAD_SCALE_QUIC_KEEPALIVE:-15}"
 per_client="${LOAD_SCALE_PER_CLIENT:-10000}"
 timers_per="${LOAD_SCALE_TIMERS_PER:-1}"
 # bytes per connection achieved on dev for 0.7.0 (#214), release build on
@@ -214,18 +214,33 @@ descriptors() {
     find "/proc/$hedge_pid/fd" -mindepth 1 2>/dev/null | wc -l
 }
 
-# user plus system time of the served process, in clock ticks
-cpu_ticks() {
-    awk '{ print $14 + $15 }' "/proc/$hedge_pid/stat"
+# CPU time the served process's threads have run, in nanoseconds, from the
+# scheduler's own accounting. /proc/<pid>/stat counts in clock ticks (10 ms),
+# too coarse for what a thousand idle connections cost in a window
+cpu_ns() {
+    cat /proc/"$hedge_pid"/task/*/schedstat 2>/dev/null | awk '{ sum += $1 } END { printf "%d", sum }'
 }
-TICKS="$(getconf CLK_TCK)"
 
-# the served process's CPU over the idle window, in clock ticks
+# the idle window. a QUIC connection sends a keep-alive once per period, and
+# the connections of a step are dialled together, so their PINGs come in a
+# burst once a period: the window is one whole period, opened one period
+# after the step so every connection has reached its keep-alive cadence
+window_for() {
+    if [ "$1" = quic ] && [ "$quic_keepalive" -gt "$idle_seconds" ]; then
+        echo "$quic_keepalive"
+    else
+        echo "$idle_seconds"
+    fi
+}
+
+# the served process's CPU over the idle window, in nanoseconds
 idle_cpu() {
-    local before
-    before="$(cpu_ticks)"
-    sleep "$idle_seconds"
-    echo $(( $(cpu_ticks) - before ))
+    local transport="$1" window before
+    window="$(window_for "$transport")"
+    if [ "$transport" = quic ]; then sleep "$quic_keepalive"; fi
+    before="$(cpu_ns)"
+    sleep "$window"
+    echo $(( $(cpu_ns) - before ))
 }
 
 # waits up to RELEASE_WAIT seconds for hedge to have no more sockets open than
@@ -319,7 +334,7 @@ measure() {
     s0="$(sockets)"
     d0="$(descriptors)"
     t0="$(metric hedge_timers_claimed)"
-    c0="$(idle_cpu)"
+    c0="$(idle_cpu "$transport")"
     if ! hold_more "$transport" "$transport-small" "$small"; then
         report 1 "$transport: $small connections held (see $transport-small.out)"
         release_holders; stop_hedge; return 1
@@ -329,7 +344,7 @@ measure() {
     d1="$(descriptors)"
     t1="$(metric hedge_timers_claimed)"
     a1="$(metric hedge_timers_armed)"
-    c1="$(idle_cpu)"
+    c1="$(idle_cpu "$transport")"
     if ! hold_more "$transport" "$transport-mid" $((mid - small)); then
         report 1 "$transport: $mid connections held (see $transport-mid.out)"
         release_holders; stop_hedge; return 1
@@ -347,7 +362,7 @@ measure() {
     d3="$(descriptors)"
     t3="$(metric hedge_timers_claimed)"
     a3="$(metric hedge_timers_armed)"
-    c3="$(idle_cpu)"
+    c3="$(idle_cpu "$transport")"
 
     release_holders
     if [ "$transport" = quic ]; then
@@ -406,19 +421,21 @@ measure() {
 # CPU per idle connection per second at small and large, over the server's own
 # idle cost, and the assertion that it is flat in N: what large connections
 # cost above idle is no more than large times the small step's per-connection
-# cost, within cpu_tolerance percent and two clock ticks
+# cost, within cpu_tolerance percent and CPU_FLOOR_NS a window of noise (an
+# admin scrape, a log flush)
+CPU_FLOOR_NS=2000000
 idle_cost() {
     local transport="$1" c0="$2" c1="$3" c3="$4"
     awk -v c0="$c0" -v c1="$c1" -v c3="$c3" -v small="$small" -v large="$large" \
-        -v w="$idle_seconds" -v ticks="$TICKS" -v tol="$cpu_tolerance" -v t="$transport" 'BEGIN {
-        idle = c0 / ticks / w
-        low = (c1 - c0) / ticks / w
-        high = (c3 - c0) / ticks / w
+        -v w="$(window_for "$transport")" -v floor="$CPU_FLOOR_NS" -v tol="$cpu_tolerance" -v t="$transport" 'BEGIN {
+        idle = c0 / 1e9 / w
+        low = (c1 - c0) / 1e9 / w
+        high = (c3 - c0) / 1e9 / w
         printf "%s: idle CPU over %ds: %.4f cores with none, %.4f above it at %d, %.4f at %d\n",
             t, w, idle, low, small, high, large
-        printf "%s: CPU per idle connection per second: %.3f us at %d, %.3f us at %d\n",
+        printf "%s: CPU per idle connection per second: %.4f us at %d, %.4f us at %d\n",
             t, low * 1e6 / small, small, high * 1e6 / large, large
-        exit !(high <= (low < 0 ? 0 : low) * large / small * (1 + tol / 100) + 2 / ticks / w)
+        exit !(high <= (low < 0 ? 0 : low) * large / small * (1 + tol / 100) + floor / 1e9 / w)
     }'
     report $? "$transport: CPU per idle connection is flat from $small to $large within $cpu_tolerance%"
 }
