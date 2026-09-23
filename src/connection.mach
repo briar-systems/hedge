@@ -1008,16 +1008,16 @@ fun staged_bytes(context: ptr, buffer: *u8, length: usize) usize {
     ret count;
 }
 
+# a TLS completion is routed into the channel, which queues this connection to
+# take what it settled on its next step
 fun settle_secure(context: ptr, token_context: usize,
     completion: io_runtime.Completion) {
     val owner: *Connection = context::*Connection;
     if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) {
         ret;
     }
-    fin { notify(owner); }
     var settled: io_runtime.Completion = completion;
     secure.accept(owner.session, ?settled);
-    advance(owner, clock.instant());
 }
 
 # TLS reads the wall clock through its policy, never `now` (#190)
@@ -1032,7 +1032,7 @@ fun begin_secure(owner: *Connection, now: time.Instant) Step {
     val channel: *secure.Channel = secure.channel(owner.session);
     if (channel == nil
         || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
-        staged_bytes, ?owner.borrower, ?owner.account)
+        staged_bytes, ?owner.borrower, ?owner.account, owner.waker)
         || !operation.bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
         settle_secure, 0)
         || !secure.begin(owner.session, hedge_tls.policy_at(owner.tls_policy),
@@ -1750,8 +1750,10 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
 pub fun advance(owner: *Connection, now: time.Instant) Step {
     if (owner == nil || !owner.initialized) { ret STEP_ERROR; }
     fin { track_memory(owner, now); }
-    # a wake may be the pool funding what TLS was blocked on
-    if (owner.session != secure.NO_SESSION) { secure.resume(owner.session); }
+    # what the engines submit to the secure channel while this runs is started
+    # here, and whatever is left unstarted queues the connection again
+    if (owner.session != secure.NO_SESSION) { secure.begin_step(owner.session); }
+    fin { end_secure_step(owner); }
     var steps: usize = 0;
     # a connection still moving when its step bound runs out has more to do
     var settled: Step = STEP_PROGRESS;
@@ -1770,6 +1772,21 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
         ret STEP_PROGRESS;
     }
     ret settled;
+}
+
+fun end_secure_step(owner: *Connection) {
+    if (owner.initialized && owner.session != secure.NO_SESSION) {
+        secure.end_step(owner.session);
+    }
+}
+
+# the pool funded this connection's account again: a TLS lane parked for memory
+# is retried, and its retry comes back as a completion that queues the
+# connection. the worker queues the connection as well, for an HTTP engine that
+# was blocked on the same account
+pub fun funded(owner: *Connection) {
+    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) { ret; }
+    secure.resume(owner.session);
 }
 
 pub fun begin_graceful(owner: *Connection) bool {
@@ -1857,17 +1874,21 @@ fun close_h1_engine(owner: *Connection) bool {
 }
 
 # start what the engine queued on the secure channel and take one completion it
-# published. true when one was taken, which may be what the engine waits on
+# published into whichever engine runs on it. true when one was taken, which
+# may be what the engine waits on
 fun pump_secure_close(owner: *Connection) bool {
     secure.drive(owner.session);
     var settled: transport.Completion;
     if (!secure.take(owner.session, ?settled)) { ret false; }
-    connection.complete_io(?owner.engine, ?settled, clock.instant());
+    if (owner.h2_session != h2.NO_SESSION) {
+        h2.complete_io(h2_of(owner), ?settled, clock.instant());
+    }
+    or { connection.complete_io(?owner.engine, ?settled, clock.instant()); }
     ret true;
 }
 
 # a retiring slot is no longer advanced, so closing drives the secure channel
-# itself. the engine's cancellation queues its transport close on the channel,
+# itself, for HTTP/1.1 here and for HTTP/2 in `close_h2`. the engine's cancellation queues its transport close on the channel,
 # and nothing starts it but a drive after that queueing (#257). a completion the
 # channel settles without the socket is taken here at once. one that needs the
 # socket wakes the connection through settle_secure for the next close to take
@@ -1878,6 +1899,19 @@ fun close_h1(owner: *Connection) bool {
         }
     }
     ret true;
+}
+
+# the HTTP/2 engine's release waits on its transport operations, which over TLS
+# settle into the secure channel. a TLS completion only queues the connection,
+# and a retiring slot is not advanced, so the close takes them itself (#195)
+fun close_h2(owner: *Connection) h2.ReleaseStatus {
+    for {
+        val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions,
+            owner.h2_session);
+        if (released != h2.RELEASE_PENDING || owner.session == secure.NO_SESSION
+            || !pump_secure_close(owner)) { ret released; }
+    }
+    ret h2.RELEASE_PENDING;
 }
 
 pub fun close(owner: *Connection) bool {
@@ -1906,8 +1940,7 @@ pub fun close(owner: *Connection) bool {
     }
     if (owner.h2_session != h2.NO_SESSION) {
         owner.requests = h2.requests(h2_of(owner));
-        val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions,
-            owner.h2_session);
+        val released: h2.ReleaseStatus = close_h2(owner);
         if (released == h2.RELEASE_PENDING) {
             owner.close_pending = true;
             ret false;
