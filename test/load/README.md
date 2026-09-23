@@ -165,6 +165,12 @@ for every transport, and the 100k projection is the per-connection cost times
 What the process gives back after the connections leave is printed and not
 asserted: the record tables release their trailing chunks, and what the
 allocator then returns to the kernel is the allocator's business.
+The QUIC cell does check that they have left first. A connection the client
+closed stays in its draining period (mach-quic's 3 s drain timeout) before
+hedge releases it, so a sample on a fixed delay after release measured
+connections still draining (#269). The cell reads `hedge_quic_connections`
+from an admin listener on 127.0.0.1:19116, waits up to 15 s for it to reach
+zero, and fails if it does not, before the after-release sample is taken.
 
 ### The measured run for 0.7.0
 
