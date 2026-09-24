@@ -16,6 +16,7 @@ use quic_runtime: hedge.protocol.quic.runtime;
 use hedge.serve;
 use hedge.service;
 use hedge.test.runtime.wire;
+use hedge.wake;
 use http.core.exchange;
 use http.core.field;
 use http.core.message;
@@ -66,8 +67,20 @@ val RESPONSE_BYTES: usize = 8192;
 val CACHE_ENTRIES:  usize = 8;
 val CACHE_BODY:     usize = 4096;
 
+# a request carrying the field `tag` parks in the origin while `holding` is
+# set, and leaves its waker so the test can resume it
+rec Hold {
+    tag:     str;
+    holding: bool;
+    parked:  bool;
+    waker:   wake.Waker;
+}
+
+val HOLDS: usize = 2;
+
 # an origin service that counts how often it is actually reached
 rec Origin {
+    holds:                         [HOLDS]Hold;
     calls:                         usize;
     conditional_calls:             usize;
     resume_calls:                  usize;
@@ -115,6 +128,17 @@ fun verify_request_rollback(context: ptr, active: *call.Call) bool {
 
 fun origin_serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     val state: *Origin = context::*Origin;
+    var h:     usize   = 0;
+    for (h < HOLDS) {
+        val hold: *Hold = ?state.holds[h];
+        if (hold.holding && field.find_first(?call.request(active).fields,
+            service.text_view(hold.tag)) != nil) {
+            hold.parked = true;
+            hold.waker  = call.waker(active);
+            ret call.park(active, call.WAIT_WAKE, 0);
+        }
+        h = h + 1;
+    }
     state.calls = state.calls + 1;
     val conditional_etag: *field.Field = field.find_first(?call.request(active).fields,
         service.text_view(field.IF_NONE_MATCH));
@@ -378,6 +402,12 @@ fun boot_with_disk(harness: *Harness, generation: u64, cache_enabled: bool,
     harness.origin.repeated_disposition_rejected = false;
     harness.origin.mutate_request                = false;
     harness.origin.rollback_preserved            = false;
+    var h: usize = 0;
+    for (h < HOLDS) {
+        harness.origin.holds[h] = Hold{tag: nil, holding: false, parked: false,
+            waker: wake.no_waker()};
+        h = h + 1;
+    }
     if (!page_ok(page.make(?harness.scratch))) { ret false; }
     service.make_applications(?harness.applications, ?harness.application_slots[0], 2);
     if (cache_enabled) {
@@ -2349,5 +2379,132 @@ test "cache: stop names the disk request a stalled disk still holds" {
     # the stalled read outlived the deadline, and stop says which request it is
     if (stopped)                                                             { ret 3; }
     if (count != 1 || named[0].op != disk.READ || named[0].name_length == 0) { ret 4; }
+    ret 0;
+}
+
+# send a request whose origin call parks on hold `index`, and serve until it has
+fun send_held(harness: *Harness, index: usize, request: str, client: *tcp.Stream) bool {
+    if (!send_only(harness, request, client)) { ret false; }
+    var rounds: usize = 0;
+    for (rounds < wire.MAX_ROUNDS && !harness.origin.holds[index].parked) {
+        wire.pump(?harness.runtime, 1);
+        rounds = rounds + 1;
+    }
+    ret harness.origin.holds[index].parked;
+}
+
+# let the call parked on hold `index` go, and collect its answer
+fun release_held(harness: *Harness, index: usize, client: *tcp.Stream, marker: str,
+    response: *u8, capacity: usize, output: *usize) bool {
+    val hold: *Hold = ?harness.origin.holds[index];
+    hold.holding = false;
+    if (!hold.parked || !wake.wake(?hold.waker)) { ret false; }
+    @output = wire.collect(?harness.runtime, client, response, capacity, marker);
+    ret true;
+}
+
+test "cache: a call resumed in the origin after a precondition miss is looked up once" {
+    var harness: Harness;
+    if (!boot(?harness, 46, true, true, "cached", "max-age=60", nil)) {
+        shutdown(?harness);
+        ret 1;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    var length:   usize = 0;
+    if (!exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "cached", ?response[0], RESPONSE_BYTES, ?length)) {
+        shutdown(?harness);
+        ret 2;
+    }
+    harness.origin.holds[0].tag     = "x-hold";
+    harness.origin.holds[0].holding = true;
+    var client: tcp.Stream;
+    if (!send_held(?harness, 0,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nIf-Match: *\r\nX-Hold: yes\r\n\r\n",
+        ?client)) {
+        shutdown(?harness);
+        ret 3;
+    }
+    harness.origin.payload = "origin";
+    if (!release_held(?harness, 0, ?client, "origin", ?response[0], RESPONSE_BYTES,
+        ?length)) {
+        tcp.stream_close(?client);
+        shutdown(?harness);
+        ret 4;
+    }
+    tcp.stream_close(?client);
+    settle(?harness);
+    val calls:  usize             = harness.origin.calls;
+    val report: http_cache.Report = http_cache.report(?harness.layer);
+    shutdown(?harness);
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 200 OK")
+        || !wire.contains(?response[0], length, "origin")) { ret 5; }
+    # the store miss and the precondition miss, and no second lookup on resume
+    if (calls != 2 || report.misses != 2 || report.hits != 0) { ret 6; }
+    ret 0;
+}
+
+test "cache: a call resumed in the origin is not answered from an entry refreshed meanwhile" {
+    var harness: Harness;
+    if (!boot(?harness, 47, true, true, "stored", "max-age=0", nil)) {
+        shutdown(?harness);
+        ret 1;
+    }
+    harness.origin.etag = "\"stored\"";
+    var response: [RESPONSE_BYTES]u8;
+    var length:   usize = 0;
+    if (!exchange_once(?harness, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "stored", ?response[0], RESPONSE_BYTES, ?length)) {
+        shutdown(?harness);
+        ret 2;
+    }
+    harness.origin.not_modified             = true;
+    harness.origin.validation_etag          = "\"stored\"";
+    harness.origin.validation_cache_control = "max-age=60";
+    harness.origin.holds[0].tag             = "x-hold-revalidation";
+    harness.origin.holds[0].holding         = true;
+    harness.origin.holds[1].tag             = "x-hold-miss";
+    harness.origin.holds[1].holding         = true;
+    # the first call revalidates the stale entry and parks in the origin
+    var revalidating: tcp.Stream;
+    if (!send_held(?harness, 0,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nX-Hold-Revalidation: yes\r\n\r\n",
+        ?revalidating)) {
+        shutdown(?harness);
+        ret 3;
+    }
+    # the second finds the entry under revalidation, goes to the origin, and parks
+    var missed: tcp.Stream;
+    if (!send_held(?harness, 1,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nX-Hold-Miss: yes\r\n\r\n", ?missed)) {
+        tcp.stream_close(?revalidating);
+        shutdown(?harness);
+        ret 4;
+    }
+    # the revalidation's 304 makes the entry fresh while the second call is parked
+    if (!release_held(?harness, 0, ?revalidating, "stored", ?response[0], RESPONSE_BYTES,
+        ?length) || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK")) {
+        tcp.stream_close(?revalidating);
+        tcp.stream_close(?missed);
+        shutdown(?harness);
+        ret 5;
+    }
+    tcp.stream_close(?revalidating);
+    harness.origin.payload = "from origin";
+    if (!release_held(?harness, 1, ?missed, "from origin", ?response[0], RESPONSE_BYTES,
+        ?length)) {
+        tcp.stream_close(?missed);
+        shutdown(?harness);
+        ret 6;
+    }
+    tcp.stream_close(?missed);
+    settle(?harness);
+    val calls:  usize             = harness.origin.calls;
+    val report: http_cache.Report = http_cache.report(?harness.layer);
+    shutdown(?harness);
+    if (!wire.starts_with(?response[0], length, "HTTP/1.1 200 OK")
+        || !wire.contains(?response[0], length, "from origin")) { ret 7; }
+    # the revalidation's 304 is the one hit, and the resumed call is not another
+    if (calls != 3 || report.hits != 1) { ret 8; }
     ret 0;
 }

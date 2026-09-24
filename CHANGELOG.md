@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- A call the cache sent to its inner service goes back to it when entered again (#302). The cache remembered its choice only for a parked disk hit and for a call it was recording. A call sent on with nothing recorded (a request with an origin precondition, an entry another call was revalidating, no free recording slot, an unkeyed request) was looked up again each time its inner service parked and resumed, counted another miss, and could be answered from an entry stored meanwhile while the inner service still held it. Every such call is now marked with a recorder that records nothing, `call.recorded_by` finds a call's recorder by its head function, and a marked call resumes its inner service without a second lookup. A call that cannot be marked fails.
 - A QUIC connection survives its client moving to a new address (#293). Dependencies move to mach-quic v0.19.1 in the root and `test/acme`, selected by an exact version and committed as gitlinks. quic 0.19.0 never validated a peer's new path, so hedge could send it no more than three times what it received, and it counted Handshake packet numbers against migration, so a client that rebound early was never followed (mach-quic#232). With a client rebinding each connection to a new source port, 0 of 32 connections carried on before and all 32 do now.
 
 ### Changed
