@@ -149,7 +149,8 @@ resolve_h3_curl() {
 # fetches the body over HTTP/3 once per transfer at `rate`, each transfer
 # under its own authority so curl opens a connection for it rather than
 # multiplexing, and prints one line per transfer: status, bytes, version,
-# connect and total time
+# connect and total time. the bound covers a 60 s connect timeout and a 64 s
+# transfer after it
 curl_h3() {
     local port="$1" count="$2" name="$3" rate="$4"
     shift 4
@@ -161,7 +162,7 @@ curl_h3() {
     done
     "$h3curl" --parallel --parallel-immediate --parallel-max "$count" \
         --http3-only --insecure --connect-to "::127.0.0.1:$port" \
-        --max-time 120 --limit-rate "$rate" \
+        --max-time 180 --limit-rate "$rate" \
         --write-out '%{http_code} %{size_download} %{http_version} %{time_appconnect} %{time_total}\n' \
         "$@" --config "$config"
 }
