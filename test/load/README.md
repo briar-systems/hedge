@@ -228,6 +228,38 @@ rest of a TLS connection is its session in `protocol/secure` and one TLS
 record chunk; the rest of a QUIC connection is mach-quic's per-connection
 assembly and crypto state and the pool chunks its handshake left welded.
 
+The pins stay at those 0.7.0 figures.
+
+### The measured run on std 8.0.0 and quic 0.20.0
+
+Release build, mach 5.12.0, linux-x86_64, 16 cores, loopback, 1000 to 10000
+connections, transparent huge pages off, the machine otherwise idle (load
+average 0.9 to 1.5). Dependencies are std 8.0.0, crypto 0.22.0, http 0.19.0,
+tls 0.12.0, quic 0.20.0, acme 0.8.0 and laurel 0.17.0. The build before them
+(std 7.5.0, crypto 0.20.0, tls 0.10.0, quic 0.19.1, mach 5.10.0) was measured in
+the same session:
+
+| transport | bytes per idle connection | halves (1000..5500, 5500..10000) | resident at 10000 | projected at 100k | before |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TCP, HTTP/1.1 keep-alive after one request | 13,194 | 13,263 / 13,124 | 137 MiB | 1,269 MiB | 13,194 |
+| TLS, HTTP/1.1 keep-alive after one request | 24,596 | 24,819 / 24,373 | 247 MiB | 2,357 MiB | 22,528 |
+| QUIC, handshake only | 110,011 | 110,468 / 109,554 | 1,062 MiB | 10,503 MiB | 103,625 |
+
+The idle server is 10.8 MiB resident, against 10.9 MiB before. After release it
+keeps, above idle, 2,376 and 3,928 KiB for TCP after 1k and 10k connections,
+and 3,308 and 4,864 KiB for TLS, the same as before for TCP and 128 KiB more
+for TLS. QUIC after release is 20.4 MiB resident, the same as before.
+
+TLS grows by 2,068 bytes a connection because tls 0.11 keeps each AES-GCM key
+expanded in the record cipher, and `stream.Stream` grew by 2,048 bytes with it.
+QUIC grows by 6,386 bytes a connection because quic 0.20.0 keeps its
+packet-protection keys expanded, each live level's in a secret chunk from
+hedge's pool. The old dependencies built with mach 5.12.0 measure 22,528 and
+103,600, so the compiler accounts for none of it. On this build
+`connection.Connection` is 11,088 bytes, `listener.Connection` 280,
+`secure.Channel` 480, `quic_runtime.Connection` 17,792,
+`quic_runtime.ConnectionStorage` 13,672 and `h3_session.Session` 23,784.
+
 The lane ends with #220: two requests on one HTTP/3 connection, each throttled,
 must be served at the same time under the default budget (the slowest finishes
 within half again the fastest), and under a `connection_memory_bytes` that
