@@ -8,6 +8,7 @@
   - `connection.make` no longer takes a `*net_async.Driver`. Drop that argument: the connection takes its driver from the queued connection's socket.
   - `secure.attach(h, driver, socket, ...)` is now `secure.attach(h, socket, ...)`, where `socket` is a `*hedge.socket.Socket`. Pass the socket in place of the driver and `*tcp.Stream`.
   - `listener.Connection` drops `transport`, `tcp_stream` and `local_stream` for `socket`. Operate on the stream through `hedge.socket` (`submit_read`, `submit_readable`, `submit_write`, `submit_shutdown_write`, `submit_close`, `released`, `local_endpoint`) instead of calling `std.net.async` or `std.net.async.local` on the raw stream.
+- An HTTP/1.1 or HTTP/2 connection is no longer closed 300 s after it opened (#294). hedge set every engine timeout it configures but left mach-http's `total_timeout_ns`, a whole-life bound on each connection, at its 300 s default, so a connection held open under a longer `keep_alive_ms` was closed at five minutes whatever it was doing. That is why the scale lane's 100k TLS run held about 63k: its clients opened connections for longer than five minutes, and the first were closed as the last arrived. hedge now sets no lifetime, and a connection ends when its peer closes it or one of the configured timeouts ends it. HTTP/3 had no such bound.
 
 ## [0.11.0] - 2026-09-25
 
