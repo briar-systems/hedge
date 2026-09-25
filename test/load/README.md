@@ -403,20 +403,43 @@ arrive at a fixed rate, `LOAD_CHURN_TLS_RATE` (200) over TLS and
 `LOAD_CHURN_H3_RATE` (100) over HTTP/3. Each one carries one request and
 closes. The client is open-loop, so a start that finds all
 `LOAD_CHURN_IN_FLIGHT` (256) workers busy is counted as missed rather than
-queued. Every `LOAD_CHURN_SAMPLE` seconds (10) it samples the server's
-resident set and CPU time. The lane passes when:
+queued. Every `LOAD_CHURN_SAMPLE` seconds (10) it samples the server's CPU
+time and the most connections it had open at once since the last sample.
 
-- every connection is served, with no missed start;
-- the resident set's peak over the second half of the run is within
-  `LOAD_CHURN_RSS_MARGIN` bytes (4 MiB) of its peak over the first half;
-- the CPU per connection over the last quarter is within
-  `LOAD_CHURN_CPU_TOLERANCE` percent (25) of the second quarter's. The first
-  quarter is warm-up.
+The run is two phases of half the time each against one server. After each
+phase the lane waits for every connection to leave (hedge's QUIC connection
+count at zero, or its sockets back to the idle count) and reads the resident
+set at rest. The lane passes when:
+
+- every connection is served, with no missed start, and every one leaves;
+- the resident set at rest after the second phase is within
+  `LOAD_CHURN_RSS_MARGIN` bytes (4 MiB) of what it was after the first;
+- the CPU per connection over the second half of the second phase is within
+  `LOAD_CHURN_CPU_TOLERANCE` percent (25) of the first phase's. Each phase's
+  first half is warm-up.
 
 Anything a retired connection leaves behind (a record, a timer entry, a pool
-chunk) grows the resident set linearly in the connections served, and it
-fails the first check. A walk over anything that grows the same way fails
-the second. CI runs it for 60 s. The lane binds ports 19160 to 19162.
+chunk) grows the resident set at rest linearly in the connections served,
+and it fails the second check: the margin is 140 bytes a connection over the
+30,000 HTTP/3 connections of a 10-minute phase, and 1.4 KiB over the 3,000 of
+CI's. A walk over anything that grows the same way fails the third. The lane
+binds ports 19160 to 19163.
+
+The resident set is read at rest rather than under load. Under load it holds
+every live connection, and a QUIC connection stays live through its draining
+period after its client closes (about 300 at 100 a second), so the resident
+set moves with how the closes bunch up rather than with what connections
+leave behind. An earlier form of the cell compared the peaks of the two
+halves of one run under load. It failed one of the two CI attempts on
+b163699 (+5.3 MiB against the 4 MiB margin). On two cores of a Ryzen 7
+5800X3D (`taskset -c 0,1`) at 100 a second, one run in seven stepped by
+10 MiB under load while the client never had more than two connections
+open, so the step was not a backlog of connections.
+
+CI runs 60 s at the default rates, and allows 50% of CPU drift because the
+client shares the runner's cores. The single QUIC worker (until #174) spends
+about 4 ms of CPU on each HTTP/3 connection, so 100 a second is about 40% of
+one core, on the CI runner and on the 5800X3D alike.
 
 ## The migration lane
 
