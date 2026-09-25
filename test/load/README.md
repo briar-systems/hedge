@@ -334,8 +334,12 @@ TCP and 30k for QUIC. For TLS and QUIC the lane found problems past those
 counts rather than figures:
 
 - TLS at 100k: hedge held 62,925 of the 100,000 connections its clients had
-  handshaken and been served on, so connections were closed under it past
-  about 63k.
+  handshaken and been served on. The count was not a capacity: hedge left
+  mach-http's 300 s whole-life bound on every HTTP/1.1 and HTTP/2 connection,
+  and the TLS ramp to 100k runs longer than that, so the first connections
+  were closed as the last arrived (#294). With no lifetime, the same lane holds
+  all 100,000 at 24,013 bytes a connection from 10k, with 100,000 descriptors
+  and timer entries and no idle CPU.
 - TCP at 100k: the server keeps 84.5 MiB more after its connections leave than
   it does after 10k, so something grows with the peak past 10k.
 - QUIC at 30k: 12,652 connections were still live 15 s after their clients
