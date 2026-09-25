@@ -6,6 +6,10 @@
 
 - An HTTP/1.1 or HTTP/2 connection is no longer closed 300 s after it opened (#294). hedge set every engine timeout it configures but left mach-http's `total_timeout_ns`, a whole-life bound on each connection, at its 300 s default, so a connection held open under a longer `keep_alive_ms` was closed at five minutes whatever it was doing. That is why the scale lane's 100k TLS run held about 63k: its clients opened connections for longer than five minutes, and the first were closed as the last arrived. hedge now sets no lifetime, and a connection ends when its peer closes it or one of the configured timeouts ends it. HTTP/3 had no such bound.
 
+### Changed
+
+- A finished HTTP/3 session is released after the turn's socket reads, a bounded number a turn, and its record is no longer zeroed on release (#330). The turn that finished a session used to release it at once: the engine, its streams and chunks, the 23,784-byte `Session` zeroed, and with a table chunk's last session the chunk unwelded. In a burst of closes that was half the QUIC worker's time, so it fell behind its socket and the kernel dropped closes (#296). Now the connection joins a teardown queue, and each turn releases at most `TEARDOWN_BUDGET` (64, one receive batch) of them after its other work, reading the sockets before each release. The connection keeps its session, and so is not released itself, until the queue has released it. A queued connection is woken by the queue rather than polled every turn. The `Session` record is zeroed only by the secret table that holds it, which wipes its welded chunk whole on release (crypto.secret, then std). `h3_session.acquire` arms each field, `begin` no longer resets the request slots a second time, and `free_request` still resets a slot when it claims it. h3's `destroy` leaves the engine zero, and one a refused start wrote is cleared on release.
+
 ## [0.11.0] - 2026-09-25
 
 ### Added

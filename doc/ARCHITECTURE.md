@@ -124,6 +124,12 @@ share the listener completion driver with TCP while retaining independent
 connection ownership. The serving loop bounds its wait by the next QUIC timer
 deadline. Reload stages every QUIC admission generation before publishing the
 new request plan, then gracefully retires connections pinned to the old plan.
+An HTTP/3 session that has finished is not released in the turn that
+finished it. Its connection joins a teardown queue, and each turn releases at
+most one receive batch's worth of sessions (`TEARDOWN_BUDGET`, 64) after its
+other work, reading the sockets before each release. So a burst of closes is
+read at the receive path's rate and torn down behind it. The connection keeps
+its session, and so is not released itself, until the queue has released it.
 
 Each protocol engine translates its connection-specific state into the common HTTP service exchange. The common exchange supports streaming bodies, informational responses, trailers, cancellation, upgrades where the protocol permits them, and peer metadata.
 
