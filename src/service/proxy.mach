@@ -113,6 +113,7 @@ pub rec Route {
     items:        [upstream.MAX_UPSTREAMS]upstream.Upstream;
     authorities:  [upstream.MAX_UPSTREAMS][64]u8;
     max_attempts: usize;
+    reuse:        link.Reuse;
     live:         bool;
 }
 
@@ -132,15 +133,17 @@ pub rec Runtime {
     pseudonym:       str;
     links:           [MAX_LINKS]link.Link;
     link_registries: [MAX_LINKS]*Registry;
-    attempts:        [MAX_LINKS]Attempt;
-    engine:          engine_h1.Config;
-    limits:          upstream.Limits;
-    total_attempts:  u64;
-    total_failures:  u64;
-    total_served:    u64;
-    total_reused:    u64;
-    live:            bool;
-    quiescing:       bool;
+    # the route a link was opened for, whose upstreams and reuse policy it serves
+    link_routes:    [MAX_LINKS]*Route;
+    attempts:       [MAX_LINKS]Attempt;
+    engine:         engine_h1.Config;
+    limits:         upstream.Limits;
+    total_attempts: u64;
+    total_failures: u64;
+    total_served:   u64;
+    total_reused:   u64;
+    live:           bool;
+    quiescing:      bool;
 }
 
 pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: str,
@@ -164,6 +167,7 @@ pub fun make_runtime(runtime: *Runtime, driver: *net_async.Driver, pseudonym: st
         runtime.links[i].close_failed       = false;
         runtime.links[i].engine_close_owned = false;
         runtime.link_registries[i]          = nil;
+        runtime.link_routes[i]              = nil;
         runtime.attempts[i].live            = false;
         runtime.attempts[i].registry        = nil;
         i                                   = i + 1;
@@ -195,6 +199,7 @@ pub fun close_runtime(runtime: *Runtime) bool {
     var i: usize = 0;
     for (i < MAX_LINKS) {
         runtime.link_registries[i]   = nil;
+        runtime.link_routes[i]       = nil;
         runtime.attempts[i].registry = nil;
         i                            = i + 1;
     }
@@ -249,6 +254,7 @@ pub fun close_registry(runtime: *Runtime, registry: *Registry) bool {
             }
             if (link.teardown_failed(?runtime.links[i])) { ret false; }
             runtime.link_registries[i] = nil;
+            runtime.link_routes[i]     = nil;
         }
         i = i + 1;
     }
@@ -285,7 +291,7 @@ pub fun route_count(registry: *Registry) usize {
 pub fun poll(context: ptr, now: time.Instant) bool {
     val runtime: *Runtime = context::*Runtime;
     if (runtime == nil || !runtime.live) { ret false; }
-    var progressed: bool  = false;
+    var progressed: bool  = retire_expired(runtime, now);
     var i:          usize = 0;
     for (i < MAX_LINKS) {
         val current: *link.Link = ?runtime.links[i];
@@ -351,11 +357,29 @@ fun free_attempt(runtime: *Runtime) *Attempt {
     ret nil;
 }
 
+# the pool's reuse policy: an idle connection past its route's idle timeout or
+# lifetime is closed, never handed out. the idle timeout's deadline is on the
+# worker's wheel, so this runs when it passes
+fun retire_expired(runtime: *Runtime, now: time.Instant) bool {
+    var retired: bool  = false;
+    var i:       usize = 0;
+    for (i < MAX_LINKS) {
+        if (link.expired(?runtime.links[i], now)) {
+            link.close(?runtime.links[i]);
+            retired = true;
+        }
+        i = i + 1;
+    }
+    ret retired;
+}
+
 # prefer an idle connection to the chosen upstream before opening a new one
-fun acquire_link(runtime: *Runtime, registry: *Registry, upstream_index: usize) *link.Link {
+fun acquire_link(runtime: *Runtime, registry: *Registry, route: *Route,
+    upstream_index: usize, now: time.Instant) *link.Link {
+    retire_expired(runtime, now);
     var i: usize = 0;
     for (i < MAX_LINKS) {
-        if (runtime.link_registries[i] == registry
+        if (runtime.link_registries[i] == registry && runtime.link_routes[i] == route
             && link.idle_for(?runtime.links[i], upstream_index)
             && link.lease(?runtime.links[i])) {
             runtime.total_reused = runtime.total_reused + 1;
@@ -367,6 +391,7 @@ fun acquire_link(runtime: *Runtime, registry: *Registry, upstream_index: usize) 
     for (i < MAX_LINKS) {
         if (link.free(?runtime.links[i])) {
             runtime.link_registries[i] = registry;
+            runtime.link_routes[i]     = route;
             ret ?runtime.links[i];
         }
         i = i + 1;
@@ -381,6 +406,7 @@ fun acquire_link(runtime: *Runtime, registry: *Registry, upstream_index: usize) 
                 cnt;
             }
             runtime.link_registries[i] = registry;
+            runtime.link_routes[i]     = route;
             ret ?runtime.links[i];
         }
         i = i + 1;
@@ -594,7 +620,8 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
     attempt.attempts       = attempt.attempts + 1;
     runtime.total_attempts = runtime.total_attempts + 1;
     val chosen: *upstream.Upstream = ?attempt.route.pool.items[selection.index];
-    attempt.link = acquire_link(runtime, attempt.registry, selection.index);
+    attempt.link = acquire_link(runtime, attempt.registry, attempt.route,
+        selection.index, now);
     if (attempt.link == nil) {
         settle_attempt(attempt, upstream.FAILURE, now);
         ret bad_gateway(active, status.SERVICE_UNAVAILABLE);
@@ -606,7 +633,7 @@ fun begin_attempt(attempt: *Attempt, active: *call.Call, runtime: *Runtime,
     if (attempt.link.state != link.READY
         && !link.make(attempt.link, runtime.driver, runtime.memory, runtime.budgets,
         runtime.plane, selection.index, chosen.endpoint,
-        runtime.engine, now)) {
+        runtime.engine, attempt.route.reuse, now)) {
         link.close(attempt.link);
         attempt.link = nil;
         upstream.release(?attempt.route.pool, selection.index, upstream.FAILURE, now);
@@ -994,7 +1021,14 @@ pub fun factory(context: ptr, configured: *schema.Service, handler: *service.Han
     val route: *Route = ?registry.routes[registry.len];
     route.name         = schema.text(?configured.name);
     route.max_attempts = 2;
-    route.live         = true;
+    route.reuse        = link.Reuse{
+        idle_ns:     configured.upstream_idle_ms * 1000000,
+        lifetime_ns: opt[u64].none{},
+    };
+    if (sel configured.upstream_lifetime_ms.some) {
+        route.reuse.lifetime_ns = opt[u64].some{configured.upstream_lifetime_ms.some * 1000000};
+    }
+    route.live = true;
     if (!upstream.make_pool(?route.pool, ?route.items[0], upstream.MAX_UPSTREAMS,
         upstream.ROUND_ROBIN, runtime.limits)) { ret false; }
     if (!add_configured_upstreams(route, schema.text(?configured.target))) { ret false; }
@@ -1017,6 +1051,7 @@ fun configured_proxy(graph: *schema.Graph, target: str) *schema.Service {
     schema.set_text(?configured.target, target);
     configured.kind  = schema.SERVICE_PROXY;
     configured.cache = false;
+    schema.reset_service(configured);
     ret configured;
 }
 
@@ -1065,7 +1100,7 @@ test "proxy: route registries are reclaimed only after their generation drains" 
     ret 0;
 }
 
-test "proxy: idle upstream links are scoped to their service registry" {
+test "proxy: idle upstream links are scoped to their service registry and route" {
     var runtime: Runtime;
     if (!make_runtime(?runtime, nil, "hedge-test", upstream.default_limits())) { ret 1; }
     var first:  Registry;
@@ -1077,8 +1112,18 @@ test "proxy: idle upstream links are scoped to their service registry" {
     runtime.links[0].upstream     = 0;
     runtime.links[0].engine.state = engine_h1.OPEN;
     runtime.link_registries[0]    = ?first;
-    val selected: *link.Link = acquire_link(?runtime, ?second, 0);
+    runtime.link_routes[0]        = ?first.routes[0];
+    val selected: *link.Link = acquire_link(?runtime, ?second, ?second.routes[0], 0,
+        clock.instant());
     if (selected != ?runtime.links[1] || runtime.link_registries[0] != ?first
         || runtime.link_registries[1] != ?second) { ret 3; }
+    # nor is one reused by another route of the same generation, whose upstream
+    # at the same index is a different endpoint with its own reuse policy
+    runtime.link_registries[0] = ?second;
+    runtime.link_routes[0]     = ?second.routes[1];
+    val other: *link.Link = acquire_link(?runtime, ?second, ?second.routes[0], 0,
+        clock.instant());
+    if (other == nil || other == ?runtime.links[0]
+        || runtime.link_routes[0] != ?second.routes[1]) { ret 4; }
     ret 0;
 }
