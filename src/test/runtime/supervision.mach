@@ -23,11 +23,15 @@ use http.core.status;
 use std.allocator;
 use std.allocator.page;
 use std.filesystem;
-use io_error: std.io.error;
+use io_error:     std.io.error;
+use io_lifecycle: std.io.lifecycle;
 use std.net.ip;
+use local_socket: std.net.local;
+use local_types:  std.net.local.types;
 use std.net.tcp;
 use std.sync.atomic;
 use std.sync.thread;
+use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -35,6 +39,7 @@ use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
 val RESPONSE_BYTES: usize = 4096;
 # a read waits wire.READ_TIMEOUT_MS, so this bounds one exchange at ten seconds
@@ -52,6 +57,10 @@ rec Harness {
     supervising: supervisor.Supervisor;
     thread:      thread.Thread;
     endpoint:    ip.Endpoint;
+    # a local listener's abstract name, served in place of the TCP one when set
+    local:        bool;
+    local_name:   [64]u8;
+    local_target: local_socket.Endpoint;
     # what the next reload's candidate answers with, and whether it moves the
     # listener, which a reload must refuse
     next_body:     str;
@@ -87,7 +96,7 @@ fun origin_factory(context: ptr, configured: *schema.Service,
     ret true;
 }
 
-fun configure(graph: *schema.Graph, body: str, cached: bool) {
+fun configure(graph: *schema.Graph, body: str, cached: bool, local_address: str) {
     schema.reset_graph(graph);
     schema.set_text(?graph.server_name, "supervision-test");
     graph.listener_count = 1;
@@ -130,6 +139,10 @@ fun configure(graph: *schema.Graph, body: str, cached: bool) {
     graph.budgets[0].memory_bytes = 0;
     schema.set_text(?graph.routes[0].budget, "route");
     graph.timeouts.drain_ms = 1000;
+    if (local_address != nil) {
+        schema.set_text(?public.address, local_address);
+        public.transport = schema.TRANSPORT_LOCAL;
+    }
     if (!cached) { ret; }
     # four clients against a concurrency of four can meet the allowance one
     # worker holds unused, which refuses by design, so the cache runs uncapped
@@ -149,9 +162,9 @@ fun configure(graph: *schema.Graph, body: str, cached: bool) {
 }
 
 fun seal(candidate: *generation.Generation, id: u64, body: str, cached: bool,
-    diagnostics: *schema.Diagnostics) bool {
+    local_address: str, diagnostics: *schema.Diagnostics) bool {
     if (!generation.make_candidate(candidate, id)) { ret false; }
-    configure(?candidate.graph, body, cached);
+    configure(?candidate.graph, body, cached, local_address);
     schema.reset_diagnostics(diagnostics);
     ret generation.seal(candidate, diagnostics, nil, (0::usize)::generation.ConstructFun);
 }
@@ -162,7 +175,8 @@ fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Gene
     if (active == ?harness.generations[0]) { target = 1; }
     val candidate: *generation.Generation = ?harness.generations[target];
     atomic.fetch_add(?harness.loads, 1);
-    if (!seal(candidate, id, harness.next_body, harness.cached, ?harness.diagnostics)) {
+    if (!seal(candidate, id, harness.next_body, harness.cached, local_address(harness),
+        ?harness.diagnostics)) {
         ret nil;
     }
     if (harness.move_listener) {
@@ -174,6 +188,41 @@ fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Gene
 fun supervise(arg: *u8) {
     val harness: *Harness = arg::*Harness;
     supervisor.run(?harness.supervising);
+}
+
+fun local_address(harness: *Harness) str {
+    if (!harness.local) { ret nil; }
+    ret ?harness.local_name[0];
+}
+
+# an abstract socket name this process alone uses, so parallel runs never meet
+fun name_local(harness: *Harness) bool {
+    val prefix: str   = "@hedge-supervision-";
+    var length: usize = 0;
+    for (prefix[length] != 0) {
+        harness.local_name[length] = prefix[length];
+        length                     = length + 1;
+    }
+    var digits: [20]u8;
+    var count:  usize = 0;
+    var pid:    u64   = os.getpid()::u64;
+    for (count == 0 || pid != 0) {
+        digits[count] = ('0'::u64 + pid % 10)::u8;
+        pid           = pid / 10;
+        count         = count + 1;
+    }
+    for (count > 0 && length + 1 < 64) {
+        count                      = count - 1;
+        harness.local_name[length] = digits[count];
+        length                     = length + 1;
+    }
+    harness.local_name[length] = 0;
+    val target: res[local_socket.Endpoint, io_error.Error] = local_socket.abstract(
+        ?harness.local_name[1], length - 1);
+    if (sel target.err) { ret false; }
+    harness.local_target = target.ok;
+    harness.local        = true;
+    ret true;
 }
 
 # the process up, its two workers serving on threads and the supervisor on another
@@ -195,7 +244,8 @@ fun boot(harness: *Harness, cached: bool) bool {
     harness.cached        = cached;
     if (cached && (!ensure_dir("out") || !ensure_dir(CACHE_ROOT))) { ret false; }
     val initial: *generation.Generation = ?harness.generations[0];
-    if (!seal(initial, 1, "hello from one\n", cached, ?harness.diagnostics)) { ret false; }
+    if (!seal(initial, 1, "hello from one\n", cached, local_address(harness),
+        ?harness.diagnostics)) { ret false; }
     var options: composition.Options = composition.default_options();
     options.native = service.Factory{ctx: (harness)::ptr, build: origin_factory};
     # two workers, which on a platform whose reuseport balances share the port
@@ -208,7 +258,7 @@ fun boot(harness: *Harness, cached: bool) bool {
     if (supervisor.start(?harness.supervising) != composition.START_OK) { ret false; }
     val owned: *listener.OwnedListener = listener.active_listener(
         ?composition.worker_at(harness.composed, 0).serving.owner, 0);
-    if (owned == nil || !owned.has_bound_endpoint) { ret false; }
+    if (owned == nil || (!harness.local && !owned.has_bound_endpoint)) { ret false; }
     harness.endpoint = owned.bound_endpoint;
     val spawned: thread.Operation = thread.spawn_with(supervise, (harness)::*u8,
         ?harness.thread);
@@ -235,6 +285,7 @@ fun fetch(harness: *Harness, expected: str) bool {
 
 # one request, read without driving anything: the worker's thread serves it
 fun fetch_request(harness: *Harness, request: str, expected: str) bool {
+    if (harness.local) { ret fetch_local(harness, request, expected); }
     var client: tcp.Stream;
     if (!wire.connect(harness.endpoint, ?client)) { ret false; }
     if (!wire.send(?client, request)) {
@@ -254,6 +305,40 @@ fun fetch_request(harness: *Harness, request: str, expected: str) bool {
         rounds = rounds + 1;
     }
     tcp.stream_close(?client);
+    response[total] = 0;
+    ret wire.starts_with(?response[0], total, "HTTP/1.1 200 OK\r\n")
+        && wire.contains(?response[0], total, expected);
+}
+
+# `fetch_request` over the local listener
+fun fetch_local(harness: *Harness, request: str, expected: str) bool {
+    val connected: res[local_types.Stream, io_error.Error] = local_socket.connect(
+        harness.local_target);
+    if (sel connected.err) { ret false; }
+    var client: local_types.Stream = connected.ok;
+    os.sock_set_rcvtimeo(client.handle, wire.READ_TIMEOUT_MS);
+    val length:  usize                      = str_len(request);
+    val written: res[usize, io_error.Error] = local_socket.stream_write(?client,
+        request::*u8, length);
+    var sent: usize = 0;
+    if (sel written.ok) { sent = written.ok; }
+    if (sent != length) {
+        local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
+        ret false;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    var total:    usize = 0;
+    var rounds:   usize = 0;
+    for (rounds < READ_ROUNDS && total + 1 < RESPONSE_BYTES) {
+        val read: res[usize, io_error.Error] = local_socket.stream_read(?client,
+            ?response[total], RESPONSE_BYTES - total - 1);
+        if (sel read.ok) {
+            if (read.ok == 0) { brk; }
+            total = total + read.ok;
+        }
+        rounds = rounds + 1;
+    }
+    local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
     response[total] = 0;
     ret wire.starts_with(?response[0], total, "HTTP/1.1 200 OK\r\n")
         && wire.contains(?response[0], total, expected);
@@ -287,6 +372,7 @@ fun published(harness: *Harness, id: u64) bool {
 
 test "supervision: worker threads serve, reload and stop as the supervisor asks" {
     var harness: Harness;
+    harness.local = false;
     if (!boot(?harness, false)) { ret 1; }
     if (!fetch(?harness, "hello from one")) {
         finish(?harness);
@@ -370,6 +456,7 @@ fun cached_client(arg: *u8) {
 # while clients on several threads keep both busy (#286)
 test "supervision: two workers serve hits from one disk cache" {
     var harness: Harness;
+    harness.local = false;
     if (!boot(?harness, true)) { ret 1; }
     var clients: [4]thread.Thread;
     var spawned: usize = 0;
@@ -398,5 +485,43 @@ test "supervision: two workers serve hits from one disk cache" {
     # both workers answered, so the entries one stored the other read back
     if (composition.worker_at(harness.composed, 0).serving.served == 0
         || composition.worker_at(harness.composed, 1).serving.served == 0) { ret 7; }
+    ret 0;
+}
+
+val LOCAL_FETCHES: usize = 16;
+
+# a local listener is accepted by the first worker alone, which hands each
+# connection to the least loaded worker, and every one of them is served (#298)
+test "supervision: a local listener's connections are handed off and served" {
+    $if ($mach.build.os != $mach.os.linux) {
+        ret 0;
+    }
+    var harness: Harness;
+    if (!name_local(?harness))  { ret 1; }
+    if (!boot(?harness, false)) { ret 2; }
+    var answered: usize = 0;
+    var i:        usize = 0;
+    for (i < LOCAL_FETCHES) {
+        if (fetch(?harness, "hello from one")) { answered = answered + 1; }
+        i = i + 1;
+    }
+    # a reload reaches a handed-off connection's worker like any other
+    harness.next_body = "hello from two\n";
+    supervisor.request_reload(?harness.supervising);
+    val reloaded: bool                   = fetch_eventually(?harness, "hello from two");
+    val stopped:  composition.StopReport = finish(?harness);
+    if (answered != LOCAL_FETCHES) { ret 3; }
+    if (!reloaded)                 { ret 4; }
+    if (!stopped.stopped || stopped.serve_failures != 0
+        || stopped.cleanup_failures != 0 || stopped.reason == lifecycle.FAILED) { ret 5; }
+    # the second worker never accepts on a local listener, so what it served
+    # it was handed
+    val first:  *worker.Worker = composition.worker_at(harness.composed, 0);
+    val second: *worker.Worker = composition.worker_at(harness.composed, 1);
+    if (first.serving.served == 0 || second.serving.served == 0)     { ret 6; }
+    if (first.serving.accepted == 0 || second.serving.accepted == 0) { ret 7; }
+    if (first.serving.rejected != 0 || second.serving.rejected != 0) { ret 8; }
+    if (listener.snapshot(?first.serving.owner).leaked_descriptors != 0
+        || listener.snapshot(?second.serving.owner).leaked_descriptors != 0) { ret 9; }
     ret 0;
 }
