@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- The scale and churn lanes record the QUIC listener socket's kernel drop counter (#331). Each QUIC phase prints the datagrams the kernel dropped at the socket and the most bytes its receive queue held against its size, sampled every 0.1 s, and the scale lane prints the release phase's figures beside its check that every connection left, so a cell that fails on stuck connections says whether their closes were dropped. `lib.sh` reads the counters through sock_diag (`ss`) for the one socket, and the burst and ramp lanes use the same helper in place of their own reads of `/proc/net/udp`, which with 30,000 holder sockets cost about two seconds of CPU a read.
+
 ### Fixed
 
 - **Breaking.** A `transport = "local"` listener serves its connections (#298). `connection.make` took the TCP stream and the network driver, so every connection a local listener queued was served on a TCP stream that did not exist and reset. An accepted stream is now a `hedge.socket.Socket`: the stream bound to the driver that owns it, with its transport's operations in an `Ops` table. The listener builds one when it admits a stream (`from_tcp`, `from_local`), and the connection plane, the TLS channel below it and the listener's teardown all submit through it, so nothing above `hedge.socket` names a transport. A supervision test serves sixteen requests over a local listener across two workers, and the second worker serves only what the first hands it. The public API changes:

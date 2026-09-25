@@ -122,8 +122,8 @@ A warm-up of `LOAD_BURST_WARM` dials (200) must all connect and gives the
 service rate. Then `LOAD_BURST` dials (3000) go out together with a client
 budget of `LOAD_BURST_CONNECT_TIMEOUT` seconds (30) against a server
 `handshake_ms` of `LOAD_BURST_HANDSHAKE_MS` (10000), and the lane reads the
-admission counters from an admin listener and the socket's drop counter from
-`/proc/net/udp`. It passes when every promoted handshake completed (connected
+admission counters from an admin listener and the socket's drop counter (see
+[the socket's counters](#the-quic-sockets-counters)). It passes when every promoted handshake completed (connected
 equals promoted, so nothing was admitted and then lost), every dial either
 completed or was refused (connected plus dropped covers the burst), the socket
 dropped nothing, and the completions are the measured rate over the client
@@ -208,6 +208,13 @@ hedge releases it, so a sample on a fixed delay after release measured
 connections still draining (#269). The cell reads `hedge_quic_connections`
 from an admin listener on 127.0.0.1:19116, waits up to 15 s for it to reach
 zero, and fails if it does not, before the after-release sample is taken.
+
+It also prints what the QUIC listener's socket did over each step (up to the
+small count, the midpoint and the large count, and the release): the
+datagrams the kernel dropped and the most bytes the receive queue held
+against its size. The release figure is printed beside the check that the
+connections left, so a cell that fails on stuck connections says whether
+their closes were dropped at the socket (#296).
 
 ### The measured run for 0.7.0
 
@@ -346,6 +353,26 @@ resident peak moved by 140 KiB and 40 KiB between the halves. CPU per
 connection was 1,451 against 1,458 µs for TLS and 4,131 against 4,290 µs for
 HTTP/3.
 
+## The QUIC socket's counters
+
+A QUIC listener is one UDP socket, so a datagram hedge reads too slowly is
+dropped by the kernel when that socket's receive queue is full, and nothing
+in hedge sees it. A dropped CONNECTION_CLOSE leaves its connection live until
+the idle timeout, which looks like a leak or a hang from the lane (#296). The
+burst, ramp, scale and churn lanes read the socket's counters through
+`udp_socket` in `lib.sh`: the bytes in its receive queue, the queue's size
+and its drop count, which are `sk_rmem_alloc`, `sk_rcvbuf` and `sk_drops`
+(the `rx_queue` and `drops` of `/proc/net/udp`). It asks sock_diag (`ss`)
+for the one socket rather than reading `/proc/net/udp`, which formats every
+UDP socket on the host: with 30,000 holder sockets one read of it took about
+two seconds of CPU, where `ss` took about 15 ms.
+
+The scale and churn lanes sample the socket every 0.1 s for the life of the
+QUIC server, so a phase's queue peak is the largest sample it spans, and read
+the drop count directly at each phase's ends. A burst that fills the queue
+between two samples still shows in the drops. The counters are recorded, not
+asserted, in those two lanes.
+
 ## The rate lane
 
 ```sh
@@ -428,6 +455,10 @@ and it fails the second check: the margin is 140 bytes a connection over the
 30,000 HTTP/3 connections of a 10-minute phase, and 1.4 KiB over the 3,000 of
 CI's. A walk over anything that grows the same way fails the third. The lane
 binds ports 19160 to 19163.
+
+The HTTP/3 cell prints, beside the first check, the QUIC listener socket's
+drops and receive-queue peak over each phase, its wait for the connections to
+leave included.
 
 The resident set is read at rest rather than under load. Under load it holds
 every live connection, and a QUIC connection stays live through its draining

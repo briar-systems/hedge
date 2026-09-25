@@ -139,6 +139,17 @@ mappings() {
     wc -l < "/proc/$hedge_pid/maps"
 }
 
+# the QUIC listener's socket over one phase of a QUIC cell: quic_mark opens
+# the phase and quic_phase prints its drops and receive-queue peak, after
+# `prefix` when one is given. a TCP or TLS cell has no one socket to read, so
+# both print nothing for it
+quic_mark() {
+    if [ "$1" = quic ]; then socket_mark "$QUIC_PORT"; fi
+}
+quic_phase() {
+    if [ "$1" = quic ]; then echo "${3:-}$(socket_phase "$QUIC_PORT" "$2")"; fi
+}
+
 # one server per transport so every baseline is a process that has served
 # nothing. no connection cap, a budget that admits the large count (the pool
 # preallocates nothing, so the budget is a number, not memory), and keep-alive
@@ -260,18 +271,21 @@ measure() {
     local per_low per_high per once projection agree
     local c0 c1 c3 d0 d1 d3 t0 t1 t3 a1 a3 w3
     local mid=$(( (small + large) / 2 ))
+    local mark s_small s_mid s_large s_release
 
     start_scale_server
     next_source=2
     sleep 0.5
+    if [ "$transport" = quic ]; then start_socket_sampler "$QUIC_PORT"; fi
+    mark="$(quic_mark "$transport")"
     r0="$(resident)"
     s0="$(sockets)"
     d0="$(descriptors)"
     t0="$(metric hedge_timers_claimed)"
     c0="$(idle_cpu "$transport")"
     if ! hold_more "$transport" "$transport-small" "$small"; then
-        report 1 "$transport: $small connections held (see $transport-small.out)"
-        release_holders; stop_hedge; return 1
+        report 1 "$transport: $small connections held (see $transport-small.out)$(quic_phase "$transport" "$mark" ", socket")"
+        release_holders; stop_socket_sampler; stop_hedge; return 1
     fi
     sleep 0.5
     r1="$(resident)"
@@ -279,15 +293,19 @@ measure() {
     t1="$(metric hedge_timers_claimed)"
     a1="$(metric hedge_timers_armed)"
     c1="$(idle_cpu "$transport")"
+    s_small="$(quic_phase "$transport" "$mark")"
+    mark="$(quic_mark "$transport")"
     if ! hold_more "$transport" "$transport-mid" $((mid - small)); then
-        report 1 "$transport: $mid connections held (see $transport-mid.out)"
-        release_holders; stop_hedge; return 1
+        report 1 "$transport: $mid connections held (see $transport-mid.out)$(quic_phase "$transport" "$mark" ", socket")"
+        release_holders; stop_socket_sampler; stop_hedge; return 1
     fi
     sleep 0.5
     r2="$(resident)"
+    s_mid="$(quic_phase "$transport" "$mark")"
+    mark="$(quic_mark "$transport")"
     if ! hold_more "$transport" "$transport-large" $((large - mid)); then
-        report 1 "$transport: $large connections held (see $transport-large.out)"
-        release_holders; stop_hedge; return 1
+        report 1 "$transport: $large connections held (see $transport-large.out)$(quic_phase "$transport" "$mark" ", socket")"
+        release_holders; stop_socket_sampler; stop_hedge; return 1
     fi
     sleep 0.5
     r3="$(resident)"
@@ -298,12 +316,16 @@ measure() {
     t3="$(metric hedge_timers_claimed)"
     a3="$(metric hedge_timers_armed)"
     c3="$(idle_cpu "$transport")"
+    s_large="$(quic_phase "$transport" "$mark")"
+    mark="$(quic_mark "$transport")"
 
     release_holders
     if [ "$transport" = quic ]; then
-        local live
+        local live released
         live="$(quic_released)"
-        report $? "quic: hedge holds no QUIC connection after release ($live live)"
+        released=$?
+        s_release="$(quic_phase quic "$mark")"
+        report "$released" "quic: hedge holds no QUIC connection after release ($live live, socket $s_release)"
     else
         local open
         open="$(sockets_released "$s0")"
@@ -330,6 +352,11 @@ measure() {
         "$transport" "$small" "$mid" "$per_low" "$mid" "$large" "$per_high" "$agree" \
         "$small" "$large" "$per" $((once / 1024))
     printf '%s: projection at %dk=%d MiB\n' "$transport" $((PROJECTION / 1000)) $((projection / 1048576))
+    if [ "$transport" = quic ]; then
+        stop_socket_sampler
+        printf 'quic: socket to %d: %s, to %d: %s, to %d: %s, release: %s\n' \
+            "$small" "$s_small" "$mid" "$s_mid" "$large" "$s_large" "$s_release"
+    fi
 
     idle_cost "$transport" "$c0" "$c1" "$c3"
     descriptors_held "$transport" "$d0" "$d1" "$d3"
