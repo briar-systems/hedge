@@ -25,6 +25,7 @@ use hedge.protocol.selection;
 use hedge_tls: hedge.protocol.tls;
 use hedge.protocol.trust;
 use hedge.service;
+use hedge_socket: hedge.socket;
 use hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
 use hedge_timer:     hedge.timer;
@@ -45,13 +46,10 @@ use A: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
 use io_error:     std.io.error;
-use io_handle:    std.io.handle;
 use io_lifecycle: std.io.lifecycle;
 use io_runtime:   std.io.runtime;
 use std.memory.buffers;
-use net_async: std.net.async;
 use std.net.ip;
-use std.net.tcp;
 use std.sync.cancel;
 use std.system.os;
 use std.types.bool.bool;
@@ -84,6 +82,9 @@ pub val CAPTURE_SLOTS:          usize = 8;
 pub val MAX_STEPS:              usize = 64;
 pub val PROLOGUE_BYTES:         usize = prologue.MAX_BYTES;
 pub val PROXY_SCRATCH_BYTES:    usize = proxy_protocol.MAX_TEXT_BYTES;
+# the resource a staged completion names: it settles at once and was never
+# submitted on the socket, so it names none
+val STAGED_RESOURCE: usize = 0;
 
 # where exchange construction stopped, reported through the connection snapshot
 pub def Setup: u8;
@@ -191,6 +192,9 @@ pub fun config_from(graph: *schema.Graph) Config {
     engine.request_timeout_ns = graph.timeouts.request_ms * 1000000;
     engine.idle_timeout_ns    = graph.timeouts.keep_alive_ms * 1000000;
     engine.write_timeout_ns   = graph.timeouts.write_ms * 1000000;
+    # a connection lives until its peer closes it or a configured timeout ends
+    # it, never for a fixed lifetime (#294)
+    engine.total_timeout_ns = clock.UNBOUNDED_NS;
     ret Config{engine: engine, max_streams: max_streams,
         request_timeout_ns:  graph.timeouts.request_ms * 1000000,
         prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000,
@@ -235,7 +239,7 @@ pub rec Connection {
     id:                 u64;
     generation:         u64;
     token:              listener.ConnectionToken;
-    stream:             tcp.Stream;
+    socket:             hedge_socket.Socket;
     peer:               ip.Endpoint;
     peer_text:          [PEER_BYTES]u8;
     peer_len:           usize;
@@ -247,7 +251,6 @@ pub rec Connection {
     local_kind:         message.EndpointKind;
     secure:             bool;
     listener_name:      str;
-    driver:             *net_async.Driver;
     runtime_stream:     transport.RuntimeStream;
     adapter:            transport.Adapter;
     channel:            transport.Transport;
@@ -368,14 +371,14 @@ fun deliver_staged(owner: *Connection, scope: *cancel.Scope, buffer: *u8,
         i         = i + 1;
     }
     val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
-        owner.driver.runtime, scope,
-        io_runtime.Operation{kind: io_runtime.READ, resource: owner.stream.handle.value,
+        owner.socket.runtime, scope,
+        io_runtime.Operation{kind: io_runtime.READ, resource: STAGED_RESOURCE,
         buffer:  buffer, length: length, offset: 0,
         context: (?owner.contexts[index])::usize});
     if (sel submitted.err) { ret submitted; }
     val token:     io_runtime.Token    = submitted.ok;
-    val published: err[io_error.Error] = io_runtime.complete(owner.driver.runtime,
-        token, count, owner.stream.handle.value, false);
+    val published: err[io_error.Error] = io_runtime.complete(owner.socket.runtime,
+        token, count, STAGED_RESOURCE, false);
     if (sel published.err) {
         # nothing was delivered, so the staged bytes stay staged
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
@@ -395,7 +398,7 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
         && owner.prologue_read < owner.prologue_len && length != 0) {
         ret deliver_staged(owner, scope, buffer, length, index);
     }
-    ret net_async.submit_read(owner.driver, scope, ?owner.stream, buffer, length,
+    ret hedge_socket.submit_read(?owner.socket, scope, buffer, length,
         (?owner.contexts[index])::usize);
 }
 
@@ -403,12 +406,12 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
 fun ready_staged(owner: *Connection, scope: *cancel.Scope,
     index: usize) res[io_runtime.Token, io_error.Error] {
     val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
-        owner.driver.runtime, scope,
-        io_runtime.Operation{kind: io_runtime.READABLE, resource: owner.stream.handle.value,
+        owner.socket.runtime, scope,
+        io_runtime.Operation{kind: io_runtime.READABLE, resource: STAGED_RESOURCE,
         buffer: nil, length: 0, offset: 0, context: (?owner.contexts[index])::usize});
     if (sel submitted.err) { ret submitted; }
-    val published: err[io_error.Error] = io_runtime.complete(owner.driver.runtime,
-        submitted.ok, 0, owner.stream.handle.value, false);
+    val published: err[io_error.Error] = io_runtime.complete(owner.socket.runtime,
+        submitted.ok, 0, STAGED_RESOURCE, false);
     if (sel published.err) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
     }
@@ -425,7 +428,7 @@ fun submit_readable(context: ptr, scope: *cancel.Scope,
     if (secure.absent(owner.session) && owner.prologue_read < owner.prologue_len) {
         ret ready_staged(owner, scope, index);
     }
-    ret net_async.submit_readable(owner.driver, scope, ?owner.stream,
+    ret hedge_socket.submit_readable(?owner.socket, scope,
         (?owner.contexts[index])::usize);
 }
 
@@ -436,7 +439,7 @@ fun submit_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WRITE)};
     }
-    ret net_async.submit_write(owner.driver, scope, ?owner.stream, buffer, length,
+    ret hedge_socket.submit_write(?owner.socket, scope, buffer, length,
         (?owner.contexts[index])::usize);
 }
 
@@ -447,7 +450,7 @@ fun submit_shutdown(context: ptr, scope: *cancel.Scope,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)};
     }
-    ret net_async.submit_shutdown_write(owner.driver, scope, ?owner.stream,
+    ret hedge_socket.submit_shutdown_write(?owner.socket, scope,
         (?owner.contexts[index])::usize);
 }
 
@@ -458,7 +461,7 @@ fun submit_close(context: ptr, scope: *cancel.Scope,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)};
     }
-    ret net_async.submit_stream_close(owner.driver, scope, ?owner.stream,
+    ret hedge_socket.submit_close(?owner.socket, scope,
         io_lifecycle.ABORTIVE, (?owner.contexts[index])::usize);
 }
 
@@ -604,11 +607,8 @@ fun record_observed(owner: *Connection, source: *listener.Connection) {
     owner.local_kind = message.ENDPOINT_UNSPECIFIED;
     owner.local_len  = 0;
     owner.local_port = 0;
-    # the bound address of a wildcard listener is not the address this
-    # connection arrived on, so the socket is asked rather than the listener
-    val local: res[ip.Endpoint, io_error.Error] = tcp.stream_local_endpoint(?owner.stream);
-    if (sel local.ok) {
-        val endpoint: ip.Endpoint = local.ok;
+    var endpoint: ip.Endpoint;
+    if (hedge_socket.local_endpoint(?owner.socket, ?endpoint)) {
         owner.local_len = format_endpoint(endpoint, ?owner.local_text[0], PEER_BYTES);
         if (owner.local_len != 0) {
             owner.local_kind = message.ENDPOINT_IP;
@@ -660,7 +660,6 @@ pub fun make(
     generation: u64,
     token: listener.ConnectionToken,
     source: *listener.Connection,
-    net_driver: *net_async.Driver,
     active_plan: *plan.Plan,
     budgets: *budget.Set,
     configured: Config,
@@ -676,7 +675,7 @@ pub fun make(
     owner.initialized    = false;
     owner.account_live   = false;
     owner.refused_memory = false;
-    if (source == nil || net_driver == nil || active_plan == nil
+    if (source == nil || active_plan == nil
         || owned == nil || shared == nil || pool == nil || id == 0 || generation == 0
         || !hedge_wake.valid(?waker)) { ret false; }
     owner.waker                = waker;
@@ -699,9 +698,8 @@ pub fun make(
     owner.id                   = id;
     owner.generation           = generation;
     owner.token                = token;
-    owner.stream               = source.tcp_stream;
+    owner.socket               = source.socket;
     owner.listener_name        = schema.text(?owned.name);
-    owner.driver               = net_driver;
     owner.engine_live          = false;
     owner.protocol             = selection.NONE;
     owner.refusal              = prologue.REFUSED_NONE;
@@ -750,7 +748,7 @@ pub fun make(
     if (!operation_ok(cancel.make_child(?owner.prologue_scope, ?owner.operation_root, opt[time.Instant].none{}))) { ret false; }
     owner.prologue_scope_live = true;
     owner.runtime_stream      = transport.RuntimeStream{
-        runtime:               net_driver.runtime,
+        runtime:               owner.socket.runtime,
         context:               (owner)::ptr,
         submit_read:           submit_read,
         submit_readable:       submit_readable,
@@ -1054,7 +1052,7 @@ fun begin_secure(owner: *Connection, now: time.Instant) Step {
     }
     val channel: *secure.Channel = secure.channel(owner.session);
     if (channel == nil
-        || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
+        || !secure.attach(owner.session, ?owner.socket, (owner)::ptr,
         staged_bytes, ?owner.borrower, ?owner.account, owner.waker)
         || !operation.bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
         settle_secure, 0)
@@ -1112,9 +1110,8 @@ fun submit_prologue_read(owner: *Connection) Step {
         (owner)::ptr, settle_prologue, 0)) {
         ret refuse(owner, prologue.REFUSED_TRANSPORT);
     }
-    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_read(
-        owner.driver, ?owner.prologue_scope, ?owner.stream,
-        ?owner.prologue_buffer[owner.prologue_len],
+    val submitted: res[io_runtime.Token, io_error.Error] = hedge_socket.submit_read(
+        ?owner.socket, ?owner.prologue_scope, ?owner.prologue_buffer[owner.prologue_len],
         PROLOGUE_BYTES - owner.prologue_len,
         (?owner.prologue_context)::usize);
     if (sel submitted.err) {
@@ -2018,7 +2015,7 @@ pub fun close(owner: *Connection) bool {
 # driver has seen is only ever closed through it, so when nothing here closed
 # it, the listener that accepted it does (#716)
 pub fun stream_released(owner: *Connection) bool {
-    ret owner != nil && !io_handle.socket_is_valid(owner.stream.handle);
+    ret owner != nil && hedge_socket.released(?owner.socket);
 }
 
 pub fun close_waiting(owner: *Connection) bool {
@@ -2397,6 +2394,14 @@ test "connection: the configured pipeline bound reaches both protocol engines" {
     configured                      = config_from(?graph);
     if (configured.engine.max_pipeline != PIPELINE_DEPTH
         || configured.max_streams != h2.MAX_STREAMS) { ret 2; }
+    ret 0;
+}
+
+test "connection: no engine bounds a connection's whole life (#294)" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    val configured: Config = config_from(?graph);
+    if (configured.engine.total_timeout_ns != clock.UNBOUNDED_NS) { ret 1; }
     ret 0;
 }
 
