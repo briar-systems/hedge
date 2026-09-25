@@ -454,6 +454,38 @@ status = 308
 
 A `fixed` service defaults to status 200 and `text/plain; charset=utf-8`. A `redirect` defaults to 302 and accepts 300 through 308, so a permanent redirect states its 301 or 308 explicitly.
 
+### Upstream connections
+
+A `proxy` service keeps the connections it opens to its upstreams in a pool and
+sends each later request to the same upstream over an idle one. Two settings
+decide how long a pooled connection is kept:
+
+```toml
+[service.api]
+kind = "proxy"
+upstream = "127.0.0.1:8081, 127.0.0.1:8082"
+upstream_idle_ms = 60000
+upstream_lifetime_ms = 3600000
+```
+
+- `upstream_idle_ms` is how long a connection may wait in the pool between
+  exchanges. Once it passes, the pool closes the connection. It defaults to
+  60000 (one minute). Set it below the upstream server's own keep-alive
+  timeout, so the pool closes an idle connection before the upstream does and
+  never sends a request on one the upstream is closing.
+- `upstream_lifetime_ms` is the age, counted from when the connection opened,
+  after which it is no longer reused. A connection that reaches it finishes
+  the exchange it carries and is then closed, and one that reaches it idle is
+  closed at once. It is unset by default, so a connection is reused for as long
+  as it stays open.
+
+Neither setting ever cuts an exchange short. The time an exchange may take is
+bounded by the request's own deadline. Both take positive milliseconds, and
+either one on a service that is not a `proxy` is refused. A pooled connection
+serves only the service that opened it, so each service's settings govern its
+own connections, and a reload that changes them applies to the connections
+the new generation opens.
+
 ## Automatic certificate management
 
 ```toml

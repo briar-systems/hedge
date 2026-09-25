@@ -327,6 +327,10 @@ rec Edge {
     checks:          [1]telemetry_health.Check;
     # the listener speaks TLS with the interop fixture identity
     secure: bool;
+    # the proxy service's upstream reuse policy, when a test sets one
+    tuned:       bool;
+    idle_ms:     u64;
+    lifetime_ms: opt[u64];
 }
 
 fun quiesce_proxy(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
@@ -375,6 +379,10 @@ fun start_edge_with(edge: *Edge, generation: u64, upstream_address: str,
     edge.site.graph.telemetry.traces       = traces;
     add_service(?edge.site.graph, "backend", schema.SERVICE_PROXY, upstream_address);
     add_route(?edge.site.graph, "all", "/**", "backend");
+    if (edge.tuned) {
+        edge.site.graph.services[0].upstream_idle_ms     = edge.idle_ms;
+        edge.site.graph.services[0].upstream_lifetime_ms = edge.lifetime_ms;
+    }
     if (edge.secure) { secure_listener(?edge.site.graph); }
     service.make_applications(?edge.site.applications, ?edge.site.application_slots[0], 2);
     if (!proxy.make_runtime(?edge.proxy_runtime, nil, "hedge-test", upstream.default_limits())) { ret false; }
@@ -964,6 +972,166 @@ test "proxy: successive proxied requests reuse the client connection" {
     if (view.total_served != 2 || origin.served != 2) { ret 9; }
     # the upstream connection was kept and used again, so the origin accepted once
     if (view.total_reused != 1 || origin.accepted != 1) { ret 10; }
+    ret 0;
+}
+
+# one exchange through the edge, then the pool is driven until its link is idle.
+# returns the instant after that, from which a test ages the pool
+fun settle_idle_link(edge: *Edge, origin: *Origin, path: str, at: *time.Instant) bool {
+    var quic_controls: quic_runtime.ControlView;
+    var client:        tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) { ret false; }
+    if (!wire.send(?client, path)) {
+        tcp.stream_close(?client);
+        ret false;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val length:   usize = collect_both(edge, origin, ?client, ?response[0], RESPONSE_BYTES, "pooled");
+    tcp.stream_close(?client);
+    if (length == 0 || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")) { ret false; }
+    var view:   proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+    var rounds: usize          = 0;
+    for (rounds < 64 && (view.live_attempts != 0 || view.idle_links != 1)) {
+        serve.poll(?quic_controls, ?edge.site.runtime, 1);
+        view   = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+        rounds = rounds + 1;
+    }
+    @at = clock.instant();
+    ret view.live_attempts == 0 && view.idle_links == 1;
+}
+
+fun later(from: time.Instant, seconds: i64) time.Instant {
+    ret time.Instant{sec: from.sec + seconds, nsec: from.nsec};
+}
+
+# a closed link finishes its teardown on the worker's next turns
+fun settle_links(edge: *Edge) usize {
+    var quic_controls: quic_runtime.ControlView;
+    var view:          proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+    var rounds:        usize          = 0;
+    for (rounds < 64 && view.live_links != 0) {
+        serve.poll(?quic_controls, ?edge.site.runtime, 1);
+        view   = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+        rounds = rounds + 1;
+    }
+    ret view.live_links;
+}
+
+# the pool is aged by handing its poll a later instant, so no test waits
+fun idle_links_at(edge: *Edge, at: time.Instant) usize {
+    proxy.poll((?edge.proxy_runtime)::ptr, at);
+    ret proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry).idle_links;
+}
+
+test "proxy: a pooled upstream connection outlives 300 s when its policy allows" {
+    var origin: Origin;
+    if (!start_origin(?origin, "pooled")) { ret 1; }
+    var edge: Edge;
+    edge.tuned       = true;
+    edge.idle_ms     = 3600000;
+    edge.lifetime_ms = opt[u64].none{};
+    if (!start_edge(?edge, 5, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin);
+        ret 2;
+    }
+    var settled: time.Instant;
+    if (!settle_idle_link(?edge, ?origin, "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ?settled)) {
+        shutdown_edge(?edge, ?origin);
+        ret 3;
+    }
+    # mach-http's default would end the connection at 300 s, and nothing hedge
+    # sets may: past 301 s it is still pooled and the next deadline is its idle
+    val aged:  time.Instant = later(settled, 301);
+    var at_ns: u64          = 0;
+    if (idle_links_at(?edge, aged) != 1
+        || !proxy.deadline(?edge.proxy_runtime, ?at_ns) || at_ns <= clock.to_ns(aged)) {
+        shutdown_edge(?edge, ?origin);
+        ret 4;
+    }
+    if (idle_links_at(?edge, later(settled, 3599)) != 1) {
+        shutdown_edge(?edge, ?origin);
+        ret 5;
+    }
+    var client: tcp.Stream;
+    if (!wire.connect(edge.site.endpoint, ?client)) {
+        shutdown_edge(?edge, ?origin);
+        ret 6;
+    }
+    if (!wire.send(?client, "GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        tcp.stream_close(?client);
+        shutdown_edge(?edge, ?origin);
+        ret 7;
+    }
+    var response: [RESPONSE_BYTES]u8;
+    val second:   usize          = collect_both(?edge, ?origin, ?client, ?response[0], RESPONSE_BYTES, "pooled");
+    val view:     proxy.Snapshot = proxy.snapshot(?edge.proxy_runtime, ?edge.proxy_registry);
+    tcp.stream_close(?client);
+    shutdown_edge(?edge, ?origin);
+    if (second == 0 || !wire.starts_with(?response[0], second, "HTTP/1.1 200 OK\r\n")) { ret 8; }
+    # the second exchange rode the connection the first one opened
+    if (view.total_reused != 1 || origin.accepted != 1 || origin.served != 2) { ret 9; }
+    ret 0;
+}
+
+test "proxy: an idle upstream connection is closed at its idle timeout" {
+    var origin: Origin;
+    if (!start_origin(?origin, "pooled")) { ret 1; }
+    var edge: Edge;
+    if (!start_edge(?edge, 6, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin);
+        ret 2;
+    }
+    var settled: time.Instant;
+    if (!settle_idle_link(?edge, ?origin, "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ?settled)) {
+        shutdown_edge(?edge, ?origin);
+        ret 3;
+    }
+    # the default idle timeout is a minute
+    if (idle_links_at(?edge, later(settled, 59)) != 1) {
+        shutdown_edge(?edge, ?origin);
+        ret 4;
+    }
+    val retired: usize = idle_links_at(?edge, later(settled, 61));
+    val live:    usize = settle_links(?edge);
+    shutdown_edge(?edge, ?origin);
+    if (retired != 0 || live != 0) { ret 5; }
+    ret 0;
+}
+
+test "proxy: a pooled upstream connection is closed at its lifetime" {
+    var origin: Origin;
+    if (!start_origin(?origin, "pooled")) { ret 1; }
+    var edge: Edge;
+    edge.tuned       = true;
+    edge.idle_ms     = 3600000;
+    edge.lifetime_ms = opt[u64].some{120000};
+    if (!start_edge(?edge, 7, (?origin.address[0])::str, false)) {
+        shutdown_edge(?edge, ?origin);
+        ret 2;
+    }
+    var settled: time.Instant;
+    if (!settle_idle_link(?edge, ?origin, "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ?settled)) {
+        shutdown_edge(?edge, ?origin);
+        ret 3;
+    }
+    if (idle_links_at(?edge, later(settled, 119)) != 1) {
+        shutdown_edge(?edge, ?origin);
+        ret 4;
+    }
+    # the lifetime is on the wheel while the connection idles
+    var at_ns: u64 = 0;
+    if (!proxy.deadline(?edge.proxy_runtime, ?at_ns)
+        || at_ns > clock.to_ns(later(settled, 120))) {
+        shutdown_edge(?edge, ?origin);
+        ret 5;
+    }
+    val retired: usize = idle_links_at(?edge, later(settled, 121));
+    val live:    usize = settle_links(?edge);
+    shutdown_edge(?edge, ?origin);
+    if (retired != 0 || live != 0) { ret 6; }
     ret 0;
 }
 
