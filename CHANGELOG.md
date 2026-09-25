@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-25
+
 ### Added
 
 - A supervisor and one worker per CPU (#173). The supervisor thread takes the signals, reloads the configuration, drives ACME and installs what it issues, and maintains the TLS policies, on an io runtime and network driver of its own. Each worker starts, serves and stops on a thread of its own with its own io runtime, listeners, timer wheel, buffer pool, proxy runtime, QUIC runtime and compiled plans (`hedge.worker`), and talks to the supervisor through an atomic control record and `io_runtime.wake`. A reload is two phases: every worker builds and checks the candidate before any publishes it, a refusal leaves every worker as it was, and a worker keeps the old generation pinned until its last connection leaves. `server.workers` sets the worker count (one per CPU the process may run on by default, at most 256) and `server.pin_workers` pins each worker to its CPU (the default when more than one serves). On Linux each worker binds every TCP listener with `SO_REUSEPORT` and the kernel spreads connections; the first worker resolves each address and the rest bind beside it. On a platform whose reuseport does not balance (darwin, Windows), and for a local listener, the first worker accepts and hands each connection to the least loaded worker through std's detach and adopt (`hedge.handoff`). QUIC listeners are served by the first worker until #174. The startup log names the worker count, and `net.ipv4.tcp_migrate_req=1` is documented for hosts that stop hedge under load.
