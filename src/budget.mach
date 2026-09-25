@@ -11,6 +11,7 @@
 # exactly once. that ordering is the point: admitting work and then discovering
 # there is no room for it is how a bounded system becomes an unbounded one.
 
+use hedge.allowance;
 use hedge.clock;
 use hedge_wake: hedge.wake;
 use A:          std.allocator;
@@ -19,6 +20,7 @@ use std.chrono.time;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
@@ -55,6 +57,12 @@ pub rec Budget {
     # there is room, so a waiter never has to ask again to be let in
     head: *Charge;
     tail: *Charge;
+    # this worker's allowances of the budget's concurrency and memory, drawn
+    # from pools every worker shares, or from the budget's own when it is
+    # charged on one worker alone
+    concurrency_share: allowance.Share;
+    memory_share:      allowance.Share;
+    own:               allowance.BudgetPool;
 }
 
 pub rec Set {
@@ -131,8 +139,44 @@ pub fun define(set: *Set, name: str, concurrency: usize, queue: usize,
     value.live         = true;
     value.head         = nil;
     value.tail         = nil;
-    set.count          = index + 1;
+    if (!allowance.make_pool(?value.own.concurrency, bound(concurrency), concurrency, nil)
+        || !allowance.make_pool(?value.own.memory, bound(memory_bytes), memory_bytes, nil)) {
+        value.live = false;
+        ret NO_BUDGET;
+    }
+    allowance.join(?value.concurrency_share, ?value.own.concurrency, 0);
+    allowance.join(?value.memory_share, ?value.own.memory, 0);
+    set.count = index + 1;
     ret index;
+}
+
+fun bound(value: usize) opt[usize] {
+    if (value == 0) { ret opt[usize].none{}; }
+    ret opt[usize].some{value};
+}
+
+# charge budget `index` against pools every worker shares, as worker `worker`,
+# before anything is charged to it
+pub fun share(set: *Set, index: usize, pool: *allowance.BudgetPool, worker: usize) bool {
+    val value: *Budget = at(set, index);
+    if (value == nil || pool == nil || value.active != 0 || value.waiting != 0) { ret false; }
+    allowance.join(?value.concurrency_share, ?pool.concurrency, worker);
+    allowance.join(?value.memory_share, ?pool.memory, worker);
+    ret true;
+}
+
+# give back what this worker holds of every budget's shared caps, as it stops
+# or as the generation retires
+pub fun leave(set: *Set) {
+    if (set == nil) { ret; }
+    var i: usize = 0;
+    for (i < set.count) {
+        if (set.items[i].live) {
+            allowance.leave(?set.items[i].concurrency_share);
+            allowance.leave(?set.items[i].memory_share);
+        }
+        i = i + 1;
+    }
 }
 
 pub fun find(set: *Set, name: str) usize {
@@ -150,14 +194,17 @@ pub fun at(set: *Set, index: usize) *Budget {
     ret ?set.items[index];
 }
 
-fun room_to_run(value: *Budget, bytes: usize) bool {
-    if (value.concurrency != 0 && value.active >= value.concurrency) { ret false; }
-    if (value.memory_bytes == 0)                                     { ret true; }
+# take a turn and `bytes` from this worker's allowances, or take neither
+fun reserve(value: *Budget, bytes: usize) bool {
     # a charge larger than the whole budget can never be admitted, and saying so
     # here is what stops it waiting for room that will never appear
-    if (bytes > value.memory_bytes)             { ret false; }
-    if (value.memory_used > value.memory_bytes) { ret false; }
-    ret bytes <= value.memory_bytes - value.memory_used;
+    if (value.memory_bytes != 0 && bytes > value.memory_bytes) { ret false; }
+    if (!allowance.take(?value.concurrency_share, 1))          { ret false; }
+    if (bytes != 0 && !allowance.take(?value.memory_share, bytes)) {
+        allowance.give(?value.concurrency_share, 1);
+        ret false;
+    }
+    ret true;
 }
 
 fun enqueue(value: *Budget, output: *Charge) {
@@ -181,7 +228,7 @@ fun dequeue(value: *Budget, output: *Charge) {
 # admit waiters in arrival order while there is room. the head that does not fit
 # holds everyone behind it, so a small late charge cannot starve a large early one
 fun admit_waiters(value: *Budget) {
-    for (value.head != nil && room_to_run(value, value.head.bytes)) {
+    for (value.head != nil && reserve(value, value.head.bytes)) {
         val waiter: *Charge = value.head;
         dequeue(value, waiter);
         start(value, waiter, waiter.index, waiter.bytes);
@@ -219,7 +266,7 @@ pub fun charge(set: *Set, index: usize, bytes: usize, now: time.Instant,
     }
     val value: *Budget = at(set, index);
     if (value == nil) { ret REFUSED; }
-    if (value.head == nil && room_to_run(value, bytes)) {
+    if (value.head == nil && reserve(value, bytes)) {
         ret start(value, output, index, bytes);
     }
     # no room to run. a budget that permits waiting lets the caller hold a place
@@ -311,8 +358,22 @@ pub fun release(set: *Set, output: *Charge) bool {
     value.active      = value.active - 1;
     value.memory_used = value.memory_used - output.bytes;
     output.live       = false;
+    allowance.give(?value.concurrency_share, 1);
+    if (output.bytes != 0) { allowance.give(?value.memory_share, output.bytes); }
     admit_waiters(value);
     ret true;
+}
+
+# admit what waits on every budget that another worker's release may have made
+# room for. a worker short of a shared budget is woken when units come back,
+# and this is what it does with the turn
+pub fun resume(set: *Set) {
+    if (set == nil) { ret; }
+    var i: usize = 0;
+    for (i < set.count) {
+        if (set.items[i].live && set.items[i].head != nil) { admit_waiters(?set.items[i]); }
+        i = i + 1;
+    }
 }
 
 pub rec Snapshot {

@@ -13,11 +13,14 @@ use http.core.exchange;
 use http.core.field;
 use http.core.message;
 use http.core.method;
+use std.allocator;
 use std.log.record;
 use std.log.sink;
+use std.sync.mutex;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
@@ -42,26 +45,19 @@ pub def FlushFun: fun(ptr) bool;
 
 pub val BUILT_IN_METRIC_SERIES: usize = schema.MIN_METRIC_SERIES;
 
-pub rec Runtime {
-    logger:            telemetry_log.Logger;
-    log_sink:          sink.Sink;
-    metrics:           telemetry_metrics.Registry;
-    health:            telemetry_health.Health;
-    admin:             telemetry_admin.Handler;
-    flush_context:     ptr;
-    flush:             FlushFun;
-    logs_enabled:      bool;
-    metrics_enabled:   bool;
-    traces_enabled:    bool;
-    admin_enabled:     bool;
-    trace_state_bytes: usize;
-    requests:          telemetry_metrics.Token;
-    failures:          telemetry_metrics.Token;
-    request_bytes:     telemetry_metrics.Token;
-    response_bytes:    telemetry_metrics.Token;
-    duration_us:       telemetry_metrics.Token;
-    memory_refusals:   telemetry_metrics.Token;
-    replay_full:       telemetry_metrics.Token;
+# one worker's metrics: a registry only that worker writes, so its updates are
+# never contended, and the running totals its reports have added so far. the
+# process's `Runtime` merges every recorder's registry when it renders
+pub rec Recorder {
+    runtime:         *Runtime;
+    metrics:         telemetry_metrics.Registry;
+    requests:        telemetry_metrics.Token;
+    failures:        telemetry_metrics.Token;
+    request_bytes:   telemetry_metrics.Token;
+    response_bytes:  telemetry_metrics.Token;
+    duration_us:     telemetry_metrics.Token;
+    memory_refusals: telemetry_metrics.Token;
+    replay_full:     telemetry_metrics.Token;
     # the last QUIC replay refusal total reported, so each report adds the rise
     replay_full_seen: u64;
     # the admitted QUIC connections hedge holds, from admission until release
@@ -98,6 +94,33 @@ pub rec Runtime {
     # the timer wheel: entries claimed by a connection or plane, and those armed
     timers_claimed: telemetry_metrics.Token;
     timers_armed:   telemetry_metrics.Token;
+    live:           bool;
+}
+
+# a recorder per worker and the process's own
+pub val MAX_RECORDERS: usize = 257;
+
+pub rec Runtime {
+    logger:            telemetry_log.Logger;
+    log_sink:          sink.Sink;
+    health:            telemetry_health.Health;
+    admin:             telemetry_admin.Handler;
+    flush_context:     ptr;
+    flush:             FlushFun;
+    logs_enabled:      bool;
+    metrics_enabled:   bool;
+    traces_enabled:    bool;
+    admin_enabled:     bool;
+    trace_state_bytes: usize;
+    # how many series each recorder's registry holds
+    metric_series: usize;
+    # the process's own recorder, over the storage `make` was given, which
+    # records for whatever serves on no worker of its own
+    own: Recorder;
+    # every recorder a render merges, the process's first
+    recorders:      [MAX_RECORDERS]*Recorder;
+    recorder_count: usize;
+    recorders_lock: mutex.Mutex;
     initialized:    bool;
 }
 
@@ -137,7 +160,17 @@ fun copy_text(output: *u8, capacity: usize, value: str) usize {
 fun built_in_metrics(context: ptr, output: *u8, capacity: usize) usize {
     val runtime: *Runtime = context::*Runtime;
     if (!runtime.metrics_enabled) { ret copy_text(output, capacity, "# metrics disabled\n"); }
-    val rendered: telemetry_metrics.Rendered = telemetry_metrics.render(?runtime.metrics, output, capacity);
+    var registries: [MAX_RECORDERS]*telemetry_metrics.Registry;
+    mutex.lock(?runtime.recorders_lock);
+    val count: usize = runtime.recorder_count;
+    var i:     usize = 0;
+    for (i < count) {
+        registries[i] = ?runtime.recorders[i].metrics;
+        i             = i + 1;
+    }
+    mutex.unlock(?runtime.recorders_lock);
+    val rendered: telemetry_metrics.Rendered = telemetry_metrics.render_all(?registries[0],
+        count, output, capacity);
     if (!rendered.ok)      { ret 0; }
     if (rendered.len == 0) { ret copy_text(output, capacity, "# no metrics\n"); }
     ret rendered.len;
@@ -149,6 +182,128 @@ fun built_in_state(context: ptr, output: *u8, capacity: usize) usize {
     if (!state.live) { ret copy_text(output, capacity, "{\"live\":false,\"ready\":false}\n"); }
     if (state.ready) { ret copy_text(output, capacity, "{\"live\":true,\"ready\":true}\n"); }
     ret copy_text(output, capacity, "{\"live\":true,\"ready\":false}\n");
+}
+
+fun reset_seen(recorder: *Recorder) {
+    recorder.replay_full_seen          = 0;
+    recorder.handshakes_deferred_seen  = 0;
+    recorder.handshakes_promoted_seen  = 0;
+    recorder.handshakes_completed_seen = 0;
+    recorder.handshakes_dropped_seen   = 0;
+    recorder.handshakes_refused_seen   = 0;
+    recorder.handshakes_expired_seen   = 0;
+    recorder.retries_dropped_seen      = 0;
+    var class: usize = 0;
+    for (class < ARRIVAL_CLASSES) {
+        recorder.arrivals_dropped_seen[class] = 0;
+        class                                 = class + 1;
+    }
+    recorder.refused_memory_seen = 0;
+    var lane: usize = 0;
+    for (lane < LANE_COUNT) {
+        recorder.memory_seen[lane] = hedge_memory.LaneCounters{held: 0, peak: 0,
+            refusals: 0, exhausted: 0, timeouts: 0};
+        lane = lane + 1;
+    }
+}
+
+# every built-in series, registered in one order on every recorder, which is
+# what lets a render merge them series by series
+fun register_built_ins(recorder: *Recorder, storage: *telemetry_metrics.Series) bool {
+    val capacity: usize = recorder.runtime.metric_series;
+    if (!telemetry_metrics.make(?recorder.metrics, storage, capacity)) { ret false; }
+    var bounds: [9]u64 = [9]u64{100, 500, 1000, 5000, 10000,
+        50000, 100000, 500000, 1000000};
+    ret telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_requests_total", nil, 0,
+        nil, 0, ?recorder.requests)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_request_failures_total", nil, 0,
+        nil, 0, ?recorder.failures)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_request_bytes_total", nil, 0,
+        nil, 0, ?recorder.request_bytes)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_response_bytes_total", nil, 0,
+        nil, 0, ?recorder.response_bytes)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.HISTOGRAM, "hedge_request_duration_us", nil, 0,
+        ?bounds[0], 9, ?recorder.duration_us)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_request_memory_refusals_total", nil, 0,
+        nil, 0, ?recorder.memory_refusals)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_retry_replay_full_total", nil, 0,
+        nil, 0, ?recorder.replay_full)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_connections_refused_memory_total", nil, 0,
+        nil, 0, ?recorder.refused_connections)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.GAUGE, "hedge_quic_handshakes_in_flight", nil, 0,
+        nil, 0, ?recorder.handshakes_in_flight)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.GAUGE, "hedge_quic_connections", nil, 0,
+        nil, 0, ?recorder.quic_connections)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.GAUGE, "hedge_quic_handshake_service_ns", nil, 0,
+        nil, 0, ?recorder.handshake_service_ns)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_handshakes_deferred_total", nil, 0,
+        nil, 0, ?recorder.handshakes_deferred)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_handshakes_promoted_total", nil, 0,
+        nil, 0, ?recorder.handshakes_promoted)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_handshakes_completed_total", nil, 0,
+        nil, 0, ?recorder.handshakes_completed)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_handshakes_dropped_total", nil, 0,
+        nil, 0, ?recorder.handshakes_dropped)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_handshakes_refused_total", nil, 0,
+        nil, 0, ?recorder.handshakes_refused)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_handshakes_expired_total", nil, 0,
+        nil, 0, ?recorder.handshakes_expired)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.GAUGE, "hedge_quic_handshake_finish_ns", nil, 0,
+        nil, 0, ?recorder.handshake_finish_ns)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.COUNTER, "hedge_quic_retries_dropped_total", nil, 0,
+        nil, 0, ?recorder.retries_dropped)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.GAUGE, "hedge_timers_claimed", nil, 0,
+        nil, 0, ?recorder.timers_claimed)
+        && telemetry_metrics.register(?recorder.metrics,
+        telemetry_metrics.GAUGE, "hedge_timers_armed", nil, 0,
+        nil, 0, ?recorder.timers_armed)
+        && register_arrival_classes(recorder)
+        && register_lanes(recorder);
+}
+
+# a worker's recorder, with series storage of its own from `a`, merged into
+# every render of `runtime` from here on
+pub fun make_recorder(recorder: *Recorder, runtime: *Runtime, a: *allocator.Allocator) bool {
+    if (recorder == nil || runtime == nil || !runtime.initialized || a == nil) { ret false; }
+    recorder.runtime = runtime;
+    recorder.live    = false;
+    reset_seen(recorder);
+    if (runtime.metrics_enabled) {
+        val storage: res[*telemetry_metrics.Series, allocator.Error] =
+            allocator.allocate[telemetry_metrics.Series](a, runtime.metric_series);
+        if (sel storage.err)                           { ret false; }
+        if (!register_built_ins(recorder, storage.ok)) { ret false; }
+    }
+    mutex.lock(?runtime.recorders_lock);
+    if (runtime.recorder_count >= MAX_RECORDERS) {
+        mutex.unlock(?runtime.recorders_lock);
+        ret false;
+    }
+    runtime.recorders[runtime.recorder_count] = recorder;
+    runtime.recorder_count                    = runtime.recorder_count + 1;
+    recorder.live                             = true;
+    mutex.unlock(?runtime.recorders_lock);
+    ret true;
 }
 
 pub fun make(
@@ -169,31 +324,17 @@ pub fun make(
 ) bool {
     if (runtime == nil || graph == nil || check_storage == nil || check_capacity == 0)                                                                 { ret false; }
     if (graph.telemetry.traces && (graph.telemetry.trace_state_bytes == 0 || graph.telemetry.trace_state_bytes > telemetry_trace.TRACESTATE_CAPACITY)) { ret false; }
-    runtime.logs_enabled              = graph.telemetry.logs;
-    runtime.metrics_enabled           = graph.telemetry.metrics;
-    runtime.traces_enabled            = graph.telemetry.traces;
-    runtime.admin_enabled             = graph.admin.enabled;
-    runtime.trace_state_bytes         = graph.telemetry.trace_state_bytes;
-    runtime.replay_full_seen          = 0;
-    runtime.handshakes_deferred_seen  = 0;
-    runtime.handshakes_promoted_seen  = 0;
-    runtime.handshakes_completed_seen = 0;
-    runtime.handshakes_dropped_seen   = 0;
-    runtime.handshakes_refused_seen   = 0;
-    runtime.handshakes_expired_seen   = 0;
-    runtime.retries_dropped_seen      = 0;
-    var class: usize = 0;
-    for (class < ARRIVAL_CLASSES) {
-        runtime.arrivals_dropped_seen[class] = 0;
-        class                                = class + 1;
-    }
-    runtime.refused_memory_seen = 0;
-    var lane: usize = 0;
-    for (lane < LANE_COUNT) {
-        runtime.memory_seen[lane] = hedge_memory.LaneCounters{held: 0, peak: 0,
-            refusals: 0, exhausted: 0, timeouts: 0};
-        lane = lane + 1;
-    }
+    runtime.logs_enabled      = graph.telemetry.logs;
+    runtime.metrics_enabled   = graph.telemetry.metrics;
+    runtime.traces_enabled    = graph.telemetry.traces;
+    runtime.admin_enabled     = graph.admin.enabled;
+    runtime.trace_state_bytes = graph.telemetry.trace_state_bytes;
+    runtime.metric_series     = graph.telemetry.metric_series;
+    runtime.recorders_lock    = mutex.make();
+    runtime.recorder_count    = 0;
+    runtime.own.runtime       = runtime;
+    runtime.own.live          = false;
+    reset_seen(?runtime.own);
     runtime.flush_context = flush_context;
     runtime.flush         = flush;
     if (!telemetry_health.make(?runtime.health, check_storage, check_capacity)) { ret false; }
@@ -217,76 +358,11 @@ pub fun make(
     if (runtime.metrics_enabled) {
         if (metric_storage == nil || metric_capacity < graph.telemetry.metric_series
             || graph.telemetry.metric_series < BUILT_IN_METRIC_SERIES
-            || !telemetry_metrics.make(?runtime.metrics, metric_storage,
-            graph.telemetry.metric_series)) { ret false; }
-        var bounds: [9]u64 = [9]u64{100, 500, 1000, 5000, 10000,
-            50000, 100000, 500000, 1000000};
-        if (!telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_requests_total", nil, 0,
-            nil, 0, ?runtime.requests)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_request_failures_total", nil, 0,
-            nil, 0, ?runtime.failures)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_request_bytes_total", nil, 0,
-            nil, 0, ?runtime.request_bytes)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_response_bytes_total", nil, 0,
-            nil, 0, ?runtime.response_bytes)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.HISTOGRAM, "hedge_request_duration_us", nil, 0,
-            ?bounds[0], 9, ?runtime.duration_us)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_request_memory_refusals_total", nil, 0,
-            nil, 0, ?runtime.memory_refusals)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_retry_replay_full_total", nil, 0,
-            nil, 0, ?runtime.replay_full)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_connections_refused_memory_total", nil, 0,
-            nil, 0, ?runtime.refused_connections)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.GAUGE, "hedge_quic_handshakes_in_flight", nil, 0,
-            nil, 0, ?runtime.handshakes_in_flight)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.GAUGE, "hedge_quic_connections", nil, 0,
-            nil, 0, ?runtime.quic_connections)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.GAUGE, "hedge_quic_handshake_service_ns", nil, 0,
-            nil, 0, ?runtime.handshake_service_ns)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_handshakes_deferred_total", nil, 0,
-            nil, 0, ?runtime.handshakes_deferred)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_handshakes_promoted_total", nil, 0,
-            nil, 0, ?runtime.handshakes_promoted)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_handshakes_completed_total", nil, 0,
-            nil, 0, ?runtime.handshakes_completed)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_handshakes_dropped_total", nil, 0,
-            nil, 0, ?runtime.handshakes_dropped)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_handshakes_refused_total", nil, 0,
-            nil, 0, ?runtime.handshakes_refused)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_handshakes_expired_total", nil, 0,
-            nil, 0, ?runtime.handshakes_expired)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.GAUGE, "hedge_quic_handshake_finish_ns", nil, 0,
-            nil, 0, ?runtime.handshake_finish_ns)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.COUNTER, "hedge_quic_retries_dropped_total", nil, 0,
-            nil, 0, ?runtime.retries_dropped)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.GAUGE, "hedge_timers_claimed", nil, 0,
-            nil, 0, ?runtime.timers_claimed)
-            || !telemetry_metrics.register(?runtime.metrics,
-            telemetry_metrics.GAUGE, "hedge_timers_armed", nil, 0,
-            nil, 0, ?runtime.timers_armed)
-            || !register_arrival_classes(runtime)
-            || !register_lanes(runtime)) { ret false; }
+            || !register_built_ins(?runtime.own, metric_storage)) { ret false; }
     }
+    runtime.own.live       = true;
+    runtime.recorders[0]   = ?runtime.own;
+    runtime.recorder_count = 1;
     if (runtime.admin_enabled) {
         var metrics_context:  ptr                       = render_context;
         var state_context:    ptr                       = render_context;
@@ -416,7 +492,9 @@ fun copy_header(request: *message.Request, name: str, name_length: usize,
 }
 
 fun observe_begin(context: ptr, active: *call.Call) bool {
-    val runtime: *Runtime = context::*Runtime;
+    val recorder: *Recorder = context::*Recorder;
+    if (recorder == nil) { ret false; }
+    val runtime: *Runtime = recorder.runtime;
     if (runtime == nil || !runtime.initialized || active == nil
         || active.telemetry == nil) { ret false; }
     if (!runtime.traces_enabled) {
@@ -516,7 +594,9 @@ fun request_elapsed_us(active: *call.Call, now_ns: u64) u64 {
 }
 
 fun observe_end(context: ptr, active: *call.Call, complete: bool) {
-    val runtime: *Runtime = context::*Runtime;
+    val recorder: *Recorder = context::*Recorder;
+    if (recorder == nil) { ret; }
+    val runtime: *Runtime = recorder.runtime;
     if (runtime == nil || !runtime.initialized || active == nil
         || active.exchange == nil) { ret; }
     val request:    *message.Request    = call.request(active);
@@ -528,17 +608,17 @@ fun observe_end(context: ptr, active: *call.Call, complete: bool) {
         trace_text = (?trace_id[0])::str;
     }
     if (runtime.metrics_enabled) {
-        telemetry_metrics.counter_add(?runtime.metrics, runtime.requests, 1);
-        telemetry_metrics.counter_add(?runtime.metrics, runtime.request_bytes,
+        telemetry_metrics.counter_add(?recorder.metrics, recorder.requests, 1);
+        telemetry_metrics.counter_add(?recorder.metrics, recorder.request_bytes,
             completion.bytes_in);
-        telemetry_metrics.counter_add(?runtime.metrics, runtime.response_bytes,
+        telemetry_metrics.counter_add(?recorder.metrics, recorder.response_bytes,
             completion.bytes_out);
-        telemetry_metrics.observe(?runtime.metrics, runtime.duration_us, elapsed_us);
+        telemetry_metrics.observe(?recorder.metrics, recorder.duration_us, elapsed_us);
         if (!complete || completion.outcome != exchange.OUTCOME_OK) {
-            telemetry_metrics.counter_add(?runtime.metrics, runtime.failures, 1);
+            telemetry_metrics.counter_add(?recorder.metrics, recorder.failures, 1);
         }
         if (call.memory_refused(active)) {
-            telemetry_metrics.counter_add(?runtime.metrics, runtime.memory_refusals, 1);
+            telemetry_metrics.counter_add(?recorder.metrics, recorder.memory_refusals, 1);
         }
     }
     access_request(runtime, request, active.listener,
@@ -555,20 +635,20 @@ fun observe_end(context: ptr, active: *call.Call, complete: bool) {
 
 # report the QUIC runtime's running total of Retry tokens refused at the replay
 # bound, which a full store turns into dropped Initials the client retransmits
-pub fun quic_replay_full(runtime: *Runtime, total: u64) {
-    if (runtime == nil || total <= runtime.replay_full_seen) { ret; }
-    if (runtime.metrics_enabled) {
-        telemetry_metrics.counter_add(?runtime.metrics, runtime.replay_full,
-            total - runtime.replay_full_seen);
+pub fun quic_replay_full(recorder: *Recorder, total: u64) {
+    if (recorder == nil || total <= recorder.replay_full_seen) { ret; }
+    if (recorder.runtime.metrics_enabled) {
+        telemetry_metrics.counter_add(?recorder.metrics, recorder.replay_full,
+            total - recorder.replay_full_seen);
     }
-    runtime.replay_full_seen = total;
+    recorder.replay_full_seen = total;
 }
 
-fun report_rise(runtime: *Runtime, token: telemetry_metrics.Token, total: u64,
+fun report_rise(recorder: *Recorder, token: telemetry_metrics.Token, total: u64,
     seen: *u64) {
     if (total <= @seen) { ret; }
-    if (runtime.metrics_enabled) {
-        telemetry_metrics.counter_add(?runtime.metrics, token, total - @seen);
+    if (recorder.runtime.metrics_enabled) {
+        telemetry_metrics.counter_add(?recorder.metrics, token, total - @seen);
     }
     @seen = total;
 }
@@ -605,50 +685,50 @@ fun arrival_class_name(class: usize) str {
     ret "other";
 }
 
-fun register_arrival_classes(runtime: *Runtime) bool {
+fun register_arrival_classes(recorder: *Recorder) bool {
     var class: usize = 0;
     for (class < ARRIVAL_CLASSES) {
         var label: [1]telemetry_metrics.LabelView = [1]telemetry_metrics.LabelView{
             telemetry_metrics.LabelView{key: "class", value: arrival_class_name(class)}
         };
-        if (!telemetry_metrics.register(?runtime.metrics, telemetry_metrics.COUNTER,
+        if (!telemetry_metrics.register(?recorder.metrics, telemetry_metrics.COUNTER,
             "hedge_quic_arrivals_dropped_total", ?label[0], 1, nil, 0,
-            ?runtime.arrivals_dropped[class])) { ret false; }
+            ?recorder.arrivals_dropped[class])) { ret false; }
         class = class + 1;
     }
     ret true;
 }
 
-pub fun quic_handshakes(runtime: *Runtime, report: HandshakeReport) {
-    if (runtime == nil) { ret; }
-    if (runtime.metrics_enabled) {
-        telemetry_metrics.gauge_set(?runtime.metrics, runtime.handshakes_in_flight,
+pub fun quic_handshakes(recorder: *Recorder, report: HandshakeReport) {
+    if (recorder == nil) { ret; }
+    if (recorder.runtime.metrics_enabled) {
+        telemetry_metrics.gauge_set(?recorder.metrics, recorder.handshakes_in_flight,
             report.in_flight::i64);
-        telemetry_metrics.gauge_set(?runtime.metrics, runtime.quic_connections,
+        telemetry_metrics.gauge_set(?recorder.metrics, recorder.quic_connections,
             report.connections::i64);
-        telemetry_metrics.gauge_set(?runtime.metrics, runtime.handshake_service_ns,
+        telemetry_metrics.gauge_set(?recorder.metrics, recorder.handshake_service_ns,
             report.service_ns::i64);
-        telemetry_metrics.gauge_set(?runtime.metrics, runtime.handshake_finish_ns,
+        telemetry_metrics.gauge_set(?recorder.metrics, recorder.handshake_finish_ns,
             report.finish_ns::i64);
     }
-    report_rise(runtime, runtime.handshakes_deferred, report.deferred,
-        ?runtime.handshakes_deferred_seen);
-    report_rise(runtime, runtime.handshakes_promoted, report.promoted,
-        ?runtime.handshakes_promoted_seen);
-    report_rise(runtime, runtime.handshakes_completed, report.completed,
-        ?runtime.handshakes_completed_seen);
-    report_rise(runtime, runtime.handshakes_dropped, report.dropped,
-        ?runtime.handshakes_dropped_seen);
-    report_rise(runtime, runtime.handshakes_refused, report.refused,
-        ?runtime.handshakes_refused_seen);
-    report_rise(runtime, runtime.handshakes_expired, report.expired,
-        ?runtime.handshakes_expired_seen);
-    report_rise(runtime, runtime.retries_dropped, report.retries_dropped,
-        ?runtime.retries_dropped_seen);
+    report_rise(recorder, recorder.handshakes_deferred, report.deferred,
+        ?recorder.handshakes_deferred_seen);
+    report_rise(recorder, recorder.handshakes_promoted, report.promoted,
+        ?recorder.handshakes_promoted_seen);
+    report_rise(recorder, recorder.handshakes_completed, report.completed,
+        ?recorder.handshakes_completed_seen);
+    report_rise(recorder, recorder.handshakes_dropped, report.dropped,
+        ?recorder.handshakes_dropped_seen);
+    report_rise(recorder, recorder.handshakes_refused, report.refused,
+        ?recorder.handshakes_refused_seen);
+    report_rise(recorder, recorder.handshakes_expired, report.expired,
+        ?recorder.handshakes_expired_seen);
+    report_rise(recorder, recorder.retries_dropped, report.retries_dropped,
+        ?recorder.retries_dropped_seen);
     var class: usize = 0;
     for (class < ARRIVAL_CLASSES) {
-        report_rise(runtime, runtime.arrivals_dropped[class],
-            report.arrivals_dropped[class], ?runtime.arrivals_dropped_seen[class]);
+        report_rise(recorder, recorder.arrivals_dropped[class],
+            report.arrivals_dropped[class], ?recorder.arrivals_dropped_seen[class]);
         class = class + 1;
     }
 }
@@ -663,21 +743,21 @@ fun lane_name(lane: usize) str {
     ret "request";
 }
 
-fun register_lanes(runtime: *Runtime) bool {
+fun register_lanes(recorder: *Recorder) bool {
     var lane: usize = 0;
     for (lane < LANE_COUNT) {
         var label: [1]telemetry_metrics.LabelView = [1]telemetry_metrics.LabelView{
             telemetry_metrics.LabelView{key: "lane", value: lane_name(lane)}
         };
-        if (!telemetry_metrics.register(?runtime.metrics, telemetry_metrics.GAUGE,
+        if (!telemetry_metrics.register(?recorder.metrics, telemetry_metrics.GAUGE,
             "hedge_memory_held_bytes", ?label[0], 1, nil, 0,
-            ?runtime.memory_held[lane])
-            || !telemetry_metrics.register(?runtime.metrics, telemetry_metrics.COUNTER,
+            ?recorder.memory_held[lane])
+            || !telemetry_metrics.register(?recorder.metrics, telemetry_metrics.COUNTER,
             "hedge_memory_refusals_total", ?label[0], 1, nil, 0,
-            ?runtime.memory_refused[lane])
-            || !telemetry_metrics.register(?runtime.metrics, telemetry_metrics.COUNTER,
+            ?recorder.memory_refused[lane])
+            || !telemetry_metrics.register(?recorder.metrics, telemetry_metrics.COUNTER,
             "hedge_memory_timeouts_total", ?label[0], 1, nil, 0,
-            ?runtime.memory_timeouts[lane])) { ret false; }
+            ?recorder.memory_timeouts[lane])) { ret false; }
         lane = lane + 1;
     }
     ret true;
@@ -688,51 +768,53 @@ fun rise(total: u64, seen: u64) u64 {
     ret total - seen;
 }
 
-# report a worker pool's running totals, so each report adds only the rise.
-# a refusal is any acquire the lane could not fund, whether or not it waited
-pub fun timers(runtime: *Runtime, claimed: usize, armed: usize) {
-    if (runtime == nil || !runtime.metrics_enabled) { ret; }
-    telemetry_metrics.gauge_set(?runtime.metrics, runtime.timers_claimed, claimed::i64);
-    telemetry_metrics.gauge_set(?runtime.metrics, runtime.timers_armed, armed::i64);
+# report a worker's timer wheel: the entries claimed and those armed
+pub fun timers(recorder: *Recorder, claimed: usize, armed: usize) {
+    if (recorder == nil || !recorder.runtime.metrics_enabled) { ret; }
+    telemetry_metrics.gauge_set(?recorder.metrics, recorder.timers_claimed, claimed::i64);
+    telemetry_metrics.gauge_set(?recorder.metrics, recorder.timers_armed, armed::i64);
 }
 
-pub fun memory(runtime: *Runtime, pool: hedge_memory.Snapshot, refused_connections: u64) {
-    if (runtime == nil) { ret; }
-    if (runtime.metrics_enabled) {
+# report a worker pool's running totals, so each report adds only the rise.
+# a refusal is any acquire the lane could not fund, whether or not it waited
+pub fun memory(recorder: *Recorder, pool: hedge_memory.Snapshot, refused_connections: u64) {
+    if (recorder == nil) { ret; }
+    if (recorder.runtime.metrics_enabled) {
         var lane: usize = 0;
         for (lane < LANE_COUNT) {
             val now:  hedge_memory.LaneCounters  = pool.lanes[lane];
-            val seen: *hedge_memory.LaneCounters = ?runtime.memory_seen[lane];
-            telemetry_metrics.gauge_set(?runtime.metrics, runtime.memory_held[lane],
+            val seen: *hedge_memory.LaneCounters = ?recorder.memory_seen[lane];
+            telemetry_metrics.gauge_set(?recorder.metrics, recorder.memory_held[lane],
                 now.held::i64);
             val refused: u64 = rise(now.refusals + now.exhausted,
                 seen.refusals + seen.exhausted);
             if (refused != 0) {
-                telemetry_metrics.counter_add(?runtime.metrics,
-                    runtime.memory_refused[lane], refused);
+                telemetry_metrics.counter_add(?recorder.metrics,
+                    recorder.memory_refused[lane], refused);
             }
             val timeouts: u64 = rise(now.timeouts, seen.timeouts);
             if (timeouts != 0) {
-                telemetry_metrics.counter_add(?runtime.metrics,
-                    runtime.memory_timeouts[lane], timeouts);
+                telemetry_metrics.counter_add(?recorder.metrics,
+                    recorder.memory_timeouts[lane], timeouts);
             }
             lane = lane + 1;
         }
-        val connections: u64 = rise(refused_connections, runtime.refused_memory_seen);
+        val connections: u64 = rise(refused_connections, recorder.refused_memory_seen);
         if (connections != 0) {
-            telemetry_metrics.counter_add(?runtime.metrics, runtime.refused_connections,
+            telemetry_metrics.counter_add(?recorder.metrics, recorder.refused_connections,
                 connections);
         }
     }
-    runtime.memory_seen = pool.lanes;
-    if (refused_connections > runtime.refused_memory_seen) {
-        runtime.refused_memory_seen = refused_connections;
+    recorder.memory_seen = pool.lanes;
+    if (refused_connections > recorder.refused_memory_seen) {
+        recorder.refused_memory_seen = refused_connections;
     }
 }
 
-pub fun observer(runtime: *Runtime) call.Observer {
-    if (runtime == nil || !runtime.initialized) { ret call.no_observer(); }
-    ret call.Observer{ctx: runtime::ptr, begin: observe_begin, end: observe_end};
+pub fun observer(recorder: *Recorder) call.Observer {
+    if (recorder == nil || !recorder.live || recorder.runtime == nil
+        || !recorder.runtime.initialized) { ret call.no_observer(); }
+    ret call.Observer{ctx: recorder::ptr, begin: observe_begin, end: observe_end};
 }
 
 pub fun begin_ready(runtime: *Runtime) bool {
@@ -971,12 +1053,12 @@ test "telemetry: QUIC replay refusals are counted once each" {
         ?checks[0], 2, nil, test_auth, nil, test_render, test_render,
         nil, (0::usize)::FlushFun)) { ret 1; }
     # the runtime reports a running total, so a repeated total adds nothing
-    quic_replay_full(?runtime, 3);
-    quic_replay_full(?runtime, 3);
-    quic_replay_full(?runtime, 5);
+    quic_replay_full(?runtime.own, 3);
+    quic_replay_full(?runtime.own, 3);
+    quic_replay_full(?runtime.own, 5);
     var sampled: telemetry_metrics.Sample;
-    if (!telemetry_metrics.sample(?runtime.metrics, runtime.replay_full, ?sampled)) { ret 2; }
-    if (sampled.value != 5)                                                         { ret (10 + sampled.value)::i32; }
+    if (!telemetry_metrics.sample(?runtime.own.metrics, runtime.own.replay_full, ?sampled)) { ret 2; }
+    if (sampled.value != 5)                                                                 { ret (10 + sampled.value)::i32; }
     ret 0;
 }
 
@@ -995,13 +1077,13 @@ test "telemetry: the live QUIC connection gauge follows each report" {
         nil, (0::usize)::FlushFun)) { ret 1; }
     var report: HandshakeReport;
     report.connections = 3445;
-    quic_handshakes(?runtime, report);
+    quic_handshakes(?runtime.own, report);
     var sampled: telemetry_metrics.Sample;
-    if (!telemetry_metrics.sample(?runtime.metrics, runtime.quic_connections, ?sampled)
+    if (!telemetry_metrics.sample(?runtime.own.metrics, runtime.own.quic_connections, ?sampled)
         || sampled.signed_value != 3445) { ret 2; }
     report.connections = 0;
-    quic_handshakes(?runtime, report);
-    if (!telemetry_metrics.sample(?runtime.metrics, runtime.quic_connections, ?sampled)
+    quic_handshakes(?runtime.own, report);
+    if (!telemetry_metrics.sample(?runtime.own.metrics, runtime.own.quic_connections, ?sampled)
         || sampled.signed_value != 0) { ret 3; }
     ret 0;
 }
@@ -1025,19 +1107,19 @@ test "telemetry: pool lanes report held bytes and add only the rise in refusals"
     pool.lanes[io].refusals  = 1;
     pool.lanes[io].exhausted = 2;
     pool.lanes[io].timeouts  = 1;
-    memory(?runtime, pool, 2);
-    memory(?runtime, pool, 2);
+    memory(?runtime.own, pool, 2);
+    memory(?runtime.own, pool, 2);
     pool.lanes[io].held     = 0;
     pool.lanes[io].timeouts = 3;
-    memory(?runtime, pool, 5);
+    memory(?runtime.own, pool, 5);
     var sampled: telemetry_metrics.Sample;
-    if (!telemetry_metrics.sample(?runtime.metrics, runtime.memory_held[io], ?sampled)
+    if (!telemetry_metrics.sample(?runtime.own.metrics, runtime.own.memory_held[io], ?sampled)
         || sampled.signed_value != 0) { ret 2; }
-    if (!telemetry_metrics.sample(?runtime.metrics, runtime.memory_refused[io], ?sampled)
+    if (!telemetry_metrics.sample(?runtime.own.metrics, runtime.own.memory_refused[io], ?sampled)
         || sampled.value != 3) { ret 3; }
-    if (!telemetry_metrics.sample(?runtime.metrics, runtime.memory_timeouts[io], ?sampled)
+    if (!telemetry_metrics.sample(?runtime.own.metrics, runtime.own.memory_timeouts[io], ?sampled)
         || sampled.value != 3) { ret 4; }
-    if (!telemetry_metrics.sample(?runtime.metrics, runtime.refused_connections, ?sampled)
+    if (!telemetry_metrics.sample(?runtime.own.metrics, runtime.own.refused_connections, ?sampled)
         || sampled.value != 5) { ret 5; }
     ret 0;
 }

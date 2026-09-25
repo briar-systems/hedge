@@ -34,7 +34,7 @@ enough that a shutdown with a peer still holding a request open reaches the
 deadline within the life of a test.
 
 `cache-disabled.toml` and `cache-enabled.toml` differ only in cache activation.
-The runner observes the disabled process through `/proc`: it has one thread, no
+The runner observes the disabled process through `/proc`: it has one thread per serving worker and one for the supervisor, no
 timer descriptor, no descriptor for the configured cache root, and no cache
 arena in its virtual memory footprint.
 

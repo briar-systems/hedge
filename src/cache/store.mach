@@ -274,10 +274,17 @@ pub fun make(store: *Store, entries: *Entry, capacity: usize, body: *u8,
 # a disk-backed store keeps large representations outside the memory budget.
 # the root is purged of what a killed process left in it before disk placement
 # is used, and that purge is a request like every other disk operation.
-pub fun attach_disk(store: *Store, root_path: str, scratch: *allocator.Allocator) bool {
+# the root's requests run on `executor` (`disk.inline(?store.disk)` runs them
+# on the submitting thread), which is installed before the purge
+pub fun attach_disk(store: *Store, root_path: str, scratch: *allocator.Allocator,
+    executor: disk.Executor) bool {
     if (store == nil || !store.live || store.has_root || root_path == nil) { ret false; }
     if (store.limits.disk_bytes == 0 || scratch == nil)                    { ret false; }
     if (!disk.open(?store.disk, root_path, scratch))                       { ret false; }
+    if (!disk.use_executor(?store.disk, executor)) {
+        disk.close(?store.disk);
+        ret false;
+    }
     store.purge    = disk.idle();
     store.purge.op = disk.PURGE;
     val submitted: disk.Submitted = disk.submit(?store.disk, ?store.purge);
@@ -814,6 +821,12 @@ fun reject(shard: *Shard) Writer {
     ret no_writer();
 }
 
+# refuse a disk writer whose stream was already admitted
+fun reject_stream(store: *Store, shard: *Shard) Writer {
+    disk.leave(?store.disk);
+    ret reject(shard);
+}
+
 # open an entry for writing, evicting until it fits or refusing outright
 pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
     metadata: policy.Metadata, code: status.Status, declared_length: usize,
@@ -837,6 +850,9 @@ pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
     }
     or {
         if (declared_length > disk_budget(shard)) { ret reject(shard); }
+        # the executor's bound: a disk writer is one stream of writes, and a
+        # refused stream is a response not stored (#286)
+        if (!disk.admit(?store.disk)) { ret reject(shard); }
         reap(shard);
         var flushed: bool = false;
         for (shard.disk_used + declared_length > disk_budget(shard)) {
@@ -844,15 +860,18 @@ pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
             # would make room, its removal is submitted and taken back. a
             # removal still in flight after that refuses the admission
             if (shard.disk_used - leaving(shard) + declared_length <= disk_budget(shard)) {
-                if (flushed) { ret reject(shard); }
+                if (flushed) { ret reject_stream(store, shard); }
                 flush(shard);
                 flushed = true;
             }
-            or (!evict_one(shard)) { ret reject(shard); }
+            or (!evict_one(shard)) { ret reject_stream(store, shard); }
         }
     }
     val index: usize = free_slot(shard);
-    if (index == NO_ENTRY) { ret reject(shard); }
+    if (index == NO_ENTRY) {
+        if (chosen == ON_DISK) { ret reject_stream(store, shard); }
+        ret reject(shard);
+    }
     val entry: *Entry = ?shard.entries[index];
     entry.state            = WRITING;
     entry.placement        = chosen;
@@ -1008,6 +1027,7 @@ pub fun commit(writer: *Writer) bool {
     if (writer == nil || !writer.active || writer.pending) { ret false; }
     val shard: *Shard = writer.shard;
     writer.active = false;
+    if (writer.placement == ON_DISK) { disk.leave(?writer.store.disk); }
     lock(shard);
     val entry: *Entry = ?shard.entries[writer.index];
     entry.body_length = writer.written;
@@ -1028,6 +1048,7 @@ pub fun abandon(writer: *Writer) bool {
     if (writer == nil || !writer.active || writer.pending) { ret false; }
     val shard: *Shard = writer.shard;
     writer.active = false;
+    if (writer.placement == ON_DISK) { disk.leave(?writer.store.disk); }
     lock(shard);
     discard(shard, writer.index);
     shard.partial_discards = shard.partial_discards + 1;
@@ -1538,7 +1559,7 @@ fun disk_fixture(fixture: *Fixture, root: str, disk_bytes: usize) bool {
     if (!make(?fixture.store, ?fixture.entries[0], 8, ?fixture.body[0], TEST_BODY, limits, 1)) {
         ret false;
     }
-    ret attach_disk(?fixture.store, root, ?fixture.scratch);
+    ret attach_disk(?fixture.store, root, ?fixture.scratch, disk.inline(?fixture.store.disk));
 }
 
 fun store_disk_entry(fixture: *Fixture, name: str, payload: str, length: usize) bool {
@@ -1801,6 +1822,20 @@ test "cache store: a refused disk write leaves no visible entry" {
 rec Held {
     disk:    *disk.Disk;
     request: *disk.Request;
+    streams: usize;
+    limit:   usize;
+}
+
+fun admit_held(context: ptr) bool {
+    val held: *Held = context::*Held;
+    if (held.streams >= held.limit) { ret false; }
+    held.streams = held.streams + 1;
+    ret true;
+}
+
+fun leave_held(context: ptr) {
+    val held: *Held = context::*Held;
+    held.streams = held.streams - 1;
 }
 
 fun submit_held(context: ptr, request: *disk.Request) disk.Submitted {
@@ -1824,8 +1859,9 @@ fun run_held(held: *Held) bool {
 test "cache store: queued disk requests hold what they name until they complete" {
     var fixture: Fixture;
     if (!disk_fixture(?fixture, "out/cache-disk-queued", 10)) { ret 1; }
-    var held: Held = Held{disk: ?fixture.store.disk, request: nil};
-    disk.use_executor(?fixture.store.disk, disk.Executor{ctx: (?held)::ptr, submit: submit_held});
+    var held: Held = Held{disk: ?fixture.store.disk, request: nil, streams: 0, limit: 1};
+    disk.use_executor(?fixture.store.disk, disk.Executor{ctx: (?held)::ptr, submit: submit_held,
+        admit: admit_held, leave: leave_held});
     var identity: key.Key;
     make_key(?identity, "a");
     var dimensions: key.Dimensions;
@@ -1837,7 +1873,7 @@ test "cache store: queued disk requests hold what they name until they complete"
     if (commit(?writer) || abandon(?writer) || !write_pending(?writer))              { ret 4; }
     if (settle_write(?writer) != WRITE_PENDING)                                      { ret 5; }
     if (!run_held(?held) || settle_write(?writer) != WRITE_DONE || !commit(?writer)) { ret 6; }
-    if (!found(?fixture.store, "a"))                                                 { ret 7; }
+    if (!found(?fixture.store, "a") || held.streams != 0)                            { ret 7; }
     var pinned:   Pin          = pin_key(?fixture.store, "a");
     var request:  disk.Request = disk.idle();
     var output:   [8]u8;
@@ -1852,6 +1888,12 @@ test "cache store: queued disk requests hold what they name until they complete"
     # the file is not yet gone, so its bytes still count against the disk bound
     if (totals(?fixture.store).disk_bytes != 4 || found(?fixture.store, "a")) { ret 12; }
     if (!run_held(?held) || totals(?fixture.store).disk_bytes != 0)           { ret 13; }
+    # a full executor refuses the stream, and the response is not stored
+    held.limit = 0;
+    make_key(?identity, "b");
+    val refused: Writer = begin(?fixture.store, ?identity, ?dimensions, policy.blank(),
+        status.OK, 4, ON_DISK);
+    if (refused.active || held.streams != 0 || totals(?fixture.store).rejections != 1) { ret 15; }
     disk.use_executor(?fixture.store.disk, disk.inline(?fixture.store.disk));
     if (!close(?fixture.store)) { ret 14; }
     ret 0;
@@ -2077,7 +2119,7 @@ fun open_shared(shared: *Shared, disk_root: str) bool {
     if (!ensure_dir("out") || !ensure_dir(disk_root) || !page_ok(page.make(?shared.scratch))) {
         ret false;
     }
-    ret attach_disk(?shared.store, disk_root, ?shared.scratch);
+    ret attach_disk(?shared.store, disk_root, ?shared.scratch, disk.inline(?shared.store.disk));
 }
 
 fun shared_run(disk_root: str) i32 {

@@ -1,0 +1,301 @@
+# where an accepted connection is served, when one worker accepts for all
+#
+# a listener that reuseport cannot spread (a local socket, or TCP where the
+# kernel does not balance reuseport groups) is accepted by one worker, which
+# hands each connection to the least loaded worker. the board is what that
+# choice reads: one load count per worker, each on its own cache line so a
+# worker counting its own connections does not stall the others.
+#
+# a connection is charged to a worker when it is routed there and discharged
+# when that worker lets it go, so a burst of arrivals the target has not yet
+# taken still counts against it and the next arrival goes elsewhere.
+#
+# a reload publishes the new listeners one worker at a time, the accepting
+# worker first. a connection accepted under the new generation can only be
+# served by a worker that has published it, so each lane also carries the
+# generation its worker serves and a choice only considers workers on the
+# acceptor's generation.
+#
+# the connection itself travels as an `Arrival`: the socket detached from the
+# acceptor's driver, posted to the target's inbox, and adopted by the target's
+# driver. an arrival nobody adopts owns its socket, and whoever gives up on it
+# closes it.
+
+use hedge.allowance;
+use hedge.config.schema;
+use A:        std.allocator;
+use io_error: std.io.error;
+use std.io.lifecycle;
+use net_async:   std.net.async;
+use local_async: std.net.async.local;
+use std.net.ip;
+use local_socket: std.net.local;
+use std.net.tcp;
+use std.sync.atomic;
+use std.sync.channel;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+# one worker's load and the listener generation it serves, alone on a 64-byte
+# line. generation 0 is a worker that serves none yet
+#[align(64)]
+rec Lane {
+    load:       i64;
+    generation: i64;
+    pad:        [6]i64;
+}
+
+# the most arrivals waiting on one worker. an acceptor that finds the inbox
+# full serves the connection itself
+pub val INBOX_CAPACITY: usize = 256;
+
+# a connection accepted by one worker for another
+# ---
+# generation:     the listener generation it was accepted under
+# listener_index: the listener it arrived on
+# transport:      schema.TRANSPORT_TCP or schema.TRANSPORT_LOCAL
+# tcp, local:     the detached socket, of the transport's kind
+pub rec Arrival {
+    generation:     u64;
+    listener_index: usize;
+    transport:      u8;
+    has_peer:       bool;
+    peer:           ip.Endpoint;
+    tcp:            net_async.Detached;
+    local:          local_async.Detached;
+}
+
+rec Inbox {
+    channel: channel.Channel[Arrival];
+    storage: [INBOX_CAPACITY]Arrival;
+}
+
+# the board and the inboxes live as long as the process, not as any worker: an
+# acceptor may post to a worker that is stopping, and finds its inbox closed
+pub rec Board {
+    count: usize;
+    # where the next search starts, so ties spread instead of piling on worker 0
+    next:    i64;
+    wakers:  *allowance.Wakers;
+    heap:    *A.Allocator;
+    inboxes: *Inbox;
+    lanes:   [allowance.MAX_WORKERS]Lane;
+}
+
+# a board for `count` workers. `heap` holds one inbox per worker until
+# destroy_board, and a nil heap is a board that routes nothing (a unit test)
+pub fun make_board(board: *Board, heap: *A.Allocator, wakers: *allowance.Wakers, count: usize) bool {
+    if (board == nil || count == 0 || count > allowance.MAX_WORKERS) { ret false; }
+    if (wakers != nil && wakers.count != count)                      { ret false; }
+    board.count   = count;
+    board.wakers  = wakers;
+    board.heap    = heap;
+    board.inboxes = nil;
+    atomic.store(?board.next, 0);
+    var i: usize = 0;
+    for (i < allowance.MAX_WORKERS) {
+        atomic.store(?board.lanes[i].load, 0);
+        atomic.store(?board.lanes[i].generation, 0);
+        i = i + 1;
+    }
+    if (heap == nil || count == 1) { ret true; }
+    val made: res[*Inbox, A.Error] = A.allocate[Inbox](heap, count);
+    if (sel made.err) { ret false; }
+    board.inboxes = made.ok;
+    i             = 0;
+    for (i < count) {
+        val inbox:        *Inbox            = ?board.inboxes[i];
+        val made_channel: channel.Operation = channel.make[Arrival](?inbox.channel, ?inbox.storage[0], INBOX_CAPACITY);
+        if (sel made_channel.err) {
+            A.deallocate[Inbox](heap, board.inboxes, count);
+            board.inboxes = nil;
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every worker has stopped and closed its inbox
+pub fun destroy_board(board: *Board) {
+    if (board == nil || board.inboxes == nil) { ret; }
+    var i: usize = 0;
+    for (i < board.count) {
+        channel.close[Arrival](?board.inboxes[i].channel);
+        channel.destroy[Arrival](?board.inboxes[i].channel);
+        i = i + 1;
+    }
+    A.deallocate[Inbox](board.heap, board.inboxes, board.count);
+    board.inboxes = nil;
+}
+
+# whether connections can move between workers at all
+pub fun routes(board: *Board) bool {
+    ret board != nil && board.inboxes != nil;
+}
+
+# hand `arrival` to `worker` and wake it. refused when its inbox is full or
+# closed, and the arrival still owns its socket
+pub fun post(board: *Board, worker: usize, arrival: Arrival) bool {
+    if (!routes(board) || worker >= board.count) { ret false; }
+    val status: channel.Status[Arrival] = channel.try_send[Arrival](?board.inboxes[worker].channel, arrival);
+    if (!(sel status.sent)) { ret false; }
+    wake(board, worker);
+    ret true;
+}
+
+# the next arrival waiting on `worker`
+pub fun take(board: *Board, worker: usize, output: *Arrival) bool {
+    if (!routes(board) || worker >= board.count || output == nil) { ret false; }
+    val status: channel.Status[Arrival] = channel.try_receive[Arrival](?board.inboxes[worker].channel);
+    if (sel status.received) {
+        @output = status.received;
+        ret true;
+    }
+    ret false;
+}
+
+# `worker` takes no more arrivals. what is already waiting is still taken
+pub fun close_inbox(board: *Board, worker: usize) {
+    if (!routes(board) || worker >= board.count) { ret; }
+    channel.close[Arrival](?board.inboxes[worker].channel);
+}
+
+# close the socket of an arrival nobody will adopt, false when the close failed
+# and the descriptor is lost
+pub fun abandon(arrival: *Arrival) bool {
+    if (arrival == nil) { ret true; }
+    var closed: err[io_error.Error];
+    if (arrival.transport == schema.TRANSPORT_TCP) {
+        closed = tcp.stream_close(?arrival.tcp.stream);
+    }
+    or {
+        closed = local_socket.stream_close(?arrival.local.stream, lifecycle.ABORTIVE);
+    }
+    ret sel closed.ok;
+}
+
+# one more connection routed to `worker`
+pub fun charge(board: *Board, worker: usize) bool {
+    if (board == nil || worker >= board.count) { ret false; }
+    atomic.fetch_add(?board.lanes[worker].load, 1);
+    ret true;
+}
+
+# one connection `worker` was charged for is gone, served or refused
+pub fun discharge(board: *Board, worker: usize) bool {
+    if (board == nil || worker >= board.count) { ret false; }
+    val before: i64 = atomic.fetch_sub(?board.lanes[worker].load, 1);
+    if (before <= 0) {
+        # a discharge without its charge is a bookkeeping bug, and the count is
+        # put back rather than left to steer every later choice
+        atomic.fetch_add(?board.lanes[worker].load, 1);
+        ret false;
+    }
+    ret true;
+}
+
+pub fun load(board: *Board, worker: usize) i64 {
+    if (board == nil || worker >= board.count) { ret 0; }
+    ret atomic.load(?board.lanes[worker].load);
+}
+
+# `worker` now serves listener `generation`
+pub fun publish(board: *Board, worker: usize, generation: u64) bool {
+    if (board == nil || worker >= board.count || generation > 0x7fffffffffffffff) { ret false; }
+    atomic.store(?board.lanes[worker].generation, generation::i64);
+    ret true;
+}
+
+# the worker on `generation` with the fewest connections, or `from` (the
+# acceptor) when no worker is. the loads are read one at a time while others
+# move them, so the answer is a good choice, not an exact one
+pub fun least_loaded(board: *Board, from: usize, generation: u64) usize {
+    if (board == nil || board.count <= 1 || generation == 0 || generation > 0x7fffffffffffffff) { ret from; }
+    val wanted:    i64   = generation::i64;
+    val start:     usize = (atomic.fetch_add(?board.next, 1)::u64 % board.count::u64)::usize;
+    var best:      usize = from;
+    var best_load: i64   = 0;
+    var found:     bool  = false;
+    var step:      usize = 0;
+    for (step < board.count) {
+        val index: usize = (start + step) % board.count;
+        step = step + 1;
+        if (atomic.load(?board.lanes[index].generation) != wanted) { cnt; }
+        val current: i64 = atomic.load(?board.lanes[index].load);
+        if (!found || current < best_load) {
+            best      = index;
+            best_load = current;
+            found     = true;
+            if (best_load <= 0) { brk; }
+        }
+    }
+    ret best;
+}
+
+# the target has work waiting: end its wait so it takes the connection now
+pub fun wake(board: *Board, worker: usize) bool {
+    if (board == nil || worker >= board.count) { ret false; }
+    ret allowance.wake(board.wakers, worker);
+}
+
+test "handoff.board: the least loaded worker is chosen and ties rotate" {
+    var board: Board;
+    if (!make_board(?board, nil, nil, 3)) { ret 1; }
+    # nothing published: the acceptor keeps what it accepted
+    if (least_loaded(?board, 0, 1) != 0)                                            { ret 2; }
+    if (!publish(?board, 0, 1) || !publish(?board, 1, 1) || !publish(?board, 2, 1)) { ret 3; }
+    # all idle: successive choices start at successive workers
+    if (least_loaded(?board, 0, 1) != 1 || least_loaded(?board, 0, 1) != 2 || least_loaded(?board, 0, 1) != 0) { ret 4; }
+    charge(?board, 0);
+    charge(?board, 0);
+    charge(?board, 1);
+    if (least_loaded(?board, 0, 1) != 2) { ret 5; }
+    charge(?board, 2);
+    charge(?board, 2);
+    if (least_loaded(?board, 0, 1) != 1)                                        { ret 6; }
+    if (!discharge(?board, 0) || !discharge(?board, 0) || load(?board, 0) != 0) { ret 7; }
+    if (least_loaded(?board, 0, 1) != 0)                                        { ret 8; }
+    # an unmatched discharge is refused and leaves the count alone
+    if (discharge(?board, 0) || load(?board, 0) != 0) { ret 9; }
+    if (charge(?board, 3) || discharge(?board, 3))    { ret 10; }
+    ret 0;
+}
+
+test "handoff.board: only workers on the acceptor's generation are chosen" {
+    var board: Board;
+    if (!make_board(?board, nil, nil, 3)) { ret 1; }
+    publish(?board, 0, 2);
+    publish(?board, 1, 1);
+    publish(?board, 2, 1);
+    # the acceptor published generation 2 first and is the only worker on it,
+    # however loaded it is
+    charge(?board, 0);
+    charge(?board, 0);
+    var i: usize = 0;
+    for (i < 6) {
+        if (least_loaded(?board, 0, 2) != 0) { ret 2; }
+        i = i + 1;
+    }
+    publish(?board, 2, 2);
+    if (least_loaded(?board, 0, 2) != 2) { ret 3; }
+    # a worker still on generation 1 is not a choice for generation 2
+    if (least_loaded(?board, 0, 2) == 1) { ret 4; }
+    ret 0;
+}
+
+test "handoff.board: a board sized unlike its wakers is refused" {
+    var wakers: allowance.Wakers;
+    if (!allowance.make_wakers(?wakers, 2)) { ret 1; }
+    var board: Board;
+    if (make_board(?board, nil, ?wakers, 3))                                                        { ret 2; }
+    if (!make_board(?board, nil, ?wakers, 2))                                                       { ret 3; }
+    if (make_board(?board, nil, nil, 0) || make_board(?board, nil, nil, allowance.MAX_WORKERS + 1)) { ret 4; }
+    # nothing registered yet: a wake has no runtime to end
+    if (wake(?board, 1)) { ret 5; }
+    ret 0;
+}

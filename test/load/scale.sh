@@ -161,6 +161,9 @@ mappings() {
 # long enough that nothing is retired while it is being counted. an admin
 # listener serves the metrics the release check reads.
 export HEDGE_ADMIN_TOKEN=scale-secret
+# every term below was measured on one worker. each worker holds tables and a
+# buffer pool of its own, so these cells fix one and leave the cost of more
+# to the multi-core cells
 start_scale_server() {
     write_config "$work/scale.toml" \
         "max_connections_per_peer = $((large * 2))
@@ -184,7 +187,7 @@ metrics = true
 enabled = true
 listener = \"admin\"
 auth_secret = \"admin-token\"
-max_response_bytes = 8192"
+max_response_bytes = 8192" 1
     start_hedge "$work/scale.toml"
 }
 
@@ -567,7 +570,7 @@ depth_served() {
 measure_depth() {
     local connections
     write_config "$work/depth.toml" "max_connections_per_peer = 64" \
-        "$DEPTH_CLEARTEXT_PORT" "$DEPTH_SECURE_PORT" "$DEPTH_QUIC_PORT"
+        "$DEPTH_CLEARTEXT_PORT" "$DEPTH_SECURE_PORT" "$DEPTH_QUIC_PORT" "" "" 1
     start_hedge "$work/depth.toml"
     connections="$(depth_h3 depth-default)"
     depth_served "$connections" "$work/depth-default.out" overlap
@@ -578,7 +581,7 @@ measure_depth() {
     # the same two requests are served one after the other
     write_config "$work/depth-one.toml" "max_connections_per_peer = 64
 connection_memory_bytes = $ONE_REQUEST_BYTES" \
-        "$DEPTH_CLEARTEXT_PORT" "$DEPTH_SECURE_PORT" "$DEPTH_QUIC_PORT"
+        "$DEPTH_CLEARTEXT_PORT" "$DEPTH_SECURE_PORT" "$DEPTH_QUIC_PORT" "" "" 1
     start_hedge "$work/depth-one.toml"
     connections="$(depth_h3 depth-one)"
     depth_served "$connections" "$work/depth-one.out" serial

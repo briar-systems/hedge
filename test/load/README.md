@@ -16,7 +16,9 @@ mach build . --profile release
 `HEDGE_BINARY` qualifies a different build. `LOAD_QUIC_SERVED=0` skips the
 assertions that HTTP/3 transfers were served, leaving admission and refusal
 checked. `LOAD_CONNECTIONS` and `LOAD_TARGET` change the shape of the TCP load, `LOAD_QUIC_CONNECTIONS` and `LOAD_QUIC_RATE`
-the QUIC load. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
+the QUIC load. `LOAD_CACHE=memory` puts the cache in front of the content, and
+`LOAD_CACHE=disk` also keeps the large body on disk, so any lane can be run with the
+cache on. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
 and releases every server and client on every exit path. The QUIC cells use the
 system `curl` when it is built with HTTP/3, and otherwise fetch a pinned static
 build into `.tools/`.
@@ -25,8 +27,10 @@ build into `.tools/`.
 
 Each of `LOAD_CONNECTIONS` workers owns one connection and issues requests on it
 back to back. The run stops as soon as the median connection has completed
-`LOAD_TARGET` requests, and then every connection must have completed at least
-half of that median.
+`LOAD_TARGET` requests (40 by default), and then every connection must have
+completed at least half of that median. The target outlasts the ramp: hedge's
+workers take their first connections at different moments, which over a
+handful of requests spreads the counts on its own.
 
 The verdict is a ratio taken inside a single run, never a duration. A slow
 machine moves every connection's count together and the ratio does not move, so
@@ -335,9 +339,9 @@ as on an idle one. The rate does not, because the client shares the cores.
 list such as `1 2 4 8`, it runs every cell once per count with
 `server.workers` set to that count, and asserts that each rate at N workers
 reaches `LOAD_RATE_EFFICIENCY` (0.7) of N over the first count times the
-first count's rate, up to the host's core count. `server.workers` arrives
-with #173, so until then the lane runs the server's default and asserts only
-that every operation succeeds. The lane binds ports 19140 to 19142.
+first count's rate, up to the host's core count. With it empty the lane runs
+the server's default worker count and asserts only that every operation
+succeeds. The lane binds ports 19140 to 19142.
 
 ## The ramp lane
 

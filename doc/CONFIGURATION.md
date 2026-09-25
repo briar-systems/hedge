@@ -83,6 +83,46 @@ The implemented schema accepts these top-level sections:
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
+## Workers
+
+hedge runs a supervisor and one worker per CPU. The supervisor takes the
+signals, reloads the configuration, drives ACME and maintains the TLS policies.
+Each worker serves connections on a thread of its own, with its own io runtime,
+listeners, timers, buffer pool and proxy pools.
+
+```toml
+[server]
+name = "example"
+workers = 8
+pin_workers = true
+```
+
+- `server.workers` is how many workers serve. It defaults to one per CPU the
+  process may run on, and a process runs at most 256.
+- `server.pin_workers` pins worker `i` to the `i`th CPU the process may run on.
+  It defaults to true. Where pinning is unsupported or refused, the workers run
+  unpinned and startup says so once. A single worker is never pinned.
+- Both are fixed at startup, so a reload that changes either is refused.
+
+How connections reach the workers depends on what the platform can do:
+
+- On Linux every worker binds its own socket for each TCP listener with
+  `SO_REUSEPORT`, and the kernel spreads connections across them.
+- Elsewhere, and for local listeners, the first worker accepts and hands each
+  connection to the least loaded worker serving the same configuration. A
+  worker whose queue of handed connections is full is passed over, and the
+  first worker serves the connection itself.
+- A QUIC listener is served by the first worker until connection IDs route
+  datagrams across workers (#174).
+
+The caps stay process-wide. `max_connections`, `max_handshakes` and every
+budget's `concurrency` and `memory_bytes` are held as per-worker allowances
+drawn in batches from one shared pool, so the total never exceeds the cap. A
+worker can refuse while another holds allowance it is not using, which is
+bounded by the worker count times the batch. The per-peer caps are counted
+across every worker. `server.limits.memory_bytes` sizes each worker's buffer
+pool.
+
 ## TLS policies
 
 A `tls` policy names the credentials one listener serves. The single-pair form
@@ -276,7 +316,8 @@ read and write buffers, and each request's parsed head. Nothing is reserved per
 connection up front. Each connection instead opens an account on the pool with
 a budget, and borrows against it as it needs memory.
 
-- `server.limits.memory_bytes` is the pool's total budget. It defaults to
+- `server.limits.memory_bytes` is the pool's total budget, for each worker's
+  pool. It defaults to
   `max_connections` connections' worth, or 256 connections' worth when
   `max_connections` is not set.
 - `server.limits.connection_memory_bytes` is what one connection may hold. It
@@ -555,6 +596,8 @@ Caching is off by default and is opted into twice: once for the process with `ca
 Size `entries` against the authorities clients actually use, not against the number of routes. A cache key includes the scheme and the authority the request carried, so one representation is stored once per name it is reached by. A host declaring three names holds three entries for the same file if clients use all three, and a `*.example.com` host holds one entry per distinct subdomain requested rather than one for the wildcard. `Vary` multiplies again on top of that, once per distinct combination of selecting values. None of this is visible from the route count, and running out of entries evicts rather than fails, so an undersized `entries` shows up as a hit rate that quietly falls instead of an error.
 
 A representation larger than a quarter of the memory budget goes to disk when `disk_bytes` and `disk_root` are set. Cache file names come from an internal counter and never from request data. A graceful shutdown removes every file the store wrote; starting up removes any file a killed process left behind, so the disk bound holds across a crash. Only names the store's own counter could have produced are removed.
+
+Every worker serves from the one cache. With a disk root the process starts one store thread that runs every disk read, write and removal for all of them, so no serving worker waits on the disk. A worker hands a request to it and serves other connections until the answer comes back. The store thread's queue is bounded at 64 bodies read or written at once. When it is full, a request that would be a disk hit goes to the origin as a miss, and a response that would be written to disk is served without being stored. A disk hit reads its first 16 KiB before the response starts, so a slow or full disk never cuts a response short. Shutdown waits for the queue to drain, giving up once `timeouts.stop_ms` passes with no request completing, and then names every request still outstanding.
 
 `heuristic_percent` is the fraction of a representation's age at its `Last-Modified` that a response with no explicit freshness may be assumed fresh for, capped at one day. It defaults to zero, which means a response that states no freshness of its own is not stored.
 

@@ -149,7 +149,8 @@ resolve_h3_curl() {
 # fetches the body over HTTP/3 once per transfer at `rate`, each transfer
 # under its own authority so curl opens a connection for it rather than
 # multiplexing, and prints one line per transfer: status, bytes, version,
-# connect and total time
+# connect and total time. the bound covers a 60 s connect timeout and a 64 s
+# transfer after it
 curl_h3() {
     local port="$1" count="$2" name="$3" rate="$4"
     shift 4
@@ -161,7 +162,7 @@ curl_h3() {
     done
     "$h3curl" --parallel --parallel-immediate --parallel-max "$count" \
         --http3-only --insecure --connect-to "::127.0.0.1:$port" \
-        --max-time 120 --limit-rate "$rate" \
+        --max-time 180 --limit-rate "$rate" \
         --write-out '%{http_code} %{size_download} %{http_version} %{time_appconnect} %{time_total}\n' \
         "$@" --config "$config"
 }
@@ -206,6 +207,12 @@ prepare_load() {
     mkdir -p "$work/content"
     head -c "$BODY_BYTES" /dev/urandom > "$work/content/body"
     head -c "$SMALL_BYTES" /dev/urandom > "$work/content/small"
+    if [ -n "${LOAD_CACHE:-}" ]; then
+        # old enough that the heuristic freshness write_config enables reaches
+        # its one-day cap, so every body is stored after its first request
+        touch -d "2000-01-01" "$work/content/body" "$work/content/small"
+        mkdir -p "$work/cache"
+    fi
 
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -sha256 -days 1 -nodes \
@@ -225,11 +232,39 @@ prepare_load() {
 # per-peer limit is always raised to the global one or past the load. the
 # optional sixth argument is the body of a [server.timeouts] table, and the
 # optional seventh is appended whole (an admin listener, telemetry).
+# `workers`, when given, fixes the worker count; otherwise one serves per CPU
 write_config() {
-    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}"
+    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}" workers="${8:-}"
+    local cache_service="" cache_table="" cache_memory=$((BODY_BYTES * 4))
+    # LOAD_CACHE=memory caches the content in memory. LOAD_CACHE=disk halves the
+    # memory budget so the large body (past a quarter of it) is kept on disk and
+    # the small one in memory. either way the cache is in front of every request
+    case "${LOAD_CACHE:-}" in
+        "") ;;
+        memory|disk)
+            if [ "$LOAD_CACHE" = disk ]; then cache_memory=$((BODY_BYTES * 2)); fi
+            cache_service="cache = true"
+            cache_table="[cache]
+enabled = true
+memory_bytes = $cache_memory
+max_entry_bytes = $((BODY_BYTES * 2))
+entries = 64
+heuristic_percent = 10"
+            if [ "$LOAD_CACHE" = disk ]; then
+                cache_table="$cache_table
+disk_bytes = $((BODY_BYTES * 16))
+disk_root = \"$work/cache\""
+            fi
+            ;;
+        *)
+            echo "LOAD_CACHE is memory, disk or unset, not $LOAD_CACHE"
+            exit 1
+            ;;
+    esac
     cat > "$path" <<EOF
 [server]
 name = "load"
+${workers:+workers = $workers}
 
 [server.limits]
 $limits
@@ -279,12 +314,15 @@ names = ["localhost", "*.load.test"]
 [service.body]
 kind = "static"
 root = "$work/content"
+$cache_service
 
 [[route]]
 name = "body"
 host = "site"
 path = "/**"
 service = "body"
+
+$cache_table
 
 $extra
 EOF
