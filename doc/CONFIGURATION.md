@@ -601,6 +601,8 @@ Every worker serves from the one cache. With a disk root the process starts one 
 
 `heuristic_percent` is the fraction of a representation's age at its `Last-Modified` that a response with no explicit freshness may be assumed fresh for, capped at one day. It defaults to zero, which means a response that states no freshness of its own is not stored.
 
+A cache key has at most one fill in flight, whichever `Vary` representation it is for. Until a response is stored, every request for it misses and is answered by the origin, and only the first of those is recorded: the rest are served without being stored. An entry being written cannot be evicted, so recording every concurrent miss of one popular key would crowd the store and evict other keys, most of all while a slow disk holds the writes. The cache does not merge those misses into one origin request.
+
 Hedge is a shared cache. `private`, `no-store`, `Vary: *`, an authorized request without an explicit invitation, and a `206 Partial Content` are all refused. A response carrying `Set-Cookie` is refused unless the origin named that field in a qualified `private="set-cookie"` or `no-cache="set-cookie"`, in which case the field is dropped and the rest of the representation is stored. Fields a qualified directive names are never stored, and hop-by-hop fields never cross into an entry.
 
 A stored entry answers a request only when every field named by the response's `Vary` holds the same value it held for the request that produced the entry. A conditional request and a single byte range are both answered out of the store without reaching the service.
