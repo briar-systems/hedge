@@ -14,6 +14,11 @@
 #
 # stop drains the queue. it gives up once its timeout passes with no request
 # completing, and `outstanding` then names what is still queued or running.
+#
+# the worker keeps time on a clock of its own: stop's timeout and a slow disk's
+# delay are both measured on it. in service that is the monotonic clock, and a
+# test hands it a manual one it moves itself, so no scheduling delay can reach
+# a deadline the test depends on.
 
 use hedge.cache.disk;
 use hedge.clock;
@@ -24,9 +29,11 @@ use std.chrono.time;
 use std.filesystem;
 use io_error:   std.io.error;
 use io_runtime: std.io.runtime;
+use std.sync.atomic;
 use std.sync.condition;
 use std.sync.mutex;
 use std.sync.thread;
+use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -34,6 +41,58 @@ use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+
+# the clock a worker keeps time on: `now` reads it, and `advance` lets `ns`
+# pass on it, returning once they have
+pub rec Clock {
+    ctx:     ptr;
+    now:     fun(ptr) time.Instant;
+    advance: fun(ptr, u64);
+}
+
+# a clock only its owner moves, for tests. it reads zero until advanced
+pub rec ManualClock {
+    now_ns: i64;
+}
+
+# the monotonic clock, on which advancing sleeps
+pub fun monotonic() Clock {
+    ret Clock{ctx: nil, now: monotonic_now, advance: monotonic_advance};
+}
+
+fun monotonic_now(context: ptr) time.Instant {
+    ret clock.instant();
+}
+
+fun monotonic_advance(context: ptr, ns: u64) {
+    val deadline: time.Instant = clock.after(clock.instant(), ns);
+    var left:     u64          = ns;
+    for (left != 0) {
+        os.sleep(left::i64);
+        left = clock.between_ns(clock.instant(), deadline);
+    }
+}
+
+pub fun manual_clock() ManualClock {
+    ret ManualClock{now_ns: 0};
+}
+
+# `source` as a worker's clock, which advancing moves at once
+pub fun manual(source: *ManualClock) Clock {
+    ret Clock{ctx: (source)::ptr, now: manual_now, advance: manual_advance};
+}
+
+pub fun manual_ns(source: *ManualClock) u64 {
+    ret atomic.load(?source.now_ns)::u64;
+}
+
+fun manual_now(context: ptr) time.Instant {
+    ret clock.from_ns(manual_ns(context::*ManualClock));
+}
+
+fun manual_advance(context: ptr, ns: u64) {
+    atomic.fetch_add(?(context::*ManualClock).now_ns, ns::i64);
+}
 
 # a request stop could not drain, and whether it was running or still queued
 pub rec Outstanding {
@@ -62,8 +121,9 @@ pub rec Worker {
     unwoken:       u64;
     stopping:      bool;
     exited:        bool;
+    clock:         Clock;
     # fault injection for tests: a paused worker runs nothing until resumed,
-    # and a delay is added before every request it runs
+    # and a delay passes on its clock before every request it runs
     paused:   bool;
     delay_ns: u64;
     thread:   thread.Thread;
@@ -84,6 +144,7 @@ pub fun idle() Worker {
     worker.unwoken      = 0;
     worker.stopping     = false;
     worker.exited       = false;
+    worker.clock        = monotonic();
     worker.paused       = false;
     worker.delay_ns     = 0;
     worker.live         = false;
@@ -161,13 +222,6 @@ fun copy_name(request: *disk.Request, output: *u8) usize {
     ret i;
 }
 
-# hold the lock until `deadline` passes, however often the wait is woken
-fun wait_out(worker: *Worker, deadline: time.Instant) {
-    for (clock.between_ns(clock.instant(), deadline) != 0) {
-        condition.wait_until(?worker.work, ?worker.lock, deadline);
-    }
-}
-
 fun run_worker(argument: *u8) {
     val worker: *Worker = argument::*Worker;
     mutex.lock(?worker.lock);
@@ -184,8 +238,10 @@ fun run_worker(argument: *u8) {
         worker.running       = true;
         worker.running_op    = request.op;
         worker.running_bytes = copy_name(request, ?worker.running_name[0]);
-        if (worker.delay_ns != 0) { wait_out(worker, clock.after(clock.instant(), worker.delay_ns)); }
+        val delay_ns: u64   = worker.delay_ns;
+        val keeper:   Clock = worker.clock;
         mutex.unlock(?worker.lock);
+        if (delay_ns != 0) { keeper.advance(keeper.ctx, delay_ns); }
         disk.run(worker.target, request);
         # the request is its submitter's once this returns, so nothing here
         # reads it afterwards
@@ -202,26 +258,32 @@ fun run_worker(argument: *u8) {
 }
 
 # admit no more streams, drain what is queued and join the thread. false once
-# `timeout_ns` passes with no request completing: the thread is left running
-# what it holds, and `outstanding` names it
+# `timeout_ns` passes on the worker's clock with no request completing: the
+# thread is left running what it holds, and `outstanding` names it
 pub fun stop(worker: *Worker, timeout_ns: u64) bool {
     if (worker == nil || !worker.live) { ret true; }
     mutex.lock(?worker.lock);
     worker.stopping = true;
     condition.broadcast(?worker.work);
+    val keeper:   Clock        = worker.clock;
     var seen:     u64          = worker.completed;
-    var deadline: time.Instant = clock.after(clock.instant(), timeout_ns);
+    var deadline: time.Instant = clock.after(keeper.now(keeper.ctx), timeout_ns);
     for (!worker.exited) {
         # with nothing left the thread is on its way out, which no timeout cuts
         if (worker.head == nil && !worker.running) {
             condition.wait(?worker.settled, ?worker.lock);
         }
-        or { condition.wait_until(?worker.settled, ?worker.lock, deadline); }
+        or {
+            # the wait sleeps on the monotonic clock for what the worker's
+            # clock has left, and the deadline is judged on the worker's
+            val left: u64 = clock.between_ns(keeper.now(keeper.ctx), deadline);
+            condition.wait_until(?worker.settled, ?worker.lock, clock.after(clock.instant(), left));
+        }
         if (worker.completed != seen) {
             seen     = worker.completed;
-            deadline = clock.after(clock.instant(), timeout_ns);
+            deadline = clock.after(keeper.now(keeper.ctx), timeout_ns);
         }
-        or (!worker.exited && clock.between_ns(clock.instant(), deadline) == 0) {
+        or (!worker.exited && clock.between_ns(keeper.now(keeper.ctx), deadline) == 0) {
             mutex.unlock(?worker.lock);
             ret false;
         }
@@ -300,7 +362,17 @@ pub fun resume(worker: *Worker) {
     mutex.unlock(?worker.lock);
 }
 
-# add `delay_ns` before every request, for tests of a slow disk
+# keep the worker's time on `source`, for tests that move time themselves.
+# set before anything is submitted or stopped
+pub fun keep_time(worker: *Worker, source: Clock) {
+    if (worker == nil || !worker.live) { ret; }
+    mutex.lock(?worker.lock);
+    worker.clock = source;
+    mutex.unlock(?worker.lock);
+}
+
+# let `delay_ns` pass on the worker's clock before every request, for tests of
+# a slow disk
 pub fun slow_down(worker: *Worker, delay_ns: u64) {
     if (worker == nil || !worker.live) { ret; }
     mutex.lock(?worker.lock);
@@ -416,7 +488,11 @@ test "store worker: stop drains a slow queue and names what a paused one holds" 
     if (!open_disk(?target, "out/store-worker-stop", ?pages)) { ret 1; }
     var worker: Worker = idle();
     if (!start(?worker, ?target, 4, 4) || !disk.use_executor(?target, executor(?worker))) { ret 2; }
-    slow_down(?worker, 100000000);
+    # each request takes 150 ms on the worker's clock, which moves only when a
+    # request does, so the margin under the timeout is exact whatever the load
+    var ticks: ManualClock = manual_clock();
+    keep_time(?worker, manual(?ticks));
+    slow_down(?worker, 150000000);
     var writes: [3]disk.Request;
     writes[0] = request_for(disk.WRITE, "slow-0", "x"::*u8, 1);
     writes[1] = request_for(disk.WRITE, "slow-1", "x"::*u8, 1);
@@ -434,6 +510,7 @@ test "store worker: stop drains a slow queue and names what a paused one holds" 
         if (!disk.done(?writes[i]) || !writes[i].ok) { ret 5; }
         i = i + 1;
     }
+    if (manual_ns(?ticks) != 450000000) { ret 14; }
     var held: Worker = idle();
     if (!start(?held, ?target, 4, 4) || !disk.use_executor(?target, executor(?held))) { ret 6; }
     pause(?held);
