@@ -181,6 +181,50 @@ check "HTTP/3 request body" 200 \
         --resolve api.example.com:9443:127.0.0.1 \
         --data-binary @"$work/upload.bin" https://api.example.com:9443/echo)"
 
+# a request target whose percent escape is broken is not a URI: every protocol
+# answers it 400, in the path and in the query, and never serves or drops it
+for target in '/hel%ZZlo' '/hello?q=%ZZ' '/hello?q=%4'; do
+    check "cleartext HTTP/1.1 answers 400 to $target" 400 \
+        "$(curl_code --http1.1 -H 'Host: localhost' "http://127.0.0.1:9080$target")"
+    check "cleartext HTTP/2 answers 400 to $target" 400 \
+        "$(curl_code --http2-prior-knowledge -H 'Host: localhost' "http://127.0.0.1:9080$target")"
+    for version in http1.1 http2 http3-only; do
+        check "TLS $version answers 400 to $target" 400 \
+            "$(curl_code --$version --cacert $fixtures/root.pem \
+                --resolve api.example.com:9443:127.0.0.1 "https://api.example.com:9443$target")"
+    done
+done
+
+# HTTP/1.1 cannot find the next request after a head it could not parse, so the
+# 400 says the connection closes, the request behind it is never answered, and
+# the server closes: the client reads end of stream, not a timeout
+rejected="$(timeout 15 python3 - <<'PY'
+import socket
+s = socket.create_connection(('127.0.0.1', 9080), timeout=10)
+s.sendall(b'GET /hello?q=%ZZ HTTP/1.1\r\nHost: localhost\r\n\r\n'
+          b'GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n')
+s.settimeout(5)
+out, ending = b'', 'open'
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            ending = 'closed'
+            break
+        out += chunk
+except (socket.timeout, TimeoutError):
+    pass
+except ConnectionResetError:
+    ending = 'reset'
+s.close()
+head = out.split(b'\r\n', 1)[0].decode('latin-1')
+close = int(b'\r\nconnection: close\r\n' in out.lower())
+print(f"{head}/{close}/{out.count(b'HTTP/1.1 ')}/{ending}")
+PY
+)"
+check "HTTP/1.1 answers a malformed head 400, says close, reads nothing after it, and closes" \
+    "HTTP/1.1 400 Bad Request/1/1/closed" "$rejected"
+
 timeout 30 curl -sS --http3-only --cacert $fixtures/root.pem \
     --resolve api.example.com:9443:127.0.0.1 -o "$work/h3-large" \
     https://api.example.com:9443/files/large.txt >/dev/null 2>&1
