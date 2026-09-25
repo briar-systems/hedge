@@ -339,11 +339,12 @@ counts rather than figures:
   network driver, which is as high as the peak, and it stays pending after the
   load leaves. std's tables give back only chunks with nothing live in them, so
   a few parked accepts kept every chunk up to the peak. Each time the
-  connection count halves, the listener now cancels an accept whose slot is
-  past twice the runtime's live operations and arms it again in the lowest
-  free slot. On the same lane a server keeps 4,358,144 bytes after 100k and
-  4,022,272 after 10k, against 92,733,440 and 4,022,272 before, and both
-  after-release checks pass at 10k against 100k.
+  connection count halves, the listener now cancels an accept that
+  `io_runtime.pins_capacity` says keeps such a chunk, serves any connection it
+  had already taken, and arms it again in the lowest free slot. On the same
+  lane a server keeps 4,395,008 bytes after 100k and 4,055,040 after 10k,
+  against 92,737,440 and 4,022,272 before, and both after-release checks pass
+  at 10k against 100k.
 - QUIC at 30k: 12,652 connections were still live 15 s after their clients
   closed them, which is #274's socket-drop shape at the close.
 - QUIC at 50k: the host swapped hedge's pages out. The lane now counts
