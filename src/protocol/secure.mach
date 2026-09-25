@@ -36,6 +36,7 @@ use hedge.config.schema;
 use hedge.listener;
 use hedge.memory;
 use hedge.protocol.tls;
+use hedge_socket: hedge.socket;
 use hedge.storage;
 use hedge_wake:     hedge.wake;
 use http_transport: http.core.transport;
@@ -46,8 +47,6 @@ use io_error: std.io.error;
 use std.io.lifecycle;
 use io_runtime: std.io.runtime;
 use std.memory.buffers;
-use net_async: std.net.async;
-use std.net.tcp;
 use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -141,8 +140,7 @@ pub rec Channel {
     handshake_error:   tls_error.Error;
     peer_closed:       bool;
     lower_eof:         bool;
-    driver:            *net_async.Driver;
-    socket:            *tcp.Stream;
+    socket:            *hedge_socket.Socket;
     context:           listener.ConnectionContext;
     owner:             ptr;
     staged:            StagedFun;
@@ -227,7 +225,6 @@ fun reset_channel(value: *Channel, h: Handle) {
     value.handshake_error   = tls_error.OK;
     value.peer_closed       = false;
     value.lower_eof         = false;
-    value.driver            = nil;
     value.socket            = nil;
     value.owner             = nil;
     value.staged            = (0::usize)::StagedFun;
@@ -354,10 +351,9 @@ pub fun release(h: Handle) bool {
 
 # --- the byte transport below TLS ---
 
-fun lower_resource(value: *Channel) usize {
-    if (value.socket == nil) { ret 0; }
-    ret value.socket.handle.value;
-}
+# a staged completion settles at once and was never submitted on the socket,
+# so it names no resource
+val STAGED_RESOURCE: usize = 0;
 
 fun completion_context(value: *Channel) usize {
     ret (?value.context)::usize;
@@ -370,14 +366,14 @@ fun deliver_staged(value: *Channel, scope: *cancel.Scope, buffer: *u8,
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.WOULD_BLOCK, io_error.OP_READ)};
     }
     val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
-        value.driver.runtime, scope,
-        io_runtime.Operation{kind: io_runtime.READ, resource: lower_resource(value),
+        value.socket.runtime, scope,
+        io_runtime.Operation{kind: io_runtime.READ, resource: STAGED_RESOURCE,
         buffer:  buffer, length: length, offset: 0,
         context: completion_context(value)});
     if (sel submitted.err) { ret submitted; }
     val token: io_runtime.Token = submitted.ok;
-    if (!runtime_ok(io_runtime.complete(value.driver.runtime,
-        token, count, lower_resource(value), false))) {
+    if (!runtime_ok(io_runtime.complete(value.socket.runtime,
+        token, count, STAGED_RESOURCE, false))) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
     }
     ret submitted;
@@ -390,7 +386,7 @@ fun staged_left(value: *Channel) bool {
 fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
-    if (value == nil || value.driver == nil || value.socket == nil) {
+    if (value == nil || value.socket == nil) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
     }
     if (value.staged::usize != 0 && length != 0) {
@@ -398,39 +394,39 @@ fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
             value, scope, buffer, length);
         if (sel staged.ok) { ret staged; }
     }
-    ret net_async.submit_read(value.driver, scope, value.socket, buffer, length,
+    ret hedge_socket.submit_read(value.socket, scope, buffer, length,
         completion_context(value));
 }
 
 fun lower_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
-    if (value == nil || value.driver == nil || value.socket == nil) {
+    if (value == nil || value.socket == nil) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WRITE)};
     }
-    ret net_async.submit_write(value.driver, scope, value.socket, buffer, length,
+    ret hedge_socket.submit_write(value.socket, scope, buffer, length,
         completion_context(value));
 }
 
 fun lower_shutdown(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
-    if (value == nil || value.driver == nil || value.socket == nil) {
+    if (value == nil || value.socket == nil) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_SHUTDOWN)};
     }
-    ret net_async.submit_shutdown_write(value.driver, scope, value.socket,
+    ret hedge_socket.submit_shutdown_write(value.socket, scope,
         completion_context(value));
 }
 
 fun lower_close(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val value: *Channel = context::*Channel;
-    if (value == nil || value.driver == nil || value.socket == nil) {
+    if (value == nil || value.socket == nil) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)};
     }
     # the argument is the close mode, not a cause: the cause constant selected
     # a graceful shutdown-write whose completion the TLS close never accepts
-    ret net_async.submit_stream_close(value.driver, scope, value.socket,
+    ret hedge_socket.submit_close(value.socket, scope,
         lifecycle.ABORTIVE, completion_context(value));
 }
 
@@ -447,16 +443,12 @@ fun lower_aliases(context: ptr, data: *u8, len: usize) bool {
     val value: *Channel = context::*Channel;
     if (value == nil || data == nil || len == 0)                { ret false; }
     if (overlaps((value)::usize, $size_of(Channel), data, len)) { ret true; }
-    if (value.socket != nil
-        && overlaps((value.socket)::usize, $size_of(tcp.Stream), data, len)) {
-        ret true;
-    }
-    ret value.driver != nil && io_runtime.aliases(value.driver.runtime, data, len);
+    ret value.socket != nil && hedge_socket.aliases(value.socket, data, len);
 }
 
 fun lower_transport(value: *Channel) tls_transport.Transport {
     var descriptor: tls_transport.Transport;
-    descriptor.runtime         = value.driver.runtime;
+    descriptor.runtime         = value.socket.runtime;
     descriptor.context         = (value)::ptr;
     descriptor.context_size    = $size_of(Channel);
     descriptor.aliases_state   = lower_aliases;
@@ -674,8 +666,8 @@ fun start_readable(h: Handle) {
         ret;
     }
     if (value.readable_waiting) { ret; }
-    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_readable(
-        value.driver, slot.scope, value.socket, completion_context(value));
+    val submitted: res[io_runtime.Token, io_error.Error] = hedge_socket.submit_readable(
+        value.socket, slot.scope, completion_context(value));
     if (sel submitted.err) {
         fail_pending(value, KIND_READABLE, tls_error.INTERNAL_ERROR);
         ret;
@@ -862,8 +854,8 @@ pub fun adapter(h: Handle) http_transport.Adapter {
     value.submit_write          = adapter_write;
     value.submit_shutdown_write = adapter_shutdown;
     value.submit_close          = adapter_close;
-    if (!claimed_index(h) || channel_at(h).driver == nil) { ret value; }
-    value.runtime = channel_at(h).driver.runtime;
+    if (!claimed_index(h) || channel_at(h).socket == nil) { ret value; }
+    value.runtime = channel_at(h).socket.runtime;
     value.context = (channel_at(h))::ptr;
     ret value;
 }
@@ -880,14 +872,13 @@ pub fun channel(h: Handle) *Channel {
 # the prologue already read, the memory its buffers come from, and who is woken
 # when the channel has work. `borrower` and `account` are the connection's, and
 # the account must stay open until the session is released
-pub fun attach(h: Handle, driver: *net_async.Driver, socket: *tcp.Stream,
+pub fun attach(h: Handle, socket: *hedge_socket.Socket,
     owner: ptr, staged: StagedFun, borrower: *memory.Borrower,
     account: *buffers.Account, waker: hedge_wake.Waker) bool {
     prepare(h.table);
-    if (!claimed_index(h) || driver == nil || socket == nil || borrower == nil
+    if (!claimed_index(h) || socket == nil || borrower == nil
         || account == nil || !account.open || !hedge_wake.valid(?waker)) { ret false; }
     channel_at(h).waker   = waker;
-    channel_at(h).driver  = driver;
     channel_at(h).socket  = socket;
     channel_at(h).owner   = owner;
     channel_at(h).staged  = staged;
@@ -915,7 +906,7 @@ pub fun begin(h: Handle, policy: *tls.Policy, connection: *cancel.Scope,
     handshake: *cancel.Scope) bool {
     prepare(h.table);
     if (!claimed_index(h) || policy == nil || !policy.live
-        || channel_at(h).driver == nil || channel_at(h).account == nil
+        || channel_at(h).socket == nil || channel_at(h).account == nil
         || connection == nil || handshake == nil) { ret false; }
     val value: *Channel = channel_at(h);
     value.state             = IDLE;
