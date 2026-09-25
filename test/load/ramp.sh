@@ -42,31 +42,8 @@ start_ramp_server() {
 memory_bytes = $((count * 4 * 1048576))" \
         "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
         "keep_alive_ms = 900000" \
-        "[[listener]]
-name = \"admin\"
-address = \"127.0.0.1:$ADMIN_PORT\"
-protocols = [\"http/1.1\"]
-
-[secret.admin-token]
-provider = \"env\"
-key = \"HEDGE_ADMIN_TOKEN\"
-
-[telemetry]
-metrics = true
-
-[admin]
-enabled = true
-listener = \"admin\"
-auth_secret = \"admin-token\"
-max_response_bytes = 8192"
+        "$(admin_config)"
     start_hedge "$work/ramp.toml"
-}
-
-metric() {
-    curl -sS -H "Authorization: Bearer $HEDGE_ADMIN_TOKEN" \
-        "http://127.0.0.1:$ADMIN_PORT/metrics" \
-        | awk -v name="$1" '$1 == name { print $2; found = 1 }
-            END { if (!found) print "missing" }'
 }
 
 # the kernel's per-socket drop counter for the QUIC listener

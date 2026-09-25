@@ -123,23 +123,7 @@ ONE_REQUEST_BYTES=262144
 prepare_load
 if ! resolve_h3load; then exit 1; fi
 
-# a resident set under transparent huge pages counts 2 MiB for the first byte
-# touched in each aligned region and moves as khugepaged collapses pages, so
-# the figures would carry the kernel's policy rather than hedge's footprint.
-# the served process runs with them disabled (PR_SET_THP_DISABLE, inherited
-# across exec), which is what the figures below assume.
-launcher=(python3 -c 'import ctypes, os, sys
-ctypes.CDLL(None, use_errno=True).prctl(41, 1, 0, 0, 0)
-os.execv(sys.argv[1], sys.argv[1:])')
-
-# resident bytes of the served process, from the kernel's own rollup, with
-# whatever of it the kernel has swapped out counted back in: under memory
-# pressure a page hedge touched can leave the resident set without leaving
-# hedge's footprint, and a figure that fell for that reason would read as a
-# smaller per-connection cost
-resident() {
-    awk '/^(Rss|Swap):/ { sum += $2 } END { printf "%d", sum * 1024 }' "/proc/$hedge_pid/smaps_rollup"
-}
+thp_off
 
 # the part of that the kernel had swapped out, printed beside each transport
 swapped() {
@@ -171,54 +155,8 @@ memory_bytes = $((large * 4 * 1048576))" \
         "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
         "keep_alive_ms = 900000
 drain_ms = 5000" \
-        "[[listener]]
-name = \"admin\"
-address = \"127.0.0.1:$ADMIN_PORT\"
-protocols = [\"http/1.1\"]
-
-[secret.admin-token]
-provider = \"env\"
-key = \"HEDGE_ADMIN_TOKEN\"
-
-[telemetry]
-metrics = true
-
-[admin]
-enabled = true
-listener = \"admin\"
-auth_secret = \"admin-token\"
-max_response_bytes = 8192" 1
+        "$(admin_config)" 1
     start_hedge "$work/scale.toml"
-}
-
-# a metric's value from the admin listener, or `missing`
-metric() {
-    curl -sS -H "Authorization: Bearer $HEDGE_ADMIN_TOKEN" \
-        "http://127.0.0.1:$ADMIN_PORT/metrics" \
-        | awk -v name="$1" '$1 == name { print $2; found = 1 }
-            END { if (!found) print "missing" }'
-}
-
-# waits up to RELEASE_WAIT seconds for hedge to hold no QUIC connection and
-# prints the last count read. a QUIC connection the peer closed is kept through
-# its draining period (RFC 9000 section 10.2, mach-quic's 3 s drain timeout)
-# before it is released, so a sample taken on a fixed delay after release can
-# measure connections still draining rather than what they left behind
-RELEASE_WAIT=15
-quic_released() {
-    local live
-    for _ in $(seq $((RELEASE_WAIT * 10))); do
-        live="$(metric hedge_quic_connections)"
-        if [ "$live" = 0 ]; then break; fi
-        sleep 0.1
-    done
-    echo "$live"
-    test "$live" = 0
-}
-
-# the sockets the served process has open
-sockets() {
-    find "/proc/$hedge_pid/fd" -lname 'socket:*' 2>/dev/null | wc -l
 }
 
 # every descriptor the served process has open
@@ -253,22 +191,6 @@ idle_cpu() {
     before="$(cpu_ns)"
     sleep "$window"
     echo $(( $(cpu_ns) - before ))
-}
-
-# waits up to RELEASE_WAIT seconds for hedge to have no more sockets open than
-# `idle` and prints the last count read. a TCP or TLS connection whose peer
-# closed is retired once hedge sees the close (TLS after its close_notify
-# exchange), and its socket is closed as it goes, so the count falling back to
-# the idle one is every connection having left
-sockets_released() {
-    local idle="$1" open
-    for _ in $(seq $((RELEASE_WAIT * 10))); do
-        open="$(sockets)"
-        if [ "$open" -le "$idle" ]; then break; fi
-        sleep 0.1
-    done
-    echo "$open"
-    test "$open" -le "$idle"
 }
 
 # the loopback source address the next holder binds, so no two holders of
