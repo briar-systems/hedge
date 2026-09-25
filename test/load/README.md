@@ -433,7 +433,7 @@ leave behind. An earlier form of the cell compared the peaks of the two
 halves of one run under load. It failed one of the two CI attempts on
 b163699 (+5.3 MiB against the 4 MiB margin). On two cores of a Ryzen 7
 5800X3D (`taskset -c 0,1`) at 100 a second, one run in seven stepped by
-10 MiB under load while the client never had more than two connections
+8.6 MiB under load while the client never had more than two connections
 open, so the step was not a backlog of connections.
 
 CI runs 60 s at the default rates, and allows 50% of CPU drift because the
