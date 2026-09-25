@@ -22,8 +22,9 @@ has not been run yet.
 Hedge serves from one worker thread per CPU, but a QUIC listener is served by
 the first worker alone. That worker's QUIC receive path drops datagrams past
 about 10,000 a second, which 10,000 connections sending one keep-alive a second
-reach. A `transport = "local"` listener accepts connections, then resets each
-one without serving it. The comparison against Caddy in
+reach. A `transport = "local"` listener is served like a TCP one: the first
+worker accepts and hands each connection to the least loaded worker, and no
+load lane measures that handoff yet. The comparison against Caddy in
 [`doc/bench`](doc/bench/COMPARISON.md) measured hedge 0.2.1, before the TLS
 handshake cost fell from about half a second of CPU to milliseconds and before
 serving moved to a worker per CPU. It has not been run since, so it does not
