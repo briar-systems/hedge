@@ -287,6 +287,10 @@ func churn(o *options) int {
 	defer cancel()
 	total := &tally{}
 	var missed atomic.Int64
+	// connections open at once, and the most since the last sample: a server
+	// that keeps up holds about rate times latency, one that falls behind a
+	// backlog that grows
+	var inFlight, peak atomic.Int64
 	jobs := make(chan struct{})
 	var workers sync.WaitGroup
 	for i := 0; i < o.connections; i++ {
@@ -295,7 +299,12 @@ func churn(o *options) int {
 			defer workers.Done()
 			for range jobs {
 				started := time.Now()
-				if err := churnOnce(ctx, o); err != nil {
+				now := inFlight.Add(1)
+				for seen := peak.Load(); now > seen && !peak.CompareAndSwap(seen, now); seen = peak.Load() {
+				}
+				err := churnOnce(ctx, o)
+				inFlight.Add(-1)
+				if err != nil {
 					total.fail(err)
 					continue
 				}
@@ -316,9 +325,11 @@ func churn(o *options) int {
 	end := time.After(o.duration)
 	offered := int64(0)
 	printSample := func() {
-		fmt.Printf("%s: sample t=%.1f offered=%d ok=%d failed=%d missed=%d server_cpu=%.2f rss=%d\n",
+		current := inFlight.Load()
+		fmt.Printf("%s: sample t=%.1f offered=%d ok=%d failed=%d missed=%d in_flight=%d in_flight_peak=%d server_cpu=%.2f rss=%d\n",
 			o.label, time.Since(started).Seconds(), offered, total.ok.Load(),
-			total.failed.Load(), missed.Load(), cpuSeconds(o), residentBytes(o))
+			total.failed.Load(), missed.Load(), current, peak.Swap(current),
+			cpuSeconds(o), residentBytes(o))
 	}
 	printSample()
 loop:
