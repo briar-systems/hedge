@@ -88,8 +88,20 @@ phase_cost() {
         }' "$1"
 }
 
+# the QUIC listener's socket over one phase of the h3 cell (its drops and
+# receive-queue peak): h3_mark opens the phase and h3_phase prints it, after
+# `prefix` when one is given. a TCP or TLS cell has no one socket to read, so
+# both print nothing for it
+h3_mark() {
+    if [ "$1" = h3 ]; then socket_mark "$QUIC_PORT"; fi
+}
+h3_phase() {
+    if [ "$1" = h3 ]; then echo "${3:-}$(socket_phase "$QUIC_PORT" "$2")"; fi
+}
+
 churn() {
     local protocol="$1" rate="$2" address idle half status rest1 rest2 cost1 cost2
+    local mark socket1 socket2
     address="127.0.0.1:$SECURE_PORT"
     if [ "$protocol" = h3 ]; then address="127.0.0.1:$QUIC_PORT"; fi
     if [ "$protocol" = h1 ]; then address="127.0.0.1:$CLEARTEXT_PORT"; fi
@@ -99,18 +111,24 @@ churn() {
     start_hedge "$work/churn.toml"
     idle="$(sockets)"
     half=$((seconds / 2))
+    if [ "$protocol" = h3 ]; then start_socket_sampler "$QUIC_PORT"; fi
 
+    mark="$(h3_mark "$protocol")"
     phase "$protocol" "$rate" "$address" 1 "$half"
     status=$?
     at_rest "$protocol" "$idle"
     status=$((status | $?))
     rest1="$(resident)"
+    socket1="$(h3_phase "$protocol" "$mark" ", socket in the first phase ")"
+    mark="$(h3_mark "$protocol")"
     phase "$protocol" "$rate" "$address" 2 "$half"
     status=$((status | $?))
     at_rest "$protocol" "$idle"
     status=$((status | $?))
     rest2="$(resident)"
-    report "$status" "$protocol: every one of ${seconds}s of connections at $rate/s is served, none missed, and all leave"
+    socket2="$(h3_phase "$protocol" "$mark" ", in the second ")"
+    stop_socket_sampler
+    report "$status" "$protocol: every one of ${seconds}s of connections at $rate/s is served, none missed, and all leave$socket1$socket2"
 
     cost1="$(phase_cost "$work/churn-$protocol-1.out")"
     cost2="$(phase_cost "$work/churn-$protocol-2.out")"

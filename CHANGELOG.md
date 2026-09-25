@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- The scale and churn lanes record the QUIC listener socket's kernel drop counter (#331). Each QUIC phase prints the datagrams the kernel dropped at the socket and the most bytes its receive queue held against its size, sampled every 0.1 s, and the scale lane prints the release phase's figures beside its check that every connection left, so a cell that fails on stuck connections says whether their closes were dropped. `lib.sh` reads the counters through sock_diag (`ss`) for the one socket, and the burst and ramp lanes use the same helper in place of their own reads of `/proc/net/udp`, which with 30,000 holder sockets cost about two seconds of CPU a read.
+
 ## [0.11.0] - 2026-09-25
 
 ### Added

@@ -46,16 +46,10 @@ memory_bytes = $((count * 4 * 1048576))" \
     start_hedge "$work/ramp.toml"
 }
 
-# the kernel's per-socket drop counter for the QUIC listener
-socket_drops() {
-    awk -v addr="$(printf '0100007F:%04X' "$QUIC_PORT")" '$2 == addr { print $NF; found = 1 }
-        END { if (!found) print "missing" }' /proc/net/udp
-}
-
 ramp() {
     local transport="$1" held started elapsed drops_before
     start_ramp_server
-    drops_before="$(socket_drops)"
+    drops_before="$(socket_drops "$QUIC_PORT")"
     started="$(date +%s.%N)"
     case "$transport" in
         tcp) start_holder "$transport" python3 test/load/hold.py --port "$CLEARTEXT_PORT" \
@@ -78,7 +72,7 @@ ramp() {
         dropped="$(metric hedge_quic_handshakes_dropped_total)"
         refused="$(metric hedge_quic_handshakes_refused_total)"
         expired="$(metric hedge_quic_handshakes_expired_total)"
-        drops_after="$(socket_drops)"
+        drops_after="$(socket_drops "$QUIC_PORT")"
         echo "quic: live=$live dropped=$dropped refused=$refused expired=$expired socket_drops=$((drops_after - drops_before))"
         test "$live" = "$count"
         report $? "quic: hedge holds all $count as live connections ($live)"
