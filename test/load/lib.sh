@@ -60,8 +60,98 @@ stop_hedge() {
 }
 
 # a lane may set `launcher` to a command that execs the binary under a policy
-# of its own (the scale lane disables transparent huge pages for the process)
+# of its own, such as thp_off's
 launcher=()
+
+# a resident set under transparent huge pages counts 2 MiB for the first byte
+# touched in each aligned region and moves as khugepaged collapses pages, so
+# the figures would carry the kernel's policy rather than hedge's footprint.
+# a lane that reads the resident set runs the served process with them
+# disabled (PR_SET_THP_DISABLE, inherited across exec)
+thp_off() {
+    launcher=(python3 -c 'import ctypes, os, sys
+ctypes.CDLL(None, use_errno=True).prctl(41, 1, 0, 0, 0)
+os.execv(sys.argv[1], sys.argv[1:])')
+}
+
+# resident bytes of the served process, from the kernel's own rollup, with
+# whatever of it the kernel has swapped out counted back in: under memory
+# pressure a page hedge touched can leave the resident set without leaving
+# hedge's footprint, and a figure that fell for that reason would read as a
+# smaller per-connection cost
+resident() {
+    awk '/^(Rss|Swap):/ { sum += $2 } END { printf "%d", sum * 1024 }' "/proc/$hedge_pid/smaps_rollup"
+}
+
+# the configuration of an admin listener on ADMIN_PORT that serves the
+# metrics, authorised by HEDGE_ADMIN_TOKEN, for write_config's extra tables
+admin_config() {
+    cat <<EOF
+[[listener]]
+name = "admin"
+address = "127.0.0.1:$ADMIN_PORT"
+protocols = ["http/1.1"]
+
+[secret.admin-token]
+provider = "env"
+key = "HEDGE_ADMIN_TOKEN"
+
+[telemetry]
+metrics = true
+
+[admin]
+enabled = true
+listener = "admin"
+auth_secret = "admin-token"
+max_response_bytes = 8192
+EOF
+}
+
+# a metric's value from the admin listener, or `missing`
+metric() {
+    curl -sS -H "Authorization: Bearer $HEDGE_ADMIN_TOKEN" \
+        "http://127.0.0.1:$ADMIN_PORT/metrics" \
+        | awk -v name="$1" '$1 == name { print $2; found = 1 }
+            END { if (!found) print "missing" }'
+}
+
+# the sockets the served process has open
+sockets() {
+    find "/proc/$hedge_pid/fd" -lname 'socket:*' 2>/dev/null | wc -l
+}
+
+# waits up to RELEASE_WAIT seconds for hedge to hold no QUIC connection and
+# prints the last count read. a QUIC connection the peer closed is kept through
+# its draining period (RFC 9000 section 10.2, mach-quic's 3 s drain timeout)
+# before it is released, so a sample taken on a fixed delay after release can
+# measure connections still draining rather than what they left behind
+RELEASE_WAIT=15
+quic_released() {
+    local live
+    for _ in $(seq $((RELEASE_WAIT * 10))); do
+        live="$(metric hedge_quic_connections)"
+        if [ "$live" = 0 ]; then break; fi
+        sleep 0.1
+    done
+    echo "$live"
+    test "$live" = 0
+}
+
+# waits up to RELEASE_WAIT seconds for hedge to have no more sockets open than
+# `idle` and prints the last count read. a TCP or TLS connection whose peer
+# closed is retired once hedge sees the close (TLS after its close_notify
+# exchange), and its socket is closed as it goes, so the count falling back to
+# the idle one is every connection having left
+sockets_released() {
+    local idle="$1" open
+    for _ in $(seq $((RELEASE_WAIT * 10))); do
+        open="$(sockets)"
+        if [ "$open" -le "$idle" ]; then break; fi
+        sleep 0.1
+    done
+    echo "$open"
+    test "$open" -le "$idle"
+}
 start_hedge() {
     "${launcher[@]}" "$binary" "$1" >"$work/hedge.log" 2>&1 &
     hedge_pid=$!
@@ -167,21 +257,29 @@ curl_h3() {
         "$@" --config "$config"
 }
 
-# the QUIC holder is test/load/h3load, a quic-go client, built into the
-# gitignored tools directory with the module cache beside it so a runner
-# without a Go cache still builds it
-resolve_h3load() {
-    h3load="$root/.tools/h3load"
-    if [ -x "$h3load" ] && [ "$h3load" -nt test/load/h3load/main.go ]; then
+# the Go clients under test/load (h3load, the QUIC holder and dialler, and
+# rate, the closed-loop rate client) are built into the gitignored tools
+# directory with the module cache beside it, so a runner without a Go cache
+# still builds them. resolve_go_tool sets `tool` to the built binary.
+tool=""
+resolve_go_tool() {
+    local name="$1"
+    tool="$root/.tools/$name"
+    if [ -x "$tool" ] && [ "$tool" -nt "test/load/$name/main.go" ]; then
         return 0
     fi
     if ! command -v go >/dev/null 2>&1; then
-        echo "the QUIC scale cells need go to build test/load/h3load"
+        echo "the load lanes need go to build test/load/$name"
         return 1
     fi
     mkdir -p "$root/.tools/gopath"
-    (cd test/load/h3load && GOPATH="$root/.tools/gopath" GOFLAGS=-mod=mod \
-        go build -o "$h3load" .) || return 1
+    (cd "test/load/$name" && GOPATH="$root/.tools/gopath" GOFLAGS=-mod=mod \
+        go build -o "$tool" .) || return 1
+}
+
+resolve_h3load() {
+    resolve_go_tool h3load || return 1
+    h3load="$tool"
 }
 
 # the work directory, an incompressible body so neither side can shorten a
@@ -272,7 +370,7 @@ protocols = ["http/1.1"]
 [[listener]]
 name = "secure"
 address = "127.0.0.1:$secure"
-protocols = ["http/1.1"]
+protocols = ["http/1.1", "h2"]
 tls = "load"
 
 [[listener]]

@@ -27,6 +27,25 @@
 # the slack the peak left behind, so a term that grows with the peak fails
 # even when the absolute bound has room for it.
 #
+# Each step also measures what an idle connection costs in CPU: the served
+# process's CPU time over LOAD_SCALE_IDLE_SECONDS with nothing but the held
+# connections (and QUIC's keep-alives, one every LOAD_SCALE_QUIC_KEEPALIVE per
+# connection, over a window of one whole period), less what the server spends
+# idle with none. That cost per connection per second must be flat in N: the
+# large step may spend no more than the small step's per-connection cost times
+# large, within LOAD_SCALE_CPU_TOLERANCE percent and 2 ms a window of noise. A
+# per-event path that walks the live connections is O(N) per event and O(N^2)
+# per second, and fails here. Descriptors and timer-wheel entries are counted
+# at each step too: a TCP or TLS connection holds exactly one descriptor and a
+# QUIC connection none, and no connection holds more than
+# LOAD_SCALE_TIMERS_PER wheel entries.
+#
+# The connections come from several client processes, each holding at most
+# LOAD_SCALE_PER_CLIENT connections from its own loopback source address
+# (127.0.0.2 and up), so one address's ephemeral port range never bounds N and
+# no single client's event loop is what is measured. At 100k (the manual lane)
+# that is ten holders.
+#
 # The resident set is what the operating system charges the process, so it
 # includes hedge's records, its pool chunks and its allocator's pages, and
 # excludes the kernel's socket buffers. Both ends of a step are taken from the
@@ -39,6 +58,11 @@ small="${LOAD_SCALE_SMALL:-1000}"
 large="${LOAD_SCALE_LARGE:-10000}"
 transports="${LOAD_SCALE_TRANSPORTS:-tcp tls quic}"
 tolerance="${LOAD_SCALE_TOLERANCE:-25}"
+idle_seconds="${LOAD_SCALE_IDLE_SECONDS:-10}"
+cpu_tolerance="${LOAD_SCALE_CPU_TOLERANCE:-50}"
+quic_keepalive="${LOAD_SCALE_QUIC_KEEPALIVE:-15}"
+per_client="${LOAD_SCALE_PER_CLIENT:-10000}"
+timers_per="${LOAD_SCALE_TIMERS_PER:-1}"
 # bytes per connection achieved on dev for 0.7.0 (#214), release build on
 # linux-x86_64, 1000 to 10000 connections, transparent huge pages off. the
 # measured run is in test/load/README.md.
@@ -99,18 +123,11 @@ ONE_REQUEST_BYTES=262144
 prepare_load
 if ! resolve_h3load; then exit 1; fi
 
-# a resident set under transparent huge pages counts 2 MiB for the first byte
-# touched in each aligned region and moves as khugepaged collapses pages, so
-# the figures would carry the kernel's policy rather than hedge's footprint.
-# the served process runs with them disabled (PR_SET_THP_DISABLE, inherited
-# across exec), which is what the figures below assume.
-launcher=(python3 -c 'import ctypes, os, sys
-ctypes.CDLL(None, use_errno=True).prctl(41, 1, 0, 0, 0)
-os.execv(sys.argv[1], sys.argv[1:])')
+thp_off
 
-# resident bytes of the served process, from the kernel's own rollup
-resident() {
-    awk '/^Rss:/ { printf "%d", $2 * 1024 }' "/proc/$hedge_pid/smaps_rollup"
+# the part of that the kernel had swapped out, printed beside each transport
+swapped() {
+    awk '/^Swap:/ { printf "%d", $2 * 1024 }' "/proc/$hedge_pid/smaps_rollup"
 }
 
 # address space and mapping count: what is reserved rather than touched, and
@@ -138,110 +155,98 @@ memory_bytes = $((large * 4 * 1048576))" \
         "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
         "keep_alive_ms = 900000
 drain_ms = 5000" \
-        "[[listener]]
-name = \"admin\"
-address = \"127.0.0.1:$ADMIN_PORT\"
-protocols = [\"http/1.1\"]
-
-[secret.admin-token]
-provider = \"env\"
-key = \"HEDGE_ADMIN_TOKEN\"
-
-[telemetry]
-metrics = true
-
-[admin]
-enabled = true
-listener = \"admin\"
-auth_secret = \"admin-token\"
-max_response_bytes = 8192" 1
+        "$(admin_config)" 1
     start_hedge "$work/scale.toml"
 }
 
-# a metric's value from the admin listener, or `missing`
-metric() {
-    curl -sS -H "Authorization: Bearer $HEDGE_ADMIN_TOKEN" \
-        "http://127.0.0.1:$ADMIN_PORT/metrics" \
-        | awk -v name="$1" '$1 == name { print $2; found = 1 }
-            END { if (!found) print "missing" }'
+# every descriptor the served process has open
+descriptors() {
+    find "/proc/$hedge_pid/fd" -mindepth 1 2>/dev/null | wc -l
 }
 
-# waits up to RELEASE_WAIT seconds for hedge to hold no QUIC connection and
-# prints the last count read. a QUIC connection the peer closed is kept through
-# its draining period (RFC 9000 section 10.2, mach-quic's 3 s drain timeout)
-# before it is released, so a sample taken on a fixed delay after release can
-# measure connections still draining rather than what they left behind
-RELEASE_WAIT=15
-quic_released() {
-    local live
-    for _ in $(seq $((RELEASE_WAIT * 10))); do
-        live="$(metric hedge_quic_connections)"
-        if [ "$live" = 0 ]; then break; fi
-        sleep 0.1
-    done
-    echo "$live"
-    test "$live" = 0
+# CPU time the served process's threads have run, in nanoseconds, from the
+# scheduler's own accounting. /proc/<pid>/stat counts in clock ticks (10 ms),
+# too coarse for what a thousand idle connections cost in a window
+cpu_ns() {
+    cat /proc/"$hedge_pid"/task/*/schedstat 2>/dev/null | awk '{ sum += $1 } END { printf "%d", sum }'
 }
 
-# the sockets the served process has open
-sockets() {
-    find "/proc/$hedge_pid/fd" -lname 'socket:*' 2>/dev/null | wc -l
-}
-
-# waits up to RELEASE_WAIT seconds for hedge to have no more sockets open than
-# `idle` and prints the last count read. a TCP or TLS connection whose peer
-# closed is retired once hedge sees the close (TLS after its close_notify
-# exchange), and its socket is closed as it goes, so the count falling back to
-# the idle one is every connection having left
-sockets_released() {
-    local idle="$1" open
-    for _ in $(seq $((RELEASE_WAIT * 10))); do
-        open="$(sockets)"
-        if [ "$open" -le "$idle" ]; then break; fi
-        sleep 0.1
-    done
-    echo "$open"
-    test "$open" -le "$idle"
-}
-
-# holds `count` HTTP/1.1 connections idle after one served request each
-hold_http() {
-    local name="$1" count="$2" tls="$3" port held
-    port="$CLEARTEXT_PORT"
-    if [ "$tls" = 1 ]; then port="$SECURE_PORT"; fi
-    if [ "$tls" = 1 ]; then
-        start_holder "$name" python3 test/load/hold.py --port "$port" \
-            --connections "$count" --timeout 60 --tls
+# the idle window. a QUIC connection sends a keep-alive once per period, and
+# the connections of a step are dialled together, so their PINGs come in a
+# burst once a period: the window is one whole period, opened one period
+# after the step so every connection has reached its keep-alive cadence
+window_for() {
+    if [ "$1" = quic ] && [ "$quic_keepalive" -gt "$idle_seconds" ]; then
+        echo "$quic_keepalive"
     else
-        start_holder "$name" python3 test/load/hold.py --port "$port" \
-            --connections "$count" --timeout 60
+        echo "$idle_seconds"
     fi
-    held="$(held_by "$name" "${holders[${#holders[@]}-1]}")" || return 1
-    test "$held" = "$count"
 }
 
-# holds `count` HTTP/3 connections idle after their handshakes, over
-# test/load/h3load. handshakes are bounded to DIALING in flight: a burst past a
-# few thousand loses some to their handshake timeout (#232), and this lane
-# measures what an idle connection holds, not what a burst admits.
+# the served process's CPU over the idle window, in nanoseconds
+idle_cpu() {
+    local transport="$1" window before
+    window="$(window_for "$transport")"
+    if [ "$transport" = quic ]; then sleep "$quic_keepalive"; fi
+    before="$(cpu_ns)"
+    sleep "$window"
+    echo $(( $(cpu_ns) - before ))
+}
+
+# the loopback source address the next holder binds, so no two holders of
+# one server share an address's ephemeral ports. each holder takes the next
+next_source=2
+
+# starts one holder of `count` HTTP/1.1 connections idle after one served
+# request each, from its own source address
+start_http_holder() {
+    local name="$1" count="$2" tls="$3" port="$CLEARTEXT_PORT" flags=()
+    local source="127.0.0.$next_source"
+    next_source=$((next_source + 1))
+    if [ "$tls" = 1 ]; then port="$SECURE_PORT"; flags=(--tls); fi
+    start_holder "$name" python3 test/load/hold.py --port "$port" \
+        --connections "$count" --timeout 60 --source "$source" "${flags[@]}"
+}
+
+# starts one holder of `count` HTTP/3 connections idle after their handshakes,
+# over test/load/h3load. handshakes are bounded to DIALING in flight: a burst
+# past a few thousand loses some to their handshake timeout (#232), and this
+# lane measures what an idle connection holds, not what a burst admits.
 DIALING=64
-hold_quic() {
-    local name="$1" count="$2" held
+start_quic_holder() {
+    local name="$1" count="$2" source="127.0.0.$next_source"
+    next_source=$((next_source + 1))
     start_holder "$name" "$h3load" -address "127.0.0.1:$QUIC_PORT" \
         -connections "$count" -serve=false -dialing "$DIALING" \
-        -connect-timeout 60s -idle-timeout 900s -hold
-    held="$(held_by "$name" "${holders[${#holders[@]}-1]}")" || return 1
-    test "$held" = "$count"
+        -connect-timeout 60s -idle-timeout 900s -keep-alive "${quic_keepalive}s" \
+        -source "$source" -hold
 }
 
-# holds `count` more connections over `transport` under holder `name`
+# holds `count` more connections over `transport`, split across holders of at
+# most per_client connections each that dial at once, and fails unless every
+# one of them was held
 hold_more() {
-    local transport="$1" name="$2" count="$3"
-    case "$transport" in
-        tcp)  hold_http "$name" "$count" 0 ;;
-        tls)  hold_http "$name" "$count" 1 ;;
-        quic) hold_quic "$name" "$count" ;;
-    esac
+    local transport="$1" name="$2" count="$3" part=0 take held
+    local left="$count"
+    local names=() pids=() wants=()
+    while [ "$left" -gt 0 ]; do
+        take="$left"
+        if [ "$take" -gt "$per_client" ]; then take="$per_client"; fi
+        case "$transport" in
+            tcp)  start_http_holder "$name-$part" "$take" 0 ;;
+            tls)  start_http_holder "$name-$part" "$take" 1 ;;
+            quic) start_quic_holder "$name-$part" "$take" ;;
+        esac
+        names+=("$name-$part")
+        pids+=("${holders[${#holders[@]}-1]}")
+        wants+=("$take")
+        left=$((left - take))
+        part=$((part + 1))
+    done
+    for part in "${!names[@]}"; do
+        held="$(held_by "${names[$part]}" "${pids[$part]}")" || return 1
+        test "$held" = "${wants[$part]}" || return 1
+    done
 }
 
 # report one transport: samples at 0, small, the midpoint and large
@@ -253,18 +258,27 @@ hold_more() {
 measure() {
     local transport="$1" pin="$2" r0 r1 r2 r3 r4 v3 m3 s0
     local per_low per_high per once projection agree
+    local c0 c1 c3 d0 d1 d3 t0 t1 t3 a1 a3 w3
     local mid=$(( (small + large) / 2 ))
 
     start_scale_server
+    next_source=2
     sleep 0.5
     r0="$(resident)"
     s0="$(sockets)"
+    d0="$(descriptors)"
+    t0="$(metric hedge_timers_claimed)"
+    c0="$(idle_cpu "$transport")"
     if ! hold_more "$transport" "$transport-small" "$small"; then
         report 1 "$transport: $small connections held (see $transport-small.out)"
         release_holders; stop_hedge; return 1
     fi
     sleep 0.5
     r1="$(resident)"
+    d1="$(descriptors)"
+    t1="$(metric hedge_timers_claimed)"
+    a1="$(metric hedge_timers_armed)"
+    c1="$(idle_cpu "$transport")"
     if ! hold_more "$transport" "$transport-mid" $((mid - small)); then
         report 1 "$transport: $mid connections held (see $transport-mid.out)"
         release_holders; stop_hedge; return 1
@@ -277,8 +291,13 @@ measure() {
     fi
     sleep 0.5
     r3="$(resident)"
+    w3="$(swapped)"
     v3="$(mapped)"
     m3="$(mappings)"
+    d3="$(descriptors)"
+    t3="$(metric hedge_timers_claimed)"
+    a3="$(metric hedge_timers_armed)"
+    c3="$(idle_cpu "$transport")"
 
     release_holders
     if [ "$transport" = quic ]; then
@@ -305,12 +324,16 @@ measure() {
     fi
     printf '%s: resident idle=%d at %d=%d at %d=%d at %d=%d after release=%d\n' \
         "$transport" "$r0" "$small" "$r1" "$mid" "$r2" "$large" "$r3" "$r4"
-    printf '%s: at %d address space=%d MiB in %d mappings\n' \
-        "$transport" "$large" $((v3 / 1048576)) "$m3"
+    printf '%s: at %d address space=%d MiB in %d mappings, %d KiB of the resident figure swapped out\n' \
+        "$transport" "$large" $((v3 / 1048576)) "$m3" $((w3 / 1024))
     printf '%s: bytes/connection over %d..%d=%d over %d..%d=%d (%+d%%) over %d..%d=%d, once=%d KiB\n' \
         "$transport" "$small" "$mid" "$per_low" "$mid" "$large" "$per_high" "$agree" \
         "$small" "$large" "$per" $((once / 1024))
     printf '%s: projection at %dk=%d MiB\n' "$transport" $((PROJECTION / 1000)) $((projection / 1048576))
+
+    idle_cost "$transport" "$c0" "$c1" "$c3"
+    descriptors_held "$transport" "$d0" "$d1" "$d3"
+    timers_held "$transport" "$t0" "$t1" "$a1" "$t3" "$a3"
 
     if [ "$pin" -gt 0 ]; then
         test "$per" -le $(( pin + pin * tolerance / 100 ))
@@ -330,12 +353,59 @@ measure() {
     echo
 }
 
+# CPU per idle connection per second at small and large, over the server's own
+# idle cost, and the assertion that it is flat in N: what large connections
+# cost above idle is no more than large times the small step's per-connection
+# cost, within cpu_tolerance percent and CPU_FLOOR_NS a window of noise (an
+# admin scrape, a log flush)
+CPU_FLOOR_NS=2000000
+idle_cost() {
+    local transport="$1" c0="$2" c1="$3" c3="$4"
+    awk -v c0="$c0" -v c1="$c1" -v c3="$c3" -v small="$small" -v large="$large" \
+        -v w="$(window_for "$transport")" -v floor="$CPU_FLOOR_NS" -v tol="$cpu_tolerance" -v t="$transport" 'BEGIN {
+        idle = c0 / 1e9 / w
+        low = (c1 - c0) / 1e9 / w
+        high = (c3 - c0) / 1e9 / w
+        printf "%s: idle CPU over %ds: %.4f cores with none, %.4f above it at %d, %.4f at %d\n",
+            t, w, idle, low, small, high, large
+        printf "%s: CPU per idle connection per second: %.4f us at %d, %.4f us at %d\n",
+            t, low * 1e6 / small, small, high * 1e6 / large, large
+        exit !(high <= (low < 0 ? 0 : low) * large / small * (1 + tol / 100) + floor / 1e9 / w)
+    }'
+    report $? "$transport: CPU per idle connection is flat from $small to $large within $cpu_tolerance%"
+}
+
+# a TCP or TLS connection holds its socket and nothing else, a QUIC connection
+# shares the listener's
+descriptors_held() {
+    local transport="$1" d0="$2" d1="$3" d3="$4" want_small="$small" want_large="$large"
+    if [ "$transport" = quic ]; then want_small=0; want_large=0; fi
+    printf '%s: descriptors idle=%d at %d=%d at %d=%d\n' "$transport" "$d0" "$small" "$d1" "$large" "$d3"
+    test $((d1 - d0)) -eq "$want_small" && test $((d3 - d0)) -eq "$want_large"
+    report $? "$transport: $want_large descriptors for $large connections"
+}
+
+# the timer wheel's claimed and armed entries; a build without the gauges
+# reports them missing and asserts nothing
+timers_held() {
+    local transport="$1" t0="$2" t1="$3" a1="$4" t3="$5" a3="$6"
+    printf '%s: timer entries idle=%s at %d=%s (%s armed) at %d=%s (%s armed)\n' \
+        "$transport" "$t0" "$small" "$t1" "$a1" "$large" "$t3" "$a3"
+    if [ "$t0" = missing ] || [ "$t3" = missing ]; then
+        echo "unmeasured $transport: this build reports no timer gauges"
+        return
+    fi
+    test $((t3 - t0)) -le $((large * timers_per))
+    report $? "$transport: at most $timers_per timer entries per connection ($((t3 - t0)) for $large)"
+}
+
 # what a fresh server keeps above its idle baseline after `count` connections
 # over `transport` have come and gone, or nothing when they could not be held
 # or did not leave
 kept_after() {
     local transport="$1" count="$2" r0 s0 r4
     start_scale_server
+    next_source=2
     sleep 0.5
     r0="$(resident)"
     s0="$(sockets)"
@@ -444,7 +514,7 @@ connection_memory_bytes = $ONE_REQUEST_BYTES" \
 
 echo "binary $binary"
 stat -c '  mtime %y  size %s' "$binary"
-echo "small=$small large=$large projection=$PROJECTION tolerance=$tolerance%"
+echo "small=$small large=$large projection=$PROJECTION tolerance=$tolerance% idle_window=${idle_seconds}s cpu_tolerance=$cpu_tolerance% quic_keepalive=${quic_keepalive}s per_client=$per_client"
 echo
 
 measure_depth

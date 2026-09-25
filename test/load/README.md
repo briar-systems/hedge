@@ -90,8 +90,13 @@ rather than a handshake burst. A held connection sends a keep-alive PING at half
 one every second, and 10,000 connections doing that was 10,000 datagrams a
 second into hedge's socket: the socket dropped 76,396 datagrams while they were
 held, and 2,063 more when the holder closed them, so 1,948 connections never
-saw their CONNECTION_CLOSE and stayed live until their idle timeout (#269). The lanes build it into `.tools/` with the Go
-toolchain on the box, module cache beside it.
+saw their CONNECTION_CLOSE and stayed live until their idle timeout (#269).
+`-keep-alive` sets the period outright, which the scale lane uses to give idle
+QUIC connections a known event rate. `-source` binds every socket to one local
+address, `-rate` paces the dials for the ramp, and `-migrate` rebinds every
+connection to a new port between two requests. The lanes build it, and
+`test/load/rate`, into `.tools/` with the Go toolchain on the box, module
+cache beside it.
 
 ```sh
 cd test/load/h3load && go run . -address 127.0.0.1:PORT -connections 1100
@@ -264,3 +269,189 @@ advertises only the concurrency its request lane funds.
 CI runs it on the light tier at `LOAD_SCALE_SMALL=200 LOAD_SCALE_LARGE=1000`,
 which is enough connections for the slopes to be measured and few enough to
 fit the runner.
+
+### Idle CPU, descriptors and timers (#176)
+
+Each step also measures what an idle connection costs in CPU. At 0, at the
+small count and at the large count, the lane reads the served process's CPU
+time (each thread's `schedstat`, in nanoseconds) over a window in which it
+does nothing but hold the connections. For TCP and TLS the window is
+`LOAD_SCALE_IDLE_SECONDS` (10). QUIC connections send a keep-alive PING every
+`LOAD_SCALE_QUIC_KEEPALIVE` seconds (15), and a step's connections are
+dialled together, so their PINGs arrive in one burst per period, the first a
+full period after the step. The QUIC window therefore opens one period after
+the step and lasts one whole period. The cost above idle, per connection per
+second, has to be flat in N: the large step may spend no more than the small
+step's per-connection cost times the large count, within
+`LOAD_SCALE_CPU_TOLERANCE` percent (50) plus 2 ms per window of noise. A per-event path that walks the live connections costs O(N) per
+event and O(N²) per second, and it fails here.
+
+Descriptors and timer-wheel entries are counted at each step as well. A TCP or
+TLS connection holds exactly one descriptor, and a QUIC connection holds none
+because it shares its listener's socket. The timer counts come from the
+`hedge_timers_claimed` and `hedge_timers_armed` gauges. No connection may
+hold more than `LOAD_SCALE_TIMERS_PER` wheel entries (1). A build without the
+gauges reports the timer counts as missing and asserts nothing about them.
+
+The connections come from several client processes. Each holds at most
+`LOAD_SCALE_PER_CLIENT` connections (10000) from its own loopback source
+address, 127.0.0.2 and up, so one address's ephemeral port range never
+bounds N. That makes the 100k run ten holders:
+
+```sh
+LOAD_SCALE_SMALL=10000 LOAD_SCALE_LARGE=100000 ./test/load/scale.sh
+```
+
+It is a manual lane. At 100k QUIC connections the server alone needs about
+11 GiB and the quic-go holders need several more, so on a smaller host run it
+at the largest N the host allows and state the projection it prints.
+
+### The measured run for #176
+
+The lanes are from `feat/176` at 627fc1d and 7ec5491. The binary is a release
+build of the source at fe80306 (sha256 `8daad759…`). Later commits change
+only the lanes and a unit test. It ran on linux-x86_64, a Ryzen 7 5800X3D,
+over loopback with one worker. Each run held every heavy slot (`agent-heavy
+--exclusive`) with `vmstat` alongside. The QUIC keep-alive was 15 s.
+
+| transport | span | bytes per idle connection (halves) | CPU per idle connection per second | descriptors, timer entries per connection |
+| --- | --- | ---: | ---: | --- |
+| TCP | 1k..10k | 13,166 (13,238 / 13,095) | under 0.0001 µs at both | 1, 1 |
+| TCP | 10k..100k | 12,695 (12,522 / 12,868) | under 0.0001 µs at both | 1, 1 |
+| TLS | 1k..10k | 22,501 (22,697 / 22,304) | under 0.0001 µs at both | 1, 1 |
+| QUIC | 1k..10k | 103,612 (104,122 / 103,102) | 14.79 µs, 14.12 µs | 0, 1 |
+| QUIC | 10k..30k | 102,846 (102,964 / 102,728) | 14.02 µs, 10.41 µs | 0, 1 |
+
+So CPU per idle connection is flat in N and memory is linear, up to 100k for
+TCP and 30k for QUIC. For TLS and QUIC the lane found problems past those
+counts rather than figures:
+
+- TLS at 100k: hedge held 62,925 of the 100,000 connections its clients had
+  handshaken and been served on, so connections were closed under it past
+  about 63k.
+- TCP at 100k: the server keeps 84.5 MiB more after its connections leave than
+  it does after 10k, so something grows with the peak past 10k.
+- QUIC at 30k: 12,652 connections were still live 15 s after their clients
+  closed them, which is #274's socket-drop shape at the close.
+- QUIC at 50k: the host swapped hedge's pages out. The lane now counts
+  swapped pages in the resident figure.
+
+The 10-minute churn, at 200 TLS connections a second and then 100 HTTP/3
+connections a second, served 120,000 and 60,000 with none missed. The
+resident peak moved by 140 KiB and 40 KiB between the halves. CPU per
+connection was 1,451 against 1,458 µs for TLS and 4,131 against 4,290 µs for
+HTTP/3.
+
+## The rate lane
+
+```sh
+./test/load/rate.sh
+```
+
+`rate.sh` measures request and handshake rates and what each costs the
+server. `test/load/rate` is a closed-loop Go client, so a worker offers its
+next operation only when its last one has finished, and the rate is what the
+server sustained. The cells are:
+
+- `h1`, `tls`, `h2` and `h3`: requests for a 1 KiB body back to back on
+  `LOAD_RATE_CONNECTIONS` (64) held connections, over HTTP/1.1, HTTP/1.1 over
+  TLS, HTTP/2 over TLS and HTTP/3;
+- `tls-handshake` and `quic-handshake`: full handshakes on fresh
+  connections, `LOAD_RATE_DIALING` (64) in flight, with X25519 alone and no
+  session resumption, each closed once it is established.
+
+Each cell runs against a fresh server for a `LOAD_RATE_WARMUP` (2 s) warm-up
+and a `LOAD_RATE_DURATION` (10 s) window. The client reads the server's CPU
+time from `/proc` as the window opens and closes, and each cell prints the
+rate, the server's CPU per operation and the cores it used. The CPU per
+operation is the server's own cost, so it says the same thing on a busy box
+as on an idle one. The rate does not, because the client shares the cores.
+
+`LOAD_RATE_WORKERS` is the worker-scaling cell from #169 section 8. Given a
+list such as `1 2 4 8`, it runs every cell once per count with
+`server.workers` set to that count, and asserts that each rate at N workers
+reaches `LOAD_RATE_EFFICIENCY` (0.7) of N over the first count times the
+first count's rate, up to the host's core count. With it empty the lane runs
+the server's default worker count and asserts only that every operation
+succeeds. The lane binds ports 19140 to 19142.
+
+## The ramp lane
+
+```sh
+./test/load/ramp.sh
+```
+
+`ramp.sh` is the ramp cell. `LOAD_RAMP` dials (1000) arrive at
+`LOAD_RAMP_RATE` a second (200), over TCP and TLS through `hold.py --rate`
+and over QUIC through `h3load -rate`, each against a fresh server under the
+default handshake deadline and admission. Every dial has to be held. For QUIC,
+hedge also has to count every one as a live connection, its admission
+counters must show nothing dropped, refused or expired, and the socket's drop
+counter must not move. The offered rate is below what the server can
+handshake, so any loss is work the server dropped although it had room. This
+is what a slow ramp of 1100 QUIC dials failed before #164. The lane binds
+ports 19150 to 19153.
+
+## The churn lane
+
+```sh
+./test/load/churn.sh
+```
+
+`churn.sh` is the churn cell. For `LOAD_CHURN_SECONDS` (600), new connections
+arrive at a fixed rate, `LOAD_CHURN_TLS_RATE` (200) over TLS and
+`LOAD_CHURN_H3_RATE` (100) over HTTP/3. Each one carries one request and
+closes. The client is open-loop, so a start that finds all
+`LOAD_CHURN_IN_FLIGHT` (256) workers busy is counted as missed rather than
+queued. Every `LOAD_CHURN_SAMPLE` seconds (10) it samples the server's CPU
+time and the most connections it had open at once since the last sample.
+
+The run is two phases of half the time each against one server. After each
+phase the lane waits for every connection to leave (hedge's QUIC connection
+count at zero, or its sockets back to the idle count) and reads the resident
+set at rest. The lane passes when:
+
+- every connection is served, with no missed start, and every one leaves;
+- the resident set at rest after the second phase is within
+  `LOAD_CHURN_RSS_MARGIN` bytes (4 MiB) of what it was after the first;
+- the CPU per connection over the second half of the second phase is within
+  `LOAD_CHURN_CPU_TOLERANCE` percent (25) of the first phase's. Each phase's
+  first half is warm-up.
+
+Anything a retired connection leaves behind (a record, a timer entry, a pool
+chunk) grows the resident set at rest linearly in the connections served,
+and it fails the second check: the margin is 140 bytes a connection over the
+30,000 HTTP/3 connections of a 10-minute phase, and 1.4 KiB over the 3,000 of
+CI's. A walk over anything that grows the same way fails the third. The lane
+binds ports 19160 to 19163.
+
+The resident set is read at rest rather than under load. Under load it holds
+every live connection, and a QUIC connection stays live through its draining
+period after its client closes (about 300 at 100 a second), so the resident
+set moves with how the closes bunch up rather than with what connections
+leave behind. An earlier form of the cell compared the peaks of the two
+halves of one run under load. It failed one of the two CI attempts on
+b163699 (+5.3 MiB against the 4 MiB margin). On two cores of a Ryzen 7
+5800X3D (`taskset -c 0,1`) at 100 a second, one run in seven stepped by
+8.6 MiB under load while the client never had more than two connections
+open, so the step was not a backlog of connections.
+
+CI runs 60 s at the default rates, and allows 50% of CPU drift because the
+client shares the runner's cores. The single QUIC worker (until #174) spends
+about 4 ms of CPU on each HTTP/3 connection, so 100 a second is about 40% of
+one core, on the CI runner and on the 5800X3D alike.
+
+## The migration lane
+
+```sh
+./test/load/migrate.sh
+```
+
+`migrate.sh` is the migration cell. `LOAD_MIGRATE` QUIC connections (32) each
+complete a request. Then `h3load -migrate` moves each connection's socket to a
+new local port without a PATH_CHALLENGE of its own, which is what a NAT
+rebinding looks like to the server, and completes a second request on the
+same connection. The lane passes only if hedge follows every connection to its
+new address. Once workers steer datagrams by connection ID (#174), the new
+4-tuple can land on another worker's socket, and this cell holds that case.
+The lane binds ports 19170 to 19172.

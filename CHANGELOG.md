@@ -8,6 +8,17 @@
 - Every process-wide cap is held as per-worker allowances (#173). `max_connections`, the QUIC handshakes in flight and each budget's concurrency and memory are drawn in batches from a shared pool by compare and swap (`hedge.allowance`) and returned above a high-water mark, so the total never exceeds the cap and admission is plain arithmetic on the worker. A worker short of units is woken when another returns some, and a refusal made while other workers held units is counted. The per-peer caps are counted across workers in a table of 256 shards keyed by a seeded peer hash.
 - Metrics are recorded per worker and merged on scrape (#173). Each worker writes a registry of its own (`telemetry.Recorder`), a scrape renders every registry summed series by series, and readiness, drain and the final flush are the supervisor's.
 - The open-file limit is raised at startup and logged (#173). A configured `max_connections` that does not fit beside every worker's listeners and each io runtime's reserve refuses the start.
+- The scale harness (#176, stage 8 of #169). The load lanes gain four cells and the scale lane gains three measures:
+  - **`test/load/rate.sh`.** Request rates over HTTP/1.1, HTTP/1.1 over TLS, HTTP/2 and HTTP/3, and full TLS and QUIC handshake rates. Each cell reports the server's CPU per operation, read over the client's own window. It uses `test/load/rate`, a new closed-loop Go client. `LOAD_RATE_WORKERS` runs every cell at several `server.workers` counts and asserts that the rate scales. With it empty the server runs its default worker count.
+  - **`test/load/ramp.sh`.** N dials at a fixed rate, with no losses: every dial held, and no QUIC handshake dropped, refused or expired.
+  - **`test/load/churn.sh`.** Connect, request and close at a fixed rate for 10 minutes, with a flat resident set and flat CPU per connection.
+  - **`test/load/migrate.sh`.** A QUIC connection must survive its client rebinding to a new port.
+  - **`test/load/scale.sh`.** It now measures CPU per idle connection per second (asserted flat in N), descriptors and timer entries. It holds from several client processes on their own source addresses, so it reaches 100k, and it counts swapped-out pages in the resident figure.
+  - **Clients.** `hold.py` and `h3load` take a source address and a dial rate, and `h3load` takes `-migrate`.
+  - **Telemetry.** New gauges `hedge_timers_claimed` and `hedge_timers_armed`, set by each worker and summed on scrape. The built-in series count rises to 40, so `telemetry.metric_series` must cover it.
+  - **CI.** The light tier runs the ramp, a minute of churn, the rates and migration.
+  - **Measurements.** Release build, one worker, on a quiet host. An idle TCP or TLS connection costs no measurable CPU at 1k, 10k or 100k. An idle QUIC connection with a 15 s keep-alive costs 14.8 µs of CPU a second at 1k and 10.4 µs at 30k. Memory per connection is linear: 12,695 bytes for TCP from 10k to 100k, 22,501 for TLS from 1k to 10k, and 102,846 for QUIC from 10k to 30k.
+  - **Problems found.** Past these counts the lane found problems, not figures. At 100k TLS connections hedge held only 62,925. After 100k TCP connections leave, the server keeps 84.5 MiB more than after 10k. After 30k QUIC connections close, 12,652 were still live 15 s later. The migration cell also found that a QUIC connection did not survive its client rebinding its port, fixed by #293.
 
 ### Fixed
 
