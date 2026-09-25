@@ -343,7 +343,7 @@ counts rather than figures:
   `io_runtime.pins_capacity` says keeps such a chunk, serves any connection it
   had already taken, and arms it again in the lowest free slot. On the same
   lane a server keeps 4,395,008 bytes after 100k and 4,055,040 after 10k,
-  against 92,737,440 and 4,022,272 before, and both after-release checks pass
+  against 92,737,536 and 4,022,272 before, and both after-release checks pass
   at 10k against 100k.
 - QUIC at 30k: 12,652 connections were still live 15 s after their clients
   closed them, which is #274's socket-drop shape at the close.
