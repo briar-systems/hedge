@@ -14,6 +14,7 @@ use hedge.config.schema;
 use hedge.dispatch;
 use hedge.dispatch.call;
 use hedge.dispatch.plan;
+use http_date: hedge.http.date;
 use hedge.listener;
 use hedge.memory;
 use hedge.operation;
@@ -60,6 +61,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view;
 use tls_engine: tls.engine;
 use tls_error:  tls.error;
@@ -99,6 +101,10 @@ pub val SETUP_BEGIN:    Setup = 7;
 pub val SETUP_TRACE:    Setup = 8;
 pub val SETUP_BIND:     Setup = 9;
 pub val PEER_BYTES:     usize = 64;
+
+# a rejected head's answer carries Date, Content-Length and Connection
+val REJECTION_FIELDS:     usize = 3;
+val REJECTION_DATE_BYTES: usize = http_date.IMF_LENGTH + 1;
 
 pub def State: u8;
 pub val NEW:     State = 1;
@@ -266,46 +272,53 @@ pub rec Connection {
     engine_slots:       [PIPELINE_DEPTH]connection.Slot;
     # every engine on this connection borrows from the worker's pool through
     # this account, which stays open until close has released them all
-    borrower:            memory.Borrower;
-    account:             buffers.Account;
-    source:              buffers.Source;
-    account_live:        bool;
-    refused_memory:      bool;
-    memory_deadline_ns:  u64;
-    memory_expired:      bool;
-    stage_chunk:         buffers.Chunk;
-    stage_held:          bool;
-    stage_length:        usize;
-    stage_offset:        usize;
-    body_done:           bool;
-    body_chunks:         u64;
-    request_body:        RequestBody;
-    request:             message.Request;
-    response:            message.Response;
-    response_fields:     [RESPONSE_FIELD_SLOTS]field.Field;
-    response_trailers:   [RESPONSE_TRAILER_SLOTS]field.Field;
-    informationals:      [INFORMATIONAL_SLOTS]message.Informational;
-    captures:            [CAPTURE_SLOTS]router.Capture;
-    memory:              call.Memory;
-    trace:               telemetry_trace.Context;
-    exchange:            exchange.Exchange;
-    active_call:         call.Call;
-    active_slot:         usize;
-    exchange_live:       bool;
-    response_started:    bool;
-    request_generation:  u64;
-    configured:          Config;
-    limits:              message.Limits;
-    plan:                *plan.Plan;
-    budgets:             *budget.Set;
-    charge:              budget.Charge;
-    requests:            u64;
-    last_event:          connection.EventKind;
-    last_step:           Step;
-    setup_failure:       Setup;
-    request_failure:     message.RequestStatus;
-    pending_slot:        usize;
-    has_pending:         bool;
+    borrower:           memory.Borrower;
+    account:            buffers.Account;
+    source:             buffers.Source;
+    account_live:       bool;
+    refused_memory:     bool;
+    memory_deadline_ns: u64;
+    memory_expired:     bool;
+    stage_chunk:        buffers.Chunk;
+    stage_held:         bool;
+    stage_length:       usize;
+    stage_offset:       usize;
+    body_done:          bool;
+    body_chunks:        u64;
+    request_body:       RequestBody;
+    request:            message.Request;
+    response:           message.Response;
+    response_fields:    [RESPONSE_FIELD_SLOTS]field.Field;
+    response_trailers:  [RESPONSE_TRAILER_SLOTS]field.Field;
+    informationals:     [INFORMATIONAL_SLOTS]message.Informational;
+    captures:           [CAPTURE_SLOTS]router.Capture;
+    memory:             call.Memory;
+    trace:              telemetry_trace.Context;
+    exchange:           exchange.Exchange;
+    active_call:        call.Call;
+    active_slot:        usize;
+    exchange_live:      bool;
+    response_started:   bool;
+    request_generation: u64;
+    configured:         Config;
+    limits:             message.Limits;
+    plan:               *plan.Plan;
+    budgets:            *budget.Set;
+    charge:             budget.Charge;
+    requests:           u64;
+    last_event:         connection.EventKind;
+    last_step:          Step;
+    setup_failure:      Setup;
+    request_failure:    message.RequestStatus;
+    pending_slot:       usize;
+    has_pending:        bool;
+    # a request head the engine could not parse is answered here, with no
+    # exchange, since there is no request to hand a service
+    rejecting:           bool;
+    rejected_slot:       usize;
+    rejection_items:     [REJECTION_FIELDS]field.Field;
+    rejection_fields:    field.Fields;
+    rejection_date:      [REJECTION_DATE_BYTES]u8;
     service_pending:     bool;
     initialized:         bool;
     engine_live:         bool;
@@ -728,6 +741,8 @@ pub fun make(
     owner.request_failure        = 0;
     owner.pending_slot           = 0;
     owner.has_pending            = false;
+    owner.rejecting              = false;
+    owner.rejected_slot          = no_slot();
     owner.service_pending        = false;
     owner.initialized            = false;
     # every connection is a cancel root of its own. mach-http's transport requires
@@ -810,6 +825,10 @@ pub fun pending_work(owner: *Connection) bool {
     if (owner.engine.write_length != 0 && !owner.engine.write_pending) { ret true; }
     # a request the engine handed over, waiting only for its exchange to start
     if (owner.has_pending && !owner.exchange_live) { ret true; }
+    # a rejected head whose answer is neither in flight nor waiting on memory
+    if (owner.rejecting && !owner.engine.write_pending && !owner.engine.memory_blocked) {
+        ret true;
+    }
     # a parked service whose named wait moved is re-entered by the next step
     ret owner.exchange_live && owner.service_pending && call.stirred(?owner.active_call);
 }
@@ -1621,6 +1640,73 @@ fun start_exchange(owner: *Connection, slot: usize, now: time.Instant) Step {
     ret STEP_PROGRESS;
 }
 
+# a head the engine rejected has no request to build an exchange from, so it
+# is answered here with the status the engine names, a Date as every hedge
+# response carries, an empty body, and the close the engine will make
+fun begin_rejection(owner: *Connection, slot: usize, now: time.Instant) Step {
+    val code: status.Status = connection.rejection(?owner.engine, slot);
+    owner.rejection_fields = field.init(?owner.rejection_items[0], REJECTION_FIELDS,
+        owner.limits.response_fields);
+    val dated: usize = http_date.format(clock.wall(), ?owner.rejection_date[0],
+        REJECTION_DATE_BYTES);
+    if ((dated != 0 && field.append(?owner.rejection_fields, field.Field{
+        name:  view.view(field.DATE, str_len(field.DATE)),
+        value: view.view(?owner.rejection_date[0], dated), sensitive: false
+    }) != field.ADD_OK)
+        || field.append(?owner.rejection_fields, field.Field{
+        name:  view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH)),
+        value: view.view("0", 1), sensitive: false
+    }) != field.ADD_OK
+        || field.append(?owner.rejection_fields, field.Field{
+        name:  view.view("connection", 10),
+        value: view.view("close", 5), sensitive: false
+    }) != field.ADD_OK
+        || !connection.prepare_response(?owner.engine, slot, code, reason_for(code),
+        ?owner.rejection_fields, nil, now)) {
+        owner.state = FAILED;
+        ret STEP_ERROR;
+    }
+    owner.rejecting     = true;
+    owner.rejected_slot = slot;
+    ret STEP_PROGRESS;
+}
+
+fun pump_rejection(owner: *Connection, now: time.Instant) Step {
+    if (owner.engine.write_pending) { ret STEP_BLOCKED; }
+    if (owner.engine.write_length != 0) {
+        if (!connection.submit_write(?owner.engine)) {
+            owner.state = FAILED;
+            ret STEP_ERROR;
+        }
+        ret STEP_PROGRESS;
+    }
+    if (owner.engine_slots[owner.rejected_slot].outbound_complete) {
+        if (!connection.release(?owner.engine, owner.rejected_slot, now)) {
+            owner.state = FAILED;
+            ret STEP_ERROR;
+        }
+        owner.rejecting     = false;
+        owner.rejected_slot = no_slot();
+        ret STEP_PROGRESS;
+    }
+    val offered: connection.Offer = connection.offer(?owner.engine, owner.rejected_slot,
+        nil, 0, true);
+    if (offered.status == connection.OFFER_ERROR) {
+        owner.state = FAILED;
+        ret STEP_ERROR;
+    }
+    if (offered.status == connection.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    ret STEP_PROGRESS;
+}
+
+# a slot the engine handed over is a request to serve or a head to refuse
+fun start_slot(owner: *Connection, slot: usize, now: time.Instant) Step {
+    if (connection.rejection(?owner.engine, slot) != 0) {
+        ret begin_rejection(owner, slot, now);
+    }
+    ret start_exchange(owner, slot, now);
+}
+
 # translate one protocol event into product work
 #
 # this is the only place a connection event becomes a service call. a pipelined
@@ -1649,13 +1735,14 @@ fun apply(owner: *Connection, event: connection.Event, now: time.Instant) Step {
         owner.state = CLOSING;
         ret STEP_DONE;
     }
-    if (event.kind == connection.EVENT_REQUEST_HEADERS) {
+    if (event.kind == connection.EVENT_REQUEST_HEADERS
+        || event.kind == connection.EVENT_REQUEST_REJECTED) {
         if (owner.exchange_live) {
             owner.pending_slot = event.slot;
             owner.has_pending  = true;
             ret STEP_BLOCKED;
         }
-        ret start_exchange(owner, event.slot, now);
+        ret start_slot(owner, event.slot, now);
     }
     # a pending service completes its own suspended operation when it is resumed,
     # so the host only completes what was left outstanding after the service returned
@@ -1749,10 +1836,15 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         owner.last_step = inbound;
         ret inbound;
     }
+    if (owner.rejecting) {
+        val answered: Step = pump_rejection(owner, now);
+        owner.last_step = answered;
+        ret answered;
+    }
     if (owner.has_pending) {
         owner.has_pending     = false;
         owner.service_pending = false;
-        val started: Step = start_exchange(owner, owner.pending_slot, now);
+        val started: Step = start_slot(owner, owner.pending_slot, now);
         owner.last_step = started;
         ret started;
     }

@@ -16,6 +16,11 @@
 # invalidation of a pinned entry unlinks it from the index at once, so no new
 # reader finds it, and its bytes are freed only when the last pin is released.
 #
+# A key has at most one fill in flight. An entry being written cannot be
+# evicted, so concurrent fills of one hot key would crowd the shard's slots and
+# budget, evict other keys and refuse later fills. A miss that finds its key
+# already filling goes to the origin without a writer (#341).
+#
 # Locking contract: a function taking a `*Shard` requires that shard's lock to
 # be held (`acquire` takes it, `release` lets it go). A function taking the
 # store, a pin or a writer takes whatever lock it needs itself.
@@ -145,6 +150,7 @@ pub rec Shard {
     stores:           u64;
     evictions:        u64;
     rejections:       u64;
+    skipped_fills:    u64;
     partial_discards: u64;
     unlinking:        usize;
     unlinks_waiting:  usize;
@@ -262,6 +268,7 @@ pub fun make(store: *Store, entries: *Entry, capacity: usize, body: *u8,
         shard.stores           = 0;
         shard.evictions        = 0;
         shard.rejections       = 0;
+        shard.skipped_fills    = 0;
         shard.partial_discards = 0;
         shard.unlinking        = 0;
         shard.unlinks_waiting  = 0;
@@ -827,7 +834,19 @@ fun reject_stream(store: *Store, shard: *Shard) Writer {
     ret reject(shard);
 }
 
-# open an entry for writing, evicting until it fits or refusing outright
+# whether this key already has an entry being written
+fun filling(shard: *Shard, identity: *key.Key) bool {
+    var i: usize = 0;
+    for (i < shard.capacity) {
+        val entry: *Entry = ?shard.entries[i];
+        if (entry.state == WRITING && key.equal(?entry.identity, identity)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# open an entry for writing, evicting until it fits or refusing outright. a key
+# whose fill is in flight gets no second writer, before anything is evicted
 pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
     metadata: policy.Metadata, code: status.Status, declared_length: usize,
     placement: Placement) Writer {
@@ -838,7 +857,12 @@ pub fun begin(store: *Store, identity: *key.Key, dimensions: *key.Dimensions,
         chosen = IN_MEMORY;
     }
     val shard: *Shard = acquire(store, identity);
-    if (shard == nil)                                   { ret no_writer(); }
+    if (shard == nil) { ret no_writer(); }
+    if (filling(shard, identity)) {
+        shard.skipped_fills = shard.skipped_fills + 1;
+        release(shard);
+        ret no_writer();
+    }
     if (declared_length > store.limits.max_entry_bytes) { ret reject(shard); }
     if (chosen == IN_MEMORY) {
         if (declared_length > memory_budget(shard) || declared_length > shard.body_capacity) {
@@ -1081,6 +1105,7 @@ pub rec Totals {
     stores:           u64;
     evictions:        u64;
     rejections:       u64;
+    skipped_fills:    u64;
     partial_discards: u64;
     entries:          usize;
     memory_bytes:     usize;
@@ -1089,7 +1114,7 @@ pub rec Totals {
 
 pub fun totals(store: *Store) Totals {
     var sum: Totals = Totals{hits: 0, misses: 0, stores: 0, evictions: 0, rejections: 0,
-        partial_discards: 0, entries: 0, memory_bytes: 0, disk_bytes: 0};
+        skipped_fills: 0, partial_discards: 0, entries: 0, memory_bytes: 0, disk_bytes: 0};
     if (!enabled(store)) { ret sum; }
     var s: usize = 0;
     for (s < store.shard_count) {
@@ -1101,6 +1126,7 @@ pub fun totals(store: *Store) Totals {
         sum.stores           = sum.stores + shard.stores;
         sum.evictions        = sum.evictions + shard.evictions;
         sum.rejections       = sum.rejections + shard.rejections;
+        sum.skipped_fills    = sum.skipped_fills + shard.skipped_fills;
         sum.partial_discards = sum.partial_discards + shard.partial_discards;
         sum.memory_bytes     = sum.memory_bytes + shard.body_used;
         sum.disk_bytes       = sum.disk_bytes + shard.disk_used;
@@ -1407,6 +1433,42 @@ test "cache store: an entry count bound evicts even when bytes remain" {
     if (!store_entry(?fixture, "b", "b", 1))                                        { ret 3; }
     if (!store_entry(?fixture, "c", "c", 1))                                        { ret 4; }
     if (live_entries(?fixture.store) != 2 || totals(?fixture.store).evictions != 1) { ret 5; }
+    ret 0;
+}
+
+# concurrent misses of one key must not each take a slot: an entry being
+# written cannot be evicted, so they would crowd out every other key (#341)
+test "cache store: a key with a fill in flight gets no second writer" {
+    var fixture: Fixture;
+    if (!open_store(?fixture, 1024, 3))          { ret 1; }
+    if (!store_entry(?fixture, "other", "o", 1)) { ret 2; }
+    var identity: key.Key;
+    make_key(?identity, "hot");
+    var dimensions: key.Dimensions;
+    plain_dimensions(?dimensions);
+    var metadata: policy.Metadata = policy.blank();
+    var first:    Writer          = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, 1, IN_MEMORY);
+    if (!first.active) { ret 3; }
+    var i: usize = 0;
+    for (i < 4) {
+        val extra: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+            status.OK, 1, IN_MEMORY);
+        if (extra.active) { ret 4; }
+        i = i + 1;
+    }
+    var counted: Totals = totals(?fixture.store);
+    if (counted.skipped_fills != 4 || counted.rejections != 0 || counted.evictions != 0
+        || memory_used(?fixture.store) != 2 || !found(?fixture.store, "other")) { ret 5; }
+    # the key fills again once its fill is published, and again once one is dropped
+    if (!write_now(?first, "h"::*u8, 1) || !commit(?first)) { ret 6; }
+    var refill: Writer = begin(?fixture.store, ?identity, ?dimensions, metadata,
+        status.OK, 1, IN_MEMORY);
+    if (!refill.active || !abandon(?refill))   { ret 7; }
+    if (!store_entry(?fixture, "hot", "h", 1)) { ret 8; }
+    counted = totals(?fixture.store);
+    if (counted.skipped_fills != 4 || counted.rejections != 0 || counted.evictions != 0
+        || !found(?fixture.store, "other") || !found(?fixture.store, "hot")) { ret 9; }
     ret 0;
 }
 
