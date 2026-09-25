@@ -107,14 +107,6 @@ metric_class() {
 
 arrival_classes="token untoken other duplicate"
 
-# the kernel's per-socket drop counter, the last column of the socket's row
-socket_drops() {
-    local port_hex
-    port_hex="$(printf '%04X' "$QUIC_PORT")"
-    awk -v addr="0100007F:$port_hex" '$2 == addr { print $NF; found = 1 }
-        END { if (!found) print "missing" }' /proc/net/udp
-}
-
 # a burst of `count` dials at once, every handshake in flight together. prints
 # `connected elapsed` from h3load's own report.
 dial() {
@@ -133,9 +125,9 @@ retransmits() {
         print r[2], f[2], t[2] }' "$work/$1.out"
 }
 
-drops_before="$(socket_drops)"
+drops_before="$(socket_drops "$QUIC_PORT")"
 test "$drops_before" != missing
-report $? "the QUIC socket is visible in /proc/net/udp (drops $drops_before)"
+report $? "the QUIC socket is visible to sock_diag (drops $drops_before)"
 
 read -r connected elapsed <<<"$(dial "$warm" warm)"
 test "$connected" = "$warm"
@@ -177,7 +169,7 @@ done
 expired=$(( $(metric hedge_quic_handshakes_expired_total) - expired_before ))
 in_flight="$(metric hedge_quic_handshakes_in_flight)"
 finish_ms="$(awk -v ns="$(metric hedge_quic_handshake_finish_ns)" 'BEGIN { print ns / 1000000 }')"
-drops_after="$(socket_drops)"
+drops_after="$(socket_drops "$QUIC_PORT")"
 read -r retried first_flight_retransmits token_retransmits <<<"$(retransmits burst)"
 echo "burst: dialled=$burst connected=$connected in ${elapsed}s deferred=$deferred promoted=$promoted completed=$completed dropped=$dropped refused=$refused retries_dropped=$retries_dropped in_flight=$in_flight expired=$expired finish_ms=$finish_ms socket_drops=$((drops_after - drops_before))"
 echo "burst: arrivals dropped=$arrivals_total token=${arrivals_dropped[token]} untoken=${arrivals_dropped[untoken]} other=${arrivals_dropped[other]} duplicate=${arrivals_dropped[duplicate]}"

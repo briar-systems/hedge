@@ -31,6 +31,7 @@ report() {
 }
 
 cleanup_load() {
+    stop_socket_sampler
     release_holders
     stop_hedge >/dev/null 2>&1 || true
     if [ -n "$work" ]; then rm -rf "$work"; fi
@@ -152,6 +153,84 @@ sockets_released() {
     echo "$open"
     test "$open" -le "$idle"
 }
+
+# the kernel's view of hedge's UDP socket on 127.0.0.1:`port`, as
+# `queued buffer drops`: the bytes charged to its receive queue, the queue's
+# size, and the datagrams it dropped because the queue was full
+# (sk_rmem_alloc, sk_rcvbuf and sk_drops, the first and last being the
+# rx_queue and drops of /proc/net/udp). it asks sock_diag for that one
+# socket, because /proc/net/udp formats every socket on the host and the
+# holders' 30k sockets make one read of it cost about two seconds of CPU.
+# `missing` when no such socket exists
+udp_socket() {
+    ss -H -u -a -n -m "src 127.0.0.1:$1" 2>/dev/null | awk '
+        /skmem:/ {
+            match($0, /skmem:\([^)]*\)/)
+            n = split(substr($0, RSTART + 7, RLENGTH - 8), f, ",")
+            for (i = 1; i <= n; i++) {
+                k = f[i]; sub(/[0-9]+$/, "", k); v = substr(f[i], length(k) + 1) + 0
+                m[k] = v
+            }
+            if (m["r"] > queued) queued = m["r"]
+            if (m["rb"] > buffer) buffer = m["rb"]
+            drops += m["d"]; found = 1
+        }
+        END { if (found) print queued + 0, buffer + 0, drops + 0; else print "missing" }'
+}
+
+# the socket's drop counter alone, or `missing`
+socket_drops() {
+    local sample
+    sample="$(udp_socket "$1")"
+    echo "${sample##* }"
+}
+
+# a QUIC cell samples its listener's socket every SOCKET_SAMPLE seconds for
+# the whole life of its server, so a phase's receive-queue peak is read from
+# the samples it spans. the drop count at a phase's ends is read directly, so
+# it is exact whatever the sampling missed
+SOCKET_SAMPLE=0.1
+socket_sampler=""
+socket_samples=""
+start_socket_sampler() {
+    local port="$1"
+    stop_socket_sampler
+    socket_samples="$work/socket-$port.samples"
+    : >"$socket_samples"
+    while :; do udp_socket "$port"; sleep "$SOCKET_SAMPLE"; done >>"$socket_samples" 2>/dev/null &
+    socket_sampler=$!
+}
+
+stop_socket_sampler() {
+    if [ -z "$socket_sampler" ]; then return 0; fi
+    kill "$socket_sampler" 2>/dev/null || true
+    wait "$socket_sampler" 2>/dev/null || true
+    socket_sampler=""
+}
+
+# the start of a socket phase, as `samples_seen drops`, for socket_phase
+socket_mark() {
+    echo "$(wc -l <"$socket_samples") $(socket_drops "$1")"
+}
+
+# what the socket did since `mark`, as `drops=N peak=BYTES/BUFFER`: the
+# datagrams it dropped and the most bytes its receive queue held against the
+# queue's size
+socket_phase() {
+    local port="$1" mark="$2" now
+    now="$(socket_drops "$port")"
+    awk -v skip="${mark% *}" -v before="${mark#* }" -v now="$now" '
+        NR > skip && $1 != "missing" {
+            if ($1 > peak) peak = $1
+            if ($2 > buffer) buffer = $2
+        }
+        END {
+            if (before == "missing" || now == "missing") drops = "missing"
+            else drops = now - before
+            printf "drops=%s peak=%d/%d\n", drops, peak, buffer
+        }' "$socket_samples"
+}
+
 start_hedge() {
     "${launcher[@]}" "$binary" "$1" >"$work/hedge.log" 2>&1 &
     hedge_pid=$!
