@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The store worker's drain test no longer depends on how late a timed wait returns (#327). It slowed each write with a 100 ms wall-clock wait against a 200 ms stop deadline. On the darwin CI runners that wait returned up to 150 ms late while each write took under 4 ms, so no write completed inside the deadline and `stop` gave up. The worker now keeps its time on a `store_worker.Clock`: `stop` judges its timeout on it and `slow_down` spends its delay on it. In service it is the monotonic clock, as before. The test hands the worker a `ManualClock` that moves only when a request runs, so the margin under the timeout is exact whatever the load.
+
 ## [0.11.0] - 2026-09-25
 
 ### Added
