@@ -611,6 +611,27 @@ The administration listener cannot be referenced by a public virtual host. Authe
 
 The administration service exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
 
+## Static files
+
+```toml
+[service.site]
+kind = "static"
+root = "./public"
+index = "index.html"
+precompressed = true
+cache_control = "max-age=600"
+cache_control_rules = [
+  { path = "/assets/**", value = "public, max-age=31536000, immutable" },
+  { path = "/**/*.html", value = "no-cache" },
+]
+```
+
+A `static` service serves the files under `root`. `index` names the file a directory request serves, `index.html` by default. With `precompressed` set, a request that accepts `br` or `gzip` is served a `.br` or `.gz` sibling of the file when one exists.
+
+`cache_control` is the `Cache-Control` field the service sends, and `cache_control_rules` overrides it for the files whose path matches. The rules are tried in order and the first match wins. A file no rule matches carries `cache_control`, and with neither set the field is not sent. The field goes out on `200`, `206` and `304` responses, for GET and HEAD alike, and never on an error or a redirect.
+
+A rule's `path` begins with `/` and is matched against the path of the file served, relative to `root`. That is the index file for a directory request, so `/` is matched as `/index.html`, and it is the file itself for a precompressed variant. `*` matches within one path segment, `**` matches across segments, and `**/` at the start of a segment also matches no segment, so `/**/*.html` covers `/index.html` as well as `/docs/index.html`. Every other byte matches itself. A service holds at most 8 rules. Each value must be a valid HTTP field value, and both options are refused on any service that is not `static`.
+
 ## Caching
 
 ```toml
