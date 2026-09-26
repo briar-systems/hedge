@@ -14,12 +14,21 @@ set -u
 
 binary="${HEDGE_BINARY:-out/linux-x86_64/release/bin/hedge}"
 connections="${LOAD_CONNECTIONS:-256}"
-target="${LOAD_TARGET:-8}"
+# the target is large enough that the ratio outlasts the ramp: workers take
+# their first connections at different moments, and over a handful of
+# requests that alone spreads the counts (#173). a starved connection still
+# stands out at any target
+target="${LOAD_TARGET:-40}"
 # past the 1024 QUIC connections a server with no configured limit used to be
 # capped at, so this cell fails on any build that still preallocates
 quic_connections="${LOAD_QUIC_CONNECTIONS:-1100}"
-# slow enough that every transfer is still running when the last one connects
-quic_rate="${LOAD_QUIC_RATE:-4k}"
+# every transfer has to outlast the dial burst, or the cell cannot show that all
+# of them were held open at once. the burst is bounded by the handshake rate,
+# and until #174 one worker completes every QUIC handshake, so under load it can
+# run past 20 s. a 64 KiB body at 1 KiB/s takes 64 s, which outlasts any burst
+# the connect timeout allows (#301)
+quic_connect_timeout=60
+quic_rate="${LOAD_QUIC_RATE:-1k}"
 # 0 skips every assertion that HTTP/3 transfers were served, for a box whose
 # crypto rate cannot carry the burst; admission and refusal are still checked.
 quic_served="${LOAD_QUIC_SERVED:-1}"
@@ -36,19 +45,22 @@ CAPPED_QUIC_PORT=19105
 # the capped server admits this many connections across every transport
 CAP=48
 CAP_TCP=32
+# the capped cell only needs its admitted transfers open while TCP is tried again
+CAPPED_QUIC_RATE=4k
 
 prepare_load
 
 # no connection limit, so connection storage grows with the load rather than
 # the run measuring a configured ceiling. the pool defaults to 256 connections'
 # worth without one, so it is sized for the burst outright, and the handshake
-# deadline is lifted past the run: this cell measures service under
-# concurrency, the burst lane measures the deadline
+# and request deadlines are lifted past the run: this cell measures service
+# under concurrency, the burst lane measures the deadline
 write_config "$work/hedge.toml" \
     "max_connections_per_peer = 4096
 memory_bytes = $((quic_connections * 4 * 1048576))" \
     "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
-    "handshake_ms = 60000"
+    "handshake_ms = 60000
+request_ms = 120000"
 start_hedge "$work/hedge.toml"
 
 echo "binary $binary"
@@ -89,7 +101,8 @@ if [ "$quic_served" = 1 ]; then
     # and served at once. the rate limit keeps every transfer running until after
     # the last one has connected, and that overlap is checked from curl's own
     # timings rather than assumed.
-    curl_h3 "$QUIC_PORT" "$quic_connections" open "$quic_rate" --silent --connect-timeout 60 \
+    curl_h3 "$QUIC_PORT" "$quic_connections" open "$quic_rate" --silent \
+        --connect-timeout "$quic_connect_timeout" \
         >"$work/open.out" 2>"$work/open.err"
     awk -v want="$quic_connections" -v bytes="$BODY_BYTES" '
         { total++ }
@@ -117,11 +130,14 @@ fi
 # a configured cap is one process-wide number, whichever transport a
 # connection arrives on. TCP takes part of it, QUIC must be admitted to exactly
 # the rest, and then TCP must be refused because QUIC holds the remainder.
+# exactly is one worker's promise: across workers the cap is never exceeded,
+# but a worker may refuse while another holds allowance it is not using, up to
+# the worker count times a batch, so this cell runs one
 echo
 write_config "$work/capped.toml" \
     "max_connections = $CAP
 max_connections_per_peer = $CAP" \
-    "$CAPPED_CLEARTEXT_PORT" "$CAPPED_SECURE_PORT" "$CAPPED_QUIC_PORT"
+    "$CAPPED_CLEARTEXT_PORT" "$CAPPED_SECURE_PORT" "$CAPPED_QUIC_PORT" "" "" 1
 start_hedge "$work/capped.toml"
 
 start_holder tcp python3 test/load/hold.py --port "$CAPPED_CLEARTEXT_PORT" \
@@ -134,7 +150,7 @@ report $? "a cap of $CAP holds $CAP_TCP TCP connections (held ${held:-none})"
 # tried again. a refused QUIC connection is never answered, so it fails its
 # connect timeout, and curl logs one `using HTTP/3` per connection admitted.
 quic_room=$((CAP - CAP_TCP))
-curl_h3 "$CAPPED_QUIC_PORT" "$CAP_TCP" capped "$quic_rate" --verbose --silent \
+curl_h3 "$CAPPED_QUIC_PORT" "$CAP_TCP" capped "$CAPPED_QUIC_RATE" --verbose --silent \
     --connect-timeout 15 >"$work/capped.out" 2>"$work/capped.err" &
 capped_pid=$!
 admitted=0

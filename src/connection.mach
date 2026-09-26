@@ -14,6 +14,7 @@ use hedge.config.schema;
 use hedge.dispatch;
 use hedge.dispatch.call;
 use hedge.dispatch.plan;
+use http_date: hedge.http.date;
 use hedge.listener;
 use hedge.memory;
 use hedge.operation;
@@ -25,6 +26,7 @@ use hedge.protocol.selection;
 use hedge_tls: hedge.protocol.tls;
 use hedge.protocol.trust;
 use hedge.service;
+use hedge_socket: hedge.socket;
 use hedge.storage;
 use telemetry_trace: hedge.telemetry.trace;
 use hedge_timer:     hedge.timer;
@@ -45,13 +47,10 @@ use A: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
 use io_error:     std.io.error;
-use io_handle:    std.io.handle;
 use io_lifecycle: std.io.lifecycle;
 use io_runtime:   std.io.runtime;
 use std.memory.buffers;
-use net_async: std.net.async;
 use std.net.ip;
-use std.net.tcp;
 use std.sync.cancel;
 use std.system.os;
 use std.types.bool.bool;
@@ -62,6 +61,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view;
 use tls_engine: tls.engine;
 use tls_error:  tls.error;
@@ -84,6 +84,9 @@ pub val CAPTURE_SLOTS:          usize = 8;
 pub val MAX_STEPS:              usize = 64;
 pub val PROLOGUE_BYTES:         usize = prologue.MAX_BYTES;
 pub val PROXY_SCRATCH_BYTES:    usize = proxy_protocol.MAX_TEXT_BYTES;
+# the resource a staged completion names: it settles at once and was never
+# submitted on the socket, so it names none
+val STAGED_RESOURCE: usize = 0;
 
 # where exchange construction stopped, reported through the connection snapshot
 pub def Setup: u8;
@@ -98,6 +101,10 @@ pub val SETUP_BEGIN:    Setup = 7;
 pub val SETUP_TRACE:    Setup = 8;
 pub val SETUP_BIND:     Setup = 9;
 pub val PEER_BYTES:     usize = 64;
+
+# a rejected head's answer carries Date, Content-Length and Connection
+val REJECTION_FIELDS:     usize = 3;
+val REJECTION_DATE_BYTES: usize = http_date.IMF_LENGTH + 1;
 
 pub def State: u8;
 pub val NEW:     State = 1;
@@ -134,13 +141,17 @@ pub val STEP_ERROR:    Step = 5;
 
 # storage a connection claims only once it selects a protocol that needs it,
 # owned by the runtime and shared by every connection it drives
+# one worker's connection storage. `worker` names the worker every connection
+# made from it belongs to, which is how its TLS session finds that worker's table
 pub rec Storage {
     h2_sessions: storage.Table[h2.Session];
     chunks:      storage.Chunks;
+    worker:      usize;
 }
 
-pub fun make_storage(shared: *Storage, a: *A.Allocator) bool {
-    if (shared == nil) { ret false; }
+pub fun make_storage(shared: *Storage, a: *A.Allocator, worker: usize) bool {
+    if (shared == nil || worker >= secure.MAX_TABLES) { ret false; }
+    shared.worker = worker;
     ret storage.make_table[h2.Session](?shared.h2_sessions, a)
         && storage.make_chunks(?shared.chunks, a);
 }
@@ -187,6 +198,9 @@ pub fun config_from(graph: *schema.Graph) Config {
     engine.request_timeout_ns = graph.timeouts.request_ms * 1000000;
     engine.idle_timeout_ns    = graph.timeouts.keep_alive_ms * 1000000;
     engine.write_timeout_ns   = graph.timeouts.write_ms * 1000000;
+    # a connection lives until its peer closes it or a configured timeout ends
+    # it, never for a fixed lifetime (#294)
+    engine.total_timeout_ns = clock.UNBOUNDED_NS;
     ret Config{engine: engine, max_streams: max_streams,
         request_timeout_ns:  graph.timeouts.request_ms * 1000000,
         prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000,
@@ -231,7 +245,7 @@ pub rec Connection {
     id:                 u64;
     generation:         u64;
     token:              listener.ConnectionToken;
-    stream:             tcp.Stream;
+    socket:             hedge_socket.Socket;
     peer:               ip.Endpoint;
     peer_text:          [PEER_BYTES]u8;
     peer_len:           usize;
@@ -243,7 +257,6 @@ pub rec Connection {
     local_kind:         message.EndpointKind;
     secure:             bool;
     listener_name:      str;
-    driver:             *net_async.Driver;
     runtime_stream:     transport.RuntimeStream;
     adapter:            transport.Adapter;
     channel:            transport.Transport;
@@ -259,46 +272,53 @@ pub rec Connection {
     engine_slots:       [PIPELINE_DEPTH]connection.Slot;
     # every engine on this connection borrows from the worker's pool through
     # this account, which stays open until close has released them all
-    borrower:            memory.Borrower;
-    account:             buffers.Account;
-    source:              buffers.Source;
-    account_live:        bool;
-    refused_memory:      bool;
-    memory_deadline_ns:  u64;
-    memory_expired:      bool;
-    stage_chunk:         buffers.Chunk;
-    stage_held:          bool;
-    stage_length:        usize;
-    stage_offset:        usize;
-    body_done:           bool;
-    body_chunks:         u64;
-    request_body:        RequestBody;
-    request:             message.Request;
-    response:            message.Response;
-    response_fields:     [RESPONSE_FIELD_SLOTS]field.Field;
-    response_trailers:   [RESPONSE_TRAILER_SLOTS]field.Field;
-    informationals:      [INFORMATIONAL_SLOTS]message.Informational;
-    captures:            [CAPTURE_SLOTS]router.Capture;
-    memory:              call.Memory;
-    trace:               telemetry_trace.Context;
-    exchange:            exchange.Exchange;
-    active_call:         call.Call;
-    active_slot:         usize;
-    exchange_live:       bool;
-    response_started:    bool;
-    request_generation:  u64;
-    configured:          Config;
-    limits:              message.Limits;
-    plan:                *plan.Plan;
-    budgets:             *budget.Set;
-    charge:              budget.Charge;
-    requests:            u64;
-    last_event:          connection.EventKind;
-    last_step:           Step;
-    setup_failure:       Setup;
-    request_failure:     message.RequestStatus;
-    pending_slot:        usize;
-    has_pending:         bool;
+    borrower:           memory.Borrower;
+    account:            buffers.Account;
+    source:             buffers.Source;
+    account_live:       bool;
+    refused_memory:     bool;
+    memory_deadline_ns: u64;
+    memory_expired:     bool;
+    stage_chunk:        buffers.Chunk;
+    stage_held:         bool;
+    stage_length:       usize;
+    stage_offset:       usize;
+    body_done:          bool;
+    body_chunks:        u64;
+    request_body:       RequestBody;
+    request:            message.Request;
+    response:           message.Response;
+    response_fields:    [RESPONSE_FIELD_SLOTS]field.Field;
+    response_trailers:  [RESPONSE_TRAILER_SLOTS]field.Field;
+    informationals:     [INFORMATIONAL_SLOTS]message.Informational;
+    captures:           [CAPTURE_SLOTS]router.Capture;
+    memory:             call.Memory;
+    trace:              telemetry_trace.Context;
+    exchange:           exchange.Exchange;
+    active_call:        call.Call;
+    active_slot:        usize;
+    exchange_live:      bool;
+    response_started:   bool;
+    request_generation: u64;
+    configured:         Config;
+    limits:             message.Limits;
+    plan:               *plan.Plan;
+    budgets:            *budget.Set;
+    charge:             budget.Charge;
+    requests:           u64;
+    last_event:         connection.EventKind;
+    last_step:          Step;
+    setup_failure:      Setup;
+    request_failure:    message.RequestStatus;
+    pending_slot:       usize;
+    has_pending:        bool;
+    # a request head the engine could not parse is answered here, with no
+    # exchange, since there is no request to hand a service
+    rejecting:           bool;
+    rejected_slot:       usize;
+    rejection_items:     [REJECTION_FIELDS]field.Field;
+    rejection_fields:    field.Fields;
+    rejection_date:      [REJECTION_DATE_BYTES]u8;
     service_pending:     bool;
     initialized:         bool;
     engine_live:         bool;
@@ -322,7 +342,7 @@ pub rec Connection {
     waker:       hedge_wake.Waker;
     wake_failed: bool;
     tls_policy:  usize;
-    session:     usize;
+    session:     secure.Handle;
     # the h2 session's index in the shared table, or h2.NO_SESSION
     h2_session:             usize;
     shared:                 *Storage;
@@ -364,14 +384,14 @@ fun deliver_staged(owner: *Connection, scope: *cancel.Scope, buffer: *u8,
         i         = i + 1;
     }
     val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
-        owner.driver.runtime, scope,
-        io_runtime.Operation{kind: io_runtime.READ, resource: owner.stream.handle.value,
-        buffer: buffer, length: length, offset: 0,
+        owner.socket.runtime, scope,
+        io_runtime.Operation{kind: io_runtime.READ, resource: STAGED_RESOURCE,
+        buffer:  buffer, length: length, offset: 0,
         context: (?owner.contexts[index])::usize});
     if (sel submitted.err) { ret submitted; }
     val token:     io_runtime.Token    = submitted.ok;
-    val published: err[io_error.Error] = io_runtime.complete(owner.driver.runtime,
-        token, count, owner.stream.handle.value, false);
+    val published: err[io_error.Error] = io_runtime.complete(owner.socket.runtime,
+        token, count, STAGED_RESOURCE, false);
     if (sel published.err) {
         # nothing was delivered, so the staged bytes stay staged
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
@@ -387,11 +407,11 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
     }
-    if (owner.session == secure.NO_SESSION
+    if (secure.absent(owner.session)
         && owner.prologue_read < owner.prologue_len && length != 0) {
         ret deliver_staged(owner, scope, buffer, length, index);
     }
-    ret net_async.submit_read(owner.driver, scope, ?owner.stream, buffer, length,
+    ret hedge_socket.submit_read(?owner.socket, scope, buffer, length,
         (?owner.contexts[index])::usize);
 }
 
@@ -399,12 +419,12 @@ fun submit_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
 fun ready_staged(owner: *Connection, scope: *cancel.Scope,
     index: usize) res[io_runtime.Token, io_error.Error] {
     val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
-        owner.driver.runtime, scope,
-        io_runtime.Operation{kind: io_runtime.READABLE, resource: owner.stream.handle.value,
+        owner.socket.runtime, scope,
+        io_runtime.Operation{kind: io_runtime.READABLE, resource: STAGED_RESOURCE,
         buffer: nil, length: 0, offset: 0, context: (?owner.contexts[index])::usize});
     if (sel submitted.err) { ret submitted; }
-    val published: err[io_error.Error] = io_runtime.complete(owner.driver.runtime,
-        submitted.ok, 0, owner.stream.handle.value, false);
+    val published: err[io_error.Error] = io_runtime.complete(owner.socket.runtime,
+        submitted.ok, 0, STAGED_RESOURCE, false);
     if (sel published.err) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_READ)};
     }
@@ -418,10 +438,10 @@ fun submit_readable(context: ptr, scope: *cancel.Scope,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
     }
-    if (owner.session == secure.NO_SESSION && owner.prologue_read < owner.prologue_len) {
+    if (secure.absent(owner.session) && owner.prologue_read < owner.prologue_len) {
         ret ready_staged(owner, scope, index);
     }
-    ret net_async.submit_readable(owner.driver, scope, ?owner.stream,
+    ret hedge_socket.submit_readable(?owner.socket, scope,
         (?owner.contexts[index])::usize);
 }
 
@@ -432,7 +452,7 @@ fun submit_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WRITE)};
     }
-    ret net_async.submit_write(owner.driver, scope, ?owner.stream, buffer, length,
+    ret hedge_socket.submit_write(?owner.socket, scope, buffer, length,
         (?owner.contexts[index])::usize);
 }
 
@@ -443,7 +463,7 @@ fun submit_shutdown(context: ptr, scope: *cancel.Scope,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)};
     }
-    ret net_async.submit_shutdown_write(owner.driver, scope, ?owner.stream,
+    ret hedge_socket.submit_shutdown_write(?owner.socket, scope,
         (?owner.contexts[index])::usize);
 }
 
@@ -454,7 +474,7 @@ fun submit_close(context: ptr, scope: *cancel.Scope,
     if (index >= TRANSPORT_SLOTS) {
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)};
     }
-    ret net_async.submit_stream_close(owner.driver, scope, ?owner.stream,
+    ret hedge_socket.submit_close(?owner.socket, scope,
         io_lifecycle.ABORTIVE, (?owner.contexts[index])::usize);
 }
 
@@ -600,11 +620,8 @@ fun record_observed(owner: *Connection, source: *listener.Connection) {
     owner.local_kind = message.ENDPOINT_UNSPECIFIED;
     owner.local_len  = 0;
     owner.local_port = 0;
-    # the bound address of a wildcard listener is not the address this
-    # connection arrived on, so the socket is asked rather than the listener
-    val local: res[ip.Endpoint, io_error.Error] = tcp.stream_local_endpoint(?owner.stream);
-    if (sel local.ok) {
-        val endpoint: ip.Endpoint = local.ok;
+    var endpoint: ip.Endpoint;
+    if (hedge_socket.local_endpoint(?owner.socket, ?endpoint)) {
         owner.local_len = format_endpoint(endpoint, ?owner.local_text[0], PEER_BYTES);
         if (owner.local_len != 0) {
             owner.local_kind = message.ENDPOINT_IP;
@@ -656,7 +673,6 @@ pub fun make(
     generation: u64,
     token: listener.ConnectionToken,
     source: *listener.Connection,
-    net_driver: *net_async.Driver,
     active_plan: *plan.Plan,
     budgets: *budget.Set,
     configured: Config,
@@ -672,7 +688,7 @@ pub fun make(
     owner.initialized    = false;
     owner.account_live   = false;
     owner.refused_memory = false;
-    if (source == nil || net_driver == nil || active_plan == nil
+    if (source == nil || active_plan == nil
         || owned == nil || shared == nil || pool == nil || id == 0 || generation == 0
         || !hedge_wake.valid(?waker)) { ret false; }
     owner.waker                = waker;
@@ -683,7 +699,7 @@ pub fun make(
     # cleartext, so the connection is refused before it is admitted
     if (owned.policy.secure && hedge_tls.policy_at(policy) == nil) { ret false; }
     owner.tls_policy           = policy;
-    owner.session              = secure.NO_SESSION;
+    owner.session              = secure.no_session();
     owner.h2_session           = h2.NO_SESSION;
     owner.shared               = shared;
     owner.handshaking          = false;
@@ -695,9 +711,8 @@ pub fun make(
     owner.id                   = id;
     owner.generation           = generation;
     owner.token                = token;
-    owner.stream               = source.tcp_stream;
+    owner.socket               = source.socket;
     owner.listener_name        = schema.text(?owned.name);
-    owner.driver               = net_driver;
     owner.engine_live          = false;
     owner.protocol             = selection.NONE;
     owner.refusal              = prologue.REFUSED_NONE;
@@ -726,6 +741,8 @@ pub fun make(
     owner.request_failure        = 0;
     owner.pending_slot           = 0;
     owner.has_pending            = false;
+    owner.rejecting              = false;
+    owner.rejected_slot          = no_slot();
     owner.service_pending        = false;
     owner.initialized            = false;
     # every connection is a cancel root of its own. mach-http's transport requires
@@ -746,8 +763,8 @@ pub fun make(
     if (!operation_ok(cancel.make_child(?owner.prologue_scope, ?owner.operation_root, opt[time.Instant].none{}))) { ret false; }
     owner.prologue_scope_live = true;
     owner.runtime_stream      = transport.RuntimeStream{
-        runtime: net_driver.runtime,
-        context: (owner)::ptr,
+        runtime:               owner.socket.runtime,
+        context:               (owner)::ptr,
         submit_read:           submit_read,
         submit_readable:       submit_readable,
         submit_write:          submit_write,
@@ -795,7 +812,7 @@ pub fun pending_work(owner: *Connection) bool {
     if (owner.wake_failed) { ret true; }
     # the pool funded the account and nothing has routed its wake
     if (owner.account_live && owner.account.is_ready) { ret true; }
-    if (owner.session != secure.NO_SESSION && secure.pending_work(owner.session)) {
+    if (!secure.absent(owner.session) && secure.pending_work(owner.session)) {
         ret true;
     }
     if (owner.state == NEW) {
@@ -808,6 +825,10 @@ pub fun pending_work(owner: *Connection) bool {
     if (owner.engine.write_length != 0 && !owner.engine.write_pending) { ret true; }
     # a request the engine handed over, waiting only for its exchange to start
     if (owner.has_pending && !owner.exchange_live) { ret true; }
+    # a rejected head whose answer is neither in flight nor waiting on memory
+    if (owner.rejecting && !owner.engine.write_pending && !owner.engine.memory_blocked) {
+        ret true;
+    }
     # a parked service whose named wait moved is re-entered by the next step
     ret owner.exchange_live && owner.service_pending && call.stirred(?owner.active_call);
 }
@@ -837,7 +858,7 @@ pub fun close_work(owner: *Connection) bool {
     if (!close_waiting(owner))                        { ret false; }
     if (owner.wake_failed)                            { ret true; }
     if (owner.account_live && owner.account.is_ready) { ret true; }
-    if (owner.session != secure.NO_SESSION && secure.pending_work(owner.session)) {
+    if (!secure.absent(owner.session) && secure.pending_work(owner.session)) {
         ret true;
     }
     ret owner.h2_session != h2.NO_SESSION && h2.close_work(h2_of(owner));
@@ -949,7 +970,7 @@ fun refuse(owner: *Connection, reason: prologue.Refusal) Step {
 
 fun start_engine(owner: *Connection, now: time.Instant) Step {
     var adapter: transport.Adapter = owner.adapter;
-    if (owner.session != secure.NO_SESSION) { adapter = secure.adapter(owner.session); }
+    if (!secure.absent(owner.session)) { adapter = secure.adapter(owner.session); }
     if (!transport.adapter_valid(?adapter)) {
         ret refuse(owner, prologue.REFUSED_TRANSPORT);
     }
@@ -1032,7 +1053,7 @@ fun staged_bytes(context: ptr, buffer: *u8, length: usize) usize {
 fun settle_secure(context: ptr, token_context: usize,
     completion: io_runtime.Completion) {
     val owner: *Connection = context::*Connection;
-    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) {
+    if (owner == nil || !owner.initialized || secure.absent(owner.session)) {
         ret;
     }
     var settled: io_runtime.Completion = completion;
@@ -1044,13 +1065,13 @@ fun begin_secure(owner: *Connection, now: time.Instant) Step {
     if (!hedge_tls.prepare(owner.tls_policy)) {
         ret refuse(owner, prologue.REFUSED_TLS);
     }
-    owner.session = secure.acquire();
-    if (owner.session == secure.NO_SESSION) {
+    owner.session = secure.acquire(owner.shared.worker);
+    if (secure.absent(owner.session)) {
         ret refuse(owner, prologue.REFUSED_EXHAUSTED);
     }
     val channel: *secure.Channel = secure.channel(owner.session);
     if (channel == nil
-        || !secure.attach(owner.session, owner.driver, ?owner.stream, (owner)::ptr,
+        || !secure.attach(owner.session, ?owner.socket, (owner)::ptr,
         staged_bytes, ?owner.borrower, ?owner.account, owner.waker)
         || !operation.bind_operation(?owner.secure_operation, ?channel.context, (owner)::ptr,
         settle_secure, 0)
@@ -1108,9 +1129,8 @@ fun submit_prologue_read(owner: *Connection) Step {
         (owner)::ptr, settle_prologue, 0)) {
         ret refuse(owner, prologue.REFUSED_TRANSPORT);
     }
-    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_read(
-        owner.driver, ?owner.prologue_scope, ?owner.stream,
-        ?owner.prologue_buffer[owner.prologue_len],
+    val submitted: res[io_runtime.Token, io_error.Error] = hedge_socket.submit_read(
+        ?owner.socket, ?owner.prologue_scope, ?owner.prologue_buffer[owner.prologue_len],
         PROLOGUE_BYTES - owner.prologue_len,
         (?owner.prologue_context)::usize);
     if (sel submitted.err) {
@@ -1620,6 +1640,73 @@ fun start_exchange(owner: *Connection, slot: usize, now: time.Instant) Step {
     ret STEP_PROGRESS;
 }
 
+# a head the engine rejected has no request to build an exchange from, so it
+# is answered here with the status the engine names, a Date as every hedge
+# response carries, an empty body, and the close the engine will make
+fun begin_rejection(owner: *Connection, slot: usize, now: time.Instant) Step {
+    val code: status.Status = connection.rejection(?owner.engine, slot);
+    owner.rejection_fields = field.init(?owner.rejection_items[0], REJECTION_FIELDS,
+        owner.limits.response_fields);
+    val dated: usize = http_date.format(clock.wall(), ?owner.rejection_date[0],
+        REJECTION_DATE_BYTES);
+    if ((dated != 0 && field.append(?owner.rejection_fields, field.Field{
+        name:  view.view(field.DATE, str_len(field.DATE)),
+        value: view.view(?owner.rejection_date[0], dated), sensitive: false
+    }) != field.ADD_OK)
+        || field.append(?owner.rejection_fields, field.Field{
+        name:  view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH)),
+        value: view.view("0", 1), sensitive: false
+    }) != field.ADD_OK
+        || field.append(?owner.rejection_fields, field.Field{
+        name:  view.view("connection", 10),
+        value: view.view("close", 5), sensitive: false
+    }) != field.ADD_OK
+        || !connection.prepare_response(?owner.engine, slot, code, reason_for(code),
+        ?owner.rejection_fields, nil, now)) {
+        owner.state = FAILED;
+        ret STEP_ERROR;
+    }
+    owner.rejecting     = true;
+    owner.rejected_slot = slot;
+    ret STEP_PROGRESS;
+}
+
+fun pump_rejection(owner: *Connection, now: time.Instant) Step {
+    if (owner.engine.write_pending) { ret STEP_BLOCKED; }
+    if (owner.engine.write_length != 0) {
+        if (!connection.submit_write(?owner.engine)) {
+            owner.state = FAILED;
+            ret STEP_ERROR;
+        }
+        ret STEP_PROGRESS;
+    }
+    if (owner.engine_slots[owner.rejected_slot].outbound_complete) {
+        if (!connection.release(?owner.engine, owner.rejected_slot, now)) {
+            owner.state = FAILED;
+            ret STEP_ERROR;
+        }
+        owner.rejecting     = false;
+        owner.rejected_slot = no_slot();
+        ret STEP_PROGRESS;
+    }
+    val offered: connection.Offer = connection.offer(?owner.engine, owner.rejected_slot,
+        nil, 0, true);
+    if (offered.status == connection.OFFER_ERROR) {
+        owner.state = FAILED;
+        ret STEP_ERROR;
+    }
+    if (offered.status == connection.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    ret STEP_PROGRESS;
+}
+
+# a slot the engine handed over is a request to serve or a head to refuse
+fun start_slot(owner: *Connection, slot: usize, now: time.Instant) Step {
+    if (connection.rejection(?owner.engine, slot) != 0) {
+        ret begin_rejection(owner, slot, now);
+    }
+    ret start_exchange(owner, slot, now);
+}
+
 # translate one protocol event into product work
 #
 # this is the only place a connection event becomes a service call. a pipelined
@@ -1648,13 +1735,14 @@ fun apply(owner: *Connection, event: connection.Event, now: time.Instant) Step {
         owner.state = CLOSING;
         ret STEP_DONE;
     }
-    if (event.kind == connection.EVENT_REQUEST_HEADERS) {
+    if (event.kind == connection.EVENT_REQUEST_HEADERS
+        || event.kind == connection.EVENT_REQUEST_REJECTED) {
         if (owner.exchange_live) {
             owner.pending_slot = event.slot;
             owner.has_pending  = true;
             ret STEP_BLOCKED;
         }
-        ret start_exchange(owner, event.slot, now);
+        ret start_slot(owner, event.slot, now);
     }
     # a pending service completes its own suspended operation when it is resumed,
     # so the host only completes what was left outstanding after the service returned
@@ -1690,7 +1778,7 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
     }
     # a secure connection's transport work is driven by this loop rather than by
     # the engine, because exactly one TLS operation may run at a time
-    if (owner.session != secure.NO_SESSION && owner.engine_live) {
+    if (!secure.absent(owner.session) && owner.engine_live) {
         var settled: transport.Completion;
         if (secure.take(owner.session, ?settled)) {
             if (owner.h2_session != h2.NO_SESSION) {
@@ -1716,12 +1804,12 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         # whatever the engine queued in this step has to start now. leaving it
         # for the next completion strands the last frame of a response behind a
         # read the peer will never satisfy, because the peer is waiting for it.
-        if (owner.session != secure.NO_SESSION) { secure.drive(owner.session); }
+        if (!secure.absent(owner.session)) { secure.drive(owner.session); }
         owner.last_step = stepped;
         if (stepped == STEP_DONE || stepped == STEP_ERROR) { owner.state = CLOSING; }
         ret stepped;
     }
-    if (owner.session != secure.NO_SESSION) { secure.drive(owner.session); }
+    if (!secure.absent(owner.session)) { secure.drive(owner.session); }
     if (owner.engine.state == connection.CLOSED || owner.engine.state == connection.FAILED) {
         owner.state = CLOSING;
         ret STEP_DONE;
@@ -1748,10 +1836,15 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         owner.last_step = inbound;
         ret inbound;
     }
+    if (owner.rejecting) {
+        val answered: Step = pump_rejection(owner, now);
+        owner.last_step = answered;
+        ret answered;
+    }
     if (owner.has_pending) {
         owner.has_pending     = false;
         owner.service_pending = false;
-        val started: Step = start_exchange(owner, owner.pending_slot, now);
+        val started: Step = start_slot(owner, owner.pending_slot, now);
         owner.last_step = started;
         ret started;
     }
@@ -1771,7 +1864,7 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
     fin { track_memory(owner, now); }
     # what the engines submit to the secure channel while this runs is started
     # here, and whatever is left unstarted queues the connection again
-    if (owner.session != secure.NO_SESSION) { secure.begin_step(owner.session); }
+    if (!secure.absent(owner.session)) { secure.begin_step(owner.session); }
     fin { end_secure_step(owner); }
     var steps: usize = 0;
     # a connection still moving when its step bound runs out has more to do
@@ -1786,7 +1879,7 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
     }
     # the engines have nothing more to send, so a read may start without a
     # response ever having to wait behind it
-    if (owner.session != secure.NO_SESSION && owner.engine_live
+    if (!secure.absent(owner.session) && owner.engine_live
         && owner.state == ACTIVE && secure.drive(owner.session)) {
         ret STEP_PROGRESS;
     }
@@ -1794,7 +1887,7 @@ pub fun advance(owner: *Connection, now: time.Instant) Step {
 }
 
 fun end_secure_step(owner: *Connection) {
-    if (owner.initialized && owner.session != secure.NO_SESSION) {
+    if (owner.initialized && !secure.absent(owner.session)) {
         secure.end_step(owner.session);
     }
 }
@@ -1804,7 +1897,7 @@ fun end_secure_step(owner: *Connection) {
 # connection. the worker queues the connection as well, for an HTTP engine that
 # was blocked on the same account
 pub fun funded(owner: *Connection) {
-    if (owner == nil || !owner.initialized || owner.session == secure.NO_SESSION) { ret; }
+    if (owner == nil || !owner.initialized || secure.absent(owner.session)) { ret; }
     secure.resume(owner.session);
 }
 
@@ -1913,7 +2006,7 @@ fun pump_secure_close(owner: *Connection) bool {
 # socket wakes the connection through settle_secure for the next close to take
 fun close_h1(owner: *Connection) bool {
     for (!close_h1_engine(owner)) {
-        if (owner.session == secure.NO_SESSION || !pump_secure_close(owner)) {
+        if (secure.absent(owner.session) || !pump_secure_close(owner)) {
             ret false;
         }
     }
@@ -1927,7 +2020,7 @@ fun close_h2(owner: *Connection) h2.ReleaseStatus {
     for {
         val released: h2.ReleaseStatus = h2.release_status(?owner.shared.h2_sessions,
             owner.h2_session);
-        if (released != h2.RELEASE_PENDING || owner.session == secure.NO_SESSION
+        if (released != h2.RELEASE_PENDING || secure.absent(owner.session)
             || !pump_secure_close(owner)) { ret released; }
     }
     ret h2.RELEASE_PENDING;
@@ -1981,13 +2074,13 @@ pub fun close(owner: *Connection) bool {
     # a handshake the cancellation interrupted still runs in the session until
     # its transport operations settle, and releasing it before then would leave
     # its buffers held (#280). each settlement wakes the connection
-    if (owner.session != secure.NO_SESSION) {
+    if (!secure.absent(owner.session)) {
         if (!secure.idle(owner.session)) {
             owner.close_wait = CLOSE_TLS;
             ret false;
         }
         if (!secure.release(owner.session)) { owner.close_failed = true; }
-        owner.session = secure.NO_SESSION;
+        owner.session = secure.no_session();
     }
     owner.handshaking = false;
     # the account cannot close while it still holds the staging chunk, and a
@@ -2014,7 +2107,7 @@ pub fun close(owner: *Connection) bool {
 # driver has seen is only ever closed through it, so when nothing here closed
 # it, the listener that accepted it does (#716)
 pub fun stream_released(owner: *Connection) bool {
-    ret owner != nil && !io_handle.socket_is_valid(owner.stream.handle);
+    ret owner != nil && hedge_socket.released(?owner.socket);
 }
 
 pub fun close_waiting(owner: *Connection) bool {
@@ -2393,6 +2486,14 @@ test "connection: the configured pipeline bound reaches both protocol engines" {
     configured                      = config_from(?graph);
     if (configured.engine.max_pipeline != PIPELINE_DEPTH
         || configured.max_streams != h2.MAX_STREAMS) { ret 2; }
+    ret 0;
+}
+
+test "connection: no engine bounds a connection's whole life (#294)" {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    val configured: Config = config_from(?graph);
+    if (configured.engine.total_timeout_ns != clock.UNBOUNDED_NS) { ret 1; }
     ret 0;
 }
 

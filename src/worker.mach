@@ -1,0 +1,722 @@
+# one worker: everything a core owns to serve its connections
+#
+# a worker owns its serving runtime (io runtime, drivers, listeners, timer
+# wheel, wakes and buffer pool), its QUIC runtime and pump storage, its proxy
+# runtime, and the two service generations and compiled plans its connections
+# retain. nothing here is shared with another worker. what every worker reads
+# (the cache, certificates, telemetry production, the application registry)
+# belongs to the process and reaches a worker as `Inputs`.
+#
+# a worker's welded QUIC records are not in this record. they are owned by the
+# `Controls` its caller holds for the worker's lifetime and borrowed per call as
+# a `ControlView`, so no public record ever retains them.
+
+use crypto.contracts;
+use crypto.secret;
+use hedge.acme.handler;
+use http_cache: hedge.cache;
+use hedge.config.schema;
+use hedge.dispatch.middleware;
+use hedge.dispatch.plan;
+use hedge.generation;
+use hedge.lifecycle;
+use h3_session:   hedge.protocol.h3.session;
+use quic_runtime: hedge.protocol.quic.runtime;
+use hedge.proxy.upstream;
+use hedge.serve;
+use hedge.service;
+use hedge.service.proxy;
+use static_files:  hedge.service.static;
+use hedge_storage: hedge.storage;
+use hedge.telemetry;
+use http.router.router;
+use std.allocator;
+use std.chrono.time;
+use std.net.ip;
+use std.sync.atomic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use tls_server: tls.server;
+
+pub val MAX_ROUTES:       usize = 64;
+pub val MAX_SEGMENTS:     usize = 512;
+pub val MAX_SERVICES:     usize = 32;
+pub val MAX_MIDDLEWARE:   usize = 16;
+pub val MAX_STATIC_ROOTS: usize = 16;
+pub val PLAN_TEXT_BYTES:  usize = 16384;
+
+pub rec PlanStorage {
+    routes:     [MAX_ROUTES]router.CompiledRoute;
+    segments:   [MAX_SEGMENTS]router.Segment;
+    specs:      [MAX_ROUTES]router.Route;
+    entries:    [MAX_ROUTES]plan.Entry;
+    services:   [MAX_SERVICES]service.Descriptor;
+    middleware: [MAX_MIDDLEWARE]middleware.Middleware;
+    text:       [PLAN_TEXT_BYTES]u8;
+}
+
+pub def StartStatus: u8;
+pub val START_OK:      StartStatus = 1;
+pub val START_CONFIG:  StartStatus = 2;
+pub val START_RUNTIME: StartStatus = 3;
+
+pub rec StartReport {
+    status: StartStatus;
+    detail: str;
+}
+
+pub fun ok() StartReport {
+    ret StartReport{status: START_OK, detail: nil};
+}
+
+pub fun failed(status: StartStatus, detail: str) StartReport {
+    ret StartReport{status: status, detail: detail};
+}
+
+# the services a worker's planes drive alongside its connections. ACME and the
+# TLS policies are the supervisor's
+rec Planes {
+    proxying:  *proxy.Runtime;
+    recording: *http_cache.Recorders;
+}
+
+# one service bank retained by every connection on its plan
+pub rec ServiceGeneration {
+    static_registry:       static_files.Registry;
+    static_sites:          [MAX_STATIC_ROOTS]static_files.Site;
+    proxy_registry:        proxy.Registry;
+    proxy_bindings:        proxy.Bindings;
+    proxy_binding_storage: [MAX_SERVICES]proxy.Binding;
+    cache_bindings:        http_cache.Bindings;
+    cache_binding_storage: [MAX_SERVICES]http_cache.Binding;
+    services:              service.Resolver;
+    generation:            u64;
+    static_live:           bool;
+    proxy_live:            bool;
+    cache_live:            bool;
+    live:                  bool;
+}
+
+# what the process hands every worker it builds a service generation for. the
+# pointers are the process's and outlive every worker
+pub rec Inputs {
+    caching:      *http_cache.Layer;
+    applications: *service.Applications;
+    native:       service.Factory;
+    # the worker's own recorder, which its requests are observed through
+    observability:          *telemetry.Recorder;
+    listener_services:      *service.ListenerService;
+    listener_service_count: usize;
+    # the HTTP-01 challenge route, or nil when ACME answers no such challenge
+    challenge: *handler.Binding;
+    # the worker's cache recordings, or nil when the cache is off
+    recording: *http_cache.Recorders;
+}
+
+# what the supervisor asks of a worker and what the worker answers. the two
+# are different threads, so every word here is read and written atomically,
+# and a request's arguments are written before the word that posts it.
+# ---
+# shutdown:   set once by the supervisor when the process is to stop
+# request:    a reload step the supervisor posts, REQUEST_NONE once taken
+# request_id: the generation the posted step is for
+# state:      where the worker is, one of STATE_*
+# answer:     the worker's answer to the last step it took, one of ANSWER_*
+# answer_id:  the generation that answer is for
+# superseded: connections of an older generation the worker still serves
+# draining:   the worker began its shutdown sequence
+pub rec Control {
+    shutdown:   i64;
+    request:    i64;
+    request_id: i64;
+    state:      i64;
+    answer:     i64;
+    answer_id:  i64;
+    superseded: i64;
+    draining:   i64;
+}
+
+pub val REQUEST_NONE:    i64 = 0;
+pub val REQUEST_PREPARE: i64 = 1;
+pub val REQUEST_COMMIT:  i64 = 2;
+pub val REQUEST_ABORT:   i64 = 3;
+
+pub val STATE_NEW:      i64 = 0;
+pub val STATE_STARTING: i64 = 1;
+pub val STATE_READY:    i64 = 2;
+pub val STATE_FAILED:   i64 = 3;
+pub val STATE_STOPPED:  i64 = 4;
+
+pub val ANSWER_NONE:      i64 = 0;
+pub val ANSWER_PREPARED:  i64 = 1;
+pub val ANSWER_REFUSED:   i64 = 2;
+pub val ANSWER_COMMITTED: i64 = 3;
+pub val ANSWER_FAILED:    i64 = 4;
+pub val ANSWER_ABORTED:   i64 = 5;
+
+pub fun reset_control(control: *Control) {
+    atomic.store(?control.shutdown, 0);
+    atomic.store(?control.request, REQUEST_NONE);
+    atomic.store(?control.request_id, 0);
+    atomic.store(?control.state, STATE_NEW);
+    atomic.store(?control.answer, ANSWER_NONE);
+    atomic.store(?control.answer_id, 0);
+    atomic.store(?control.superseded, 0);
+    atomic.store(?control.draining, 0);
+}
+
+# post one reload step for `generation_id`
+pub fun post(control: *Control, request: i64, generation_id: u64) {
+    atomic.store(?control.request_id, generation_id::i64);
+    atomic.store(?control.request, request);
+}
+
+# take the posted step, or REQUEST_NONE
+pub fun take(control: *Control, generation_id: *u64) i64 {
+    val request: i64 = atomic.exchange(?control.request, REQUEST_NONE);
+    @generation_id = atomic.load(?control.request_id)::u64;
+    ret request;
+}
+
+pub fun answer(control: *Control, value: i64, generation_id: u64) {
+    atomic.store(?control.answer_id, generation_id::i64);
+    atomic.store(?control.answer, value);
+}
+
+# the answer for `generation_id`, or ANSWER_NONE while there is none yet
+pub fun answered(control: *Control, generation_id: u64) i64 {
+    val value: i64 = atomic.load(?control.answer);
+    if (atomic.load(?control.answer_id)::u64 != generation_id) { ret ANSWER_NONE; }
+    ret value;
+}
+
+pub rec Worker {
+    index:   usize;
+    control: Control;
+    # the configuration generations this worker's connections pin: the one it
+    # serves, and the one it is still draining after a reload, or nil
+    current:     *generation.Generation;
+    previous:    *generation.Generation;
+    diagnostics: schema.Diagnostics;
+    # this worker's metrics, which only it writes and a render merges
+    recorder: telemetry.Recorder;
+    # the cache recordings this worker has in flight, which only it touches,
+    # or nil when the cache is off
+    cache_recorders: http_cache.Recorders;
+    recording:       *http_cache.Recorders;
+    # why a start on the worker's own thread failed, and how its stop went,
+    # both written before the state that reports them
+    failure:             str;
+    failure_status:      StartStatus;
+    report:              StopReport;
+    proxying:            proxy.Runtime;
+    service_generations: [2]ServiceGeneration;
+    plans:               [2]plan.Plan;
+    storages:            [2]PlanStorage;
+    serving:             serve.Runtime;
+    quic:                quic_runtime.Runtime;
+    quic_pumps:          [quic_runtime.MAX_PUMPS]quic_runtime.PumpStorage;
+    planes:              Planes;
+    active_generation:   usize;
+    proxy_live:          bool;
+    serve_live:          bool;
+    quic_live:           bool;
+}
+
+# every welded quic record of one worker is owned by a typed secret array,
+# table or pair. Controls is held by whoever runs the worker for its lifetime,
+# never moves (a pair's slab points at its own halves), and is never retained by
+# a public record. the tables start empty and the quic runtime grows them.
+pub rec Controls {
+    pump_allocator: secret.ArrayAllocator[quic_runtime.Pump];
+    pumps:          secret.SecretArray[quic_runtime.Pump];
+    connections:    hedge_storage.Pair[quic_runtime.ConnectionStorage, quic_runtime.Connection];
+    handshakes:     hedge_storage.SecretTable[tls_server.Handshake];
+    sessions:       hedge_storage.Pair[h3_session.SessionStorage, h3_session.Session];
+    live:           bool;
+}
+
+pub fun make_controls(controls: *Controls, a: *allocator.Allocator) bool {
+    if (controls == nil || a == nil || controls.live) { ret false; }
+    controls.pump_allocator =
+        secret.system_array_allocator[quic_runtime.Pump]();
+    # each pair and table owns a slab whose link storage, and a pair's plain
+    # half, draw on this allocator; the welded records use crypto.secret's own
+    if (!hedge_storage.make_pair[quic_runtime.ConnectionStorage, quic_runtime.Connection](
+        ?controls.connections, a)
+        || !hedge_storage.make_secret_table[tls_server.Handshake](
+        ?controls.handshakes, a)
+        || !hedge_storage.make_pair[h3_session.SessionStorage, h3_session.Session](
+        ?controls.sessions, a)) { ret false; }
+    if (secret.init_array[quic_runtime.Pump](?controls.pumps,
+        ?controls.pump_allocator, quic_runtime.MAX_PUMPS) != contracts.OK) {
+        release_controls(controls);
+        ret false;
+    }
+    controls.live = true;
+    ret true;
+}
+
+# a failed destroy retains wiped ownership, so a later call retries the same
+# owner rather than abandoning it
+pub fun release_controls(controls: *Controls) bool {
+    if (controls == nil) { ret false; }
+    var released: bool = true;
+    if (!hedge_storage.destroy_pair[h3_session.SessionStorage, h3_session.Session](
+        ?controls.sessions)) { released = false; }
+    if (!hedge_storage.destroy_secret_table[tls_server.Handshake](
+        ?controls.handshakes)) { released = false; }
+    if (!hedge_storage.destroy_pair[quic_runtime.ConnectionStorage, quic_runtime.Connection](
+        ?controls.connections)) { released = false; }
+    if (secret.destroy_array[quic_runtime.Pump](?controls.pumps)
+        != contracts.OK) { released = false; }
+    if (released) { controls.live = false; }
+    ret released;
+}
+
+pub fun controls_cleanup_pending(controls: *Controls) bool {
+    if (controls == nil) { ret false; }
+    ret secret.array_cleanup_pending[quic_runtime.Pump](?controls.pumps)
+        || hedge_storage.pair_cleanup_pending[quic_runtime.ConnectionStorage,
+        quic_runtime.Connection](?controls.connections)
+        || hedge_storage.secret_table_cleanup_pending[tls_server.Handshake](
+        ?controls.handshakes)
+        || hedge_storage.pair_cleanup_pending[h3_session.SessionStorage,
+        h3_session.Session](?controls.sessions);
+}
+
+# the view is borrowed by one call and never outlives it
+pub fun controls_view(controls: *Controls,
+    output: *quic_runtime.ControlView) bool {
+    if (controls == nil || output == nil || !controls.live) { ret false; }
+    output.pumps       = secret.array_data[quic_runtime.Pump](?controls.pumps);
+    output.connections = ?controls.connections;
+    output.handshakes  = ?controls.handshakes;
+    output.sessions    = ?controls.sessions;
+    ret output.pumps != nil;
+}
+
+# the control owner is made only when a quic listener exists to need it
+pub fun quic_required(graph: *schema.Graph) bool {
+    if (graph == nil) { ret false; }
+    var i: usize = 0;
+    for (i < graph.listener_count) {
+        if (graph.listeners[i].transport == schema.TRANSPORT_QUIC) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a worker that owns nothing yet, so a partial start can be torn down
+pub fun make(worker: *Worker, index: usize, pseudonym: str) bool {
+    if (worker == nil) { ret false; }
+    worker.index         = index;
+    worker.current       = nil;
+    worker.recorder.live = false;
+    worker.recording     = nil;
+    worker.previous      = nil;
+    reset_control(?worker.control);
+    worker.failure = nil;
+    worker.report  = StopReport{stopped: true,
+        reason:           lifecycle.IMMEDIATE, abandoned: 0, serve_failures: 0,
+        cleanup_failures: 0};
+    worker.active_generation          = 0;
+    worker.proxy_live                 = false;
+    worker.serve_live                 = false;
+    worker.quic_live                  = false;
+    worker.quic.initialized           = false;
+    worker.quic.connection_generation = 0;
+    worker.planes.proxying            = nil;
+    var slot: usize = 0;
+    for (slot < 2) {
+        worker.service_generations[slot].generation  = 0;
+        worker.service_generations[slot].static_live = false;
+        worker.service_generations[slot].proxy_live  = false;
+        worker.service_generations[slot].cache_live  = false;
+        worker.service_generations[slot].live        = false;
+        slot                                         = slot + 1;
+    }
+    if (!proxy.make_runtime(?worker.proxying, nil, pseudonym, upstream.default_limits())) {
+        ret false;
+    }
+    worker.proxy_live = true;
+    ret true;
+}
+
+pub fun make_plan_storage(storage: *plan.Storage, backing: *PlanStorage) bool {
+    if (storage == nil || backing == nil) { ret false; }
+    ret plan.make_storage(storage,
+        ?backing.routes[0], MAX_ROUTES,
+        ?backing.segments[0], MAX_SEGMENTS,
+        ?backing.specs[0], MAX_ROUTES,
+        ?backing.entries[0], MAX_ROUTES,
+        ?backing.services[0], MAX_SERVICES,
+        ?backing.middleware[0], MAX_MIDDLEWARE,
+        ?backing.text[0], PLAN_TEXT_BYTES);
+}
+
+fun drive_planes(context: ptr, now: time.Instant) bool {
+    val planes: *Planes = context::*Planes;
+    if (planes == nil) { ret false; }
+    var advanced: bool = true;
+    if (planes.proxying != nil) {
+        advanced = proxy.poll((planes.proxying)::ptr, now) && advanced;
+    }
+    if (planes.recording != nil) {
+        advanced = http_cache.drive(planes.recording) && advanced;
+    }
+    ret advanced;
+}
+
+# the earliest deadline across the planes, for the worker's wheel
+fun plane_deadline(context: ptr, at_ns: *u64) bool {
+    val planes: *Planes = context::*Planes;
+    ret planes != nil && planes.proxying != nil
+        && proxy.deadline(planes.proxying, at_ns);
+}
+
+# whether a plane holds work its next drive would do, for the debug audit
+fun plane_work(context: ptr) bool {
+    val planes: *Planes = context::*Planes;
+    ret planes != nil && http_cache.pending_work(planes.recording);
+}
+
+fun quiesce_planes(context: ptr, now: time.Instant) serve.PlaneQuiesceStatus {
+    val planes: *Planes = context::*Planes;
+    if (planes == nil) { ret serve.PLANE_FAILED; }
+    if (planes.proxying != nil) {
+        val status: proxy.QuiesceStatus = proxy.quiesce(planes.proxying, now);
+        if (status == proxy.QUIESCE_PENDING) { ret serve.PLANE_PENDING; }
+        if (status != proxy.QUIESCED)        { ret serve.PLANE_FAILED; }
+    }
+    # a recording that ended with a disk write in flight settles before stop
+    if (planes.recording != nil) {
+        http_cache.drive(planes.recording);
+        if (http_cache.settling(planes.recording)) { ret serve.PLANE_PENDING; }
+    }
+    ret serve.PLANE_QUIESCED;
+}
+
+pub fun close_proxy_generation(worker: *Worker, slot: usize) bool {
+    val services: *ServiceGeneration = ?worker.service_generations[slot];
+    if (!services.proxy_live) { ret true; }
+    if (!proxy.close_registry(?worker.proxying, ?services.proxy_registry)) {
+        ret false;
+    }
+    services.proxy_live = false;
+    ret true;
+}
+
+pub fun close_cache_generation(worker: *Worker, slot: usize) bool {
+    val services: *ServiceGeneration = ?worker.service_generations[slot];
+    if (!services.cache_live)                                   { ret true; }
+    if (!http_cache.release_bindings(?services.cache_bindings)) { ret false; }
+    services.cache_live = false;
+    ret true;
+}
+
+pub fun close_static_generation(worker: *Worker, slot: usize) bool {
+    val services: *ServiceGeneration = ?worker.service_generations[slot];
+    if (!services.static_live)                                   { ret true; }
+    if (!static_files.close_registry(?services.static_registry)) { ret false; }
+    services.static_live = false;
+    ret true;
+}
+
+pub fun close_service_generation(worker: *Worker, slot: usize) bool {
+    var ok: bool = close_proxy_generation(worker, slot);
+    ok = close_cache_generation(worker, slot) && ok;
+    ok = close_static_generation(worker, slot) && ok;
+    if (ok) {
+        worker.service_generations[slot].generation = 0;
+        worker.service_generations[slot].live       = false;
+    }
+    ret ok;
+}
+
+# build the service bank and compile the plan for one generation in `slot`
+pub fun build_service_generation(worker: *Worker, slot: usize,
+    configured: *schema.Graph, generation_id: u64, inputs: *Inputs) StartReport {
+    if (worker == nil || configured == nil || generation_id == 0 || inputs == nil
+        || slot >= 2) {
+        ret failed(START_RUNTIME, "service generation input is invalid");
+    }
+    val current: *ServiceGeneration = ?worker.service_generations[slot];
+    current.generation  = generation_id;
+    current.static_live = false;
+    current.proxy_live  = false;
+    current.cache_live  = false;
+    current.live        = false;
+    if (!static_files.make_registry(?current.static_registry, ?current.static_sites[0],
+        MAX_STATIC_ROOTS, generation_id, static_files.default_options())) {
+        ret failed(START_RUNTIME, "static registry could not be constructed");
+    }
+    current.static_live = true;
+    if (!proxy.make_registry(?current.proxy_registry, generation_id)) {
+        close_service_generation(worker, slot);
+        ret failed(START_RUNTIME, "proxy registry could not be constructed");
+    }
+    current.proxy_live = true;
+    if (!proxy.make_bindings(?current.proxy_bindings,
+        ?current.proxy_binding_storage[0], MAX_SERVICES, ?worker.proxying,
+        ?current.proxy_registry)) {
+        close_service_generation(worker, slot);
+        ret failed(START_RUNTIME, "proxy bindings could not be constructed");
+    }
+    if (inputs.caching != nil) {
+        if (!http_cache.make_bindings(?current.cache_bindings,
+            ?current.cache_binding_storage[0], MAX_SERVICES, inputs.caching,
+            inputs.recording, generation_id)) {
+            close_service_generation(worker, slot);
+            ret failed(START_RUNTIME, "cache bindings could not be constructed");
+        }
+        current.cache_live = true;
+    }
+
+    current.services                        = service.no_resolver();
+    current.services.applications           = inputs.applications;
+    current.services.observer               = telemetry.observer(inputs.observability);
+    current.services.listener_services      = inputs.listener_services;
+    current.services.listener_service_count = inputs.listener_service_count;
+    current.services.static_files           = service.Factory{
+        ctx:   (?current.static_registry)::ptr,
+        build: static_files.factory,
+    };
+    current.services.proxy = service.Factory{
+        ctx:   (?current.proxy_bindings)::ptr,
+        build: proxy.factory,
+    };
+    current.services.native = inputs.native;
+    if (current.cache_live) {
+        current.services.caching = service.Wrapper{
+            ctx:  (?current.cache_bindings)::ptr,
+            wrap: http_cache.wrapper,
+        };
+    }
+    if (inputs.challenge != nil) {
+        current.services.native = handler.factory(inputs.challenge);
+    }
+
+    var layout: plan.Storage;
+    if (!make_plan_storage(?layout, ?worker.storages[slot])) {
+        close_service_generation(worker, slot);
+        ret failed(START_RUNTIME, "plan storage layout is invalid");
+    }
+    val built: plan.Report = plan.compile(?worker.plans[slot], generation_id,
+        configured, layout, ?current.services, nil);
+    if (built.status != plan.PLAN_OK) {
+        close_service_generation(worker, slot);
+        ret failed(START_CONFIG, built.detail);
+    }
+    current.live = true;
+    ret ok();
+}
+
+# bring the worker's serving runtime up on its first generation, which
+# `build_service_generation` has already compiled into slot 0. a supervised
+# worker leaves signals and SIGPIPE to its supervisor
+pub fun start(worker: *Worker, controls: *Controls, heap: *allocator.Allocator,
+    configured: *schema.Graph, generation_id: u64, caps: serve.Caps,
+    reuse_port: bool, endpoints: *ip.Endpoint, supervised: bool,
+    diagnostics: *schema.Diagnostics) StartReport {
+    var quic_controls: quic_runtime.ControlView;
+    if (worker == nil || heap == nil || configured == nil || diagnostics == nil) {
+        ret failed(START_RUNTIME, "worker input is invalid");
+    }
+    if (!serve.make(?worker.serving, worker.index, ?worker.plans[0], configured, heap)) {
+        ret failed(START_RUNTIME, "serving runtime initialization failed");
+    }
+    if (supervised) { serve.leave_process(?worker.serving); }
+    serve.share_caps(?worker.serving, caps);
+    serve.place(?worker.serving, reuse_port, endpoints);
+    if (quic_required(configured)) {
+        if (!controls_view(controls, ?quic_controls)
+            || !quic_runtime.make(?quic_controls, ?worker.quic,
+            quic_runtime.RuntimeConfig{backing: heap,
+            chunks:          ?worker.serving.storage.chunks,
+            memory:          ?worker.serving.memory,
+            timers:          ?worker.serving.timers,
+            wakes:           ?worker.serving.wakes,
+            handshakes:      caps.handshakes,
+            handshake_slots: caps.handshake_slots,
+            worker:          worker.index})) {
+            ret failed(START_RUNTIME, "QUIC runtime initialization failed");
+        }
+        worker.quic_live = true;
+        if (!serve.attach_quic(?worker.serving, ?worker.quic,
+            ?worker.quic_pumps[0])) {
+            ret failed(START_RUNTIME, "QUIC runtime could not be attached");
+        }
+    }
+    if (worker.recorder.live
+        && !serve.attach_telemetry(?worker.serving, ?worker.recorder)) {
+        ret failed(START_RUNTIME, "telemetry runtime could not be attached");
+    }
+    schema.reset_diagnostics(diagnostics);
+    if (!serve.start(?quic_controls, ?worker.serving, generation_id, configured, diagnostics)) {
+        worker.serve_live = worker.serving.state != serve.NEW
+            && worker.serving.state != serve.STOPPED;
+        ret failed(START_RUNTIME, "listeners did not become ready");
+    }
+    worker.serve_live = true;
+    if (!proxy.attach_driver(?worker.proxying, ?worker.serving.owner.network,
+        ?worker.serving.memory, worker.serving.configured.memory_budgets,
+        serve.plane_waker(?worker.serving), worker.serving.configured.engine)) {
+        ret failed(START_RUNTIME, "proxy driver could not be attached");
+    }
+    worker.planes.proxying  = ?worker.proxying;
+    worker.planes.recording = worker.recording;
+    if (worker.recording != nil
+        && !http_cache.attach_waker(worker.recording, serve.plane_waker(?worker.serving))) {
+        ret failed(START_RUNTIME, "cache recorders could not attach their waker");
+    }
+    if (!serve.attach_plane_lifecycle(?worker.serving, (?worker.planes)::ptr,
+        drive_planes, quiesce_planes, plane_deadline)
+        || !serve.attach_plane_audit(?worker.serving, plane_work)) {
+        ret failed(START_RUNTIME, "service planes could not be attached");
+    }
+    ret ok();
+}
+
+pub rec StopReport {
+    stopped:          bool;
+    reason:           lifecycle.Reason;
+    abandoned:        usize;
+    serve_failures:   u64;
+    cleanup_failures: u64;
+}
+
+# stop serving and release the QUIC runtime. false when the serving runtime
+# could not stop, which leaves everything else live for a later retry
+pub fun stop_serving(worker: *Worker, controls: *Controls, report: *StopReport) bool {
+    var quic_controls: quic_runtime.ControlView;
+    controls_view(controls, ?quic_controls);
+    if (worker.serve_live) {
+        report.stopped        = serve.stop(?quic_controls, ?worker.serving);
+        report.reason         = serve.shutdown_reason(?worker.serving);
+        report.abandoned      = serve.shutdown_cancelled(?worker.serving);
+        report.serve_failures = serve.teardown_failures(?worker.serving);
+        if (!report.stopped) { ret false; }
+        worker.serve_live = false;
+    }
+    if (worker.quic_live) {
+        if (quic_controls.pumps == nil) {
+            report.cleanup_failures = report.cleanup_failures + 1;
+        }
+        or {
+            val snapshot: quic_runtime.Snapshot =
+                quic_runtime.snapshot(?quic_controls, ?worker.quic);
+            if (snapshot.initialized
+                && quic_runtime.release(?quic_controls, ?worker.quic)
+                != quic_runtime.OK) {
+                report.cleanup_failures = report.cleanup_failures + 1;
+            }
+            or {
+                worker.quic_live = false;
+            }
+        }
+    }
+    ret true;
+}
+
+# close the proxy runtime and both generations' proxy registries. true when the
+# worker had a proxy runtime to close
+pub fun close_proxy(worker: *Worker, report: *StopReport) bool {
+    if (!worker.proxy_live) { ret false; }
+    if (!proxy.close_runtime(?worker.proxying)) {
+        report.cleanup_failures = report.cleanup_failures + 1;
+    }
+    var i: usize = 0;
+    for (i < 2) {
+        if (!close_proxy_generation(worker, i)) {
+            report.cleanup_failures = report.cleanup_failures + 1;
+        }
+        i = i + 1;
+    }
+    worker.proxy_live = false;
+    ret true;
+}
+
+# release both generations' cache bindings
+pub fun close_cache_bindings(worker: *Worker, report: *StopReport) {
+    var i: usize = 0;
+    for (i < 2) {
+        if (!close_cache_generation(worker, i)) {
+            report.cleanup_failures = report.cleanup_failures + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# close both generations' static registries. true when one was live
+pub fun close_static(worker: *Worker, report: *StopReport) bool {
+    var had_static: bool  = false;
+    var i:          usize = 0;
+    for (i < 2) {
+        if (worker.service_generations[i].static_live) { had_static = true; }
+        if (!close_static_generation(worker, i)) {
+            report.cleanup_failures = report.cleanup_failures + 1;
+        }
+        worker.service_generations[i].generation = 0;
+        worker.service_generations[i].live       = false;
+        i                                        = i + 1;
+    }
+    ret had_static;
+}
+
+# the superseded generation's services, once no connection holds them
+pub fun reclaim_superseded(worker: *Worker, controls: *Controls) bool {
+    var quic_controls: quic_runtime.ControlView;
+    controls_view(controls, ?quic_controls);
+    if (worker == nil || !worker.serve_live
+        || serve.superseded(?quic_controls, ?worker.serving) != 0) {
+        ret false;
+    }
+    val retired: usize = 1 - worker.active_generation;
+    if (!worker.service_generations[retired].live) { ret true; }
+    ret close_service_generation(worker, retired);
+}
+
+# publish a generation already built into the spare slot to this worker's
+# serving runtime, which asks every older connection to finish
+pub fun publish(worker: *Worker, controls: *Controls, configured: *schema.Graph,
+    generation_id: u64, diagnostics: *schema.Diagnostics) StartReport {
+    var quic_controls: quic_runtime.ControlView;
+    controls_view(controls, ?quic_controls);
+    val target: usize = 1 - worker.active_generation;
+    if (!serve.reload(?quic_controls, ?worker.serving, generation_id,
+        ?worker.plans[target], configured, diagnostics)) {
+        close_service_generation(worker, target);
+        ret failed(START_RUNTIME, "listeners did not republish");
+    }
+    worker.active_generation = target;
+    ret ok();
+}
+
+pub rec ServiceSnapshot {
+    generation:     u64;
+    live:           bool;
+    proxy_routes:   usize;
+    static_roots:   usize;
+    cache_bindings: usize;
+}
+
+pub fun service_snapshot(worker: *Worker, slot: usize) ServiceSnapshot {
+    if (worker == nil || slot >= 2) {
+        ret ServiceSnapshot{generation: 0, live: false, proxy_routes: 0,
+            static_roots: 0, cache_bindings: 0};
+    }
+    val current:     *ServiceGeneration = ?worker.service_generations[slot];
+    var cache_count: usize              = 0;
+    if (current.cache_live) { cache_count = current.cache_bindings.len; }
+    ret ServiceSnapshot{
+        generation:     current.generation,
+        live:           current.live,
+        proxy_routes:   proxy.route_count(?current.proxy_registry),
+        static_roots:   static_files.root_count(?current.static_registry),
+        cache_bindings: cache_count,
+    };
+}

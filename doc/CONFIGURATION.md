@@ -68,6 +68,14 @@ application = "site"
 
 A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application, binds it with `hedge.service.laurel.make`, registers `bound_handler` under that name in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `composition.stop` returns. The program also owns the application's lifecycle, so it starts the application before `composition.start` and drains and stops it after `composition.stop`. A configuration that names an unregistered application fails with `no application is registered under this name`. Register an application with the request memory it needs (see [Request memory](#request-memory)). A laurel application's per-request state alone is several kilobytes before its sessions, forms and response bodies.
 
+Every worker is handed the same registry, so a registered application is entered by every worker at once. One `app.App` bound through `hedge.service.laurel`, like any other handler in `composition.Options.applications`, serves requests on several threads concurrently, with the same context pointer on each. hedge's side of that contract:
+
+- A request belongs to one worker. Its state lives in that worker's request arena, and only that worker enters, suspends, resumes or abandons it. For a laurel service that state is the adapter's context, recorder, execution cursor and outcome, and the route captures. Nothing per request is shared between workers.
+- After startup hedge only reads the registry and the handlers in it. A reload resolves every `laurel` service against the same registry again and writes nothing to it.
+- hedge never calls the application's lifecycle. `start`, `poll_ready`, `drain`, `stop` and `release` belong to the embedding program and are called from one thread: start before `composition.start_process`, then drain and stop after `composition.stop` returns. They are never called from a handler.
+
+What the application must synchronize is everything a request reaches that outlives it. That covers its handlers' and middleware's own state, `app_state`, and whatever its callbacks change (an observer, a session store, a cache). Each worker reaches all of it at the same time, so it must be atomic or locked. A value written before `composition.start_process` and never after needs nothing. laurel's own shared state is already atomic, locked, or read-only once assembled, and laurel states its side in [the threading contract](https://github.com/briar-systems/laurel/blob/dev/demo/README.md#the-threading-contract) of its demo README.
+
 A laurel handler that waits on a request body suspends rather than blocking. The adapter reports the request as pending, the connection keeps reading, and when the body advances the adapter resumes laurel at the step that suspended: the handler is entered once however many reads its body takes. A suspended request holds its exchange, its request memory and one of the application's `max_active_requests` slots until it finishes, so a body that never arrives is bounded by the listener's request timeout rather than by the application. A connection that dies while a handler is suspended is abandoned through laurel, which runs every middleware exit half that is owed before the request's context is released.
 
 The implemented schema accepts these top-level sections:
@@ -82,6 +90,46 @@ The implemented schema accepts these top-level sections:
 - `cache` policy and `acme` certificate management
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
+
+## Workers
+
+hedge runs a supervisor and one worker per CPU. The supervisor takes the
+signals, reloads the configuration, drives ACME and maintains the TLS policies.
+Each worker serves connections on a thread of its own, with its own io runtime,
+listeners, timers, buffer pool and proxy pools.
+
+```toml
+[server]
+name = "example"
+workers = 8
+pin_workers = true
+```
+
+- `server.workers` is how many workers serve. It defaults to one per CPU the
+  process may run on, and a process runs at most 256.
+- `server.pin_workers` pins worker `i` to the `i`th CPU the process may run on.
+  It defaults to true. Where pinning is unsupported or refused, the workers run
+  unpinned and startup says so once. A single worker is never pinned.
+- Both are fixed at startup, so a reload that changes either is refused.
+
+How connections reach the workers depends on what the platform can do:
+
+- On Linux every worker binds its own socket for each TCP listener with
+  `SO_REUSEPORT`, and the kernel spreads connections across them.
+- Elsewhere, and for local listeners, the first worker accepts and hands each
+  connection to the least loaded worker serving the same configuration. A
+  worker whose queue of handed connections is full is passed over, and the
+  first worker serves the connection itself.
+- A QUIC listener is served by the first worker until connection IDs route
+  datagrams across workers (#174).
+
+The caps stay process-wide. `max_connections`, `max_handshakes` and every
+budget's `concurrency` and `memory_bytes` are held as per-worker allowances
+drawn in batches from one shared pool, so the total never exceeds the cap. A
+worker can refuse while another holds allowance it is not using, which is
+bounded by the worker count times the batch. The per-peer caps are counted
+across every worker. `server.limits.memory_bytes` sizes each worker's buffer
+pool.
 
 ## TLS policies
 
@@ -231,6 +279,9 @@ and `hedge_quic_retries_dropped_total` counts the Retries a pump dropped at its
 stateless send ceiling. `hedge_quic_connections` is a gauge of the QUIC
 connections the server holds, from admission until the record is released,
 which for a connection the peer closed is after its draining period.
+`hedge_timers_claimed` and `hedge_timers_armed` are gauges of the worker's
+timing wheel: the entries a connection or plane has claimed, and those with a
+deadline armed, reported once per loop turn.
 
 `server.limits.max_pipeline_depth` bounds HTTP/1 requests admitted into one
 connection before earlier responses release their slots. The default and fixed
@@ -273,7 +324,8 @@ read and write buffers, and each request's parsed head. Nothing is reserved per
 connection up front. Each connection instead opens an account on the pool with
 a budget, and borrows against it as it needs memory.
 
-- `server.limits.memory_bytes` is the pool's total budget. It defaults to
+- `server.limits.memory_bytes` is the pool's total budget, for each worker's
+  pool. It defaults to
   `max_connections` connections' worth, or 256 connections' worth when
   `max_connections` is not set.
 - `server.limits.connection_memory_bytes` is what one connection may hold. It
@@ -402,6 +454,38 @@ status = 308
 
 A `fixed` service defaults to status 200 and `text/plain; charset=utf-8`. A `redirect` defaults to 302 and accepts 300 through 308, so a permanent redirect states its 301 or 308 explicitly.
 
+### Upstream connections
+
+A `proxy` service keeps the connections it opens to its upstreams in a pool and
+sends each later request to the same upstream over an idle one. Two settings
+decide how long a pooled connection is kept:
+
+```toml
+[service.api]
+kind = "proxy"
+upstream = "127.0.0.1:8081, 127.0.0.1:8082"
+upstream_idle_ms = 60000
+upstream_lifetime_ms = 3600000
+```
+
+- `upstream_idle_ms` is how long a connection may wait in the pool between
+  exchanges. Once it passes, the pool closes the connection. It defaults to
+  60000 (one minute). Set it below the upstream server's own keep-alive
+  timeout, so the pool closes an idle connection before the upstream does and
+  never sends a request on one the upstream is closing.
+- `upstream_lifetime_ms` is the age, counted from when the connection opened,
+  after which it is no longer reused. A connection that reaches it finishes
+  the exchange it carries and is then closed, and one that reaches it idle is
+  closed at once. It is unset by default, so a connection is reused for as long
+  as it stays open.
+
+Neither setting ever cuts an exchange short. The time an exchange may take is
+bounded by the request's own deadline. Both take positive milliseconds, and
+either one on a service that is not a `proxy` is refused. A pooled connection
+serves only the service that opened it, so each service's settings govern its
+own connections, and a reload that changes them applies to the connections
+the new generation opens.
+
 ## Automatic certificate management
 
 ```toml
@@ -519,7 +603,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 38 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 40 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
@@ -553,7 +637,11 @@ Size `entries` against the authorities clients actually use, not against the num
 
 A representation larger than a quarter of the memory budget goes to disk when `disk_bytes` and `disk_root` are set. Cache file names come from an internal counter and never from request data. A graceful shutdown removes every file the store wrote; starting up removes any file a killed process left behind, so the disk bound holds across a crash. Only names the store's own counter could have produced are removed.
 
+Every worker serves from the one cache. With a disk root the process starts one store thread that runs every disk read, write and removal for all of them, so no serving worker waits on the disk. A worker hands a request to it and serves other connections until the answer comes back. The store thread's queue is bounded at 64 bodies read or written at once. When it is full, a request that would be a disk hit goes to the origin as a miss, and a response that would be written to disk is served without being stored. A disk hit reads its first 16 KiB before the response starts, so a slow or full disk never cuts a response short. Shutdown waits for the queue to drain, giving up once `timeouts.stop_ms` passes with no request completing, and then names every request still outstanding.
+
 `heuristic_percent` is the fraction of a representation's age at its `Last-Modified` that a response with no explicit freshness may be assumed fresh for, capped at one day. It defaults to zero, which means a response that states no freshness of its own is not stored.
+
+A cache key has at most one fill in flight, whichever `Vary` representation it is for. Until a response is stored, every request for it misses and is answered by the origin, and only the first of those is recorded: the rest are served without being stored. An entry being written cannot be evicted, so recording every concurrent miss of one popular key would crowd the store and evict other keys, most of all while a slow disk holds the writes. The cache does not merge those misses into one origin request.
 
 Hedge is a shared cache. `private`, `no-store`, `Vary: *`, an authorized request without an explicit invitation, and a `206 Partial Content` are all refused. A response carrying `Set-Cookie` is refused unless the origin named that field in a qualified `private="set-cookie"` or `no-cache="set-cookie"`, in which case the field is dropped and the rest of the representation is stored. Fields a qualified directive names are never stored, and hop-by-hop fields never cross into an entry.
 

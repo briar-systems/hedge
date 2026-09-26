@@ -34,7 +34,7 @@ enough that a shutdown with a peer still holding a request open reaches the
 deadline within the life of a test.
 
 `cache-disabled.toml` and `cache-enabled.toml` differ only in cache activation.
-The runner observes the disabled process through `/proc`: it has one thread, no
+The runner observes the disabled process through `/proc`: it has one thread per serving worker and one for the supervisor, no
 timer descriptor, no descriptor for the configured cache root, and no cache
 arena in its virtual memory footprint.
 
@@ -81,6 +81,11 @@ through to a default:
 - a required PROXY header that never arrives: closed with no response
 - a malformed PROXY header: closed with no response, and the address it asserted
   is never used
+- a request target with a broken percent escape in the path or the query
+  (`/hel%ZZlo`, `?q=%ZZ`, `?q=%4`), over cleartext HTTP/1.1 and HTTP/2 and over TLS
+  with HTTP/1.1, HTTP/2 and HTTP/3: 400. Over HTTP/1.1 the 400 carries
+  `Connection: close`, a request pipelined behind it is never answered, and the
+  server closes the connection
 
 Shutdown, asserted through the process exit status, which is the only place the
 outcome is visible to whoever supervises hedge:

@@ -1,0 +1,376 @@
+# the cache's disk, reached only through requests
+#
+# every disk operation the cache performs is a request that completes later.
+# the caller fills a request, submits it and learns one of three things: it is
+# already done, it is queued and the request's waker will be woken once when it
+# completes, or it was refused and nothing happened. the executor decides which,
+# so the inline executor here (which runs the request on the submitting thread)
+# and a store worker that runs it on its own thread are interchangeable without
+# a caller changing.
+#
+# a request and the bytes it names belong to the executor from `submit` until
+# `done` answers true. the caller neither reads nor reuses them in between.
+#
+# a stream of requests (one body read or written in pieces) is admitted before
+# its first request and leaves after its last. admission is the executor's
+# bound: a refused one is the caller's to handle, and a request of an admitted
+# stream is never refused for want of room.
+#
+# an executor that runs a request on another thread publishes it through the
+# request's waker (`complete`): the result is published on the thread that owns
+# the waker, when that thread receives the wake, so the submitter never sees a
+# request done that its wake has not yet reached.
+
+use hedge.wake;
+use std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.filesystem;
+use io_error: std.io.error;
+use std.io.file;
+use std.sync.atomic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+pub val NAME_BYTES: usize = 64;
+pub val ROOT_BYTES: usize = 256;
+
+pub def Op: u8;
+# read `length` bytes at `offset` of the named file into `data`
+pub val READ: Op = 1;
+# write `length` bytes of `data` at `offset`, truncating first when asked
+pub val WRITE: Op = 2;
+# remove the named file
+pub val UNLINK: Op = 3;
+# remove every file in the root that this cache could have written
+pub val PURGE: Op = 4;
+
+pub val IDLE:   i64 = 0;
+pub val QUEUED: i64 = 1;
+pub val DONE:   i64 = 2;
+
+pub def Submitted: u8;
+# complete before `submit` returned. no wake follows
+pub val SUBMIT_DONE: Submitted = 1;
+# accepted. the request's waker is woken once, after it completes
+pub val SUBMIT_QUEUED: Submitted = 2;
+# not accepted. the request is idle again and nothing was done
+pub val SUBMIT_REFUSED: Submitted = 3;
+
+pub rec Request {
+    # an executor's own link while the request is queued on it
+    next: *Request;
+    # how a request run off its submitter's thread reaches the submitter
+    posted:      wake.Posted;
+    op:          Op;
+    name:        [NAME_BYTES]u8;
+    name_length: usize;
+    data:        *u8;
+    length:      usize;
+    offset:      u64;
+    truncate:    bool;
+    waker:       wake.Waker;
+    phase:       i64;
+    ok:          bool;
+    produced:    usize;
+}
+
+pub rec Executor {
+    ctx:    ptr;
+    submit: fun(ptr, *Request) Submitted;
+    admit:  fun(ptr) bool;
+    leave:  fun(ptr);
+}
+
+pub rec Disk {
+    root:             file.Root;
+    root_path:        [ROOT_BYTES]u8;
+    root_path_length: usize;
+    scratch:          *allocator.Allocator;
+    executor:         Executor;
+    open:             bool;
+}
+
+pub fun idle() Request {
+    var request: Request;
+    request.next   = nil;
+    request.posted = wake.Posted{next: nil, waker: wake.no_waker(), settle: settle_posted,
+        context: nil};
+    request.op          = 0;
+    request.name[0]     = 0;
+    request.name_length = 0;
+    request.data        = nil;
+    request.length      = 0;
+    request.offset      = 0;
+    request.truncate    = false;
+    request.waker       = wake.no_waker();
+    request.phase       = IDLE;
+    request.ok          = false;
+    request.produced    = 0;
+    ret request;
+}
+
+pub fun closed() Disk {
+    var disk: Disk;
+    disk.root_path[0]     = 0;
+    disk.root_path_length = 0;
+    disk.scratch          = nil;
+    disk.executor         = Executor{ctx: nil, submit: nil, admit: nil, leave: nil};
+    disk.open             = false;
+    ret disk;
+}
+
+# name the file a request acts on. names are derived from a counter, never from
+# request data, so no path the cache opens is chosen by a client
+pub fun set_name(request: *Request, name: *u8, length: usize) bool {
+    if (request == nil || name == nil || length == 0 || length >= NAME_BYTES) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        request.name[i] = name[i];
+        i               = i + 1;
+    }
+    request.name[length] = 0;
+    request.name_length  = length;
+    ret true;
+}
+
+# a request is being executed from `submit` until this answers true
+pub fun done(request: *Request) bool {
+    ret request != nil && atomic.load(?request.phase) == DONE;
+}
+
+pub fun in_flight(request: *Request) bool {
+    ret request != nil && atomic.load(?request.phase) == QUEUED;
+}
+
+# ready a done or idle request for reuse
+pub fun reset(request: *Request) bool {
+    if (request == nil || in_flight(request)) { ret false; }
+    atomic.store(?request.phase, IDLE);
+    request.ok       = false;
+    request.produced = 0;
+    ret true;
+}
+
+# open the root every request acts under and run requests with `executor`
+pub fun open(disk: *Disk, root_path: str, scratch: *allocator.Allocator) bool {
+    if (disk == nil || disk.open || root_path == nil || scratch == nil) { ret false; }
+    val length: usize = str_len(root_path);
+    if (length == 0 || length + NAME_BYTES + 2 >= ROOT_BYTES) { ret false; }
+    val opened: err[io_error.Error] = file.root_open(?disk.root, root_path);
+    if (sel opened.err) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        disk.root_path[i] = root_path[i];
+        i                 = i + 1;
+    }
+    disk.root_path[length] = 0;
+    disk.root_path_length  = length;
+    disk.scratch           = scratch;
+    disk.executor          = inline(disk);
+    disk.open              = true;
+    ret true;
+}
+
+pub fun close(disk: *Disk) bool {
+    if (disk == nil || !disk.open) { ret false; }
+    file.root_close(?disk.root);
+    disk.open             = false;
+    disk.root_path_length = 0;
+    ret true;
+}
+
+# the executor that runs each request on the thread that submits it. it admits
+# every stream, since a request it runs is done before `submit` returns
+pub fun inline(disk: *Disk) Executor {
+    ret Executor{ctx: (disk)::ptr, submit: submit_inline, admit: admit_inline,
+        leave: leave_inline};
+}
+
+# replace the executor, which only a disk with nothing in flight may do
+pub fun use_executor(disk: *Disk, executor: Executor) bool {
+    if (disk == nil || !disk.open || executor.submit == nil || executor.admit == nil
+        || executor.leave == nil) { ret false; }
+    disk.executor = executor;
+    ret true;
+}
+
+fun submit_inline(context: ptr, request: *Request) Submitted {
+    val disk: *Disk = context::*Disk;
+    execute(disk, request);
+    ret SUBMIT_DONE;
+}
+
+fun admit_inline(context: ptr) bool {
+    ret true;
+}
+
+fun leave_inline(context: ptr) {}
+
+# admit one stream of requests. false is the executor's refusal: it has no room
+# for another stream, and the caller does without the disk
+pub fun admit(disk: *Disk) bool {
+    if (disk == nil || !disk.open || disk.executor.admit == nil) { ret false; }
+    ret disk.executor.admit(disk.executor.ctx);
+}
+
+# an admitted stream is done, with nothing of it in flight
+pub fun leave(disk: *Disk) {
+    if (disk == nil || disk.executor.leave == nil) { ret; }
+    disk.executor.leave(disk.executor.ctx);
+}
+
+pub fun submit(disk: *Disk, request: *Request) Submitted {
+    if (disk == nil || request == nil || !disk.open || disk.executor.submit == nil
+        || atomic.load(?request.phase) == QUEUED) { ret SUBMIT_REFUSED; }
+    request.ok       = false;
+    request.produced = 0;
+    atomic.store(?request.phase, QUEUED);
+    val answer: Submitted = disk.executor.submit(disk.executor.ctx, request);
+    if (answer == SUBMIT_REFUSED) { atomic.store(?request.phase, IDLE); }
+    ret answer;
+}
+
+# run one request against the root and publish its result, on the submitting
+# thread. an executor calls this, or `run` and then `complete`, exactly once per
+# accepted request
+pub fun execute(disk: *Disk, request: *Request) {
+    if (disk == nil || request == nil) { ret; }
+    run(disk, request);
+    finish(request);
+}
+
+# run one request against the root without publishing it
+pub fun run(disk: *Disk, request: *Request) {
+    if (disk == nil || request == nil) { ret; }
+    var ok:       bool  = false;
+    var produced: usize = 0;
+    if (disk.open) {
+        if (request.op == READ)   { ok = run_read(disk, request, ?produced); }
+        if (request.op == WRITE)  { ok = run_write(disk, request, ?produced); }
+        if (request.op == UNLINK) { ok = remove_named(disk, (?request.name[0])::str); }
+        if (request.op == PURGE)  { ok = run_purge(disk); }
+    }
+    request.ok       = ok;
+    request.produced = produced;
+}
+
+fun finish(request: *Request) {
+    atomic.store(?request.phase, DONE);
+}
+
+fun settle_posted(context: ptr) {
+    finish(context::*Request);
+}
+
+# publish a request `run` on a thread other than its submitter's. one with a
+# waker is published on the waker's thread when it receives the wake, and one
+# without is published here. false when the waker's thread could not be
+# reached: the request is then published here and its waiter is not woken
+pub fun complete(request: *Request) bool {
+    if (request == nil) { ret false; }
+    if (!wake.valid(?request.waker)) {
+        finish(request);
+        ret true;
+    }
+    request.posted.waker   = request.waker;
+    request.posted.settle  = settle_posted;
+    request.posted.context = (request)::ptr;
+    if (wake.post(?request.posted)) { ret true; }
+    finish(request);
+    ret false;
+}
+
+fun run_read(disk: *Disk, request: *Request, produced: *usize) bool {
+    if (request.name_length == 0 || (request.length != 0 && request.data == nil)) { ret false; }
+    val opened: res[filesystem.File, io_error.Error] = file.open_confined(?disk.root,
+        (?request.name[0])::str, file.read_options());
+    if (sel opened.err) { ret false; }
+    var handle: filesystem.File            = opened.ok;
+    val read:   res[usize, io_error.Error] = file.read_at(handle, request.data,
+        request.length, request.offset);
+    filesystem.close(?handle);
+    if (sel read.err) { ret false; }
+    @produced = read.ok;
+    ret true;
+}
+
+fun run_write(disk: *Disk, request: *Request, produced: *usize) bool {
+    if (request.name_length == 0 || request.length == 0 || request.data == nil) { ret false; }
+    var options: file.OpenOptions = file.write_options(420);
+    options.truncate = request.truncate;
+    val opened: res[filesystem.File, io_error.Error] = file.open_confined(?disk.root,
+        (?request.name[0])::str, options);
+    if (sel opened.err) { ret false; }
+    var handle:  filesystem.File            = opened.ok;
+    val written: res[usize, io_error.Error] = file.write_at(handle, request.data,
+        request.length, request.offset);
+    filesystem.close(?handle);
+    if (sel written.err) { ret false; }
+    @produced = written.ok;
+    ret written.ok == request.length;
+}
+
+fun remove_named(disk: *Disk, name: str) bool {
+    if (disk.root_path_length == 0 || name == nil || name[0] == 0) { ret false; }
+    var path: [ROOT_BYTES + NAME_BYTES + 2]u8;
+    var at:   usize = 0;
+    for (at < disk.root_path_length) {
+        path[at] = disk.root_path[at];
+        at       = at + 1;
+    }
+    path[at] = '/';
+    at       = at + 1;
+    var i: usize = 0;
+    for (name[i] != 0) {
+        if (i + 1 >= NAME_BYTES) { ret false; }
+        path[at + i] = name[i];
+        i            = i + 1;
+    }
+    path[at + i] = 0;
+    val removed: err[io_error.Error] = filesystem.remove_file((?path[0])::str);
+    ret sel removed.ok;
+}
+
+# a name this cache could have written: `e` and then decimal digits, nothing else
+pub fun own_file_name(name: str) bool {
+    if (name == nil || name[0] != 'e' || name[1] == 0) { ret false; }
+    var i: usize = 1;
+    for (name[i] != 0) {
+        if (name[i] < '0' || name[i] > '9') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# discard whatever a previous process left behind in the root
+#
+# a process that was killed never removed its files. they are charged to no
+# budget and described by no entry, so after a crash the disk bound would not
+# hold and an orphan could only ever be dead weight. only names this cache's own
+# counter could have produced are removed, so a misconfigured root costs nothing
+# that hedge did not write.
+fun run_purge(disk: *Disk) bool {
+    val listed: res[Vector[str], filesystem.FsError] = filesystem.read_dir(disk.scratch,
+        (?disk.root_path[0])::str);
+    if (sel listed.err) { ret false; }
+    var names: Vector[str] = listed.ok;
+    var i:     usize       = 0;
+    for (i < names.len) {
+        val held: opt[*str] = vector.get[str](?names, i);
+        if (sel held.some) {
+            val name: str = @held.some;
+            if (own_file_name(name)) { remove_named(disk, name); }
+        }
+        i = i + 1;
+    }
+    vector.dnit[str](?names);
+    ret true;
+}

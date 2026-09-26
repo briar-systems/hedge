@@ -1,9 +1,13 @@
 # listener, admission, and accepted-connection ownership
 
 use process_admission: hedge.admission;
+use hedge.allowance;
 use hedge.config.schema;
+use hedge.handoff;
 use quic_capacity: hedge.protocol.quic.capacity;
 use hedge.protocol.trust;
+use hedge_socket: hedge.socket;
+use hedge.spread;
 use hedge_storage: hedge.storage;
 use A:             std.allocator;
 use std.allocator.page;
@@ -123,11 +127,15 @@ pub fun make_connection_context(context: *ConnectionContext, owner_context: usiz
     ret true;
 }
 
+# an accept pending in its own child of the set's scope, so it can be cancelled
+# and armed again on its own (recycle_accepts)
 rec AcceptSlot {
     active:  bool;
     peer:    ip.Endpoint;
     token:   io_runtime.Token;
     context: CompletionContext;
+    scope:   cancel.Scope;
+    scoped:  bool;
 }
 
 # everything the connection plane needs to decide what a connection is, resolved
@@ -165,6 +173,8 @@ pub rec OwnedListener {
     accept_pending:     usize;
     connection_limit:   opt[usize];
     active_connections: usize;
+    # accepted by one worker and handed to the least loaded (spread.HANDOFF)
+    hands_off:          bool;
     tcp_listener:       tcp.Listener;
     udp_socket:         udp.Socket;
     local_listener:     local_async.Listener;
@@ -201,11 +211,9 @@ pub rec Connection {
     id:               u64;
     owner_generation: u64;
     listener_index:   usize;
-    transport:        u8;
     peer:             ip.Endpoint;
     has_peer:         bool;
-    tcp_stream:       tcp.Stream;
-    local_stream:     local_async.Stream;
+    socket:           hedge_socket.Socket;
     next:             usize;
     close_pending:    bool;
     close_completion: io_runtime.Completion;
@@ -247,10 +255,12 @@ pub rec Owner {
     active_set:             usize;
     # generation floor after a compaction and the highest generation ever issued,
     # so a token into a compacted-away chunk never matches its reused index
-    connection_epoch:         u32;
-    connection_max_gen:       u32;
-    connection_count:         usize;
-    queued_connection_count:  usize;
+    connection_epoch:        u32;
+    connection_max_gen:      u32;
+    connection_count:        usize;
+    queued_connection_count: usize;
+    # the connection count accepts were last recycled at, or the highest since
+    accept_mark:              usize;
     max_connections:          opt[usize];
     max_connections_per_peer: opt[usize];
     queue_head:               usize;
@@ -267,6 +277,7 @@ pub rec Owner {
     process:                  process_events.Source;
     root_scope:               cancel.Scope;
     sets:                     [2]ListenerSet;
+    options:                  StartOptions;
 }
 
 fun diagnose(diagnostics: *schema.Diagnostics, code: schema.DiagnosticCode, path: str, message: str) {
@@ -339,15 +350,22 @@ fun connection_for(owner: *Owner, token: ConnectionToken) *Connection {
 }
 
 fun initialize_connections(owner: *Owner, max_connections: opt[usize],
-    max_connections_per_peer: opt[usize]) bool {
+    max_connections_per_peer: opt[usize], shared: *process_admission.Shared,
+    worker: usize) bool {
     page.make(?owner.heap);
-    if (!hedge_storage.make_table[Connection](?owner.connections, ?owner.heap)
-        || !process_admission.make(?owner.admission, ?owner.heap,
+    if (!hedge_storage.make_table[Connection](?owner.connections, ?owner.heap)) { ret false; }
+    if (shared != nil) {
+        if (!process_admission.join(?owner.admission, ?owner.heap, shared, worker)) {
+            ret false;
+        }
+    }
+    or (!process_admission.make(?owner.admission, ?owner.heap,
         max_connections, max_connections_per_peer)) { ret false; }
     owner.connection_epoch        = 0;
     owner.connection_max_gen      = 0;
     owner.connection_count        = 0;
     owner.queued_connection_count = 0;
+    owner.accept_mark             = 0;
     owner.queue_head              = NO_INDEX;
     owner.queue_tail              = NO_INDEX;
     ret true;
@@ -401,6 +419,7 @@ fun release_connection_slot(owner: *Owner, index: usize) bool {
             set_index = set_index + 1;
         }
     }
+    handoff.discharge(owner.options.board, owner.options.worker);
     connection.state         = CONNECTION_FREE;
     connection.id            = 0;
     connection.lease         = process_admission.no_lease();
@@ -410,10 +429,14 @@ fun release_connection_slot(owner: *Owner, index: usize) bool {
     connection.next          = NO_INDEX;
     if (!release_connection_index(owner, index)) { ret false; }
     if (owner.connection_count > 0)              { owner.connection_count = owner.connection_count - 1; }
+    if (owner.connection_count * 2 < owner.accept_mark) {
+        owner.accept_mark = owner.connection_count;
+        recycle_accepts(owner);
+    }
     ret true;
 }
 
-fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, transport: u8, peer: *ip.Endpoint) *Connection {
+fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, accepted: hedge_socket.Socket, peer: *ip.Endpoint) *Connection {
     if (listener_index >= set.listener_count) { ret nil; }
     val listener: *OwnedListener = ?set.listeners[listener_index];
     if (!listener_can_admit(owner, listener)) { ret nil; }
@@ -434,7 +457,7 @@ fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, tr
     if (owner.next_connection_id == 0) { owner.next_connection_id = 1; }
     connection.owner_generation = set.generation;
     connection.listener_index   = listener_index;
-    connection.transport        = transport;
+    connection.socket           = accepted;
     connection.has_peer         = peer != nil;
     if (peer != nil) { connection.peer = @peer; }
     connection.next                           = NO_INDEX;
@@ -456,6 +479,7 @@ fun queue_connection(owner: *Owner, set: *ListenerSet, listener_index: usize, tr
     owner.connection_count        = owner.connection_count + 1;
     owner.queued_connection_count = owner.queued_connection_count + 1;
     listener.active_connections   = listener.active_connections + 1;
+    if (owner.connection_count > owner.accept_mark) { owner.accept_mark = owner.connection_count; }
     ret connection;
 }
 
@@ -483,20 +507,24 @@ fun submit_accept_slot(owner: *Owner, set: *ListenerSet, listener_index: usize, 
     val listener: *OwnedListener = ?set.listeners[listener_index];
     if (slot_index >= listener.accept_depth || slot_index >= MAX_ACCEPT_DEPTH) { ret false; }
     val slot: *AcceptSlot = ?listener.accepts[slot_index];
-    if (slot.active || !listener_can_admit(owner, listener)) { ret false; }
+    if (slot.active || !listener_can_admit(owner, listener))                                        { ret false; }
+    if (listener.transport != schema.TRANSPORT_TCP && listener.transport != schema.TRANSPORT_LOCAL) { ret false; }
+    if (!release_accept_scope(slot)
+        || !operation_ok(cancel.make_child(?slot.scope, ?set.scope, opt[time.Instant].none{}))) { ret false; }
+    slot.scoped = true;
     var submitted: res[io_runtime.Token, io_error.Error];
     if (listener.transport == schema.TRANSPORT_TCP) {
         slot.context.kind = CONTEXT_ACCEPT_TCP;
-        submitted         = net_async.submit_accept(?owner.network, ?set.scope, ?listener.tcp_listener, ?slot.peer, (?slot.context)::usize);
-    }
-    or (listener.transport == schema.TRANSPORT_LOCAL) {
-        slot.context.kind = CONTEXT_ACCEPT_LOCAL;
-        submitted         = local_async.submit_accept(?owner.local, ?set.scope, ?listener.local_listener, (?slot.context)::usize);
+        submitted         = net_async.submit_accept(?owner.network, ?slot.scope, ?listener.tcp_listener, ?slot.peer, (?slot.context)::usize);
     }
     or {
+        slot.context.kind = CONTEXT_ACCEPT_LOCAL;
+        submitted         = local_async.submit_accept(?owner.local, ?slot.scope, ?listener.local_listener, (?slot.context)::usize);
+    }
+    if (sel submitted.err) {
+        release_accept_scope(slot);
         ret false;
     }
-    if (sel submitted.err) { ret false; }
     slot.token              = submitted.ok;
     slot.active             = true;
     listener.accept_pending = listener.accept_pending + 1;
@@ -504,10 +532,45 @@ fun submit_accept_slot(owner: *Owner, set: *ListenerSet, listener_index: usize, 
     ret true;
 }
 
+# an accept's scope is destroyed once the accept has completed. a scope still
+# busy is kept, and destroyed before the slot is armed again or its set drains
+fun release_accept_scope(slot: *AcceptSlot) bool {
+    if (!slot.scoped)                               { ret true; }
+    if (!operation_ok(cancel.destroy(?slot.scope))) { ret false; }
+    slot.scoped = false;
+    ret true;
+}
+
+# a pending accept holds a slot in the io runtime and the network driver, and
+# the runtime gives back a chunk of its tables only once nothing in it is live.
+# an accept armed at a peak takes the lowest free slot then, which is as high as
+# the peak, and it stays pending however far the load falls, so the few accepts
+# would keep the tables at the peak's size. each time the connection count
+# halves, an accept the runtime says pins capacity is cancelled, and
+# dispatch_accept serves any connection it had already taken and arms it again
+# in the lowest free slot, which never pins. what the accepts keep then follows
+# the load
+fun recycle_accepts(owner: *Owner) {
+    if (owner.active_set == NO_INDEX || !owner.runtime_initialized) { ret; }
+    val set: *ListenerSet = ?owner.sets[owner.active_set];
+    if (set.state != SET_ACTIVE) { ret; }
+    var i: usize = 0;
+    for (i < set.listener_count) {
+        val listener: *OwnedListener = ?set.listeners[i];
+        var s:        usize          = 0;
+        for (s < listener.accept_depth) {
+            val slot: *AcceptSlot = ?listener.accepts[s];
+            if (slot.active && slot.scoped && io_runtime.pins_capacity(?owner.runtime, slot.token)) { cancel.cancel(?slot.scope); }
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+}
+
 fun replenish_listener(owner: *Owner, set: *ListenerSet, listener_index: usize) {
     if (set.state != SET_ACTIVE || listener_index >= set.listener_count) { ret; }
     val listener: *OwnedListener = ?set.listeners[listener_index];
-    if (!listener_can_admit(owner, listener)) { ret; }
+    if (listener.state != LISTENER_BOUND || !listener_can_admit(owner, listener)) { ret; }
     var i: usize = 0;
     for (i < listener.accept_depth) {
         if (!listener.accepts[i].active)          { submit_accept_slot(owner, set, listener_index, i); }
@@ -551,71 +614,227 @@ pub fun apply_stream_policy(handle: io_handle.SocketHandle) bool {
     ret is_ok_err_io_error_error(socket.set_bool(handle, socket.NO_DELAY, true));
 }
 
+# an accepted TCP stream becomes a queued connection of `set`, or is closed.
+# every stream this owner takes, from its own accept or from another worker,
+# comes through here, so each is held to the same policy and admission
+fun admit_tcp(owner: *Owner, set: *ListenerSet, listener_index: usize, stream: *tcp.Stream, peer: *ip.Endpoint) bool {
+    # policy first: a socket that cannot carry it is refused rather than served
+    # slowly, and nothing is queued that has to be unqueued
+    if (set.state == SET_ACTIVE && owner.state == OWNER_READY && apply_stream_policy(stream.handle)) {
+        val connection: *Connection = queue_connection(owner, set, listener_index,
+            hedge_socket.from_tcp(?owner.network, @stream), peer);
+        if (connection != nil) {
+            handoff.charge(owner.options.board, owner.options.worker);
+            ret true;
+        }
+    }
+    if (!close_unowned_tcp(stream)) {
+        owner.leaked_descriptors = owner.leaked_descriptors + 1;
+    }
+    ret false;
+}
+
+# an accepted local stream becomes a queued connection of `set`, or is closed
+fun admit_local(owner: *Owner, set: *ListenerSet, listener_index: usize, stream: *local_async.Stream) bool {
+    if (set.state == SET_ACTIVE && owner.state == OWNER_READY) {
+        val connection: *Connection = queue_connection(owner, set, listener_index,
+            hedge_socket.from_local(?owner.local, @stream), nil);
+        if (connection != nil) {
+            handoff.charge(owner.options.board, owner.options.worker);
+            ret true;
+        }
+    }
+    local_async.submit_stream_close(?owner.local, ?owner.root_scope, stream, lifecycle.ABORTIVE, 0);
+    ret false;
+}
+
+# the worker a stream accepted on `set` goes to, or this one. a stream in flight
+# to a worker is charged to it until that worker takes it
+fun route_target(owner: *Owner, set: *ListenerSet) usize {
+    val board: *handoff.Board = owner.options.board;
+    if (!handoff.routes(board)) { ret owner.options.worker; }
+    val target: usize = handoff.least_loaded(board, owner.options.worker, set.generation);
+    if (target != owner.options.worker) { handoff.charge(board, target); }
+    ret target;
+}
+
+# a stream detached and then refused by its target: this worker adopts it back
+# or closes it. false when it was closed
+fun post_or_keep(owner: *Owner, target: usize, arrival: *handoff.Arrival) bool {
+    val board: *handoff.Board = owner.options.board;
+    if (handoff.post(board, target, @arrival)) { ret false; }
+    handoff.discharge(board, target);
+    ret true;
+}
+
+# hand a TCP stream to the least loaded worker. true when the stream is still
+# this worker's to admit
+fun route_tcp(owner: *Owner, set: *ListenerSet, listener_index: usize, stream: *tcp.Stream, peer: *ip.Endpoint) bool {
+    val target: usize = route_target(owner, set);
+    if (target == owner.options.worker) { ret true; }
+    val detached: res[net_async.Detached, io_error.Error] = net_async.detach(?owner.network, stream);
+    if (sel detached.err) {
+        handoff.discharge(owner.options.board, target);
+        ret true;
+    }
+    var arrival: handoff.Arrival;
+    arrival.generation     = set.generation;
+    arrival.listener_index = listener_index;
+    arrival.transport      = schema.TRANSPORT_TCP;
+    arrival.has_peer       = peer != nil;
+    if (peer != nil) { arrival.peer = @peer; }
+    arrival.tcp = detached.ok;
+    if (!post_or_keep(owner, target, ?arrival)) { ret false; }
+    val adopted: res[tcp.Stream, io_error.Error] = net_async.adopt(?owner.network, ?arrival.tcp);
+    if (sel adopted.ok) {
+        @stream = adopted.ok;
+        ret true;
+    }
+    if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    ret false;
+}
+
+# hand a local stream to the least loaded worker. true when the stream is still
+# this worker's to admit
+fun route_local(owner: *Owner, set: *ListenerSet, listener_index: usize, stream: *local_async.Stream) bool {
+    val target: usize = route_target(owner, set);
+    if (target == owner.options.worker) { ret true; }
+    val detached: res[local_async.Detached, io_error.Error] = local_async.detach(?owner.local, stream);
+    if (sel detached.err) {
+        handoff.discharge(owner.options.board, target);
+        ret true;
+    }
+    var arrival: handoff.Arrival;
+    arrival.generation     = set.generation;
+    arrival.listener_index = listener_index;
+    arrival.transport      = schema.TRANSPORT_LOCAL;
+    arrival.has_peer       = false;
+    arrival.local          = detached.ok;
+    if (!post_or_keep(owner, target, ?arrival)) { ret false; }
+    val adopted: res[local_async.Stream, io_error.Error] = local_async.adopt(?owner.local, ?arrival.local);
+    if (sel adopted.ok) {
+        @stream = adopted.ok;
+        ret true;
+    }
+    if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    ret false;
+}
+
+# the set of `generation` this owner still has
+fun set_of_generation(owner: *Owner, generation: u64) *ListenerSet {
+    var i: usize = 0;
+    for (i < 2) {
+        if (owner.sets[i].scope_initialized && owner.sets[i].generation == generation) { ret ?owner.sets[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# adopt and admit every stream another worker handed this one
+fun take_arrivals(owner: *Owner) {
+    val board: *handoff.Board = owner.options.board;
+    if (!handoff.routes(board)) { ret; }
+    var arrival: handoff.Arrival;
+    for (handoff.take(board, owner.options.worker, ?arrival)) {
+        handoff.discharge(board, owner.options.worker);
+        val set: *ListenerSet = set_of_generation(owner, arrival.generation);
+        if (set != nil && arrival.transport == schema.TRANSPORT_TCP) {
+            val adopted: res[tcp.Stream, io_error.Error] = net_async.adopt(?owner.network, ?arrival.tcp);
+            if (sel adopted.ok) {
+                var stream: tcp.Stream   = adopted.ok;
+                var peer:   *ip.Endpoint = nil;
+                if (arrival.has_peer) { peer = ?arrival.peer; }
+                admit_tcp(owner, set, arrival.listener_index, ?stream, peer);
+                cnt;
+            }
+        }
+        or (set != nil && arrival.transport == schema.TRANSPORT_LOCAL) {
+            val adopted: res[local_async.Stream, io_error.Error] = local_async.adopt(?owner.local, ?arrival.local);
+            if (sel adopted.ok) {
+                var stream: local_async.Stream = adopted.ok;
+                admit_local(owner, set, arrival.listener_index, ?stream);
+                cnt;
+            }
+        }
+        if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    }
+}
+
+# this owner takes no more arrivals, and closes the ones still waiting
+fun refuse_arrivals(owner: *Owner) {
+    val board: *handoff.Board = owner.options.board;
+    if (!handoff.routes(board)) { ret; }
+    handoff.publish(board, owner.options.worker, 0);
+    handoff.close_inbox(board, owner.options.worker);
+    var arrival: handoff.Arrival;
+    for (handoff.take(board, owner.options.worker, ?arrival)) {
+        handoff.discharge(board, owner.options.worker);
+        if (!handoff.abandon(?arrival)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+    }
+}
+
+# closes whatever an accept completion hands over when nothing can take it
+fun discard_accepted(owner: *Owner, context: *CompletionContext, completion: io_runtime.Completion) {
+    var settled: io_runtime.Completion = completion;
+    if (context.kind == CONTEXT_ACCEPT_TCP) {
+        val handed: opt[tcp.Stream] = net_async.accepted(?settled);
+        if (sel handed.some) {
+            var stream: tcp.Stream = handed.some;
+            if (!close_unowned_tcp(?stream)) { owner.leaked_descriptors = owner.leaked_descriptors + 1; }
+        }
+    }
+    or (context.kind == CONTEXT_ACCEPT_LOCAL) {
+        val handed: res[local_async.Stream, io_error.Error] = local_async.accepted(?owner.local, completion);
+        if (sel handed.ok) {
+            var stream: local_async.Stream = handed.ok;
+            local_async.submit_stream_close(?owner.local, ?owner.root_scope, ?stream, lifecycle.ABORTIVE, 0);
+        }
+    }
+}
+
+# an accept completion hands a connection over when it succeeded, and also when
+# it was cancelled (recycle_accepts, a drain) after taking one, which is then
+# served or closed like any other
 fun dispatch_accept(owner: *Owner, context: *CompletionContext, completion: io_runtime.Completion) {
-    # the handle carries the socket's opening, which is how the driver tells it
-    # apart from a later socket that reuses the descriptor
-    var settled:  io_runtime.Completion = completion;
-    var accepted: tcp.Stream            = net_async.stream(?settled);
     if (context.set_index >= 2) {
-        if (!completion.has_error && context.kind == CONTEXT_ACCEPT_TCP) { close_unowned_tcp(?accepted); }
+        discard_accepted(owner, context, completion);
         ret;
     }
     val set: *ListenerSet = ?owner.sets[context.set_index];
     if (context.listener_index >= set.listener_count) {
-        if (!completion.has_error && context.kind == CONTEXT_ACCEPT_TCP) { close_unowned_tcp(?accepted); }
+        discard_accepted(owner, context, completion);
         ret;
     }
     val listener: *OwnedListener = ?set.listeners[context.listener_index];
     if (context.slot_index >= listener.accept_depth) {
-        if (!completion.has_error && context.kind == CONTEXT_ACCEPT_TCP) { close_unowned_tcp(?accepted); }
+        discard_accepted(owner, context, completion);
         ret;
     }
     val slot: *AcceptSlot = ?listener.accepts[context.slot_index];
     slot.active = false;
+    release_accept_scope(slot);
     if (listener.accept_pending > 0) { listener.accept_pending = listener.accept_pending - 1; }
     if (set.pending_accepts > 0)     { set.pending_accepts = set.pending_accepts - 1; }
 
-    if (!completion.has_error && set.state == SET_ACTIVE && owner.state == OWNER_READY) {
-        if (context.kind == CONTEXT_ACCEPT_TCP) {
-            # policy first: a socket that cannot carry it is refused rather than
-            # served slowly, and nothing is queued that has to be unqueued
-            if (!apply_stream_policy(accepted.handle)) {
-                close_unowned_tcp(?accepted);
-            }
-            or {
-                val connection: *Connection = queue_connection(owner, set, context.listener_index, schema.TRANSPORT_TCP, ?slot.peer);
-                if (connection == nil) {
-                    close_unowned_tcp(?accepted);
-                }
-                or {
-                    connection.tcp_stream = accepted;
-                }
-            }
-        }
-        or {
-            val accepted: res[local_async.Stream, io_error.Error] = local_async.accepted(?owner.local, completion);
-            if (sel accepted.ok) {
-                val connection: *Connection = queue_connection(owner, set, context.listener_index, schema.TRANSPORT_LOCAL, nil);
-                if (connection == nil) {
-                    var stream: local_async.Stream = accepted.ok;
-                    local_async.submit_stream_close(?owner.local, ?owner.root_scope, ?stream, lifecycle.ABORTIVE, 0);
-                }
-                or {
-                    connection.local_stream = accepted.ok;
-                }
+    if (context.kind == CONTEXT_ACCEPT_TCP) {
+        # the handle carries the socket's opening, which is how the driver tells
+        # it apart from a later socket that reuses the descriptor
+        var settled: io_runtime.Completion = completion;
+        val handed:  opt[tcp.Stream]       = net_async.accepted(?settled);
+        if (sel handed.some) {
+            var accepted: tcp.Stream = handed.some;
+            if (!listener.hands_off || route_tcp(owner, set, context.listener_index, ?accepted, ?slot.peer)) {
+                admit_tcp(owner, set, context.listener_index, ?accepted, ?slot.peer);
             }
         }
     }
-    or (!completion.has_error && context.kind == CONTEXT_ACCEPT_TCP) {
-        if (!close_unowned_tcp(?accepted)) {
-            owner.leaked_descriptors = owner.leaked_descriptors + 1;
-        }
-    }
-    or (!completion.has_error && context.kind == CONTEXT_ACCEPT_LOCAL) {
+    or (context.kind == CONTEXT_ACCEPT_LOCAL) {
         val accepted: res[local_async.Stream, io_error.Error] = local_async.accepted(?owner.local, completion);
         if (sel accepted.ok) {
             var stream: local_async.Stream = accepted.ok;
-            local_async.submit_stream_close(?owner.local, ?owner.root_scope, ?stream, lifecycle.ABORTIVE, 0);
+            if (!listener.hands_off || route_local(owner, set, context.listener_index, ?stream)) {
+                admit_local(owner, set, context.listener_index, ?stream);
+            }
         }
     }
     if (set.state == SET_ACTIVE) { replenish_listener(owner, set, context.listener_index); }
@@ -663,6 +882,7 @@ pub fun begin_drain(owner: *Owner) bool {
     }
     owner.stop_requested = true;
     owner.state          = OWNER_DRAINING;
+    refuse_arrivals(owner);
     if (owner.active_set != NO_INDEX) {
         val set: *ListenerSet = ?owner.sets[owner.active_set];
         if (set.state == SET_ACTIVE) {
@@ -724,6 +944,7 @@ pub fun poll(owner: *Owner, timeout_ms: i32) bool {
         dispatch_completion(owner, completions[i]);
         i = i + 1;
     }
+    take_arrivals(owner);
     drain_process_events(owner);
     replenish(owner);
     ret true;
@@ -787,6 +1008,7 @@ fun size_socket_buffer(handle: io_handle.SocketHandle, option: socket.ValueOptio
 fun initialize_owned_listener(listener: *OwnedListener, set_index: usize, listener_index: usize, configured: *schema.Listener, graph: *schema.Graph) {
     listener.state     = LISTENER_UNUSED;
     listener.transport = configured.transport;
+    listener.hands_off = spread.of(configured) == spread.HANDOFF;
     initialize_policy(?listener.policy, configured);
     listener.name               = configured.name;
     listener.configured_address = configured.address;
@@ -814,6 +1036,7 @@ fun initialize_owned_listener(listener: *OwnedListener, set_index: usize, listen
     var i: usize = 0;
     for (i < MAX_ACCEPT_DEPTH) {
         listener.accepts[i].active  = false;
+        listener.accepts[i].scoped  = false;
         listener.accepts[i].context = CompletionContext{kind: 0, set_index: set_index, listener_index: listener_index, slot_index: i, connection_index: NO_INDEX};
         i                           = i + 1;
     }
@@ -882,14 +1105,21 @@ fun prepare_local(owner: *Owner, set: *ListenerSet, listener: *OwnedListener, di
     ret true;
 }
 
-fun prepare_ip(owner: *Owner, listener: *OwnedListener, diagnostics: *schema.Diagnostics) bool {
+fun prepare_ip(owner: *Owner, listener: *OwnedListener, index: usize,
+    diagnostics: *schema.Diagnostics) bool {
     var endpoint: ip.Endpoint;
-    if (!parse_ip_endpoint(schema.text(?listener.configured_address), ?endpoint)) {
+    if (owner.options.endpoints != nil) {
+        endpoint = owner.options.endpoints[index];
+    }
+    or (!parse_ip_endpoint(schema.text(?listener.configured_address), ?endpoint)) {
         diagnose(diagnostics, schema.INVALID_VALUE, schema.text(?listener.name), "listener address is not a valid IP endpoint");
         ret false;
     }
+    val bind: socket.BindOptions = socket.BindOptions{reuse_address: true,
+        reuse_port: owner.options.reuse_port};
     if (listener.transport == schema.TRANSPORT_TCP) {
-        val listening: res[tcp.Listener, io_error.Error] = net_async.listen(endpoint, listener.backlog::i32);
+        val listening: res[tcp.Listener, io_error.Error] = net_async.listen_with(endpoint,
+            tcp.ListenOptions{bind: bind, backlog: listener.backlog::i32});
         if (sel listening.err) {
             diagnose(diagnostics, schema.SOURCE_ERROR, schema.text(?listener.name), "TCP listener bind failed");
             ret false;
@@ -904,7 +1134,7 @@ fun prepare_ip(owner: *Owner, listener: *OwnedListener, diagnostics: *schema.Dia
     }
     or (listener.transport == schema.TRANSPORT_QUIC) {
         val bound: res[udp.Socket, io_error.Error] =
-            net_async.bind_datagram(endpoint);
+            net_async.bind_datagram_with(endpoint, bind);
         if (sel bound.err) {
             diagnose(diagnostics, schema.SOURCE_ERROR,
                 schema.text(?listener.name), "UDP listener bind failed");
@@ -1007,7 +1237,13 @@ fun drain_set(owner: *Owner, set: *ListenerSet) bool {
     var success: bool  = true;
     var i:       usize = 0;
     for (i < set.listener_count) {
-        if (!close_listener(owner, set, ?set.listeners[i])) { success = false; }
+        val listener: *OwnedListener = ?set.listeners[i];
+        var s:        usize          = 0;
+        for (s < MAX_ACCEPT_DEPTH) {
+            if (!release_accept_scope(?listener.accepts[s])) { success = false; }
+            s = s + 1;
+        }
+        if (!close_listener(owner, set, listener)) { success = false; }
         i = i + 1;
     }
     if (!operation_ok(cancel.destroy(?set.scope))) { success = false; }
@@ -1048,12 +1284,17 @@ fun prepare_set(owner: *Owner, set_index: usize, generation: u64, graph: *schema
             drain_set(owner, set);
             ret false;
         }
+        # a listener another worker alone serves stays unbound here
+        if (!spread.binds(?graph.listeners[i], owner.options.worker)) {
+            i = i + 1;
+            cnt;
+        }
         var prepared: bool = false;
         if (listener.transport == schema.TRANSPORT_LOCAL) {
             prepared = prepare_local(owner, set, listener, diagnostics);
         }
         or (listener.transport == schema.TRANSPORT_TCP || listener.transport == schema.TRANSPORT_QUIC) {
-            prepared = prepare_ip(owner, listener, diagnostics);
+            prepared = prepare_ip(owner, listener, i, diagnostics);
         }
         or {
             diagnose(diagnostics, schema.UNSUPPORTED, schema.text(?listener.name), "listener transport is unsupported");
@@ -1073,7 +1314,8 @@ fun submit_initial_accepts(owner: *Owner, set: *ListenerSet, diagnostics: *schem
     var i: usize = 0;
     for (i < set.listener_count) {
         val listener: *OwnedListener = ?set.listeners[i];
-        if (listener.transport == schema.TRANSPORT_TCP || listener.transport == schema.TRANSPORT_LOCAL) {
+        if (listener.state == LISTENER_BOUND
+            && (listener.transport == schema.TRANSPORT_TCP || listener.transport == schema.TRANSPORT_LOCAL)) {
             var slot: usize = 0;
             for (slot < listener.accept_depth) {
                 if (!submit_accept_slot(owner, set, i, slot)) {
@@ -1192,7 +1434,40 @@ fun cleanup_start_failure(owner: *Owner) {
     owner.state                 = OWNER_STOPPED;
 }
 
+# how an owner starts: whether it takes the process-wide duties (the SIGPIPE
+# policy and the process events), which only one owner in a process can, and
+# the admission caps it shares with other workers' owners. a nil `admission`
+# holds the configured caps alone. `wakers` is where this owner's runtime is
+# registered to be woken when a shared cap has room again
+#
+# worker `worker` binds only the listeners `spread.binds` gives it. with
+# `reuse_port`, every listener each worker binds takes SO_REUSEPORT, so the
+# workers can share its address. `endpoints`, when not nil, is the address
+# each listener was bound to by the first worker, which a later one binds
+# again: a configured port of 0 resolves once, not once per worker
+pub rec StartOptions {
+    owns_process: bool;
+    admission:    *process_admission.Shared;
+    worker:       usize;
+    wakers:       *allowance.Wakers;
+    board:        *handoff.Board;
+    reuse_port:   bool;
+    endpoints:    *ip.Endpoint;
+}
+
+pub fun own_options() StartOptions {
+    ret StartOptions{owns_process: true, admission: nil, worker: 0, wakers: nil,
+        board: nil, reuse_port: false, endpoints: nil};
+}
+
 pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics: *schema.Diagnostics) bool {
+    ret start_with(owner, generation, graph, diagnostics, own_options());
+}
+
+pub fun start_with(owner: *Owner, generation: u64, graph: *schema.Graph,
+    diagnostics: *schema.Diagnostics, options: StartOptions) bool {
+    val owns_process: bool = options.owns_process;
+    if (owner != nil) { owner.options = options; }
     if (owner == nil || graph == nil || diagnostics == nil || generation == 0 || graph.listener_count == 0 || graph.listener_count > schema.MAX_LISTENERS || !limits_valid(graph)) {
         diagnose(diagnostics, schema.INVALID_VALUE, "server", "runtime configuration is invalid");
         ret false;
@@ -1223,12 +1498,12 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
     owner.sets[1].scope_initialized = false;
     owner.sets[1].state             = SET_UNUSED;
 
-    if (os.ignore_sigpipe() < 0) {
+    if (owns_process && os.ignore_sigpipe() < 0) {
         diagnose(diagnostics, schema.SOURCE_ERROR, "process", "SIGPIPE policy configuration failed");
         cleanup_start_failure(owner);
         ret false;
     }
-    owner.sigpipe_configured = true;
+    owner.sigpipe_configured = owns_process;
     if (!operation_ok(cancel.make_root(?owner.root_scope, opt[time.Instant].none{}))) {
         diagnose(diagnostics, schema.SOURCE_ERROR, "process", "root cancellation scope initialization failed");
         cleanup_start_failure(owner);
@@ -1238,7 +1513,7 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
     var capacity: usize = 0;
     if (!runtime_capacity(graph, ?capacity) || !initialize_connections(owner,
         graph.limits.max_connections,
-        graph.limits.max_connections_per_peer)) {
+        graph.limits.max_connections_per_peer, options.admission, options.worker)) {
         diagnose(diagnostics, schema.RESOURCE_LIMIT, "server.limits", "runtime resource budget allocation failed");
         cleanup_start_failure(owner);
         ret false;
@@ -1250,6 +1525,9 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
         ret false;
     }
     owner.runtime_initialized = true;
+    if (options.wakers != nil) {
+        allowance.register(options.wakers, options.worker, ?owner.runtime);
+    }
     val made_network: err[io_error.Error] = net_async.make(?owner.network, ?owner.runtime);
     if (sel made_network.err) {
         diagnose(diagnostics, schema.SOURCE_ERROR, "network", "network completion driver initialization failed");
@@ -1264,13 +1542,15 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
         ret false;
     }
     owner.local_initialized = true;
-    val made_process: err[io_error.Error] = process_events.make_runtime(?owner.process, ?owner.runtime);
-    if (sel made_process.err) {
-        diagnose(diagnostics, schema.SOURCE_ERROR, "process", "process event ownership initialization failed");
-        cleanup_start_failure(owner);
-        ret false;
+    if (owns_process) {
+        val made_process: err[io_error.Error] = process_events.make_runtime(?owner.process, ?owner.runtime);
+        if (sel made_process.err) {
+            diagnose(diagnostics, schema.SOURCE_ERROR, "process", "process event ownership initialization failed");
+            cleanup_start_failure(owner);
+            ret false;
+        }
+        owner.process_initialized = true;
     }
-    owner.process_initialized = true;
     if (!prepare_set(owner, 0, generation, graph, diagnostics)) {
         cleanup_start_failure(owner);
         ret false;
@@ -1282,6 +1562,7 @@ pub fun start(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics:
     }
     owner.active_set = 0;
     owner.generation = generation;
+    handoff.publish(options.board, options.worker, generation);
     ret true;
 }
 
@@ -1315,6 +1596,7 @@ pub fun reload(owner: *Owner, generation: u64, graph: *schema.Graph, diagnostics
     val previous_index: usize = owner.active_set;
     owner.active_set = candidate_index;
     owner.generation = generation;
+    handoff.publish(owner.options.board, owner.options.worker, generation);
     val previous: *ListenerSet = ?owner.sets[previous_index];
     previous.state = SET_DRAINING;
     cancel.cancel(?previous.scope);
@@ -1359,25 +1641,9 @@ pub fun close_connection(owner: *Owner, token: ConnectionToken) bool {
     connection.close_pending = true;
     # a socket the driver tracks is closed through the driver, so no backend
     # resource outlives the descriptor and attaches to its next owner
-    var submitted: res[io_runtime.Token, io_error.Error];
-    if (connection.transport == schema.TRANSPORT_TCP) {
-        submitted = net_async.submit_stream_close(
-            ?owner.network,
-            ?owner.root_scope,
-            ?connection.tcp_stream,
-            lifecycle.ABORTIVE,
-            (?connection.close_context)::usize,
-        );
-    }
-    or {
-        submitted = local_async.submit_stream_close(
-            ?owner.local,
-            ?owner.root_scope,
-            ?connection.local_stream,
-            lifecycle.ABORTIVE,
-            (?connection.close_context)::usize,
-        );
-    }
+    val submitted: res[io_runtime.Token, io_error.Error] = hedge_socket.submit_close(
+        ?connection.socket, ?owner.root_scope, lifecycle.ABORTIVE,
+        (?connection.close_context)::usize);
     if (sel submitted.err) {
         connection.state         = CONNECTION_ACTIVE;
         connection.close_pending = false;
@@ -1442,6 +1708,7 @@ pub fun stop(owner: *Owner) bool {
         > owner.connection_count) { ret false; }
     owner.state          = OWNER_DRAINING;
     owner.stop_requested = true;
+    refuse_arrivals(owner);
     var success: bool  = true;
     var i:       usize = 0;
     for (i < 2) {
@@ -1504,6 +1771,7 @@ pub fun stop(owner: *Owner) bool {
     owner.active_set              = NO_INDEX;
     owner.connection_count        = 0;
     owner.queued_connection_count = 0;
+    owner.accept_mark             = 0;
     owner.state                   = OWNER_STOPPED;
     ret success;
 }
@@ -1557,7 +1825,7 @@ test "listener: an accepted stream is adopted with Nagle disabled" {
 
 test "listener: a token into a compacted-away connection chunk is refused after regrow" {
     var owner: Owner;
-    if (!initialize_connections(?owner, opt[usize].none{}, opt[usize].none{})) { ret 1; }
+    if (!initialize_connections(?owner, opt[usize].none{}, opt[usize].none{}, nil, 0)) { ret 1; }
     # fill chunk 0 and open chunk 1 so a later release can drop a trailing chunk
     var claimed: usize = 0;
     for (claimed <= hedge_storage.FIRST_CHUNK) {

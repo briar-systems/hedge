@@ -64,6 +64,7 @@ use http.core.message;
 use h3: http.h3.connection;
 
 use process_admission: hedge.admission;
+use hedge.allowance;
 use hedge.budget;
 use hedge.clock;
 use hedge.config.schema;
@@ -105,9 +106,22 @@ fun monotonic_ns() u64 {
     ret clock.monotonic_ns();
 }
 
-pub val MAX_PUMPS:             usize = quic_capacity.MAX_PUMPS;
-pub val ADMISSION_BANKS:       usize = quic_capacity.ADMISSION_BANKS;
-pub val RECEIVE_BATCH:         usize = 64;
+pub val MAX_PUMPS:       usize = quic_capacity.MAX_PUMPS;
+pub val ADMISSION_BANKS: usize = quic_capacity.ADMISSION_BANKS;
+pub val RECEIVE_BATCH:   usize = 64;
+# the most finished HTTP/3 sessions one turn releases. a session its
+# connection is done with is queued rather than released in the turn that
+# finished it: a burst of closes is a burst of releases (an engine's streams
+# and chunks back to the pool, and with a table chunk's last session the
+# chunk unwelded and wiped), and run inline they kept the worker off its
+# socket until the kernel dropped closes (#330). the socket is read before
+# each release, so the bound is not what keeps receive ahead of teardown. it
+# bounds how long the rest of a turn (the ready connections, the timers, the
+# handshake unit) waits behind a backlog, at one receive batch: a turn whose
+# every datagram was a close queues no more than it releases, and a backlog of
+# 30,000 drains in about 470 turns, inside the drain every closed connection
+# waits out anyway
+pub val TEARDOWN_BUDGET:       usize = RECEIVE_BATCH;
 pub val MAX_STATELESS_PENDING: usize = quic_capacity.MAX_STATELESS_PENDING;
 pub val CONNECTION_ID_BYTES:   usize = 20;
 # how long one closed connection may linger before the transport abandons it.
@@ -177,6 +191,12 @@ pub rec RuntimeConfig {
     # the worker's wake queue. a service waiting on something wakes its
     # connection through it, and the worker hands the wake back through `wake`
     wakes: *hedge_wake.Queue;
+    # the caps this runtime's handshakes share with every worker's: each
+    # address's share of handshakes admitted, and the handshakes in flight.
+    # nil holds them alone, sized from the pump configuration
+    handshakes:      *process_admission.Shared;
+    handshake_slots: *allowance.Pool;
+    worker:          usize;
 }
 
 # a wheel owner is tagged as QUIC so a worker sharing one wheel can route it
@@ -545,6 +565,10 @@ pub rec Connection {
     h3_started:         bool;
     h3_abandoning:      bool;
     h3_cancelled:       bool;
+    # the session is finished and queued for release. the connection holds it,
+    # and so is not released itself, until the queue has released it
+    h3_retiring:        bool;
+    retire_next:        usize;
     close_started:      bool;
     close_deadline_ns:  u64;
     transport_finished: bool;
@@ -685,6 +709,11 @@ pub rec Runtime {
     max_handshakes:       usize;
     handshakes:           process_admission.Manager;
     handshakes_in_flight: usize;
+    # this worker's allowance of the process's handshakes in flight, from the
+    # shared pool or from `own_slots` when the runtime holds the cap alone
+    handshake_slots: allowance.Share;
+    own_slots:       allowance.Pool;
+    owns_slots:      bool;
     # stamped on each pending initial so a route to a slot the table has
     # since reused is detected as stale
     pending_generation: u64;
@@ -697,8 +726,13 @@ pub rec Runtime {
     # crypto budget rather than swept with the ready list
     handshake_ready_head: usize;
     handshake_ready_tail: usize;
-    held:                 hedge_storage.Table[HeldDatagram];
-    held_dropped:         u64;
+    # connections whose finished HTTP/3 session waits to be released, in the
+    # order they finished, TEARDOWN_BUDGET a turn after the socket is read
+    retire_head:  usize;
+    retire_tail:  usize;
+    retiring:     usize;
+    held:         hedge_storage.Table[HeldDatagram];
+    held_dropped: u64;
     # the running estimate of the worker's time per handshake, sampled as the
     # interval between two handshakes completing while handshake work waited,
     # admitted or deferred: the worker was saturated, so the interval is what
@@ -880,6 +914,8 @@ fun reset_connection(value: *Connection) {
     value.h3_started           = false;
     value.h3_abandoning        = false;
     value.h3_cancelled         = false;
+    value.h3_retiring          = false;
+    value.retire_next          = NO_CONNECTION;
     value.close_started        = false;
     value.close_deadline_ns    = 0;
     value.transport_finished   = false;
@@ -955,6 +991,7 @@ fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
     value.handshake = NO_HANDSHAKE;
     if (runtime.handshakes_in_flight != 0) {
         runtime.handshakes_in_flight = runtime.handshakes_in_flight - 1;
+        allowance.give(?runtime.handshake_slots, 1);
     }
     release_held(runtime, ?value.held);
     # its work is no longer handshake work: what it is marked for moves lists
@@ -983,8 +1020,16 @@ fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
     ret true;
 }
 
+# a slot under this runtime's bound and one of the process's, which every
+# worker's handshakes share
+fun leave_slots(runtime: *Runtime) bool {
+    allowance.leave(?runtime.handshake_slots);
+    ret true;
+}
+
 fun handshake_room(runtime: *Runtime) bool {
-    ret runtime.handshakes_in_flight < runtime.max_handshakes;
+    ret runtime.handshakes_in_flight < runtime.max_handshakes
+        && allowance.room(?runtime.handshake_slots);
 }
 
 # whether the oldest deferred Initial could take a slot this turn
@@ -1333,11 +1378,23 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
         config.backing)
         || !routing.make(?runtime.routes, config.backing)
         || !h3_session.make_pool(?runtime.sessions)
-        || !process_admission.make(?runtime.handshakes, config.backing,
-        opt[usize].none{}, opt[usize].none{})
         || !hedge_storage.make_table[HeldDatagram](?runtime.held, config.backing)) {
         ret false;
     }
+    if (config.handshakes != nil) {
+        if (!process_admission.join(?runtime.handshakes, config.backing,
+            config.handshakes, config.worker)) { ret false; }
+    }
+    or (!process_admission.make(?runtime.handshakes, config.backing,
+        opt[usize].none{}, opt[usize].none{})) { ret false; }
+    runtime.owns_slots = config.handshake_slots == nil;
+    if (runtime.owns_slots) {
+        allowance.make_pool(?runtime.own_slots,
+            opt[usize].some{schema.DEFAULT_MAX_HANDSHAKES},
+            schema.DEFAULT_MAX_HANDSHAKES, nil);
+        allowance.join(?runtime.handshake_slots, ?runtime.own_slots, config.worker);
+    }
+    or { allowance.join(?runtime.handshake_slots, config.handshake_slots, config.worker); }
     runtime.chunks            = config.chunks;
     runtime.memory            = config.memory;
     runtime.backing           = config.backing;
@@ -1377,6 +1434,9 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.crypto_budget         = 0;
     runtime.handshake_ready_head  = NO_CONNECTION;
     runtime.handshake_ready_tail  = NO_CONNECTION;
+    runtime.retire_head           = NO_CONNECTION;
+    runtime.retire_tail           = NO_CONNECTION;
+    runtime.retiring              = 0;
     runtime.held_dropped          = 0;
     runtime.read_on               = nil;
     runtime.read_on_ctx           = nil;
@@ -1806,8 +1866,12 @@ fun reap_admission(bank: *AdmissionGeneration) bool {
 
 fun apply_pump_config(runtime: *Runtime, pump: *Pump, config: *PumpConfig) {
     runtime.max_handshakes = config.max_handshakes;
-    process_admission.retune(?runtime.handshakes, opt[usize].none{},
-        config.max_handshakes_per_peer);
+    # a shared cap is the supervisor's to move, once for every worker
+    if (runtime.owns_slots) {
+        allowance.retune(?runtime.own_slots, config.max_handshakes);
+        process_admission.retune(?runtime.handshakes, opt[usize].none{},
+            config.max_handshakes_per_peer);
+    }
     pump.config                   = @config;
     pump.tls_policy               = config.tls_policy;
     pump.plan                     = config.plan;
@@ -1936,18 +2000,18 @@ fun rollback_result(controls: *ControlView, runtime: *Runtime, updates: *PumpUpd
     ret update_result(status, false, !rolled_back);
 }
 
-fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
-    count: usize, require_all: bool,
-    require_policy_identity: bool) UpdateResult {
+# whether every update could be applied as it stands, without applying any.
+# `changed` is written for each update: whether it moves its pump's admission
+# generation. INVALID or BLOCKED refuse, and nothing has changed either way
+fun validate_updates(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
+    count: usize, require_all: bool, require_policy_identity: bool,
+    changed: *bool) Status {
     if (runtime == nil || !runtime.initialized || runtime.stopping
         || count > MAX_PUMPS || (count != 0 && updates == nil)
         || (require_all && count != runtime.pump_count)) {
-        ret update_result(INVALID, false, false);
+        ret INVALID;
     }
-    if (count == 0) { ret update_result(OK, true, false); }
-    var changed: [MAX_PUMPS]bool;
-    var staged:  [MAX_PUMPS]bool;
-    var i:       usize = 0;
+    var i: usize = 0;
     for (i < count) {
         val update: *PumpUpdate = ?updates[i];
         val pump:   *Pump       = pump_for(controls, runtime, update.handle);
@@ -1956,19 +2020,19 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
             || pump.draining || pump.cancelling
             || !limit_holds(update.config.connection_limit,
             pump.active_connections, pump.queued_initials)) {
-            ret update_result(INVALID, false, false);
+            ret INVALID;
         }
         var prior: usize = 0;
         for (prior < i) {
             if (updates[prior].handle.index == update.handle.index) {
-                ret update_result(INVALID, false, false);
+                ret INVALID;
             }
             prior = prior + 1;
         }
         val current: usize                = pump.active_admission;
         val old:     *AdmissionGeneration = ?pump.admissions[current];
         if (!old.live || old.retiring) {
-            ret update_result(INVALID, false, false);
+            ret INVALID;
         }
         changed[i] = update.config.admission_generation != old.source;
         if (changed[i]) {
@@ -1977,12 +2041,32 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
             if (next.live
                 && (!next.retiring || next.active_connections != 0
                 || next.queued_initials != 0)) {
-                ret update_result(BLOCKED, false, false);
+                ret BLOCKED;
             }
         }
         i = i + 1;
     }
-    i = 0;
+    ret OK;
+}
+
+# whether `update_all` would apply every update, asked without applying any, so
+# a reload spread over several workers can refuse before any of them commits
+pub fun check_all(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
+    count: usize) Status {
+    var changed: [MAX_PUMPS]bool;
+    ret validate_updates(controls, runtime, updates, count, true, true, ?changed[0]);
+}
+
+fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *PumpUpdate,
+    count: usize, require_all: bool,
+    require_policy_identity: bool) UpdateResult {
+    var changed: [MAX_PUMPS]bool;
+    var staged:  [MAX_PUMPS]bool;
+    val valid:   Status = validate_updates(controls, runtime, updates, count,
+        require_all, require_policy_identity, ?changed[0]);
+    if (valid != OK) { ret update_result(valid, false, false); }
+    if (count == 0)  { ret update_result(OK, true, false); }
+    var i: usize = 0;
     for (i < count) {
         if (changed[i]) {
             val pump:   *Pump                = ?controls.pumps[updates[i].handle.index];
@@ -2353,6 +2437,9 @@ fun arm_timer(runtime: *Runtime, value: *Connection, now_ns: u64) bool {
     ret wheel.arm(runtime.timers, value.timer, deadline) == wheel.OK;
 }
 
+# the transport's deadline is read once per service pass, at the end of
+# progress_connection. a step that changes it and queues the record for that
+# pass leaves the timer to it, so a datagram costs one read and not one per step
 fun refresh_timer(controls: *ControlView, runtime: *Runtime, index: usize) bool {
     val value: *Connection = connection_at(controls, index);
     if (!value.live || !value.assembly.initialized) { ret false; }
@@ -2492,8 +2579,7 @@ fun deliver_held(controls: *ControlView, runtime: *Runtime, index: usize,
         value.held.count = value.held.count - 1;
         hedge_storage.table_release[HeldDatagram](?runtime.held, slot);
         if (delivered.status == qt.STATUS_ERROR
-            || !reconcile_routes(controls, runtime, index)
-            || !refresh_timer(controls, runtime, index)) {
+            || !reconcile_routes(controls, runtime, index)) {
             fail_connection(controls, runtime, index, now_ns);
         }
     }
@@ -2528,7 +2614,8 @@ pub fun has_ready(runtime: *Runtime) bool {
     ret runtime != nil && runtime.initialized
         && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil
         || runtime.pending_ready_head != NO_CONNECTION
-        || runtime.handshake_ready_head != NO_CONNECTION || promotable(runtime));
+        || runtime.handshake_ready_head != NO_CONNECTION
+        || runtime.retire_head != NO_CONNECTION || promotable(runtime));
 }
 
 fun copy_listener_name(value: *Connection, name: str) bool {
@@ -2648,9 +2735,13 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     value.call_memory_bytes  = config_snapshot.call_memory_bytes;
     value.request_timeout_ns = config_snapshot.request_timeout_ns;
     value.memory_wait_ns     = config_snapshot.memory_wait_ns;
-    value.handshake          = claim_handshake(controls);
-    if (value.handshake != NO_HANDSHAKE) {
-        runtime.handshakes_in_flight = runtime.handshakes_in_flight + 1;
+    value.handshake          = NO_HANDSHAKE;
+    if (allowance.take(?runtime.handshake_slots, 1)) {
+        value.handshake = claim_handshake(controls);
+        if (value.handshake != NO_HANDSHAKE) {
+            runtime.handshakes_in_flight = runtime.handshakes_in_flight + 1;
+        }
+        or { allowance.give(?runtime.handshake_slots, 1); }
     }
     # the connection's account spans every hedge lane. quic owns its three
     # (send, receive, crypto) and hedge composes its own (io, request) onto the
@@ -2713,7 +2804,8 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?config, ?value.storage.assembly_storage,
         ?pump.storage.scratch, ?pump.secret_scratch,
-        memory.borrowed_source(?value.storage.borrower), engine,
+        memory.borrowed_source(?value.storage.borrower),
+        memory.borrowed_secret_source(?value.storage.borrower), engine,
         ?value.storage.scope, clock.from_ns(now_ns));
     if (!initialized.ok) {
         # an attempt that leased nothing (the pool refused the account, or a
@@ -3190,8 +3282,7 @@ fun deliver_initial(controls: *ControlView, runtime: *Runtime, index: usize,
     # a cancel that does not start the close never arms the drain deadline, so
     # the connection would hold its slot and its lease and block shutdown
     if (delivered.status == qt.STATUS_ERROR
-        || !reconcile_routes(controls, runtime, index)
-        || !refresh_timer(controls, runtime, index)) {
+        || !reconcile_routes(controls, runtime, index)) {
         fail_connection(controls, runtime, index, now_ns);
         ret false;
     }
@@ -3795,6 +3886,8 @@ fun drive_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
         }
     }
     if (value.h3_session == h3_session.NO_SESSION) { ret true; }
+    # a finished session is the teardown queue's until it is released
+    if (value.h3_retiring) { ret true; }
     if (value.h3_abandoning) {
         if (!h3_session.abandon(?runtime.sessions,
             controls.sessions, value.h3_session)) { ret false; }
@@ -3821,18 +3914,9 @@ fun drive_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
         val progress: h3_session.Step =
             h3_session.advance(session, now, now_ns);
         if (progress == h3_session.STEP_DONE) {
-            val index:    usize                    = value.h3_session;
-            val released: h3_session.ReleaseStatus =
-                h3_session.release_status(?runtime.sessions,
-                controls.sessions, index);
-            if (released == h3_session.RELEASE_PENDING) { ret true; }
-            value.h3_session = h3_session.NO_SESSION;
-            if (released != h3_session.RELEASE_OK) {
-                close_or_cancel_transport(value,
-                    h3.H3_GENERAL_PROTOCOL_ERROR, now_ns);
-                ret false;
-            }
-            ret close_or_cancel_transport(value, h3.H3_NO_ERROR, now_ns);
+            value.h3_retiring = true;
+            queue_retiring(controls, runtime, index);
+            ret true;
         }
         if (progress == h3_session.STEP_BLOCKED
             || progress == h3_session.STEP_IDLE) { ret true; }
@@ -3842,6 +3926,65 @@ fun drive_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
     }
     mark_ready(controls, runtime, index);
     ret true;
+}
+
+fun queue_retiring(controls: *ControlView, runtime: *Runtime, index: usize) {
+    connection_at(controls, index).retire_next = NO_CONNECTION;
+    if (runtime.retire_tail != NO_CONNECTION) {
+        connection_at(controls, runtime.retire_tail).retire_next = index;
+    }
+    or { runtime.retire_head = index; }
+    runtime.retire_tail = index;
+    runtime.retiring    = runtime.retiring + 1;
+}
+
+fun unqueue_retiring(controls: *ControlView, runtime: *Runtime) usize {
+    val index: usize = runtime.retire_head;
+    runtime.retire_head = connection_at(controls, index).retire_next;
+    if (runtime.retire_head == NO_CONNECTION) { runtime.retire_tail = NO_CONNECTION; }
+    connection_at(controls, index).retire_next = NO_CONNECTION;
+    runtime.retiring                           = runtime.retiring - 1;
+    ret index;
+}
+
+# release a queued session and let its connection close. one still waiting on
+# its engine or scope goes to the back of the queue, and its connection is
+# serviced meanwhile, since the transport is what settles what it waits on
+fun release_retiring(controls: *ControlView, runtime: *Runtime, index: usize,
+    now_ns: u64) {
+    val value:    *Connection              = connection_at(controls, index);
+    val released: h3_session.ReleaseStatus = h3_session.release_status(
+        ?runtime.sessions, controls.sessions, value.h3_session);
+    if (released == h3_session.RELEASE_PENDING) {
+        queue_retiring(controls, runtime, index);
+        mark_ready(controls, runtime, index);
+        ret;
+    }
+    value.h3_retiring = false;
+    value.h3_session  = h3_session.NO_SESSION;
+    var code: u64 = h3.H3_NO_ERROR;
+    if (released != h3_session.RELEASE_OK) { code = h3.H3_GENERAL_PROTOCOL_ERROR; }
+    if (!close_or_cancel_transport(value, code, now_ns)
+        || released != h3_session.RELEASE_OK) {
+        fail_connection(controls, runtime, index, now_ns);
+    }
+    mark_ready(controls, runtime, index);
+}
+
+# the turn's teardown: up to TEARDOWN_BUDGET of the sessions queued before it,
+# the sockets read before each one, so a burst of closes is read at the
+# receive path's rate and released behind it
+fun advance_teardown(controls: *ControlView, runtime: *Runtime, now: time.Instant,
+    now_ns: u64) {
+    val last:   usize = runtime.retire_tail;
+    var budget: usize = TEARDOWN_BUDGET;
+    for (budget != 0 && runtime.retire_head != NO_CONNECTION) {
+        read_on(controls, runtime, now, now_ns);
+        val index: usize = unqueue_retiring(controls, runtime);
+        release_retiring(controls, runtime, index, now_ns);
+        budget = budget - 1;
+        if (index == last) { brk; }
+    }
 }
 
 fun free_send(value: *Connection) usize {
@@ -3880,8 +4023,7 @@ fun generate_sends(controls: *ControlView, runtime: *Runtime, index: usize,
         val generated: qt.Generated = qt.generate[binding.Binding](
             ?value.assembly.driver, ?value.storage.scope, ?operation.buffer[0],
             assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns), operation.generation::usize);
-        if (!reconcile_routes(controls, runtime, index)
-            || !refresh_timer(controls, runtime, index)) { ret false; }
+        if (!reconcile_routes(controls, runtime, index)) { ret false; }
         if (generated.status == qt.STATUS_EMPTY
             || generated.status == qt.STATUS_BLOCKED
             || generated.status == qt.STATUS_CLOSED
@@ -3902,8 +4044,7 @@ fun generate_sends(controls: *ControlView, runtime: *Runtime, index: usize,
         if (sel submitted.err) {
             qt.complete_send[binding.Binding](?value.assembly.driver,
                 generated.token, qt.SEND_FAILED, 0, clock.from_ns(now_ns));
-            if (!reconcile_routes(controls, runtime, index)
-                || !refresh_timer(controls, runtime, index)) { ret false; }
+            reconcile_routes(controls, runtime, index);
             ret false;
         }
         operation.pending = true;
@@ -3967,8 +4108,7 @@ fun deliver_known(controls: *ControlView, runtime: *Runtime, received: *net_type
     val delivered: qt.OperationResult = qt.receive_native[binding.Binding](
         ?value.assembly.driver, received, value.local, clock.from_ns(now_ns), 0);
     if (delivered.status == qt.STATUS_ERROR
-        || !reconcile_routes(controls, runtime, index)
-        || !refresh_timer(controls, runtime, index)) {
+        || !reconcile_routes(controls, runtime, index)) {
         fail_connection(controls, runtime, index, now_ns);
     }
     mark_ready(controls, runtime, index);
@@ -4100,8 +4240,7 @@ fun settle_send(controls: *ControlView, runtime: *Runtime, context: *CompletionC
         clock.from_ns(now_ns));
     operation.pending = false;
     if (settled.status == qt.STATUS_ERROR
-        || !reconcile_routes(controls, runtime, context.connection)
-        || !refresh_timer(controls, runtime, context.connection)) {
+        || !reconcile_routes(controls, runtime, context.connection)) {
         fail_connection(controls, runtime, context.connection, now_ns);
     }
     mark_ready(controls, runtime, context.connection);
@@ -4527,7 +4666,8 @@ fun connection_failed(runtime: *Runtime) {
 fun needs_polling(controls: *ControlView, runtime: *Runtime, value: *Connection) bool {
     if (value.state == CONNECTION_CLEANUP || value.state == CONNECTION_FINALIZING
         || value.h3_abandoning) { ret true; }
-    if (value.h3_session == h3_session.NO_SESSION) { ret false; }
+    # the teardown queue wakes a connection once its session is released
+    if (value.h3_session == h3_session.NO_SESSION || value.h3_retiring) { ret false; }
     ret value.close_started;
 }
 
@@ -4745,6 +4885,7 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
     if (runtime.crypto_budget == 0) {
         runtime.unit_ns = elapsed_since(promotion_started_ns);
     }
+    advance_teardown(controls, runtime, now, now_ns);
     ret status;
 }
 
@@ -4937,6 +5078,7 @@ pub fun release(controls: *ControlView, runtime: *Runtime) Status {
         || !h3_session.destroy_pool(?runtime.sessions)
         || (runtime.handshakes.initialized
         && !process_admission.destroy(?runtime.handshakes))
+        || !leave_slots(runtime)
         || !hedge_storage.destroy_table[HeldDatagram](?runtime.held)) {
         ret FAILED;
     }
@@ -5479,6 +5621,7 @@ test "hedge.protocol.quic.runtime: failed assembly init returns capacity" {
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
         ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
+        memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
         ?value.storage.scope, clock.from_ns(1));
     if (initialized.ok) { ret 6; }
@@ -6853,6 +6996,7 @@ test "hedge.protocol.quic.runtime: the audit asks the transport what a record ho
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
         ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
+        memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
         ?value.storage.scope, clock.from_ns(started));
     if (!initialized.ok || !value.assembly.initialized) { ret 6; }
@@ -7211,7 +7355,8 @@ fun test_dial(tls_server: *TestServer, shared: *assembly.SecretScratch, wire: *u
     }
     val dialed: assembly.InitResult = assembly.init_client(?dialer, ?dialer_config,
         ?dialer_storage, ?dialer_scratch, shared,
-        memory.borrowed_source(?dialer_borrower), ?dialer_tls, ?dialer_scope, now);
+        memory.borrowed_source(?dialer_borrower), memory.borrowed_secret_source(?dialer_borrower),
+        ?dialer_tls, ?dialer_scope, now);
     if (!dialed.ok) { ret 0; }
     val first: qt.Generated = qt.generate[binding.Binding](?dialer.driver, ?dialer_scope,
         wire, capacity, now, 0);
@@ -7243,6 +7388,7 @@ test "hedge.protocol.quic.runtime: a handshake refused memory resumes on its acc
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
         ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
+        memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
         ?value.storage.scope, clock.from_ns(started));
     if (!initialized.ok || !value.assembly.initialized) { ret 2; }
@@ -7354,6 +7500,7 @@ test "hedge.protocol.quic.runtime: an HTTP/3 session out of steps is queued for 
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
         ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
+        memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
         ?value.storage.scope, clock.from_ns(now_ns));
     if (!initialized.ok || !value.assembly.initialized) { ret 2; }
@@ -7464,5 +7611,163 @@ test "hedge.protocol.quic.runtime: an HTTP/3 session out of steps is queued for 
     if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
         server_at, ?now_ns)
         || audit(controls, ?runtime, clock.from_ns(now_ns)) != 0) { ret 20; }
+    ret 0;
+}
+
+# a connection whose HTTP/3 session has finished, as a peer's close leaves it:
+# the session closed with nothing live, and the connection still holding it
+fun test_finished_h3(controls: *ControlView, runtime: *Runtime) usize {
+    val index: usize = acquire_connection(controls, runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret NO_CONNECTION; }
+    val session_index: usize = h3_session.acquire(?runtime.sessions, controls.sessions);
+    if (session_index == h3_session.NO_SESSION) { ret NO_CONNECTION; }
+    val session: *h3_session.Session = h3_session.session_at(?runtime.sessions,
+        controls.sessions, session_index);
+    session.state = h3_session.CLOSED;
+    val value: *Connection = connection_at(controls, index);
+    value.state      = CONNECTION_RELEASING;
+    value.h3_session = session_index;
+    value.h3_started = true;
+    ret index;
+}
+
+# the sessions still held each time the teardown read the sockets
+var test_teardown_runtime: *Runtime = nil;
+var test_teardown_reads:   usize    = 0;
+var test_teardown_held:    [64]usize;
+
+fun test_teardown_read(ctx: ptr) bool {
+    if (test_teardown_reads < 64) {
+        test_teardown_held[test_teardown_reads] = test_teardown_runtime.sessions.live;
+    }
+    test_teardown_reads = test_teardown_reads + 1;
+    ret false;
+}
+
+test "hedge.protocol.quic.runtime: a burst of finished HTTP/3 sessions is released behind the socket, a bounded number a turn" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    test_teardown_runtime = ?runtime;
+    test_teardown_reads   = 0;
+    if (!bind_read_on(?runtime, test_teardown_read, nil)) { ret 91; }
+    val now_ns: u64          = 1000000000;
+    val now:    time.Instant = clock.from_ns(now_ns);
+    # more than two turns' worth, so the bound is what stops a turn
+    val burst: usize = TEARDOWN_BUDGET * 2 + 8;
+    var held:  [136]usize;
+    if (burst > 136 || TEARDOWN_BUDGET > 64) { ret 92; }
+    var i: usize = 0;
+    for (i < burst) {
+        held[i] = test_finished_h3(controls, ?runtime);
+        if (held[i] == NO_CONNECTION) { ret 1; }
+        val value: *Connection = connection_at(controls, held[i]);
+        # the turn that finishes a session queues it and releases nothing
+        if (!drive_h3(controls, ?runtime, value, held[i], now, now_ns)
+            || !value.h3_retiring
+            || value.h3_session == h3_session.NO_SESSION) { ret 2; }
+        # and a turn that services it again leaves it queued once
+        if (!drive_h3(controls, ?runtime, value, held[i], now, now_ns)) { ret 3; }
+        i = i + 1;
+    }
+    if (runtime.retiring != burst || runtime.sessions.live != burst
+        || !has_ready(?runtime)) { ret 4; }
+    # the queue wakes a retiring connection, so it is not polled every turn
+    if (needs_polling(controls, ?runtime, connection_at(controls, held[0]))) { ret 5; }
+    # one turn's teardown releases TEARDOWN_BUDGET, oldest first, and reads the
+    # sockets before each: every read saw the sessions the releases before it left
+    advance_teardown(controls, ?runtime, now, now_ns);
+    if (test_teardown_reads != TEARDOWN_BUDGET
+        || runtime.retiring != burst - TEARDOWN_BUDGET
+        || runtime.sessions.live != burst - TEARDOWN_BUDGET) { ret 6; }
+    i = 0;
+    for (i < TEARDOWN_BUDGET) {
+        if (test_teardown_held[i] != burst - i) { ret 7; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < burst) {
+        val value:    *Connection = connection_at(controls, held[i]);
+        val released: bool        = i < TEARDOWN_BUDGET;
+        if (value.h3_retiring == released
+            || (value.h3_session == h3_session.NO_SESSION) != released
+            || value.ready != released) { ret 8; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: queued HTTP/3 teardown completes and releases every connection" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val now_ns: u64          = 1000000000;
+    val now:    time.Instant = clock.from_ns(now_ns);
+    val burst:  usize        = TEARDOWN_BUDGET * 2 + 8;
+    var i:      usize        = 0;
+    for (i < burst) {
+        val index: usize = test_finished_h3(controls, ?runtime);
+        if (index == NO_CONNECTION
+            || !drive_h3(controls, ?runtime, connection_at(controls, index), index,
+            now, now_ns)) { ret 1; }
+        i = i + 1;
+    }
+    # whole turns: each releases its share, then services the connections it
+    # released, whose transport close and release follow on the next turns
+    var turns: usize = 0;
+    for (turns < 16 && (runtime.live_total != 0 || has_ready(?runtime))) {
+        if (advance(controls, ?runtime, now_ns + turns::u64) != OK) { ret 2; }
+        turns = turns + 1;
+    }
+    if (runtime.retiring != 0 || runtime.retire_head != NO_CONNECTION
+        || runtime.retire_tail != NO_CONNECTION || runtime.sessions.live != 0
+        || runtime.live_total != 0 || live_walk_length(controls, ?runtime) != 0
+        || has_ready(?runtime)) { ret 3; }
+    # three turns release the burst, and none more is needed than it takes
+    if (turns > 5) { ret 4; }
+    ret 0;
+}
+
+test "hedge.protocol.quic.runtime: a queued HTTP/3 session and its connection are held until its teardown" {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    val now_ns: u64          = 1000000000;
+    val now:    time.Instant = clock.from_ns(now_ns);
+    val index:  usize        = test_finished_h3(controls, ?runtime);
+    if (index == NO_CONNECTION) { ret 1; }
+    val value:         *Connection = connection_at(controls, index);
+    val session_index: usize       = value.h3_session;
+    if (!drive_h3(controls, ?runtime, value, index, now, now_ns)
+        || !value.h3_retiring) { ret 2; }
+    # a session claimed while it is queued takes another record
+    val other: usize = h3_session.acquire(?runtime.sessions, controls.sessions);
+    if (other == h3_session.NO_SESSION || other == session_index) { ret 3; }
+    # its connection outlives its drain deadline, since the session points into it
+    value.close_started     = true;
+    value.close_deadline_ns = now_ns;
+    if (release_connection(controls, ?runtime, index, now, now_ns + 1) != BLOCKED
+        || !value.live || value.h3_session != session_index) { ret 4; }
+    # the teardown releases the session, and then the connection goes
+    advance_teardown(controls, ?runtime, now, now_ns + 1);
+    if (value.h3_retiring || value.h3_session != h3_session.NO_SESSION
+        || h3_session.session_at(?runtime.sessions, controls.sessions,
+        session_index) != nil) { ret 5; }
+    if (release_connection(controls, ?runtime, index, now, now_ns + 2) != OK
+        || runtime.live_total != 0) { ret 6; }
+    # the record comes back armed, whatever its last use left in it
+    val again: usize               = h3_session.acquire(?runtime.sessions, controls.sessions);
+    val armed: *h3_session.Session = h3_session.session_at(?runtime.sessions,
+        controls.sessions, again);
+    if (again != session_index || armed == nil || armed.state != h3_session.IDLE
+        || armed.engine_started || armed.scope_live || armed.requests != 0
+        || armed.last_step != h3_session.STEP_IDLE) { ret 7; }
+    if (!h3_session.abandon(?runtime.sessions, controls.sessions, again)
+        || !h3_session.abandon(?runtime.sessions, controls.sessions, other)
+        || runtime.sessions.live != 0) { ret 8; }
     ret 0;
 }

@@ -2,25 +2,33 @@
 
 Hedge is a lightweight production web server written in Mach.
 
-Hedge is the deployable product in the Mach web stack. It will serve static files, Mach web applications, and upstream services over HTTP/1.1, HTTP/2, and HTTP/3 with native Mach TLS and QUIC.
+Hedge is the deployable product in the Mach web stack. It serves static files, Mach web applications, and upstream services over HTTP/1.1, HTTP/2, and HTTP/3 with native Mach TLS and QUIC.
 
-Hedge serves HTTP/1.1 and HTTP/2 over TLS 1.2 and TLS 1.3, with SNI, ALPN and
-client certificates, qualified against curl, OpenSSL and GnuTLS in
-[`test/interop`](test/interop/README.md). Static files, reverse proxying,
-bounded caches, virtual host dispatch, and ACME over authenticated TLS are
-implemented. A `transport = "quic"` listener becomes ready and serves HTTP/3,
-with ALPN inside QUIC selecting `h3`, qualified against curl 8.21.0 over
-ngtcp2 in the same interoperability matrix: request bodies, large responses,
-and prompt shutdown included. HTTP/3 is qualified for that single-client
-matrix only: under concurrent load a QUIC send failure escalates into a
-process-wide shutdown that never completes (#89), so a `quic` listener is not
-yet fit for public traffic. The current Let's Encrypt chain uses certificate algorithms
-mach-tls cannot verify (#38), and a listener's credential generation cannot
-yet be replaced (#37). Under load, hedge is not yet competitive: a TLS
-handshake costs about half a second of CPU and every TLS record tens of
-milliseconds (#91), which on a single serving thread serialises concurrent TLS
-and HTTP/2 clients into timeouts. The measured state, against Caddy, is in
-[`doc/bench`](doc/bench/COMPARISON.md).
+Hedge serves HTTP/1.1 and HTTP/2 over TLS 1.3, with SNI, ALPN, session
+resumption and client certificates. It does not offer TLS 1.2, and refuses a
+TLS 1.2 client. A `transport = "quic"` listener serves HTTP/3, with ALPN inside
+QUIC selecting `h3`. The interoperability matrix in
+[`test/interop`](test/interop/README.md) qualifies these against curl, OpenSSL
+and GnuTLS, and HTTP/3 against curl over ngtcp2, including request bodies,
+large responses and prompt shutdown. The matrix runs one client at a time. Static
+files, reverse proxying, bounded caches, virtual host dispatch, and ACME over
+authenticated TLS are implemented. A certificate that ACME issues or renews is
+installed into the running listener, and connections already open keep the
+certificate they started with. The live ACME suite reaches Let's Encrypt's
+staging directory over TLS verified against the system trust store on every
+pull request. Issuing a certificate from Let's Encrypt's production directory
+has not been run yet.
+
+Hedge serves from one worker thread per CPU, but a QUIC listener is served by
+the first worker alone. That worker's QUIC receive path drops datagrams past
+about 10,000 a second, which 10,000 connections sending one keep-alive a second
+reach. A `transport = "local"` listener is served like a TCP one: the first
+worker accepts and hands each connection to the least loaded worker, and no
+load lane measures that handoff yet. The comparison against Caddy in
+[`doc/bench`](doc/bench/COMPARISON.md) measured hedge 0.2.1, before the TLS
+handshake cost fell from about half a second of CPU to milliseconds and before
+serving moved to a worker per CPU. It has not been run since, so it does not
+describe hedge under load today.
 
 ## Product goals
 
@@ -33,7 +41,7 @@ and HTTP/2 clients into timeouts. The measured state, against Caddy, is in
 - graceful configuration reload and connection draining
 - strict resource bounds and hostile-input handling
 - structured logs, metrics, traces, health, and readiness
-- native Linux, Darwin, and Windows operation (Windows builds today but is not supported at runtime yet, see #149)
+- native Linux, Darwin, and Windows operation (Windows builds today, but its tests do not pass there yet, so it is not supported at runtime)
 - small idle footprint and pay-for-what-is-enabled composition
 
 Lightweight does not mean omitting production duties. It means that protocol engines, storage, observability, and optional services are independent components with explicit ownership and no mandatory framework runtime.
@@ -72,15 +80,18 @@ See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md
 
 ## Local development
 
-All dependencies are pinned to released Git tags.
+Each dependency is selected by an exact released version, and the resolved release is committed as a gitlink under `dep/`.
 
 ```sh
 mach dep pull
 mach test .
+mach test . --lib tests
 mach build .
 ```
 
-GitHub Actions CI runs the root test suite in both profiles and the live ACME conformance suite on every pull request.
+`mach test . --lib tests` runs the test-only modules the executable never reaches.
+
+GitHub Actions CI runs both test selections in both profiles and the live ACME conformance suite on every pull request.
 
 
 Build output uses Mach's default `out/` directory.

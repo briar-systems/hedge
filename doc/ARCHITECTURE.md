@@ -124,6 +124,12 @@ share the listener completion driver with TCP while retaining independent
 connection ownership. The serving loop bounds its wait by the next QUIC timer
 deadline. Reload stages every QUIC admission generation before publishing the
 new request plan, then gracefully retires connections pinned to the old plan.
+An HTTP/3 session that has finished is not released in the turn that
+finished it. Its connection joins a teardown queue, and each turn releases at
+most one receive batch's worth of sessions (`TEARDOWN_BUDGET`, 64) after its
+other work, reading the sockets before each release. So a burst of closes is
+read at the receive path's rate and torn down behind it. The connection keeps
+its session, and so is not released itself, until the queue has released it.
 
 Each protocol engine translates its connection-specific state into the common HTTP service exchange. The common exchange supports streaming bodies, informational responses, trailers, cancellation, upgrades where the protocol permits them, and peer metadata.
 
@@ -212,6 +218,20 @@ replace the corresponding stored fields, absent fields remain, and qualified
 private or no-cache fields are removed. The merged response must still satisfy
 shared-cache storage policy before metadata and selecting dimensions change. The
 unconditional client receives the refreshed stored representation, never the 304.
+
+Every disk operation runs on one supervisor-owned store thread
+(`hedge.cache.store_worker`), never on a serving worker. A serving worker
+submits a `disk.Request` and parks the call on it. The store thread runs the
+request and posts its completion to the submitter's wake queue through a small
+locked inbox beside the queue's lock-free list, then wakes that worker's
+`io_runtime`. The owner settles the completion on its own thread, so the wake
+queue itself is still touched only by its worker, and the audit counts a parked
+request as a registered wait. The queue is bounded by admission: a body read or
+written in pieces is one admitted stream, admitted before its first request, so
+a full queue is a refused admission its caller handles (a hit is served from the
+origin, a recording skips the disk) and never a request refused midway. A disk
+hit issues its first read before the response commits. Stop drains the queue
+within the stop deadline and names what is still outstanding.
 
 Transport and origin failures represented by 500, 502, 503, or 504 may be replaced
 with the stale stored response only while its stale-if-error interval covers the

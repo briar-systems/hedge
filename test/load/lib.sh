@@ -31,6 +31,7 @@ report() {
 }
 
 cleanup_load() {
+    stop_socket_sampler
     release_holders
     stop_hedge >/dev/null 2>&1 || true
     if [ -n "$work" ]; then rm -rf "$work"; fi
@@ -60,8 +61,176 @@ stop_hedge() {
 }
 
 # a lane may set `launcher` to a command that execs the binary under a policy
-# of its own (the scale lane disables transparent huge pages for the process)
+# of its own, such as thp_off's
 launcher=()
+
+# a resident set under transparent huge pages counts 2 MiB for the first byte
+# touched in each aligned region and moves as khugepaged collapses pages, so
+# the figures would carry the kernel's policy rather than hedge's footprint.
+# a lane that reads the resident set runs the served process with them
+# disabled (PR_SET_THP_DISABLE, inherited across exec)
+thp_off() {
+    launcher=(python3 -c 'import ctypes, os, sys
+ctypes.CDLL(None, use_errno=True).prctl(41, 1, 0, 0, 0)
+os.execv(sys.argv[1], sys.argv[1:])')
+}
+
+# resident bytes of the served process, from the kernel's own rollup, with
+# whatever of it the kernel has swapped out counted back in: under memory
+# pressure a page hedge touched can leave the resident set without leaving
+# hedge's footprint, and a figure that fell for that reason would read as a
+# smaller per-connection cost
+resident() {
+    awk '/^(Rss|Swap):/ { sum += $2 } END { printf "%d", sum * 1024 }' "/proc/$hedge_pid/smaps_rollup"
+}
+
+# the configuration of an admin listener on ADMIN_PORT that serves the
+# metrics, authorised by HEDGE_ADMIN_TOKEN, for write_config's extra tables
+admin_config() {
+    cat <<EOF
+[[listener]]
+name = "admin"
+address = "127.0.0.1:$ADMIN_PORT"
+protocols = ["http/1.1"]
+
+[secret.admin-token]
+provider = "env"
+key = "HEDGE_ADMIN_TOKEN"
+
+[telemetry]
+metrics = true
+
+[admin]
+enabled = true
+listener = "admin"
+auth_secret = "admin-token"
+max_response_bytes = 8192
+EOF
+}
+
+# a metric's value from the admin listener, or `missing`
+metric() {
+    curl -sS -H "Authorization: Bearer $HEDGE_ADMIN_TOKEN" \
+        "http://127.0.0.1:$ADMIN_PORT/metrics" \
+        | awk -v name="$1" '$1 == name { print $2; found = 1 }
+            END { if (!found) print "missing" }'
+}
+
+# the sockets the served process has open
+sockets() {
+    find "/proc/$hedge_pid/fd" -lname 'socket:*' 2>/dev/null | wc -l
+}
+
+# waits up to RELEASE_WAIT seconds for hedge to hold no QUIC connection and
+# prints the last count read. a QUIC connection the peer closed is kept through
+# its draining period (RFC 9000 section 10.2, mach-quic's 3 s drain timeout)
+# before it is released, so a sample taken on a fixed delay after release can
+# measure connections still draining rather than what they left behind
+RELEASE_WAIT=15
+quic_released() {
+    local live
+    for _ in $(seq $((RELEASE_WAIT * 10))); do
+        live="$(metric hedge_quic_connections)"
+        if [ "$live" = 0 ]; then break; fi
+        sleep 0.1
+    done
+    echo "$live"
+    test "$live" = 0
+}
+
+# waits up to RELEASE_WAIT seconds for hedge to have no more sockets open than
+# `idle` and prints the last count read. a TCP or TLS connection whose peer
+# closed is retired once hedge sees the close (TLS after its close_notify
+# exchange), and its socket is closed as it goes, so the count falling back to
+# the idle one is every connection having left
+sockets_released() {
+    local idle="$1" open
+    for _ in $(seq $((RELEASE_WAIT * 10))); do
+        open="$(sockets)"
+        if [ "$open" -le "$idle" ]; then break; fi
+        sleep 0.1
+    done
+    echo "$open"
+    test "$open" -le "$idle"
+}
+
+# the kernel's view of hedge's UDP socket on 127.0.0.1:`port`, as
+# `queued buffer drops`: the bytes charged to its receive queue, the queue's
+# size, and the datagrams it dropped because the queue was full
+# (sk_rmem_alloc, sk_rcvbuf and sk_drops, the first and last being the
+# rx_queue and drops of /proc/net/udp). it asks sock_diag for that one
+# socket, because /proc/net/udp formats every socket on the host and the
+# holders' 30k sockets make one read of it cost about two seconds of CPU.
+# `missing` when no such socket exists
+udp_socket() {
+    ss -H -u -a -n -m "src 127.0.0.1:$1" 2>/dev/null | awk '
+        /skmem:/ {
+            match($0, /skmem:\([^)]*\)/)
+            n = split(substr($0, RSTART + 7, RLENGTH - 8), f, ",")
+            for (i = 1; i <= n; i++) {
+                k = f[i]; sub(/[0-9]+$/, "", k); v = substr(f[i], length(k) + 1) + 0
+                m[k] = v
+            }
+            if (m["r"] > queued) queued = m["r"]
+            if (m["rb"] > buffer) buffer = m["rb"]
+            drops += m["d"]; found = 1
+        }
+        END { if (found) print queued + 0, buffer + 0, drops + 0; else print "missing" }'
+}
+
+# the socket's drop counter alone, or `missing`
+socket_drops() {
+    local sample
+    sample="$(udp_socket "$1")"
+    echo "${sample##* }"
+}
+
+# a QUIC cell samples its listener's socket every SOCKET_SAMPLE seconds for
+# the whole life of its server, so a phase's receive-queue peak is read from
+# the samples it spans. the drop count at a phase's ends is read directly, so
+# it is exact whatever the sampling missed
+SOCKET_SAMPLE=0.1
+socket_sampler=""
+socket_samples=""
+start_socket_sampler() {
+    local port="$1"
+    stop_socket_sampler
+    socket_samples="$work/socket-$port.samples"
+    : >"$socket_samples"
+    while :; do udp_socket "$port"; sleep "$SOCKET_SAMPLE"; done >>"$socket_samples" 2>/dev/null &
+    socket_sampler=$!
+}
+
+stop_socket_sampler() {
+    if [ -z "$socket_sampler" ]; then return 0; fi
+    kill "$socket_sampler" 2>/dev/null || true
+    wait "$socket_sampler" 2>/dev/null || true
+    socket_sampler=""
+}
+
+# the start of a socket phase, as `samples_seen drops`, for socket_phase
+socket_mark() {
+    echo "$(wc -l <"$socket_samples") $(socket_drops "$1")"
+}
+
+# what the socket did since `mark`, as `drops=N peak=BYTES/BUFFER`: the
+# datagrams it dropped and the most bytes its receive queue held against the
+# queue's size
+socket_phase() {
+    local port="$1" mark="$2" now
+    now="$(socket_drops "$port")"
+    awk -v skip="${mark% *}" -v before="${mark#* }" -v now="$now" '
+        NR > skip && $1 != "missing" {
+            if ($1 > peak) peak = $1
+            if ($2 > buffer) buffer = $2
+        }
+        END {
+            if (before == "missing" || now == "missing") drops = "missing"
+            else drops = now - before
+            printf "drops=%s peak=%d/%d\n", drops, peak, buffer
+        }' "$socket_samples"
+}
+
 start_hedge() {
     "${launcher[@]}" "$binary" "$1" >"$work/hedge.log" 2>&1 &
     hedge_pid=$!
@@ -149,7 +318,8 @@ resolve_h3_curl() {
 # fetches the body over HTTP/3 once per transfer at `rate`, each transfer
 # under its own authority so curl opens a connection for it rather than
 # multiplexing, and prints one line per transfer: status, bytes, version,
-# connect and total time
+# connect and total time. the bound covers a 60 s connect timeout and a 64 s
+# transfer after it
 curl_h3() {
     local port="$1" count="$2" name="$3" rate="$4"
     shift 4
@@ -161,26 +331,34 @@ curl_h3() {
     done
     "$h3curl" --parallel --parallel-immediate --parallel-max "$count" \
         --http3-only --insecure --connect-to "::127.0.0.1:$port" \
-        --max-time 120 --limit-rate "$rate" \
+        --max-time 180 --limit-rate "$rate" \
         --write-out '%{http_code} %{size_download} %{http_version} %{time_appconnect} %{time_total}\n' \
         "$@" --config "$config"
 }
 
-# the QUIC holder is test/load/h3load, a quic-go client, built into the
-# gitignored tools directory with the module cache beside it so a runner
-# without a Go cache still builds it
-resolve_h3load() {
-    h3load="$root/.tools/h3load"
-    if [ -x "$h3load" ] && [ "$h3load" -nt test/load/h3load/main.go ]; then
+# the Go clients under test/load (h3load, the QUIC holder and dialler, and
+# rate, the closed-loop rate client) are built into the gitignored tools
+# directory with the module cache beside it, so a runner without a Go cache
+# still builds them. resolve_go_tool sets `tool` to the built binary.
+tool=""
+resolve_go_tool() {
+    local name="$1"
+    tool="$root/.tools/$name"
+    if [ -x "$tool" ] && [ "$tool" -nt "test/load/$name/main.go" ]; then
         return 0
     fi
     if ! command -v go >/dev/null 2>&1; then
-        echo "the QUIC scale cells need go to build test/load/h3load"
+        echo "the load lanes need go to build test/load/$name"
         return 1
     fi
     mkdir -p "$root/.tools/gopath"
-    (cd test/load/h3load && GOPATH="$root/.tools/gopath" GOFLAGS=-mod=mod \
-        go build -o "$h3load" .) || return 1
+    (cd "test/load/$name" && GOPATH="$root/.tools/gopath" GOFLAGS=-mod=mod \
+        go build -o "$tool" .) || return 1
+}
+
+resolve_h3load() {
+    resolve_go_tool h3load || return 1
+    h3load="$tool"
 }
 
 # the work directory, an incompressible body so neither side can shorten a
@@ -198,6 +376,12 @@ prepare_load() {
     mkdir -p "$work/content"
     head -c "$BODY_BYTES" /dev/urandom > "$work/content/body"
     head -c "$SMALL_BYTES" /dev/urandom > "$work/content/small"
+    if [ -n "${LOAD_CACHE:-}" ]; then
+        # old enough that the heuristic freshness write_config enables reaches
+        # its one-day cap, so every body is stored after its first request
+        touch -d "2000-01-01" "$work/content/body" "$work/content/small"
+        mkdir -p "$work/cache"
+    fi
 
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -sha256 -days 1 -nodes \
@@ -217,11 +401,39 @@ prepare_load() {
 # per-peer limit is always raised to the global one or past the load. the
 # optional sixth argument is the body of a [server.timeouts] table, and the
 # optional seventh is appended whole (an admin listener, telemetry).
+# `workers`, when given, fixes the worker count; otherwise one serves per CPU
 write_config() {
-    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}"
+    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}" workers="${8:-}"
+    local cache_service="" cache_table="" cache_memory=$((BODY_BYTES * 4))
+    # LOAD_CACHE=memory caches the content in memory. LOAD_CACHE=disk halves the
+    # memory budget so the large body (past a quarter of it) is kept on disk and
+    # the small one in memory. either way the cache is in front of every request
+    case "${LOAD_CACHE:-}" in
+        "") ;;
+        memory|disk)
+            if [ "$LOAD_CACHE" = disk ]; then cache_memory=$((BODY_BYTES * 2)); fi
+            cache_service="cache = true"
+            cache_table="[cache]
+enabled = true
+memory_bytes = $cache_memory
+max_entry_bytes = $((BODY_BYTES * 2))
+entries = 64
+heuristic_percent = 10"
+            if [ "$LOAD_CACHE" = disk ]; then
+                cache_table="$cache_table
+disk_bytes = $((BODY_BYTES * 16))
+disk_root = \"$work/cache\""
+            fi
+            ;;
+        *)
+            echo "LOAD_CACHE is memory, disk or unset, not $LOAD_CACHE"
+            exit 1
+            ;;
+    esac
     cat > "$path" <<EOF
 [server]
 name = "load"
+${workers:+workers = $workers}
 
 [server.limits]
 $limits
@@ -237,7 +449,7 @@ protocols = ["http/1.1"]
 [[listener]]
 name = "secure"
 address = "127.0.0.1:$secure"
-protocols = ["http/1.1"]
+protocols = ["http/1.1", "h2"]
 tls = "load"
 
 [[listener]]
@@ -271,12 +483,15 @@ names = ["localhost", "*.load.test"]
 [service.body]
 kind = "static"
 root = "$work/content"
+$cache_service
 
 [[route]]
 name = "body"
 host = "site"
 path = "/**"
 service = "body"
+
+$cache_table
 
 $extra
 EOF
