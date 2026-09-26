@@ -3,6 +3,7 @@
 use hedge.config.lanes;
 use hedge.config.schema;
 use hedge.protocol.trust;
+use http.core.field;
 use std.allocator;
 use std.allocator.fixed;
 use std.data.toml;
@@ -15,6 +16,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.view;
 use tls.session;
 
 # std 2.0 returns opt for lookups; these keep the nil-on-absence shape the loader is written against
@@ -767,6 +769,62 @@ fun default_status(kind: u8) usize {
     ret 200;
 }
 
+# a configured Cache-Control is sent verbatim, so it must be a field value a
+# response can carry
+fun resolve_field_value(output: *schema.Text, raw: str, resolver: *Resolver,
+    diagnostics: *schema.Diagnostics, source: str, path: str) {
+    if (!resolve_text(output, raw, resolver, diagnostics, source, path) || raw == nil) { ret; }
+    if (output.len == 0 || !field.valid_value(view.view(schema.text(output), output.len))) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, path, "value is not a valid HTTP field value");
+        schema.clear_text(output);
+    }
+}
+
+fun parse_cache_rule(service: *schema.Service, table: *toml.Table, resolver: *Resolver,
+    diagnostics: *schema.Diagnostics, source: str) {
+    if (service.cache_rule_count >= schema.MAX_CACHE_RULES) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "service.cache_control_rules", "Cache-Control rule count exceeds the configured bound");
+        ret;
+    }
+    var allowed: [2]str = [2]str{"path", "value"};
+    validate_fields(table, diagnostics, source, ?allowed[0], 2);
+    val rule: *schema.CacheRule = ?service.cache_rules[service.cache_rule_count];
+    service.cache_rule_count = service.cache_rule_count + 1;
+    resolve_text(?rule.path, required_string(table, "path", diagnostics, source), resolver, diagnostics, source, "service.cache_control_rules.path");
+    if (rule.path.len == 0 || rule.path.data[0] != '/') {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, "service.cache_control_rules.path", "a Cache-Control rule path must begin with /");
+    }
+    resolve_field_value(?rule.value, required_string(table, "value", diagnostics, source), resolver, diagnostics, source, "service.cache_control_rules.value");
+}
+
+fun parse_cache_control(service: *schema.Service, table: *toml.Table, resolver: *Resolver,
+    diagnostics: *schema.Diagnostics, source: str) {
+    val rules: *toml.Value = value(table, "cache_control_rules");
+    if (service.kind != schema.SERVICE_STATIC
+        && (value(table, "cache_control") != nil || rules != nil)) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, "service.cache_control",
+            "a Cache-Control policy applies only to a static service");
+        ret;
+    }
+    resolve_field_value(?service.cache_control, optional_string(table, "cache_control", diagnostics, source), resolver, diagnostics, source, "service.cache_control");
+    if (rules == nil) { ret; }
+    if (rules.tag != toml.TYPE_ARRAY) {
+        diagnose(diagnostics, schema.WRONG_TYPE, source, "service.cache_control_rules", "Cache-Control rules must be a table array");
+        ret;
+    }
+    var i: usize = 0;
+    for (i < toml.array_len(?rules.data.array)) {
+        val entry: *toml.Value = array_at(?rules.data.array, i);
+        if (entry == nil || entry.tag != toml.TYPE_TABLE) {
+            diagnose(diagnostics, schema.WRONG_TYPE, source, "service.cache_control_rules", "Cache-Control rule entries must be tables");
+        }
+        or {
+            parse_cache_rule(service, ?entry.data.table, resolver, diagnostics, source);
+        }
+        i = i + 1;
+    }
+}
+
 fun parse_services(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
     if (section == nil) { ret; }
     var i: usize = 0;
@@ -780,8 +838,8 @@ fun parse_services(graph: *schema.Graph, section: *toml.Table, resolver: *Resolv
             diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "service count exceeds the configured bound");
         }
         or {
-            var allowed: [15]str = [15]str{"kind", "target", "root", "application", "upstream", "body", "budget", "status", "content_type", "index", "precompressed", "cache", "memory_bytes", "upstream_idle_ms", "upstream_lifetime_ms"};
-            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 15);
+            var allowed: [17]str = [17]str{"kind", "target", "root", "application", "upstream", "body", "budget", "status", "content_type", "index", "precompressed", "cache", "memory_bytes", "upstream_idle_ms", "upstream_lifetime_ms", "cache_control", "cache_control_rules"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 17);
             val service: *schema.Service = ?graph.services[graph.service_count];
             graph.service_count = graph.service_count + 1;
             resolve_text(?service.name, name, resolver, diagnostics, source, "service.name");
@@ -814,6 +872,7 @@ fun parse_services(graph: *schema.Graph, section: *toml.Table, resolver: *Resolv
                 diagnose(diagnostics, schema.INVALID_VALUE, source, "service.upstream_lifetime_ms",
                     "an upstream timeout applies only to a proxy service");
             }
+            parse_cache_control(service, ?item.data.table, resolver, diagnostics, source);
         }
         i = i + 1;
     }
@@ -1877,6 +1936,34 @@ test "config loader: a proxy's upstream idle and lifetime are defaulted, set or 
     if (build(?graph, ?diagnostics, ?a, "misplaced.toml", misplaced, nil, capabilities)
         || !has_diagnostic(?diagnostics, schema.INVALID_VALUE, "service.upstream_idle_ms")
         || !has_diagnostic(?diagnostics, schema.INVALID_VALUE, "service.upstream_lifetime_ms")) { ret 8; }
+    ret 0;
+}
+
+test "config loader: a static service's Cache-Control policy is parsed or refused" {
+    var memory:      [1048576]u8;
+    var fixed_state: fixed.FixedState;
+    var a:           allocator.Allocator;
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    var graph:        schema.Graph;
+    var diagnostics:  schema.Diagnostics;
+    val capabilities: Capabilities = Capabilities{quic: true,
+        local_transport: true, environment_secrets: true,
+        file_secrets:    true, os_secrets: true, application_secrets: true};
+    val set: str = "[server]\nname = \"site\"\n\n[service.files]\nkind = \"static\"\nroot = \"./public\"\ncache_control = \"max-age=600\"\ncache_control_rules = [\n  { path = \"/assets/**\", value = \"public, max-age=31536000, immutable\" },\n  { path = \"/**.html\", value = \"no-cache\" },\n]\n";
+    if (!build(?graph, ?diagnostics, ?a, "set.toml", set, nil, capabilities)) { ret 1; }
+    val files: *schema.Service = ?graph.services[0];
+    if (!schema.text_equals(?files.cache_control, "max-age=600") || files.cache_rule_count != 2
+        || !schema.text_equals(?files.cache_rules[0].path, "/assets/**")
+        || !schema.text_equals(?files.cache_rules[1].value, "no-cache")) { ret 2; }
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    val misplaced: str = "[server]\nname = \"site\"\n\n[service.app]\nkind = \"fixed\"\nbody = \"ok\"\ncache_control = \"max-age=600\"\n";
+    if (build(?graph, ?diagnostics, ?a, "misplaced.toml", misplaced, nil, capabilities)
+        || !has_diagnostic(?diagnostics, schema.INVALID_VALUE, "service.cache_control")) { ret 3; }
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    val invalid: str = "[server]\nname = \"site\"\n\n[service.files]\nkind = \"static\"\nroot = \"./public\"\ncache_control = \"max-age=600\\r\\nx: y\"\ncache_control_rules = [{ path = \"assets/**\", value = \"no-cache\" }]\n";
+    if (build(?graph, ?diagnostics, ?a, "invalid.toml", invalid, nil, capabilities)
+        || !has_diagnostic(?diagnostics, schema.INVALID_VALUE, "service.cache_control")
+        || !has_diagnostic(?diagnostics, schema.INVALID_VALUE, "service.cache_control_rules.path")) { ret 4; }
     ret 0;
 }
 
