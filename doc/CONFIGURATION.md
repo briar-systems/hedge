@@ -624,6 +624,8 @@ cache_control_rules = [
   { path = "/assets/**", value = "public, max-age=31536000, immutable" },
   { path = "/**/*.html", value = "no-cache" },
 ]
+not_found = "/404.html"
+media_types = { ps1 = "text/plain; charset=utf-8", webmanifest = "application/manifest+json" }
 ```
 
 A `static` service serves the files under `root`. `index` names the file a directory request serves, `index.html` by default. With `precompressed` set, a request that accepts `br` or `gzip` is served a `.br` or `.gz` sibling of the file when one exists.
@@ -631,6 +633,10 @@ A `static` service serves the files under `root`. `index` names the file a direc
 `cache_control` is the `Cache-Control` field the service sends, and `cache_control_rules` overrides it for the files whose path matches. The rules are tried in order and the first match wins. A file no rule matches carries `cache_control`, and with neither set the field is not sent. The field goes out on `200`, `206` and `304` responses, for GET and HEAD alike, and never on an error or a redirect.
 
 A rule's `path` begins with `/` and is matched against the path of the file served, relative to `root`. That is the index file for a directory request, so `/` is matched as `/index.html`, and it is the file itself for a precompressed variant. `*` matches within one path segment, `**` matches across segments, and `**/` at the start of a segment also matches no segment, so `/**/*.html` covers `/index.html` as well as `/docs/index.html`. Every other byte matches itself. A service holds at most 8 rules. Each value must be a valid HTTP field value, and both options are refused on any service that is not `static`.
+
+`not_found` names a file under `root`, written as a path that begins with `/`, that is served with status `404` whenever a request finds no file: a missing path, a directory with no index, anything that is not a regular file, a symlink, or a target the path checks refuse. It goes out with its own `Content-Type` and `Content-Length`, and HEAD gets the length with no body. It stands in for a representation that does not exist, so it carries no validators or `Cache-Control` and ignores conditions and ranges. Without `not_found`, or when the file cannot be opened at the time of the request, the `404` has an empty body.
+
+A file's `Content-Type` comes from its extension. The built-in table covers `html`/`htm`, `css`, `js`/`mjs`, `json`, `txt`, `md`, `mach`, `sh` (`application/x-sh`), `xml`, `svg`, `png`, `jpg`/`jpeg`, `gif`, `webp`, `ico`, `woff2`, `woff`, `ttf`, `wasm`, `pdf`, `zip` and `gz`, and anything else goes out as `application/octet-stream` rather than a guess. `media_types` adds or overrides types for this service. Each key is an extension without its dot, matched regardless of case, and each value is the field value sent. A configured type is used before the built-in table, a service holds at most 8, an extension may appear once whatever its case, and `media_types` is refused on any service that is not `static`.
 
 ## Caching
 
