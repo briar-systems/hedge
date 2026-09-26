@@ -340,8 +340,18 @@ counts rather than figures:
   were closed as the last arrived (#294). With no lifetime, the same lane holds
   all 100,000 at 24,013 bytes a connection from 10k, with 100,000 descriptors
   and timer entries and no idle CPU.
-- TCP at 100k: the server keeps 84.5 MiB more after its connections leave than
-  it does after 10k, so something grows with the peak past 10k.
+- TCP at 100k: the server kept 84.5 MiB more after its connections left than
+  it did after 10k. hedge's pending accepts were the cause (#295). An accept
+  armed at the peak takes the lowest free slot in the io runtime and the
+  network driver, which is as high as the peak, and it stays pending after the
+  load leaves. std's tables give back only chunks with nothing live in them, so
+  a few parked accepts kept every chunk up to the peak. Each time the
+  connection count halves, the listener now cancels an accept that
+  `io_runtime.pins_capacity` says keeps such a chunk, serves any connection it
+  had already taken, and arms it again in the lowest free slot. On the same
+  lane with std 8.2.0 a server keeps 4,575,232 bytes after 100k and 4,235,264
+  after 10k, against 92,803,072 and 4,087,808 before, and both after-release
+  checks pass at 10k against 100k.
 - QUIC at 30k: 12,652 connections were still live 15 s after their clients
   closed them, which is #274's socket-drop shape at the close.
 - QUIC at 50k: the host swapped hedge's pages out. The lane now counts
