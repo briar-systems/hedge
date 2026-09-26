@@ -12,6 +12,7 @@ use hedge.memory;
 use hedge.operation;
 use hedge.wake;
 use http.core.body;
+use http_deadline: http.core.deadline;
 use http.core.field;
 use http.core.message;
 use http.core.method;
@@ -65,6 +66,14 @@ pub val FAILED:     State = 7;
 pub val CLOSED:     State = 8;
 pub val CLOSING:    State = 10;
 
+# how long a pooled connection is kept (#332). `idle_ns` bounds the time it
+# waits between exchanges, and past `lifetime_ns` it finishes the exchange it
+# carries and is not reused. neither ever cuts an exchange short
+pub rec Reuse {
+    idle_ns:     u64;
+    lifetime_ns: opt[u64];
+}
+
 pub def Step: u8;
 pub val STEP_IDLE:     Step = 1;
 pub val STEP_PROGRESS: Step = 2;
@@ -114,6 +123,8 @@ pub rec Link {
     body_final:       bool;
     inbound_complete: bool;
     configured:       engine_h1.Config;
+    lifetime_ns:      opt[u64];
+    retire:           http_deadline.Deadline;
     # the plane is woken on every completion, so a link that moved is
     # stepped on the worker's next turn rather than at its next deadline
     plane:              wake.Waker;
@@ -222,9 +233,15 @@ fun connect_settled(context: ptr, token_context: usize, completion: io_runtime.C
 # the engine must be configured to the storage this link actually owns: a
 # pipeline depth or header bound larger than these buffers would have the engine
 # index past them
-pub fun link_config(base: engine_h1.Config) engine_h1.Config {
+# the served configuration's buffers and message bounds carry over, and the
+# route's reuse policy replaces its idle timeout. the engine's whole-life bound
+# is never set, since it would fail an exchange in flight: the lifetime only
+# stops reuse
+pub fun link_config(base: engine_h1.Config, reuse: Reuse) engine_h1.Config {
     var configured: engine_h1.Config = base;
-    configured.max_pipeline = LINK_SLOTS;
+    configured.max_pipeline     = LINK_SLOTS;
+    configured.idle_timeout_ns  = reuse.idle_ns;
+    configured.total_timeout_ns = clock.UNBOUNDED_NS;
     ret configured;
 }
 
@@ -258,7 +275,8 @@ pub fun lease(link: *Link) bool {
 pub fun release_idle(link: *Link, now: time.Instant) bool {
     if (link == nil || !link.initialized || !link.reusable
         || link.slot == engine_h1.NO_SLOT
-        || link.engine.state != engine_h1.OPEN) { ret false; }
+        || link.engine.state != engine_h1.OPEN
+        || http_deadline.expired(link.retire, now)) { ret false; }
     if (!engine_h1.release(?link.engine, link.slot, now)) { ret false; }
     link.leased           = false;
     link.slot             = engine_h1.NO_SLOT;
@@ -273,7 +291,8 @@ pub fun release_idle(link: *Link, now: time.Instant) bool {
 # only gives the worker a turn, and every turn drives the links
 pub fun make(link: *Link, driver: *net_async.Driver, pool: *memory.Memory,
     budgets: memory.Budgets, plane: wake.Waker, upstream: usize,
-    endpoint: ip.Endpoint, configured: engine_h1.Config, now: time.Instant) bool {
+    endpoint: ip.Endpoint, configured: engine_h1.Config, reuse: Reuse,
+    now: time.Instant) bool {
     if (link == nil || driver == nil || pool == nil) { ret false; }
     link.plane              = plane;
     link.account_live       = false;
@@ -284,7 +303,9 @@ pub fun make(link: *Link, driver: *net_async.Driver, pool: *memory.Memory,
     link.reusable           = false;
     link.endpoint           = endpoint;
     link.driver             = driver;
-    link.configured         = link_config(configured);
+    link.configured         = link_config(configured, reuse);
+    link.lifetime_ns        = reuse.lifetime_ns;
+    link.retire             = http_deadline.Deadline{active: false, at: now};
     link.has_stream         = false;
     link.connect_pending    = false;
     link.connect_failed     = false;
@@ -343,7 +364,18 @@ fun activate(link: *Link, now: time.Instant) bool {
         link.configured, now)) { ret false; }
     link.initialized = true;
     link.state       = READY;
+    # a connection's age counts from when it opened
+    if (sel link.lifetime_ns.some) { link.retire = http_deadline.after(now, link.lifetime_ns.some); }
     ret true;
+}
+
+# whether an idle connection has outlived the pool's reuse policy: past its
+# lifetime, or past a deadline its engine would enforce, which for an idle
+# engine is its idle timeout
+pub fun expired(link: *Link, now: time.Instant) bool {
+    if (link == nil || link.state != IDLE || link.leased || !link.initialized) { ret false; }
+    ret http_deadline.expired(link.retire, now)
+        || http_deadline.expired(engine_h1.next_deadline(?link.engine), now);
 }
 
 # publish the outbound request head; the body follows through `offer_body`
@@ -559,8 +591,9 @@ pub fun close(link: *Link) bool {
 # the earliest engine deadline of a live link, as monotonic nanoseconds
 pub fun deadline(link: *Link, at_ns: *u64) bool {
     if (link == nil || link.state == FREE) { ret false; }
-    val next: engine_h1.Deadline = engine_h1.next_deadline(?link.engine);
-    if (!next.active) { ret false; }
+    var next: engine_h1.Deadline = engine_h1.next_deadline(?link.engine);
+    if (link.state == IDLE) { next = http_deadline.earlier(next, link.retire); }
+    if (!next.active)       { ret false; }
     @at_ns = clock.to_ns(next.at);
     ret true;
 }
