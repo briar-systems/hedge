@@ -9,7 +9,7 @@ point of hedge. Each directory pairs with a row of the registry in
 | wire framing | `proxy-v1`, `proxy-v2` | `protocol.proxy_protocol.decode`, trusted and not |
 | | `prologue` | `protocol.prologue.evaluate` under every PROXY mode, trust, TLS and end-of-input |
 | | `cleartext` | `protocol.selection.select_cleartext` |
-| | `acme-response` | `acme.wire.parse_response`, open and closed, GET and HEAD |
+| | `outbound-response` | `outbound.wire.parse_response`, open and closed, GET and HEAD |
 | QUIC and HTTP/3 | `routing` | `protocol.quic.routing` publish, withdraw and lookup |
 | | `local-cid` | `protocol.quic.runtime.adopt_local_cid` |
 | | `arrivals` | `protocol.quic.arrivals`: `class_of`, `hold`, `take` |
@@ -34,9 +34,8 @@ point of hedge. Each directory pairs with a row of the registry in
 | | `acme-challenge-path` | `acme.challenge.http01_token` |
 | config and files | `config` | `config.loader.build` |
 | | `trusted-peer` | `protocol.trust.parse` and `add` |
-| | `pem-bundle` | `acme.anchors.load_bundle` |
 | | `acme-durable` | `acme.durable.open` and `open_account_key` |
-| | `acme-url` | `acme.wire.split_url` |
+| | `outbound-url` | `outbound.wire.split_url` |
 
 A boundary whose entry point takes more than one string reads its input as
 lines, and field lines are `name: value`. A field an HTTP parser would refuse is

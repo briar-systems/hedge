@@ -16,9 +16,10 @@ use acme.nonce;
 use acme.problem;
 use crypto.contracts;
 use hedge.acme.keys;
-use hedge.acme.transport;
 use hedge.clock;
 use hedge.operation;
+use hedge.outbound;
+use hedge.outbound.wire;
 use hedge.wake;
 use http.core.field;
 use A: std.allocator;
@@ -114,10 +115,13 @@ pub rec Session {
 
     signed:         ac.SignedRequest;
     nonce_attempts: usize;
-    answer:         ac.Response;
-    failure:        problem.Error;
-    state:          State;
-    live:           bool;
+    # the content-type field of the request in flight, which lives as long as
+    # its exchange
+    content_type: [1]field.Field;
+    answer:       ac.Response;
+    failure:      problem.Error;
+    state:        State;
+    live:         bool;
 }
 
 fun storage(session: *Session) ac.DirectoryStorage {
@@ -140,6 +144,13 @@ fun fail(session: *Session, cause: problem.Error) Status {
 
 fun fail_local(session: *Session, detail: str) Status {
     ret fail(session, problem.local(problem.STATE, detail));
+}
+
+# the client a conversation sends on and the exchange it holds while one
+# request is in flight
+pub rec Link {
+    client:   *outbound.Client;
+    exchange: *outbound.Exchange;
 }
 
 pub fun make(session: *Session, directory_url: view.View) Status {
@@ -200,7 +211,7 @@ pub fun state(session: *Session) State {
     ret session.state;
 }
 
-# the completed response. its views point into the transport's buffer and stay
+# the completed response. its views point into the exchange's buffer and stay
 # valid until the next exchange begins.
 pub fun response(session: *Session) ac.Response {
     ret session.answer;
@@ -242,21 +253,38 @@ pub fun begin_prepared(session: *Session) Status {
     ret PENDING;
 }
 
-fun send(session: *Session, engine: *transport.Transport,
-    request: ac.WireRequest, now: time.Instant, next: State) Status {
+fun send(session: *Session, link: *Link, request: ac.WireRequest,
+    now: time.Instant, next: State) Status {
     if (problem.failed(request.error)) { ret fail(session, request.error); }
-    transport.finish(engine);
-    val begun: transport.Status = transport.begin(engine, request, now);
-    if (begun == transport.FAILED || begun == transport.INVALID) {
+    outbound.finish(link.exchange);
+    var value: outbound.Request = outbound.request(request.method.kind, request.url);
+    value.body               = request.body;
+    value.timeout_ns         = request.timeout_ns;
+    value.max_response_bytes = request.max_response_bytes;
+    value.replay_safe        = request.replay_safe;
+    if (request.content_type.len != 0) {
+        session.content_type[0] = field.Field{name: view.view(field.CONTENT_TYPE, 12),
+            value: request.content_type, sensitive: false};
+        value.headers      = ?session.content_type[0];
+        value.header_count = 1;
+    }
+    val begun: outbound.Status = outbound.begin(link.exchange, link.client, value, now);
+    if (begun == outbound.FAILED || begun == outbound.INVALID) {
         ret fail_local(session, "acme request could not be sent");
     }
     session.state = next;
     ret PENDING;
 }
 
-fun await(session: *Session, engine: *transport.Transport,
-    now: time.Instant) transport.Status {
-    ret transport.poll(engine, now);
+fun await(link: *Link, now: time.Instant) outbound.Status {
+    ret outbound.poll(link.exchange, now);
+}
+
+# the exchange's response in the form mach-acme reads
+fun answer(link: *Link) ac.Response {
+    val value: outbound.Response = outbound.response(link.exchange);
+    ret ac.Response{status: value.status, fields: value.fields, body: value.body,
+        retry_after_seconds: wire.retry_after(value.fields)};
 }
 
 # a signing attempt with no stored nonce is not a failure: the protocol layer
@@ -300,9 +328,9 @@ fun ct_zeroize(scratch: *^u8) {
 # advances the conversation by one step. `key` is the account key; it is
 # classified into a stack buffer for the exact signing call and zeroized
 # immediately after.
-pub fun poll(session: *Session, engine: *transport.Transport, key: *keys.Key,
+pub fun poll(session: *Session, link: *Link, key: *keys.Key,
     now: time.Instant) Status {
-    if (session == nil || !session.live || engine == nil || key == nil) {
+    if (session == nil || !session.live || link == nil || key == nil) {
         ret INVALID;
     }
     if (session.state == READY)  { ret OK; }
@@ -310,54 +338,54 @@ pub fun poll(session: *Session, engine: *transport.Transport, key: *keys.Key,
     if (session.state == IDLE)   { ret INVALID; }
 
     if (session.state == DISCOVER_SEND) {
-        ret send(session, engine, ac.discovery_request(directory_view(session),
+        ret send(session, link, ac.discovery_request(directory_view(session),
             session.configured), now, DISCOVER_WAIT);
     }
     if (session.state == DISCOVER_WAIT) {
-        val progress: transport.Status = await(session, engine, now);
-        if (progress == transport.PENDING) { ret PENDING; }
-        if (progress != transport.OK) {
+        val progress: outbound.Status = await(link, now);
+        if (progress == outbound.PENDING) { ret PENDING; }
+        if (progress != outbound.OK) {
             ret fail_local(session, "acme directory could not be fetched");
         }
         val parsed: problem.Error = ac.parse_directory(
-            transport.response(engine), session.configured,
+            answer(link), session.configured,
             ?session.scratch[0], SCRATCH_BYTES, storage(session),
             ?session.directory);
-        transport.finish(engine);
+        outbound.finish(link.exchange);
         if (problem.failed(parsed)) { ret fail(session, parsed); }
         session.discovered = true;
         session.state      = READY;
         ret OK;
     }
     if (session.state == NONCE_SEND) {
-        ret send(session, engine, ac.nonce_request(?session.protocol,
+        ret send(session, link, ac.nonce_request(?session.protocol,
             session.directory), now, NONCE_WAIT);
     }
     if (session.state == NONCE_WAIT) {
-        val progress: transport.Status = await(session, engine, now);
-        if (progress == transport.PENDING) { ret PENDING; }
-        if (progress != transport.OK) {
+        val progress: outbound.Status = await(link, now);
+        if (progress == outbound.PENDING) { ret PENDING; }
+        if (progress != outbound.OK) {
             ret fail_local(session, "acme nonce could not be fetched");
         }
         val accepted: problem.Error = ac.accept_nonce_response(
-            ?session.protocol, ?session.signed, transport.response(engine));
-        transport.finish(engine);
+            ?session.protocol, ?session.signed, answer(link));
+        outbound.finish(link.exchange);
         if (problem.failed(accepted)) { ret fail(session, accepted); }
         session.state = SIGN;
         ret PENDING;
     }
     if (session.state == SIGN) { ret sign(session, key); }
     if (session.state == SEND) {
-        ret send(session, engine, ac.signed_wire(?session.protocol,
+        ret send(session, link, ac.signed_wire(?session.protocol,
             ?session.signed), now, WAIT);
     }
     if (session.state == WAIT) {
-        val progress: transport.Status = await(session, engine, now);
-        if (progress == transport.PENDING) { ret PENDING; }
-        if (progress != transport.OK) {
+        val progress: outbound.Status = await(link, now);
+        if (progress == outbound.PENDING) { ret PENDING; }
+        if (progress != outbound.OK) {
             ret fail_local(session, "acme request did not complete");
         }
-        session.answer = transport.response(engine);
+        session.answer = answer(link);
         val decision: ac.Decision = ac.accept_signed_response(
             ?session.protocol, ?session.signed, session.answer,
             ?session.scratch[0], SCRATCH_BYTES, problem_storage(session));
@@ -379,9 +407,9 @@ pub fun poll(session: *Session, engine: *transport.Transport, key: *keys.Key,
 }
 
 # releases the exchange the completed response points into
-pub fun complete(session: *Session, engine: *transport.Transport) bool {
-    if (session == nil || engine == nil) { ret false; }
-    transport.finish(engine);
+pub fun complete(session: *Session, link: *Link) bool {
+    if (session == nil || link == nil) { ret false; }
+    outbound.finish(link.exchange);
     if (session.state == READY) { session.state = IDLE; }
     ret true;
 }
@@ -398,7 +426,9 @@ rec Harness {
     driver:   net_async.Driver;
     pages:    A.Allocator;
     wakes:    wake.Queue;
-    engine:   transport.Transport;
+    client:   outbound.Client;
+    exchange: outbound.Exchange;
+    link:     Link;
     session:  Session;
     url:      [64]u8;
     reply:    [512]u8;
@@ -490,21 +520,23 @@ test discovery__directory_over_a_socket {
         tcp.listener_close(?server);
         ret 15;
     }
-    if (!transport.make(?harness.engine, ?harness.request[0], 4096,
+    if (!outbound.make(?harness.client, outbound.literal_addresses())
+        || !outbound.attach(?harness.client, ?harness.driver,
+        wake.waker(?harness.wakes, wake.PLANE_OWNER))
+        || !outbound.make_exchange(?harness.exchange, ?harness.request[0], 4096,
         ?harness.response[0], 8192, ?harness.items[0], 64,
-        field.limits(64, 16384, 128, 4096), transport.literal_addresses())
-        || !transport.attach(?harness.engine, ?harness.driver,
-        wake.waker(?harness.wakes, wake.PLANE_OWNER))) {
+        field.limits(64, 16384, 128, 4096))) {
         tcp.listener_close(?server);
         ret 3;
     }
+    harness.link = Link{client: ?harness.client, exchange: ?harness.exchange};
     var account: keys.Key;
     if (!keys.generate(?account)) {
         tcp.listener_close(?server);
         ret 4;
     }
-    if (!transport.set_origin(?harness.engine,
-        transport.cleartext_origin(endpoint))) {
+    if (!outbound.route(?harness.client, view.view("acme.example", 12),
+        outbound.cleartext_origin(endpoint))) {
         tcp.listener_close(?server);
         ret 5;
     }
@@ -524,12 +556,12 @@ test discovery__directory_over_a_socket {
     var total:    usize  = 0;
     var rounds:   usize  = 0;
     for (status == PENDING && rounds < 8192) {
-        # the worker turn the transport rides on: completions land on the
+        # the worker turn the client rides on: completions land on the
         # driver's runtime and are routed to the exchange before it is polled
         operation.pump(?harness.runtime, 10);
-        status = poll(?harness.session, ?harness.engine, ?account, clock.instant());
-        if (!accepted && transport.stage(?harness.engine) != transport.IDLE
-            && transport.stage(?harness.engine) != transport.RESOLVING) {
+        status = poll(?harness.session, ?harness.link, ?account, clock.instant());
+        if (!accepted && outbound.stage(?harness.exchange) != outbound.IDLE
+            && outbound.stage(?harness.exchange) != outbound.RESOLVING) {
             val incoming: res[tcp.Stream, io_error.Error] = tcp.accept(?server);
             if (sel incoming.ok) {
                 peer = incoming.ok;
@@ -568,16 +600,18 @@ test discovery__directory_over_a_socket {
     # the host header carries the url's authority, not the origin it was
     # actually reached at
     if (!contains(?received[0], total, "acme.example")) { ret 14; }
-    complete(?harness.session, ?harness.engine);
+    complete(?harness.session, ?harness.link);
     release(?harness.session);
-    transport.finish(?harness.engine);
+    outbound.finish(?harness.exchange);
     var settling: usize = 0;
-    for (settling < 256 && !transport.idle(?harness.engine)) {
+    for (settling < 256 && (!outbound.idle(?harness.exchange)
+        || !outbound.settled(?harness.client))) {
+        outbound.close_kept(?harness.client);
         operation.pump(?harness.runtime, 10);
-        transport.poll(?harness.engine, clock.instant());
         settling = settling + 1;
     }
-    val destroyed: bool = transport.destroy(?harness.engine);
+    val destroyed: bool = outbound.destroy_exchange(?harness.exchange)
+        && outbound.shutdown(?harness.client) == outbound.OK;
     keys.destroy(?account);
     harness_release(?harness);
     if (!destroyed) { ret 16; }

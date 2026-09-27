@@ -566,10 +566,12 @@ certificate.
 
 `trust` names a PEM anchor bundle used to authenticate every HTTPS URL the
 authority publishes. A public deployment normally points it at the operating
-system's CA bundle. Roots using algorithms outside this verifier are excluded
-from the in-memory store. A missing, empty, truncated, undecodable, or wholly
-unsupported bundle fails manager construction rather than opening an
-unverified connection.
+system's CA bundle. It is read with mach-tls's `tls.cert.bundle`: text between
+blocks is ignored, and a block that cannot become an anchor (malformed, not a
+certificate, an algorithm outside this verifier, or a duplicate) is skipped,
+since every system bundle carries some. A missing, unreadable or oversized
+bundle, or one with no usable anchor at all, fails manager construction rather
+than opening an unverified connection.
 
 The authority client accepts ECDSA-SHA384 signatures from P-384 issuers. P-384
 is a chain-verification algorithm here, not a key-exchange group or a local

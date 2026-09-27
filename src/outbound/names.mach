@@ -1,0 +1,392 @@
+# system name resolution for outbound clients, without blocking their thread
+#
+# std's resolver asks the system on a worker thread of its own and publishes
+# each answer as a completion on the runtime the client runs on, so a lookup
+# costs the driving loop one submission and one completion, never a wait. an
+# answer is kept for a short time, so a client that reaches one host again and
+# again asks the system once.
+#
+# a lookup is keyed by name, not by the exchange that asked. an exchange that
+# gives up leaves its lookup to finish into the table, where the next exchange
+# for that name finds it.
+
+use hedge.clock;
+use hedge.listener;
+use hedge.operation;
+use hedge.wake;
+use A: std.allocator;
+use std.allocator.page;
+use std.chrono.time;
+use io_error:   std.io.error;
+use io_runtime: std.io.runtime;
+use std.net.ip;
+use std.net.resolve;
+use resolve_types: std.net.resolve.types;
+use std.sync.cancel;
+use std.sync.thread;
+use std.sync.worker_pool;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+pub val MAX_ENTRIES:    usize = 8;
+pub val MAX_HOST_BYTES: usize = 253;
+# how long an answer, and a refusal, stands before the system is asked again
+pub val ANSWER_NS:  u64 = 60000000000;
+pub val REFUSAL_NS: u64 = 5000000000;
+
+pub def Status: u8;
+pub val OK:      Status = 1;
+pub val PENDING: Status = 2;
+pub val FAILED:  Status = 3;
+
+def EntryState: u8;
+val FREE:      EntryState = 0;
+val RESOLVING: EntryState = 1;
+val READY:     EntryState = 2;
+val REFUSED:   EntryState = 3;
+
+rec Entry {
+    names:     *Names;
+    host:      [256]u8;
+    host_len:  usize;
+    state:     EntryState;
+    address:   ip.Endpoint;
+    settled:   time.Instant;
+    scope:     cancel.Scope;
+    operation: operation.Operation;
+    context:   listener.ConnectionContext;
+    # the lookup's completion has not landed
+    outstanding: bool;
+    scope_live:  bool;
+}
+
+pub rec Names {
+    queue:    [4]worker_pool.Task;
+    threads:  [1]thread.Thread;
+    workers:  [1]worker_pool.Worker;
+    pool:     worker_pool.Pool;
+    resolver: resolve.Resolver;
+    pages:    A.Allocator;
+    entries:  [MAX_ENTRIES]Entry;
+    plane:    wake.Waker;
+    closing:  bool;
+    live:     bool;
+}
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+# lookups are submitted on `runtime` and their completions are delivered by
+# whoever waits on it, through `operation.deliver`. each one wakes `plane`.
+# the names stay where they are made until `close` reports OK.
+pub fun make(names: *Names, runtime: *io_runtime.Runtime, plane: wake.Waker) bool {
+    if (names == nil || runtime == nil) { ret false; }
+    names.live    = false;
+    names.closing = false;
+    names.plane   = plane;
+    page.make(?names.pages);
+    val pooled: worker_pool.Status = worker_pool.make(?names.pool,
+        (?names.queue)::*worker_pool.Task, 4, (?names.threads)::*thread.Thread,
+        (?names.workers)::*worker_pool.Worker, 1);
+    if (!sel pooled.accepted) { ret false; }
+    val made: err[resolve_types.Error] = resolve.make_runtime(?names.resolver,
+        runtime, ?names.pool, ?names.pages, MAX_ENTRIES,
+        resolve_types.ResultLimits{max_endpoints: 8, max_canonical_name_bytes: 256});
+    if (sel made.err) {
+        worker_pool.shutdown_drain(?names.pool);
+        worker_pool.destroy(?names.pool);
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < MAX_ENTRIES) {
+        val entry: *Entry = ?names.entries[i];
+        entry.names       = names;
+        entry.state       = FREE;
+        entry.host_len    = 0;
+        entry.outstanding = false;
+        entry.scope_live  = false;
+        operation.bind_operation(?entry.operation, ?entry.context,
+            (entry)::ptr, settle, i);
+        i = i + 1;
+    }
+    names.live = true;
+    ret true;
+}
+
+fun literal(host: view.View, port: u16, output: *ip.Endpoint) bool {
+    if (host.len == 0 || host.len > 63) { ret false; }
+    var text: [64]u8;
+    var i:    usize = 0;
+    for (i < host.len) {
+        text[i] = host.data[i];
+        i       = i + 1;
+    }
+    text[host.len] = 0;
+    val parsed: res[ip.Addr, ip.ParseError] = ip.addr_parse((?text[0])::str);
+    if (sel parsed.err) { ret false; }
+    val address: ip.Addr = parsed.ok;
+    if (address.is_v6 != 0) {
+        @output = ip.endpoint_v6(address.v6, port, 0);
+        ret true;
+    }
+    @output = ip.endpoint_v4(address.v4, port);
+    ret true;
+}
+
+fun same_host(entry: *Entry, host: view.View) bool {
+    if (entry.host_len != host.len) { ret false; }
+    var i: usize = 0;
+    for (i < host.len) {
+        var a: u8 = entry.host[i];
+        var b: u8 = host.data[i];
+        if (a >= 'A' && a <= 'Z') { a = a + 32; }
+        if (b >= 'A' && b <= 'Z') { b = b + 32; }
+        if (a != b)               { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun older(a: time.Instant, b: time.Instant) bool {
+    ret time.instant_before(a, b);
+}
+
+# a free entry, or the settled one answered longest ago
+fun claim(names: *Names) *Entry {
+    var chosen: *Entry = nil;
+    var i:      usize  = 0;
+    for (i < MAX_ENTRIES) {
+        val entry: *Entry = ?names.entries[i];
+        if (entry.state == FREE && !entry.outstanding) { ret entry; }
+        if ((entry.state == READY || entry.state == REFUSED) && !entry.outstanding
+            && (chosen == nil || older(entry.settled, chosen.settled))) {
+            chosen = entry;
+        }
+        i = i + 1;
+    }
+    ret chosen;
+}
+
+fun submit(names: *Names, entry: *Entry, host: view.View) Status {
+    var i: usize = 0;
+    for (i < host.len) {
+        entry.host[i] = host.data[i];
+        i             = i + 1;
+    }
+    entry.host[host.len] = 0;
+    entry.host_len       = host.len;
+    entry.state          = REFUSED;
+    entry.settled        = clock.instant();
+    if (!operation_ok(cancel.make_root(?entry.scope, opt[time.Instant].none{}))) {
+        ret FAILED;
+    }
+    entry.scope_live = true;
+    var query: resolve_types.Query = resolve_types.Query{
+        host:        (?entry.host[0])::str,
+        service:     nil,
+        family:      resolve_types.ANY_FAMILY,
+        socket_kind: resolve_types.STREAM_SOCKET,
+        protocol:    0,
+        flags:       0,
+    };
+    val submitted: res[io_runtime.Token, resolve_types.Error] = resolve.submit_runtime(
+        ?names.resolver, ?entry.scope, ?query, (?entry.context)::usize);
+    if (sel submitted.err) {
+        cancel.destroy(?entry.scope);
+        entry.scope_live = false;
+        ret FAILED;
+    }
+    entry.state       = RESOLVING;
+    entry.outstanding = true;
+    ret PENDING;
+}
+
+# one endpoint for `host`: a literal at once, a fresh answer from the table,
+# or PENDING while the system is asked. the answer's port is `port`.
+pub fun resolve_host(names: *Names, host: view.View, port: u16,
+    output: *ip.Endpoint) Status {
+    if (names == nil || !names.live || names.closing || output == nil
+        || host.data == nil || host.len == 0 || host.len > MAX_HOST_BYTES) {
+        ret FAILED;
+    }
+    if (literal(host, port, output)) { ret OK; }
+    val now: time.Instant = clock.instant();
+    var i:   usize        = 0;
+    for (i < MAX_ENTRIES) {
+        val entry: *Entry = ?names.entries[i];
+        if (entry.state != FREE && same_host(entry, host)) {
+            if (entry.state == RESOLVING) { ret PENDING; }
+            val age: u64 = clock.between_ns(entry.settled, now);
+            if (entry.state == READY && age < ANSWER_NS) {
+                @output     = entry.address;
+                output.port = port;
+                ret OK;
+            }
+            if (entry.state == REFUSED && age < REFUSAL_NS) { ret FAILED; }
+            if (entry.outstanding)                          { ret PENDING; }
+            ret submit(names, entry, host);
+        }
+        i = i + 1;
+    }
+    val entry: *Entry = claim(names);
+    # every entry is being asked about some other name: the exchange's own
+    # deadline bounds the wait for one to settle
+    if (entry == nil) { ret PENDING; }
+    ret submit(names, entry, host);
+}
+
+# an ipv4 answer first, since a host without an ipv6 route cannot use the other
+fun choose(resolution: *resolve_types.Resolution, output: *ip.Endpoint) bool {
+    if (resolution.endpoints == nil || resolution.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < resolution.len) {
+        if (resolution.endpoints[i].addr.is_v6 == 0) {
+            @output = resolution.endpoints[i];
+            ret true;
+        }
+        i = i + 1;
+    }
+    @output = resolution.endpoints[0];
+    ret true;
+}
+
+fun apply(names: *Names, completion: *resolve_types.Completion) {
+    var i: usize = 0;
+    for (i < MAX_ENTRIES) {
+        val entry: *Entry = ?names.entries[i];
+        if ((?entry.context)::usize == completion.context) {
+            entry.state = REFUSED;
+            if (!completion.has_error && choose(?completion.resolution, ?entry.address)) {
+                entry.state = READY;
+            }
+            entry.settled = clock.instant();
+            if (entry.scope_live) {
+                cancel.destroy(?entry.scope);
+                entry.scope_live = false;
+            }
+            brk;
+        }
+        i = i + 1;
+    }
+    resolve.resolution_destroy(?completion.resolution);
+}
+
+# the runtime's completion for a lookup: the answer itself is taken from the
+# resolver, which holds it until it is dequeued
+fun settle(context: ptr, index: usize, completion: io_runtime.Completion) {
+    val entry: *Entry = context::*Entry;
+    if (entry == nil || index >= MAX_ENTRIES) { ret; }
+    val names: *Names = entry.names;
+    entry.outstanding = false;
+    var answer: resolve_types.Completion;
+    for (resolve.poll(?names.resolver, ?answer, 1) != 0) {
+        apply(names, ?answer);
+    }
+    # a runtime completion whose answer never reached the resolver's queue
+    if (entry.state == RESOLVING) {
+        entry.state   = REFUSED;
+        entry.settled = clock.instant();
+    }
+    wake.wake(?names.plane);
+}
+
+# stops taking lookups and releases the resolver and its thread. PENDING while
+# a lookup is still out: its completion lands on the runtime, which the caller
+# keeps delivering, and `close` is asked again.
+pub fun close(names: *Names) Status {
+    if (names == nil || !names.live) { ret OK; }
+    if (!names.closing) {
+        names.closing = true;
+        resolve.close(?names.resolver);
+    }
+    var i: usize = 0;
+    for (i < MAX_ENTRIES) {
+        if (names.entries[i].outstanding) { ret PENDING; }
+        i = i + 1;
+    }
+    var answer: resolve_types.Completion;
+    for (resolve.poll(?names.resolver, ?answer, 1) != 0) {
+        apply(names, ?answer);
+    }
+    val destroyed: err[resolve_types.Error] = resolve.destroy(?names.resolver);
+    if (sel destroyed.err) { ret PENDING; }
+    worker_pool.shutdown_drain(?names.pool);
+    worker_pool.destroy(?names.pool);
+    names.live = false;
+    ret OK;
+}
+
+#[testing]
+rec Fixture {
+    pages:   A.Allocator;
+    runtime: io_runtime.Runtime;
+    wakes:   wake.Queue;
+    names:   Names;
+}
+
+#[testing]
+fun fixture_make(fixture: *Fixture) bool {
+    page.make(?fixture.pages);
+    val made: err[io_error.Error] = io_runtime.make(?fixture.runtime, ?fixture.pages, 8);
+    if (sel made.err)                               { ret false; }
+    if (!wake.make(?fixture.wakes, ?fixture.pages)) { ret false; }
+    ret make(?fixture.names, ?fixture.runtime,
+        wake.waker(?fixture.wakes, wake.PLANE_OWNER));
+}
+
+#[testing]
+fun fixture_close(fixture: *Fixture) bool {
+    var status: Status = close(?fixture.names);
+    var rounds: usize  = 0;
+    for (status == PENDING && rounds < 1000) {
+        operation.pump(?fixture.runtime, 10);
+        status = close(?fixture.names);
+        rounds = rounds + 1;
+    }
+    wake.destroy(?fixture.wakes);
+    io_runtime.destroy(?fixture.runtime);
+    ret status == OK;
+}
+
+test resolve_host__literal_and_hosts_file_answer {
+    var fixture: Fixture;
+    if (!fixture_make(?fixture)) { ret 1; }
+    var endpoint: ip.Endpoint;
+    # a literal never reaches the system
+    if (resolve_host(?fixture.names, view.view("127.0.0.1", 9), 8443, ?endpoint) != OK
+        || endpoint.port != 8443) {
+        fixture_close(?fixture);
+        ret 2;
+    }
+    # localhost is answered by the hosts file on every system this runs on,
+    # through the resolver's thread and a completion on the runtime
+    var status: Status = resolve_host(?fixture.names, view.view("localhost", 9),
+        80, ?endpoint);
+    var rounds: usize = 0;
+    for (status == PENDING && rounds < 500) {
+        operation.pump(?fixture.runtime, 10);
+        status = resolve_host(?fixture.names, view.view("localhost", 9), 80,
+            ?endpoint);
+        rounds = rounds + 1;
+    }
+    if (status != OK || endpoint.port != 80 || !wake.pending(?fixture.wakes)) {
+        fixture_close(?fixture);
+        ret 3;
+    }
+    # the answer is kept, so asking again settles at once
+    if (resolve_host(?fixture.names, view.view("LOCALHOST", 9), 81, ?endpoint) != OK
+        || endpoint.port != 81) {
+        fixture_close(?fixture);
+        ret 4;
+    }
+    if (!fixture_close(?fixture)) { ret 5; }
+    ret 0;
+}
