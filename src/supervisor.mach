@@ -20,6 +20,12 @@
 # drain deadline once shutdown begins, and it is stopped after the last worker
 # has. the registry lives for the whole process, so a reload rebuilds the
 # services that reach an application but never restarts the application.
+#
+# it owns the background task thread too, when the process was composed with
+# a task facility: the thread starts before any hosted application, its tasks
+# drain toward the same deadline as the workers, and the facility is stopped
+# and the thread joined after the hosted applications have stopped. tasks are
+# process-scoped, so a reload never touches them.
 
 use acme: hedge.acme.manager;
 use hedge.clock;
@@ -32,6 +38,7 @@ use quic_runtime: hedge.protocol.quic.runtime;
 use hedge_tls:    hedge.protocol.tls;
 use hedge.serve;
 use hedge.service;
+use hedge.task;
 use hedge.telemetry;
 use telemetry_health: hedge.telemetry.health;
 use hedge_wake:       hedge.wake;
@@ -147,6 +154,12 @@ pub rec Supervisor {
     hosted_deadline:  time.Instant;
     hosted_failed:    bool;
     hosted_abandoned: usize;
+    # the task thread runs, the task drain has settled, and how many runs it
+    # abandoned, which is reported once
+    tasks_live:      bool;
+    tasks_settled:   bool;
+    tasks_abandoned: usize;
+    tasks_reported:  bool;
 }
 
 fun runtime_ok(outcome: err[io_error.Error]) bool {
@@ -214,6 +227,10 @@ pub fun make(supervisor: *Supervisor, composed: *composition.Runtime,
     supervisor.hosted_count     = 0;
     supervisor.hosted_failed    = false;
     supervisor.hosted_abandoned = 0;
+    supervisor.tasks_live       = false;
+    supervisor.tasks_settled    = false;
+    supervisor.tasks_abandoned  = 0;
+    supervisor.tasks_reported   = false;
     supervisor.seats            = nil;
     supervisor.threads          = nil;
     supervisor.spawned          = 0;
@@ -760,6 +777,94 @@ fun stop_hosted(supervisor: *Supervisor, report: *worker.StopReport) {
     }
 }
 
+fun tasks_of(supervisor: *Supervisor) *task.Tasks {
+    ret supervisor.composed.options.tasks;
+}
+
+# the task thread's news reaches the supervisor as a wake of its runtime
+fun notify_tasks(context: ptr) {
+    wake_supervisor(context::*Supervisor);
+}
+
+# start the task thread and wait until its loop is open. a thread that cannot
+# start or open its loop, or a stop asked for meanwhile, refuses the start
+fun start_tasks(supervisor: *Supervisor) worker.StartStatus {
+    val tasks: *task.Tasks = tasks_of(supervisor);
+    if (tasks == nil) { ret worker.START_OK; }
+    if (!task.spawn(tasks, notify_tasks, supervisor::ptr)) {
+        print.eprintln("hedge: the background task thread could not be started");
+        ret worker.START_RUNTIME;
+    }
+    for (task.thread_state(tasks) == task.THREAD_OPENING) {
+        if (!deliver(supervisor, -1)
+            || atomic.load(?supervisor.stop_requested) != 0) { ret worker.START_RUNTIME; }
+    }
+    if (task.thread_state(tasks) != task.THREAD_OPEN) {
+        print.eprintln("hedge: the background task thread could not open its runtime");
+        ret worker.START_RUNTIME;
+    }
+    supervisor.tasks_live = true;
+    ret worker.START_OK;
+}
+
+fun tasks_draining(supervisor: *Supervisor) bool {
+    ret supervisor.tasks_live && supervisor.shutdown_sent && !supervisor.tasks_settled;
+}
+
+# a drain that has settled, and what it abandoned, which is said once
+fun settle_tasks(supervisor: *Supervisor, drained: task.Drain) {
+    if (drained.status != task.DRAIN_DONE) { ret; }
+    supervisor.tasks_settled   = true;
+    supervisor.tasks_abandoned = drained.abandoned;
+    if (drained.abandoned == 0 || supervisor.tasks_reported) { ret; }
+    supervisor.tasks_reported = true;
+    print.eprintlnf("hedge: {} background task runs overran the drain deadline and were abandoned",
+        drained.abandoned::u64);
+    telemetry.error(?supervisor.composed.observability.runtime, telemetry.Failure{
+        component: "tasks", operation: "drain", code: "deadline",
+        message:   "background task runs overran the drain deadline and were abandoned",
+        trace_id:  nil
+    });
+}
+
+# the task drain's progress, which the task thread wakes the supervisor for
+fun drive_task_drain(supervisor: *Supervisor) {
+    if (!tasks_draining(supervisor)) { ret; }
+    settle_tasks(supervisor, task.drain(tasks_of(supervisor), supervisor.hosted_deadline));
+}
+
+# stop the task facility once no worker serves and every hosted application
+# has stopped, then join its thread, whose loop closes within the stop timeout.
+# runs abandoned at the drain deadline make the process's reason DEADLINE
+fun stop_tasks(supervisor: *Supervisor, report: *worker.StopReport) {
+    val tasks: *task.Tasks = tasks_of(supervisor);
+    if (tasks == nil) { ret; }
+    val deadline_ns: u64          = clock.after_ns(clock.monotonic_ns(), supervisor.stop_timeout_ns);
+    var until:       time.Instant = clock.instant();
+    if (supervisor.shutdown_sent) { until = supervisor.hosted_deadline; }
+    var drained: task.Drain = task.drain(tasks, until);
+    for (supervisor.tasks_live && drained.status == task.DRAIN_PENDING) {
+        var left: i32 = wait_before(deadline_ns);
+        if (left > HOSTED_POLL_MS)                   { left = HOSTED_POLL_MS; }
+        if (left == 0 || !deliver(supervisor, left)) { brk; }
+        drained = task.drain(tasks, until);
+    }
+    settle_tasks(supervisor, drained);
+    if (task.stop(tasks) != task.STATUS_OK) {
+        print.eprintln("hedge: background tasks could not stop: a run is in flight or a snapshot is still leased");
+        report.cleanup_failures = report.cleanup_failures + 1;
+    }
+    if (!task.close(tasks, deadline_ns)) {
+        print.eprintln("hedge: the background task thread did not close its runtime in time");
+        report.cleanup_failures = report.cleanup_failures + 1;
+    }
+    supervisor.tasks_live  = false;
+    report.tasks_abandoned = supervisor.tasks_abandoned;
+    if (supervisor.tasks_abandoned != 0 && report.reason != lifecycle.FAILED) {
+        report.reason = lifecycle.DEADLINE;
+    }
+}
+
 # every worker is asked to finish, once
 fun fan_shutdown(supervisor: *Supervisor) {
     if (supervisor.shutdown_sent) { ret; }
@@ -767,6 +872,11 @@ fun fan_shutdown(supervisor: *Supervisor) {
     # readiness goes false before any worker stops accepting
     telemetry.begin_drain(?supervisor.composed.observability.runtime);
     begin_hosted_drain(supervisor);
+    # triggers are refused from here on, and running tasks are cancelled
+    if (tasks_of(supervisor) != nil) {
+        val drained: task.Drain = task.drain(tasks_of(supervisor), supervisor.hosted_deadline);
+        if (supervisor.tasks_live) { settle_tasks(supervisor, drained); }
+    }
     var i: usize = 0;
     for (i < supervisor.spawned) {
         atomic.store(?worker_of(supervisor, i).control.shutdown, 1);
@@ -1012,8 +1122,11 @@ pub fun start(supervisor: *Supervisor) worker.StartStatus {
     thread.config_default(?config);
     config.stack_reserve = WORKER_STACK_BYTES;
     config.name          = "hedge-worker";
-    # every hosted application has started before a worker binds a listener
-    var status: worker.StartStatus = start_hosted(supervisor);
+    # the task thread runs before any hosted application starts, so a start
+    # step may register and trigger tasks, and every hosted application has
+    # started before a worker binds a listener
+    var status: worker.StartStatus = start_tasks(supervisor);
+    if (status == worker.START_OK) { status = start_hosted(supervisor); }
     if (status == worker.START_OK) {
         status = worker.START_RUNTIME;
         if (spawn(supervisor, 0, ?config)) { status = await_started(supervisor); }
@@ -1060,14 +1173,17 @@ fun run_wait_ms(supervisor: *Supervisor) i32 {
 }
 
 # supervise until every worker has stopped and every hosted application's
-# drain has settled
+# drain, and the task drain, has settled
 pub fun run(supervisor: *Supervisor) {
-    for (!all_stopped(supervisor) || hosted_draining(supervisor)) {
+    for (!all_stopped(supervisor) || hosted_draining(supervisor) || tasks_draining(supervisor)) {
         deliver(supervisor, run_wait_ms(supervisor));
         if (atomic.load(?supervisor.stop_requested) != 0 || any_draining(supervisor)) {
             fan_shutdown(supervisor);
         }
-        if (supervisor.shutdown_sent) { drive_hosted_drain(supervisor); }
+        if (supervisor.shutdown_sent) {
+            drive_hosted_drain(supervisor);
+            drive_task_drain(supervisor);
+        }
         # a reload under way is carried to its end even once the process is
         # stopping, so what the supervisor records matches what every worker
         # published. none begins once a stop has been asked for
@@ -1120,7 +1236,7 @@ pub fun release(supervisor: *Supervisor) bool {
 pub fun stop(supervisor: *Supervisor) worker.StopReport {
     var merged: worker.StopReport = worker.StopReport{stopped: true,
         reason:           lifecycle.IMMEDIATE, abandoned: 0, applications_abandoned: 0,
-        serve_failures:   0,
+        tasks_abandoned:  0, serve_failures: 0,
         cleanup_failures: 0};
     var i:        usize = 0;
     var reasoned: bool  = false;
@@ -1143,6 +1259,8 @@ pub fun stop(supervisor: *Supervisor) worker.StopReport {
     }
     # no request reaches an application once every worker has stopped
     stop_hosted(supervisor, ?merged);
+    # nor a lease on a task's snapshot once every application has stopped
+    stop_tasks(supervisor, ?merged);
     if (!quiesce_certificates(supervisor)) {
         merged.cleanup_failures = merged.cleanup_failures + 1;
     }
