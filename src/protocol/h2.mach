@@ -159,6 +159,8 @@ rec Slot {
     stream_released:   bool;
     close_disposition: bool;
     bound:             bool;
+    # the response hedge answered in place of one it could not encode
+    response_replaced: bool;
     charge:            budget.Charge;
     # this slot's index into the session's slot arrays, the identity of its
     # borrowed storage chunk. set when the chunk is borrowed and never reset, so
@@ -248,6 +250,7 @@ fun reset_slot(slot: *Slot) {
     slot.stream_released   = false;
     slot.close_disposition = false;
     slot.bound             = false;
+    slot.response_replaced = false;
     slot.charge            = budget.no_charge();
 }
 
@@ -909,16 +912,45 @@ fun has_body(slot: *Slot) bool {
     ret slot.response.body_kind == message.BODY_READER;
 }
 
+# a response that fails once it has started, or that cannot start at all, is
+# reset with INTERNAL_ERROR (RFC 9113 section 7). the reset is what tells the
+# client that what it received is incomplete. it fails this stream alone, and
+# only a stream the connection can no longer reset fails the connection
+fun reset_response(session: *Session, slot: *Slot) Step {
+    val stream: *engine_h2.Stream = engine_h2.stream_for(?session.engine, slot.id);
+    if (stream != nil && stream.state != engine_h2.STREAM_CLOSED
+        && !engine_h2.cancel_stream(?session.engine, slot.id,
+        engine_h2.H2_INTERNAL_ERROR)) { ret STEP_ERROR; }
+    ret retire_closed_stream(session, slot);
+}
+
+# a head the engine refuses to encode (a field past the name buffer or the
+# item slots, a list past the peer's SETTINGS_MAX_HEADER_LIST_SIZE or the
+# encoder's bounds) belongs to this stream alone (#388). none of it has reached
+# the client, which is owed a status for its request, so hedge answers 502 in
+# its place as the gateway that could not relay what it received (RFC 9110
+# section 15.6.3). a replacement that cannot be sent either resets the stream
+fun refuse_response(session: *Session, slot: *Slot) Step {
+    if (slot.response_replaced
+        || !service.replace_committed(?slot.active_call, status.BAD_GATEWAY)) {
+        ret reset_response(session, slot);
+    }
+    slot.response_replaced = true;
+    ret begin_response(session, slot);
+}
+
 fun begin_response(session: *Session, slot: *Slot) Step {
     if (slot.headers_sent)        { ret STEP_IDLE; }
     if (!slot.response.committed) { ret STEP_IDLE; }
     var count: usize = 0;
-    if (!response_headers(?session.names, slot, ?count)) { ret STEP_ERROR; }
+    if (!response_headers(?session.names, slot, ?count)) {
+        ret refuse_response(session, slot);
+    }
     val final:   bool            = !has_body(slot) && slot.response.trailers.len == 0;
     val offered: engine_h2.Offer = engine_h2.send_headers(?session.engine, slot.id,
         ?slot.header_items[0], count, final, true);
     if (offered.status == engine_h2.OFFER_BLOCKED) { ret STEP_BLOCKED; }
-    if (offered.status == engine_h2.OFFER_ERROR)   { ret STEP_ERROR; }
+    if (offered.status == engine_h2.OFFER_ERROR)   { ret refuse_response(session, slot); }
     slot.headers_sent = true;
     if (final) { slot.response_complete = true; }
     or         { engine_h2.set_writable(?session.engine, slot.id, true, session.now); }
@@ -927,11 +959,11 @@ fun begin_response(session: *Session, slot: *Slot) Step {
 
 fun send_trailers(session: *Session, slot: *Slot) Step {
     if (slot.trailers_sent || slot.response.trailers.len == 0) { ret STEP_IDLE; }
-    if (!response_trailers(session, slot))                     { ret STEP_ERROR; }
+    if (!response_trailers(session, slot))                     { ret reset_response(session, slot); }
     val offered: engine_h2.Offer = engine_h2.send_headers(?session.engine, slot.id,
         ?session.trailer_items[0], slot.response.trailers.len, true, true);
     if (offered.status == engine_h2.OFFER_BLOCKED) { ret STEP_BLOCKED; }
-    if (offered.status == engine_h2.OFFER_ERROR)   { ret STEP_ERROR; }
+    if (offered.status == engine_h2.OFFER_ERROR)   { ret reset_response(session, slot); }
     slot.trailers_sent     = true;
     slot.response_complete = true;
     ret STEP_PROGRESS;
@@ -980,7 +1012,7 @@ fun advance_response(session: *Session, slot: *Slot) Step {
                     ret STEP_BLOCKED;
                 }
                 or (progress.status == body.COMPLETE) { slot.body_done = true; }
-                or                                    { ret STEP_ERROR; }
+                or                                    { ret reset_response(session, slot); }
             }
             or {
                 slot.body_done = true;
@@ -1002,7 +1034,7 @@ fun advance_response(session: *Session, slot: *Slot) Step {
     }
     val offered: engine_h2.Offer = engine_h2.offer_data(?session.engine, slot.id,
         payload, length, final, session.now);
-    if (offered.status == engine_h2.OFFER_ERROR)   { ret STEP_ERROR; }
+    if (offered.status == engine_h2.OFFER_ERROR)   { ret reset_response(session, slot); }
     if (offered.status == engine_h2.OFFER_BLOCKED) { ret STEP_BLOCKED; }
     slot.stage_offset = slot.stage_offset + offered.consumed;
     if (final && offered.status == engine_h2.OFFER_DONE) {
