@@ -1,0 +1,267 @@
+# the arrival queue: unknown Initials and version requests held for preflight
+#
+# an Initial or version request from no known connection is held as received
+# until the worker's preflight turn. preflight may answer it with a Retry, which
+# is crypto, and crypto never runs in the receive path: the socket is read at
+# read speed and this queue, sized to the socket's own buffer, is the visible
+# backlog the kernel's buffer used to be.
+#
+# an arrival's class is its worth to the server, in preflight order. a token
+# Initial has cost a Retry and its client an RTT, an untoken Initial is a first
+# flight that costs only a Retry, other is a version to negotiate, and a
+# duplicate carries the destination CID of something already held. under
+# pressure a new arrival takes the slot of the oldest held arrival of a lower
+# class, and a duplicate takes nothing. the queue reports what it dropped, and
+# its owner counts it
+
+use hedge.protocol.quic.routing;
+use hedge_storage: hedge.storage;
+use hedge.telemetry;
+use quic.connection.assembly;
+use quic_listener: quic.connection.listener;
+use A:             std.allocator;
+use std.collections.map;
+use std_memory: std.memory;
+use net_types:  std.net.async.types;
+use std.net.ip;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+pub val TOKEN:     usize = telemetry.ARRIVAL_TOKEN;
+pub val UNTOKEN:   usize = telemetry.ARRIVAL_UNTOKEN;
+pub val OTHER:     usize = telemetry.ARRIVAL_OTHER;
+pub val DUPLICATE: usize = telemetry.ARRIVAL_DUPLICATE;
+pub val CLASSES:   usize = telemetry.ARRIVAL_CLASSES;
+
+pub val NONE: usize = (-1)::usize;
+
+pub rec Arrival {
+    data:                  [assembly.MAX_UDP_PAYLOAD]u8;
+    peer:                  ip.Endpoint;
+    local_destination:     ip.Addr;
+    key:                   routing.Key;
+    length:                usize;
+    interface_index:       u32;
+    has_local_destination: bool;
+    arrival_ns:            u64;
+    class:                 usize;
+    next:                  usize;
+}
+
+pub rec Queue {
+    arrivals: hedge_storage.Table[Arrival];
+    heads:    [CLASSES]usize;
+    tails:    [CLASSES]usize;
+    held:     [CLASSES]usize;
+    # held destination CIDs, each with the count of arrivals that carry it
+    index:    map.MapBy[routing.Key, usize];
+    live:     usize;
+    capacity: usize;
+}
+
+pub def Outcome: u8;
+# the arrival is held
+pub val HELD: Outcome = 1;
+# the arrival is not held: the queue is at its bound with nothing of a lower
+# class to take, or its storage refused
+pub val DROPPED: Outcome = 2;
+# the datagram is empty, oversized, or of no class
+pub val INVALID: Outcome = 3;
+
+pub rec Holding {
+    outcome: Outcome;
+    # the class whose oldest arrival was dropped to make room, or NONE
+    evicted: usize;
+}
+
+fun clear(queue: *Queue) {
+    var class: usize = 0;
+    for (class < CLASSES) {
+        queue.heads[class] = NONE;
+        queue.tails[class] = NONE;
+        queue.held[class]  = 0;
+        class              = class + 1;
+    }
+    queue.live = 0;
+}
+
+# an empty queue, which holds nothing until it is given a capacity
+pub fun make(queue: *Queue, backing: *A.Allocator) bool {
+    if (queue == nil || backing == nil)                               { ret false; }
+    if (!hedge_storage.make_table[Arrival](?queue.arrivals, backing)) { ret false; }
+    queue.index    = map.init_by[routing.Key, usize](backing, routing.key_hash, routing.key_equal);
+    queue.capacity = 0;
+    clear(queue);
+    ret true;
+}
+
+# the most arrivals the queue holds. a smaller bound evicts nothing: arrivals
+# already held stay until they are taken, and new ones meet the bound
+pub fun resize(queue: *Queue, capacity: usize) {
+    queue.capacity = capacity;
+}
+
+# releases the queue's storage, whatever it still holds
+pub fun destroy(queue: *Queue) bool {
+    var success: bool = true;
+    if (!hedge_storage.destroy_table[Arrival](?queue.arrivals)) { success = false; }
+    val dropped: err[A.Error] = map.dnit_by[routing.Key, usize](?queue.index);
+    if (sel dropped.err) { success = false; }
+    clear(queue);
+    ret success;
+}
+
+pub fun live(queue: *Queue) usize {
+    ret queue.live;
+}
+
+pub fun held(queue: *Queue) bool {
+    ret queue.live != 0;
+}
+
+pub fun at(queue: *Queue, index: usize) *Arrival {
+    ret hedge_storage.table_at[Arrival](?queue.arrivals, index);
+}
+
+# the class of an unknown Initial or negotiation datagram at the queue: a
+# destination CID already held makes it a duplicate whatever it carries
+pub fun class_of(queue: *Queue, classified: *quic_listener.ClassifiedDatagram,
+    key: routing.Key) usize {
+    val held_key: opt[*usize] = map.get_by[routing.Key, usize](?queue.index, ?key);
+    if (sel held_key.some)                                  { ret DUPLICATE; }
+    if (classified.class != quic_listener.DATAGRAM_INITIAL) { ret OTHER; }
+    if (classified.token_length != 0)                       { ret TOKEN; }
+    ret UNTOKEN;
+}
+
+fun index_key(queue: *Queue, key: routing.Key) bool {
+    val held_key: opt[*usize] = map.get_by[routing.Key, usize](?queue.index, ?key);
+    if (sel held_key.some) {
+        @held_key.some = @held_key.some + 1;
+        ret true;
+    }
+    val inserted: res[bool, A.Error] =
+        map.insert_by[routing.Key, usize](?queue.index, key, 1);
+    ret !(sel inserted.err);
+}
+
+fun unindex_key(queue: *Queue, key: routing.Key) {
+    val held_key: opt[*usize] = map.get_by[routing.Key, usize](?queue.index, ?key);
+    if (!(sel held_key.some)) { ret; }
+    if (@held_key.some > 1) {
+        @held_key.some = @held_key.some - 1;
+        ret;
+    }
+    map.remove_by[routing.Key, usize](?queue.index, ?key);
+}
+
+# unlinks the oldest arrival of a class and releases its record
+fun evict(queue: *Queue, class: usize) bool {
+    val index: usize = queue.heads[class];
+    if (index == NONE) { ret false; }
+    val arrival: *Arrival = at(queue, index);
+    queue.heads[class] = arrival.next;
+    if (queue.heads[class] == NONE) { queue.tails[class] = NONE; }
+    queue.held[class] = queue.held[class] - 1;
+    queue.live        = queue.live - 1;
+    unindex_key(queue, arrival.key);
+    hedge_storage.table_release[Arrival](?queue.arrivals, index);
+    ret true;
+}
+
+# frees a slot for an arrival of the given class by evicting the oldest held
+# arrival of the lowest class below it. NONE when nothing below it is held
+fun preempt(queue: *Queue, class: usize) usize {
+    var victim: usize = CLASSES;
+    for (victim > class + 1) {
+        victim = victim - 1;
+        if (evict(queue, victim)) { ret victim; }
+    }
+    ret NONE;
+}
+
+fun holding(outcome: Outcome, evicted: usize) Holding {
+    var value: Holding;
+    value.outcome = outcome;
+    value.evicted = evicted;
+    ret value;
+}
+
+# holds an unknown datagram for the preflight turn, or drops it at the queue's
+# bound: the client's PTO retransmits it, exactly as a kernel drop would have
+# cost. at the bound a token Initial takes the slot of a held duplicate,
+# negotiation or first flight, an untoken one takes a duplicate's or a
+# negotiation's, and a duplicate is dropped
+pub fun hold(queue: *Queue, received: *net_types.Packet, key: routing.Key, class: usize,
+    now_ns: u64) Holding {
+    if (received.length == 0 || received.length > assembly.MAX_UDP_PAYLOAD
+        || class >= CLASSES) { ret holding(INVALID, NONE); }
+    var evicted: usize = NONE;
+    if (queue.live >= queue.capacity) {
+        evicted = preempt(queue, class);
+        if (evicted == NONE) { ret holding(DROPPED, NONE); }
+    }
+    val index: usize = hedge_storage.table_claim[Arrival](?queue.arrivals);
+    if (index == hedge_storage.NO_INDEX) { ret holding(DROPPED, evicted); }
+    if (!index_key(queue, key)) {
+        hedge_storage.table_release[Arrival](?queue.arrivals, index);
+        ret holding(DROPPED, evicted);
+    }
+    val arrival: *Arrival = at(queue, index);
+    std_memory.raw_copy(?arrival.data[0], received.buffer, received.length);
+    arrival.peer                  = received.peer;
+    arrival.local_destination     = received.local_destination;
+    arrival.key                   = key;
+    arrival.length                = received.length;
+    arrival.interface_index       = received.interface_index;
+    arrival.has_local_destination = received.has_local_destination;
+    arrival.arrival_ns            = now_ns;
+    arrival.class                 = class;
+    arrival.next                  = NONE;
+    if (queue.tails[class] != NONE) { at(queue, queue.tails[class]).next = index; }
+    or                              { queue.heads[class] = index; }
+    queue.tails[class] = index;
+    queue.held[class]  = queue.held[class] + 1;
+    queue.live         = queue.live + 1;
+    ret holding(HELD, evicted);
+}
+
+# the class whose oldest arrival preflights next: the highest class held, or
+# CLASSES when nothing is held
+pub fun next_class(queue: *Queue) usize {
+    var class: usize = 0;
+    for (class < CLASSES) {
+        if (queue.heads[class] != NONE) { ret class; }
+        class = class + 1;
+    }
+    ret CLASSES;
+}
+
+# takes the oldest arrival of the highest class held, copied out so its record
+# is released before the caller acts on it. false when nothing is held
+pub fun take(queue: *Queue, output: *Arrival) bool {
+    val class: usize = next_class(queue);
+    if (class == CLASSES) { ret false; }
+    @output = @at(queue, queue.heads[class]);
+    ret evict(queue, class);
+}
+
+# the datagram an arrival holds, as the receive path delivered it
+pub fun packet(arrival: *Arrival) net_types.Packet {
+    var value: net_types.Packet;
+    value.buffer                = ?arrival.data[0];
+    value.capacity              = arrival.length;
+    value.length                = arrival.length;
+    value.peer                  = arrival.peer;
+    value.local_destination     = arrival.local_destination;
+    value.interface_index       = arrival.interface_index;
+    value.has_local_destination = arrival.has_local_destination;
+    value.truncated             = false;
+    value.zero_length           = false;
+    ret value;
+}
