@@ -1,0 +1,341 @@
+# the keys every worker shares for one QUIC listener
+#
+# a listener's connection IDs are minted under one of seven codepoints, the
+# config rotation bits of QUIC-LB (draft-ietf-quic-load-balancers-21 3.1, an
+# expired draft). each codepoint holds a CID key and a stateless reset key, both
+# drawn at random when it is keyed and neither derived from the other, so a
+# party given the CID key cannot forge a reset. a reload keys a free codepoint
+# and makes it current. the old one keeps decoding until no live connection
+# holds a CID minted under it and every Retry minted under it has expired, and
+# only then is it retired and free again. the Retry and NEW_TOKEN key rotates
+# on the same reload, keeping one previous key.
+#
+# the keys are process-wide and indexed by listener, as the TLS policies are:
+# every worker's pump for a listener points at its record, and nothing public
+# holds them. the supervisor is the only writer. a worker reads a codepoint's key when it
+# first needs it, under a sequence lock: the sequence is zero before the
+# codepoint is first keyed, odd while it is written, and even once it is. a
+# worker keeps the sequence its copy was taken at, and a copy whose sequence
+# no longer matches is stale. workers count the connections they hold under
+# each codepoint on a cache line of their own, which the supervisor sums.
+
+use hedge.allowance;
+use hedge.config.schema;
+use std.crypto.ct;
+use io_error:      std.io.error;
+use memory_secret: std.memory.secret;
+use std.sync.atomic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+
+pub val CODEPOINTS:      usize = 7;
+pub val UNROUTABLE:      u8    = 7;
+pub val CID_KEY_BYTES:   usize = 16;
+pub val RESET_KEY_BYTES: usize = 32;
+pub val TOKEN_KEY_BYTES: usize = 32;
+
+pub rec Codepoint {
+    sequence: i64;
+    live:     i64;
+    # when it stopped being current, on the monotonic clock. zero while current
+    superseded_ns: u64;
+    cid_key:       [CID_KEY_BYTES]^u8;
+    reset_key:     [RESET_KEY_BYTES]^u8;
+}
+
+# the connections one worker holds under each codepoint, alone on its line
+#[align(64)]
+pub rec Counts {
+    live: [CODEPOINTS]i64;
+    pad:  i64;
+}
+
+pub rec Listener {
+    codepoints: [CODEPOINTS]Codepoint;
+    current:    i64;
+    # the Retry and NEW_TOKEN key, and the one before it. generation zero is
+    # no key
+    token_key:                 [TOKEN_KEY_BYTES]^u8;
+    token_generation:          u64;
+    token_previous:            [TOKEN_KEY_BYTES]^u8;
+    token_previous_generation: u64;
+    # rotations a reload asked for that found no free codepoint
+    rotations_skipped: i64;
+    counts:            [allowance.MAX_WORKERS]Counts;
+}
+
+# every QUIC listener's keys, one per listener index, for the process's life
+var listeners: [schema.MAX_LISTENERS]Listener;
+var keyed:     usize;
+
+fun drawn(data: *^u8, length: usize) bool {
+    val filled: err[io_error.Error] = memory_secret.random_fill(data, length);
+    if (sel filled.err) {
+        ct.zeroize(data, length);
+        ret false;
+    }
+    ret true;
+}
+
+# key `codepoint` afresh. false when the random source refused, which leaves it
+# unkeyed
+fun key_codepoint(listener: *Listener, codepoint: usize) bool {
+    val point:    *Codepoint = ?listener.codepoints[codepoint];
+    val sequence: i64        = atomic.load(?point.sequence);
+    atomic.store(?point.sequence, sequence + 1);
+    val keyed: bool = drawn(?point.cid_key[0], CID_KEY_BYTES)
+        && drawn(?point.reset_key[0], RESET_KEY_BYTES);
+    if (!keyed) {
+        ct.zeroize(?point.cid_key[0], CID_KEY_BYTES);
+        ct.zeroize(?point.reset_key[0], RESET_KEY_BYTES);
+        atomic.store(?point.live, 0);
+    }
+    or { atomic.store(?point.live, 1); }
+    point.superseded_ns = 0;
+    atomic.store(?point.sequence, sequence + 2);
+    ret keyed;
+}
+
+fun retire(listener: *Listener, codepoint: usize) {
+    val point:    *Codepoint = ?listener.codepoints[codepoint];
+    val sequence: i64        = atomic.load(?point.sequence);
+    atomic.store(?point.sequence, sequence + 1);
+    atomic.store(?point.live, 0);
+    ct.zeroize(?point.cid_key[0], CID_KEY_BYTES);
+    ct.zeroize(?point.reset_key[0], RESET_KEY_BYTES);
+    point.superseded_ns = 0;
+    atomic.store(?point.sequence, sequence + 2);
+}
+
+# a listener's first keys: codepoint 0 and token generation 1
+fun key_listener(listener: *Listener) bool {
+    atomic.store(?listener.current, 0);
+    atomic.store(?listener.rotations_skipped, 0);
+    listener.token_generation          = 0;
+    listener.token_previous_generation = 0;
+    if (!key_codepoint(listener, 0)
+        || !drawn(?listener.token_key[0], TOKEN_KEY_BYTES)) { ret false; }
+    listener.token_generation = 1;
+    ret true;
+}
+
+# keys for `count` listeners, each keyed at codepoint 0. refused while keys
+# are already made
+pub fun make(count: usize) bool {
+    if (keyed != 0 || count == 0 || count > schema.MAX_LISTENERS) { ret false; }
+    keyed = count;
+    var i: usize = 0;
+    for (i < count) {
+        if (!key_listener(?listeners[i])) {
+            destroy();
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every key is wiped
+pub fun destroy() {
+    var i: usize = 0;
+    for (i < keyed) {
+        val listener: *Listener = ?listeners[i];
+        var j:        usize     = 0;
+        for (j < CODEPOINTS) {
+            retire(listener, j);
+            atomic.store(?listener.codepoints[j].sequence, 0);
+            j = j + 1;
+        }
+        ct.zeroize(?listener.token_key[0], TOKEN_KEY_BYTES);
+        ct.zeroize(?listener.token_previous[0], TOKEN_KEY_BYTES);
+        listener.token_generation          = 0;
+        listener.token_previous_generation = 0;
+        j                                  = 0;
+        for (j < allowance.MAX_WORKERS) {
+            var k: usize = 0;
+            for (k < CODEPOINTS) {
+                atomic.store(?listener.counts[j].live[k], 0);
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    keyed = 0;
+}
+
+pub fun made() bool {
+    ret keyed != 0;
+}
+
+pub fun listener_at(index: usize) *Listener {
+    if (index >= keyed) { ret nil; }
+    ret ?listeners[index];
+}
+
+# the codepoint new connection IDs are minted under
+pub fun current(listener: *Listener) u8 {
+    ret atomic.load(?listener.current)::u8;
+}
+
+# copy codepoint `codepoint`'s CID key into `output` and return the sequence it
+# was taken at, or zero when the codepoint is not keyed or was being written
+pub fun take_cid_key(listener: *Listener, codepoint: usize, output: *^u8) i64 {
+    if (codepoint >= CODEPOINTS) { ret 0; }
+    val point:  *Codepoint = ?listener.codepoints[codepoint];
+    val before: i64        = atomic.load(?point.sequence);
+    if (before == 0 || (before & 1) != 0 || atomic.load(?point.live) == 0) { ret 0; }
+    var i: usize = 0;
+    for (i < CID_KEY_BYTES) {
+        output[i] = point.cid_key[i];
+        i         = i + 1;
+    }
+    if (atomic.load(?point.sequence) != before) {
+        ct.zeroize(output, CID_KEY_BYTES);
+        ret 0;
+    }
+    ret before;
+}
+
+# the same for the stateless reset key
+pub fun take_reset_key(listener: *Listener, codepoint: usize, output: *^u8) i64 {
+    if (codepoint >= CODEPOINTS) { ret 0; }
+    val point:  *Codepoint = ?listener.codepoints[codepoint];
+    val before: i64        = atomic.load(?point.sequence);
+    if (before == 0 || (before & 1) != 0 || atomic.load(?point.live) == 0) { ret 0; }
+    var i: usize = 0;
+    for (i < RESET_KEY_BYTES) {
+        output[i] = point.reset_key[i];
+        i         = i + 1;
+    }
+    if (atomic.load(?point.sequence) != before) {
+        ct.zeroize(output, RESET_KEY_BYTES);
+        ret 0;
+    }
+    ret before;
+}
+
+# whether a copy taken at `sequence` is still the codepoint's key
+pub fun still_keyed(listener: *Listener, codepoint: usize, sequence: i64) bool {
+    ret codepoint < CODEPOINTS && sequence != 0
+        && atomic.load(?listener.codepoints[codepoint].sequence) == sequence;
+}
+
+# worker `worker` gained (delta 1) or let go of (delta -1) a connection under
+# `codepoint`. only that worker writes its line
+pub fun count(listener: *Listener, worker: usize, codepoint: usize, delta: i64) {
+    if (listener == nil || worker >= allowance.MAX_WORKERS
+        || codepoint >= CODEPOINTS) { ret; }
+    atomic.fetch_add(?listener.counts[worker].live[codepoint], delta);
+}
+
+fun held(listener: *Listener, codepoint: usize, workers: usize) i64 {
+    var total: i64   = 0;
+    var i:     usize = 0;
+    for (i < workers && i < allowance.MAX_WORKERS) {
+        total = total + atomic.load(?listener.counts[i].live[codepoint]);
+        i     = i + 1;
+    }
+    ret total;
+}
+
+# a reload's rotation, on the supervisor. every codepoint that stopped being
+# current at least `grace_ns` ago and that no connection of `workers` holds is
+# retired first, then the next free one is keyed and made current, and the
+# token key moves on. false when no codepoint was free, or the random source
+# refused: the current keys then stay, and the first case is counted
+pub fun rotate(listener: *Listener, now_ns: u64, grace_ns: u64, workers: usize) bool {
+    if (listener == nil) { ret false; }
+    val was: usize = current(listener)::usize;
+    var i:   usize = 0;
+    for (i < CODEPOINTS) {
+        val point: *Codepoint = ?listener.codepoints[i];
+        if (i != was && atomic.load(?point.live) != 0 && point.superseded_ns != 0
+            && now_ns >= point.superseded_ns && now_ns - point.superseded_ns >= grace_ns
+            && held(listener, i, workers) == 0) {
+            retire(listener, i);
+        }
+        i = i + 1;
+    }
+    var next: usize = CODEPOINTS;
+    var step: usize = 1;
+    for (step < CODEPOINTS) {
+        val candidate: usize = (was + step) % CODEPOINTS;
+        if (atomic.load(?listener.codepoints[candidate].live) == 0) {
+            next = candidate;
+            brk;
+        }
+        step = step + 1;
+    }
+    if (next == CODEPOINTS) {
+        atomic.fetch_add(?listener.rotations_skipped, 1);
+        ret false;
+    }
+    var token: [TOKEN_KEY_BYTES]^u8;
+    if (!drawn(?token[0], TOKEN_KEY_BYTES) || !key_codepoint(listener, next)) {
+        ct.zeroize(?token[0], TOKEN_KEY_BYTES);
+        ret false;
+    }
+    listener.codepoints[was].superseded_ns = now_ns;
+    atomic.store(?listener.current, next::i64);
+    i = 0;
+    for (i < TOKEN_KEY_BYTES) {
+        listener.token_previous[i] = listener.token_key[i];
+        listener.token_key[i]      = token[i];
+        i                          = i + 1;
+    }
+    ct.zeroize(?token[0], TOKEN_KEY_BYTES);
+    listener.token_previous_generation = listener.token_generation;
+    listener.token_generation          = listener.token_generation + 1;
+    ret true;
+}
+
+pub fun rotations_skipped(listener: *Listener) u64 {
+    ret atomic.load(?listener.rotations_skipped)::u64;
+}
+
+test rotate__retires_only_what_nothing_holds {
+    if (!make(1)) { ret 1; }
+    val listener: *Listener = listener_at(0);
+    if (current(listener) != 0 || listener.token_generation != 1) { ret 2; }
+    var key:   [CID_KEY_BYTES]^u8;
+    val first: i64 = take_cid_key(listener, 0, ?key[0]);
+    if (first == 0 || take_cid_key(listener, 1, ?key[0]) != 0) { ret 3; }
+    # worker 1 holds a connection under codepoint 0 when the reload rotates
+    count(listener, 1, 0, 1);
+    if (!rotate(listener, 1000, 500, 2) || current(listener) != 1
+        || listener.token_generation != 2 || listener.token_previous_generation != 1) {
+        ret 4;
+    }
+    # past the grace, but still held: codepoint 0 keeps decoding with its key
+    if (!rotate(listener, 2000, 500, 2) || current(listener) != 2
+        || !still_keyed(listener, 0, first)) { ret 5; }
+    count(listener, 1, 0, -1);
+    # nothing holds 0 and its grace has passed, so it is retired and free,
+    # while 1, superseded only now, keeps its key
+    if (!rotate(listener, 2100, 500, 2) || current(listener) != 3
+        || still_keyed(listener, 0, first) || take_cid_key(listener, 0, ?key[0]) != 0
+        || take_cid_key(listener, 1, ?key[0]) == 0) { ret 6; }
+    destroy();
+    ret 0;
+}
+
+test rotate__skips_when_every_codepoint_is_held {
+    if (!make(1)) { ret 1; }
+    val listener: *Listener = listener_at(0);
+    var i:        usize     = 0;
+    for (i < CODEPOINTS) {
+        count(listener, 0, current(listener)::usize, 1);
+        if (i + 1 < CODEPOINTS && !rotate(listener, 1000 + i::u64, 0, 1)) { ret 2; }
+        i = i + 1;
+    }
+    val at: u8 = current(listener);
+    if (rotate(listener, 5000, 0, 1) || current(listener) != at
+        || rotations_skipped(listener) != 1) { ret 3; }
+    destroy();
+    if (made() || listener_at(0) != nil) { ret 4; }
+    ret 0;
+}
