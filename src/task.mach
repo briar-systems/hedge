@@ -1,0 +1,1220 @@
+# background tasks: work on its own schedule next to request handling
+#
+# one facility for the whole process. its tasks run on one thread the
+# supervisor owns, with an io runtime of its own that an outbound HTTPS loop
+# waits on, so a task never runs on a worker or on the supervisor's thread and
+# a task bug cannot stall signals, reloads or ACME. a run is a sequence of
+# non-blocking steps, each with the run's cancellation scope and deadline.
+#
+# a task is triggered by its period or on demand, single-flight: at most one
+# run is in flight and at most one more is queued behind it. what a run
+# produces it publishes as a snapshot into slots the task owns, and any thread
+# reads the current one without waiting on a run, under a counted lease that
+# keeps its slot from being reused.
+#
+# every operation takes the facility's lock, and a step runs with it released,
+# so a step may publish, read or trigger, and handlers may call from any worker.
+# tasks are process-scoped: registered once, untouched by a configuration
+# reload, drained with the process and stopped after its hosted applications.
+
+use hedge.clock;
+use hedge.outbound;
+use hedge.service;
+use std.chrono.time;
+use io_runtime: std.io.runtime;
+use std.sync.atomic;
+use std.sync.cancel;
+use std.sync.mutex;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.view;
+use tls.cert;
+
+pub val MAX_TASKS:          usize = 16;
+pub val MIN_SNAPSHOT_SLOTS: usize = 2;
+pub val MAX_SNAPSHOT_SLOTS: usize = 8;
+pub val MAX_NAME_BYTES:     usize = 64;
+pub val MAX_ERROR_BYTES:    usize = 128;
+# the longest secret a borrow hands over
+pub val MAX_SECRET_BYTES: usize = 512;
+# the outbound exchanges one run may have begun at once
+pub val MAX_RUN_EXCHANGES: usize = 4;
+# how soon a run that answered pending is stepped again when nothing woke it
+pub val STEP_INTERVAL_NS: u64 = 10000000;
+
+pub def Status: u8;
+pub val STATUS_OK:        Status = 1;
+pub val STATUS_INVALID:   Status = 2;
+pub val STATUS_DRAINING:  Status = 3;
+pub val STATUS_FULL:      Status = 4;
+pub val STATUS_EMPTY:     Status = 5;
+pub val STATUS_COALESCED: Status = 6;
+pub val STATUS_BUSY:      Status = 7;
+
+pub def Cause: u8;
+pub val CAUSE_PERIOD:  Cause = 1;
+pub val CAUSE_TRIGGER: Cause = 2;
+
+pub def Outcome: u8;
+pub val OUTCOME_NONE:      Outcome = 1;
+pub val OUTCOME_COMPLETED: Outcome = 2;
+pub val OUTCOME_FAILED:    Outcome = 3;
+pub val OUTCOME_ABANDONED: Outcome = 4;
+
+pub def DrainStatus: u8;
+pub val DRAIN_PENDING: DrainStatus = 1;
+pub val DRAIN_DONE:    DrainStatus = 2;
+pub val DRAIN_INVALID: DrainStatus = 3;
+
+pub def Borrow: u8;
+pub val BORROW_OK:      Borrow = 1;
+pub val BORROW_MISSING: Borrow = 2;
+pub val BORROW_REFUSED: Borrow = 3;
+pub val BORROW_INVALID: Borrow = 4;
+
+# the task thread's progress, which only that thread moves
+pub def ThreadState: i64;
+pub val THREAD_NONE:    ThreadState = 0;
+pub val THREAD_OPENING: ThreadState = 1;
+pub val THREAD_RUNNING: ThreadState = 2;
+pub val THREAD_FAILED:  ThreadState = 3;
+pub val THREAD_CLOSED:  ThreadState = 4;
+
+# an opaque public name for one registered task
+pub rec Handle {
+    slot:       u32;
+    generation: u32;
+}
+
+# one run of one task, owned by the facility and valid only during a step.
+# `scope` is cancelled when drain begins and times out at `deadline`, and
+# `loop` is the task thread's outbound loop, nil when no thread drives the
+# facility
+pub rec Run {
+    task:     Handle;
+    tasks:    *Tasks;
+    scope:    *cancel.Scope;
+    deadline: opt[time.Instant];
+    cause:    Cause;
+    sequence: u64;
+    loop:     *outbound.Loop;
+}
+
+# a step never blocks: pending asks to be stepped again, failed ends the run
+pub def StepFun: fun(ptr, *Run) service.Step;
+
+# `state` is public task state only, and secrets are borrowed through the run.
+# `period_ns` runs the task that long after the facility first sees it and
+# then that long after each run ends, and zero runs it only when triggered.
+# `timeout_ns` bounds each run, and zero leaves it to the drain deadline.
+# `slots` is caller-owned storage for `slot_count` snapshots of `slot_bytes`
+# each, and a `slot_count` of 0 registers a task that publishes nothing.
+pub rec Spec {
+    name:       view.View;
+    state:      ptr;
+    step:       StepFun;
+    period_ns:  u64;
+    timeout_ns: u64;
+    slots:      *u8;
+    slot_bytes: usize;
+    slot_count: usize;
+}
+
+# a writable snapshot slot claimed by a run, published by `commit`
+pub rec Draft {
+    task:     Handle;
+    slot:     u32;
+    sequence: u64;
+    data:     *u8;
+    capacity: usize;
+}
+
+# a counted borrow of one published snapshot, valid until `release`
+pub rec Lease {
+    task:     Handle;
+    slot:     u32;
+    sequence: u64;
+    data:     *u8;
+    len:      usize;
+}
+
+# what one task has done. runs are counted by outcome, and the durations and
+# the last success are on `hedge.clock`'s monotonic nanoseconds
+pub rec Report {
+    runs:      u64;
+    completed: u64;
+    failed:    u64;
+    abandoned: u64;
+    # triggers that found a run already queued and joined it
+    coalesced:        u64;
+    last:             Outcome;
+    running:          bool;
+    queued:           bool;
+    published:        u64;
+    last_duration_ns: u64;
+    max_duration_ns:  u64;
+    # when the last completed run ended, or zero before the first
+    last_success_ns: u64;
+    error:           [128]u8;
+    error_len:       usize;
+}
+
+pub rec Drain {
+    status:    DrainStatus;
+    abandoned: usize;
+}
+
+# copies the named secret into `output` and returns its length, or -1 when it
+# has no such secret. a length of `capacity` or more is refused as too large
+pub def ResolveFun: fun(ptr, view.View, *u8, usize) i64;
+
+pub rec Secrets {
+    ctx:     ptr;
+    resolve: ResolveFun;
+}
+
+pub fun no_secrets() Secrets {
+    ret Secrets{ctx: nil, resolve: (0::usize)::ResolveFun};
+}
+
+# the secret is valid only for the call and is cleared after it
+pub def UseFun: fun(ptr, view.View) bool;
+
+# how the embedding program sets the facility up. `trust` verifies every
+# https peer a task reaches and stays alive while the facility does, and nil
+# refuses https. `secrets` answers `borrow`
+pub rec Options {
+    trust:   *cert.TrustStore;
+    secrets: Secrets;
+}
+
+pub fun default_options() Options {
+    ret Options{trust: nil, secrets: no_secrets()};
+}
+
+# told of the thread's progress and of a drain that has settled, on the task
+# thread and with the facility's lock released
+pub def NotifyFun: fun(ptr);
+
+val NO_SLOT: usize = 18446744073709551615;
+
+rec Entry {
+    used:       bool;
+    generation: u32;
+    spec:       Spec;
+    queued:     bool;
+    cause:      Cause;
+    running:    bool;
+    scheduled:  bool;
+    due:        time.Instant;
+    started:    time.Instant;
+    scope:      cancel.Scope;
+    scope_live: bool;
+    run:        Run;
+    runs:       u64;
+    current:    usize;
+    drafting:   usize;
+    published:  u64;
+    refs:       [8]u32;
+    lens:       [8]usize;
+    sequences:  [8]u64;
+    exchanges:  [4]*outbound.Exchange;
+    report:     Report;
+}
+
+# caller-owned facility state. it stays where it is made from `make` until
+# `close` has returned
+pub rec Tasks {
+    entries:  [16]Entry;
+    root:     cancel.Scope;
+    options:  Options;
+    lock:     mutex.Mutex;
+    polling:  bool;
+    draining: bool;
+    deadline: time.Instant;
+    # the drain has settled and the thread was told
+    settled: bool;
+    stopped: bool;
+    # the task thread and its loop, opened and closed on that thread
+    loop:       outbound.Loop;
+    thread:     thread.Thread;
+    spawned:    bool;
+    state:      i64;
+    wakeable:   bool;
+    exiting:    i64;
+    close_ns:   u64;
+    notify:     NotifyFun;
+    notify_ctx: ptr;
+    valid:      bool;
+}
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun past(deadline: time.Instant, now: time.Instant) bool {
+    ret !time.instant_before(now, deadline);
+}
+
+fun lock(tasks: *Tasks) {
+    mutex.lock(?tasks.lock);
+}
+
+fun unlock(tasks: *Tasks) {
+    mutex.unlock(?tasks.lock);
+}
+
+# the task thread hears of new work, under the lock, so its runtime is never
+# woken once the thread has begun to close it
+fun wake_locked(tasks: *Tasks) {
+    if (tasks.wakeable) { io_runtime.wake(?tasks.loop.runtime); }
+}
+
+fun live(tasks: *Tasks) bool {
+    ret tasks != nil && tasks.valid;
+}
+
+fun entry_of(tasks: *Tasks, handle: Handle) *Entry {
+    if (tasks.stopped || handle.generation == 0 || handle.slot::usize >= MAX_TASKS) {
+        ret nil;
+    }
+    val entry: *Entry = ?tasks.entries[handle.slot::usize];
+    if (!entry.used || entry.generation != handle.generation) { ret nil; }
+    ret entry;
+}
+
+# the entry whose run this is, while that run is in flight
+fun live_run(tasks: *Tasks, run: *Run) *Entry {
+    if (run == nil || run.tasks != tasks) { ret nil; }
+    val entry: *Entry = entry_of(tasks, run.task);
+    if (entry == nil || !entry.running || run != ?entry.run || run.sequence != entry.runs) {
+        ret nil;
+    }
+    ret entry;
+}
+
+fun slot_data(entry: *Entry, slot: usize) *u8 {
+    ret ?entry.spec.slots[slot * entry.spec.slot_bytes];
+}
+
+pub fun name_valid(name: view.View) bool {
+    if (name.len == 0 || name.len > MAX_NAME_BYTES || name.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        val byte: u8 = name.data[i];
+        if (byte < 0x21 || byte > 0x7e) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun spec_valid(spec: *Spec) bool {
+    if (spec == nil || !name_valid(spec.name) || spec.step == nil) { ret false; }
+    if (spec.slot_count == 0)                                      { ret true; }
+    ret spec.slot_count >= MIN_SNAPSHOT_SLOTS && spec.slot_count <= MAX_SNAPSHOT_SLOTS
+        && spec.slots != nil && spec.slot_bytes > 0
+        && spec.slot_bytes <= 18446744073709551615 / spec.slot_count;
+}
+
+# sets the facility up in `tasks`. nothing runs until the supervisor starts
+# the task thread, but tasks may be registered and triggered from here on
+pub fun make(tasks: *Tasks, options: Options) bool {
+    if (tasks == nil) { ret false; }
+    tasks.valid = false;
+    if (!operation_ok(cancel.make_root(?tasks.root, opt[time.Instant].none{}))) { ret false; }
+    var i: usize = 0;
+    for (i < MAX_TASKS) {
+        tasks.entries[i].used       = false;
+        tasks.entries[i].generation = 0;
+        tasks.entries[i].running    = false;
+        tasks.entries[i].scope_live = false;
+        i                           = i + 1;
+    }
+    tasks.options    = options;
+    tasks.lock       = mutex.make();
+    tasks.polling    = false;
+    tasks.draining   = false;
+    tasks.deadline   = time.Instant{sec: 0, nsec: 0};
+    tasks.settled    = false;
+    tasks.stopped    = false;
+    tasks.spawned    = false;
+    tasks.wakeable   = false;
+    tasks.close_ns   = 0;
+    tasks.notify     = nil;
+    tasks.notify_ctx = nil;
+    tasks.loop.live  = false;
+    atomic.store(?tasks.state, THREAD_NONE);
+    atomic.store(?tasks.exiting, 0);
+    tasks.valid = true;
+    ret true;
+}
+
+fun register_locked(tasks: *Tasks, spec: *Spec, output: *Handle) Status {
+    if (tasks.stopped)  { ret STATUS_INVALID; }
+    if (tasks.draining) { ret STATUS_DRAINING; }
+    var i: usize = 0;
+    for (i < MAX_TASKS) {
+        val entry: *Entry = ?tasks.entries[i];
+        if (!entry.used && entry.generation != 4294967295) {
+            entry.generation = entry.generation + 1;
+            entry.used       = true;
+            entry.spec       = @spec;
+            entry.queued     = false;
+            entry.cause      = CAUSE_PERIOD;
+            entry.running    = false;
+            entry.scheduled  = false;
+            entry.runs       = 0;
+            entry.current    = NO_SLOT;
+            entry.drafting   = NO_SLOT;
+            entry.published  = 0;
+            var slot: usize = 0;
+            for (slot < MAX_SNAPSHOT_SLOTS) {
+                entry.refs[slot]      = 0;
+                entry.lens[slot]      = 0;
+                entry.sequences[slot] = 0;
+                slot                  = slot + 1;
+            }
+            slot = 0;
+            for (slot < MAX_RUN_EXCHANGES) {
+                entry.exchanges[slot] = nil;
+                slot                  = slot + 1;
+            }
+            entry.report.runs             = 0;
+            entry.report.completed        = 0;
+            entry.report.failed           = 0;
+            entry.report.abandoned        = 0;
+            entry.report.coalesced        = 0;
+            entry.report.last             = OUTCOME_NONE;
+            entry.report.last_duration_ns = 0;
+            entry.report.max_duration_ns  = 0;
+            entry.report.last_success_ns  = 0;
+            entry.report.error_len        = 0;
+            @output                       = Handle{slot: i::u32, generation: entry.generation};
+            ret STATUS_OK;
+        }
+        i = i + 1;
+    }
+    ret STATUS_FULL;
+}
+
+# registers a task, refused once drain has begun and full at MAX_TASKS. the
+# facility borrows the spec's name, state and slots until `close`
+pub fun register(tasks: *Tasks, spec: *Spec, output: *Handle) Status {
+    if (!live(tasks) || !spec_valid(spec) || output == nil) { ret STATUS_INVALID; }
+    lock(tasks);
+    val status: Status = register_locked(tasks, spec, output);
+    if (status == STATUS_OK) { wake_locked(tasks); }
+    unlock(tasks);
+    ret status;
+}
+
+fun trigger_locked(tasks: *Tasks, handle: Handle) Status {
+    val entry: *Entry = entry_of(tasks, handle);
+    if (entry == nil)   { ret STATUS_INVALID; }
+    if (tasks.draining) { ret STATUS_DRAINING; }
+    entry.cause = CAUSE_TRIGGER;
+    if (entry.queued) {
+        entry.report.coalesced = entry.report.coalesced + 1;
+        ret STATUS_COALESCED;
+    }
+    entry.queued = true;
+    wake_locked(tasks);
+    ret STATUS_OK;
+}
+
+# queues one run. a trigger while a run is queued joins it and answers
+# STATUS_COALESCED, and one while a run is in flight queues a single follow-up,
+# so a change that arrives mid-run is never missed. refused with
+# STATUS_DRAINING once drain has begun. callable from any thread, a handler's
+# included, and it never waits on a run
+pub fun trigger(tasks: *Tasks, handle: Handle) Status {
+    if (!live(tasks)) { ret STATUS_INVALID; }
+    lock(tasks);
+    val status: Status = trigger_locked(tasks, handle);
+    unlock(tasks);
+    ret status;
+}
+
+fun read_locked(tasks: *Tasks, handle: Handle, output: *Lease) Status {
+    val entry: *Entry = entry_of(tasks, handle);
+    if (entry == nil)             { ret STATUS_INVALID; }
+    if (entry.current == NO_SLOT) { ret STATUS_EMPTY; }
+    val slot: usize = entry.current;
+    if (entry.refs[slot] == 4294967295) { ret STATUS_FULL; }
+    entry.refs[slot] = entry.refs[slot] + 1;
+    @output          = Lease{task: handle, slot: slot::u32, sequence: entry.sequences[slot],
+        data: slot_data(entry, slot), len: entry.lens[slot]};
+    ret STATUS_OK;
+}
+
+# the current snapshot under a lease, or STATUS_EMPTY before the first
+# publish. it never waits on a run, and the leased slot is not reused until
+# `release`
+pub fun read(tasks: *Tasks, handle: Handle, output: *Lease) Status {
+    if (!live(tasks) || output == nil) { ret STATUS_INVALID; }
+    lock(tasks);
+    val status: Status = read_locked(tasks, handle, output);
+    unlock(tasks);
+    ret status;
+}
+
+fun release_locked(tasks: *Tasks, lease: *Lease) Status {
+    val entry: *Entry = entry_of(tasks, lease.task);
+    if (entry == nil || lease.slot::usize >= entry.spec.slot_count) { ret STATUS_INVALID; }
+    val slot: usize = lease.slot::usize;
+    if (entry.refs[slot] == 0 || entry.sequences[slot] != lease.sequence) {
+        ret STATUS_INVALID;
+    }
+    entry.refs[slot] = entry.refs[slot] - 1;
+    lease.data       = nil;
+    lease.len        = 0;
+    ret STATUS_OK;
+}
+
+pub fun release(tasks: *Tasks, lease: *Lease) Status {
+    if (!live(tasks) || lease == nil) { ret STATUS_INVALID; }
+    lock(tasks);
+    val status: Status = release_locked(tasks, lease);
+    unlock(tasks);
+    ret status;
+}
+
+pub fun lease_view(lease: *Lease) view.View {
+    if (lease == nil || lease.data == nil) { ret view.view(nil, 0); }
+    ret view.view(lease.data, lease.len);
+}
+
+fun draft_locked(tasks: *Tasks, run: *Run, output: *Draft) Status {
+    val entry: *Entry = live_run(tasks, run);
+    if (entry == nil || entry.spec.slot_count == 0) { ret STATUS_INVALID; }
+    if (entry.drafting != NO_SLOT)                  { ret STATUS_BUSY; }
+    var slot: usize = 0;
+    for (slot < entry.spec.slot_count) {
+        if (slot != entry.current && entry.refs[slot] == 0) {
+            entry.drafting = slot;
+            @output        = Draft{task: run.task, slot: slot::u32, sequence: run.sequence,
+                data: slot_data(entry, slot), capacity: entry.spec.slot_bytes};
+            ret STATUS_OK;
+        }
+        slot = slot + 1;
+    }
+    ret STATUS_FULL;
+}
+
+# claims a free slot for the run to write. STATUS_FULL when every slot is
+# current, leased or drafting, and the current snapshot then stays in place
+pub fun draft(run: *Run, output: *Draft) Status {
+    if (run == nil || !live(run.tasks) || output == nil) { ret STATUS_INVALID; }
+    lock(run.tasks);
+    val status: Status = draft_locked(run.tasks, run, output);
+    unlock(run.tasks);
+    ret status;
+}
+
+fun draft_matches(entry: *Entry, run: *Run, pending: *Draft) bool {
+    ret entry != nil && pending != nil && entry.drafting != NO_SLOT
+        && pending.slot::usize == entry.drafting && pending.sequence == run.sequence
+        && pending.task.slot == run.task.slot && pending.task.generation == run.task.generation;
+}
+
+fun commit_locked(tasks: *Tasks, run: *Run, pending: *Draft, len: usize) Status {
+    val entry: *Entry = live_run(tasks, run);
+    if (!draft_matches(entry, run, pending) || len > entry.spec.slot_bytes) {
+        ret STATUS_INVALID;
+    }
+    val slot: usize = entry.drafting;
+    entry.published       = entry.published + 1;
+    entry.lens[slot]      = len;
+    entry.sequences[slot] = entry.published;
+    entry.current         = slot;
+    entry.drafting        = NO_SLOT;
+    pending.data          = nil;
+    pending.capacity      = 0;
+    ret STATUS_OK;
+}
+
+# publishes the draft's first `len` bytes as the task's current snapshot
+pub fun commit(run: *Run, pending: *Draft, len: usize) Status {
+    if (run == nil || !live(run.tasks)) { ret STATUS_INVALID; }
+    lock(run.tasks);
+    val status: Status = commit_locked(run.tasks, run, pending, len);
+    unlock(run.tasks);
+    ret status;
+}
+
+fun discard_locked(tasks: *Tasks, run: *Run, pending: *Draft) Status {
+    val entry: *Entry = live_run(tasks, run);
+    if (!draft_matches(entry, run, pending)) { ret STATUS_INVALID; }
+    entry.drafting   = NO_SLOT;
+    pending.data     = nil;
+    pending.capacity = 0;
+    ret STATUS_OK;
+}
+
+# gives an uncommitted draft back. a run that ends with one open has it discarded
+pub fun discard(run: *Run, pending: *Draft) Status {
+    if (run == nil || !live(run.tasks)) { ret STATUS_INVALID; }
+    lock(run.tasks);
+    val status: Status = discard_locked(run.tasks, run, pending);
+    unlock(run.tasks);
+    ret status;
+}
+
+# copies `bytes` into a free slot and publishes it
+pub fun publish(run: *Run, bytes: view.View) Status {
+    if (bytes.len > 0 && bytes.data == nil) { ret STATUS_INVALID; }
+    var pending: Draft;
+    val claimed: Status = draft(run, ?pending);
+    if (claimed != STATUS_OK) { ret claimed; }
+    if (bytes.len > pending.capacity) {
+        discard(run, ?pending);
+        ret STATUS_INVALID;
+    }
+    var i: usize = 0;
+    for (i < bytes.len) {
+        pending.data[i] = bytes.data[i];
+        i               = i + 1;
+    }
+    ret commit(run, ?pending, bytes.len);
+}
+
+pub fun report(tasks: *Tasks, handle: Handle, output: *Report) Status {
+    if (!live(tasks) || output == nil) { ret STATUS_INVALID; }
+    lock(tasks);
+    val entry: *Entry = entry_of(tasks, handle);
+    if (entry == nil) {
+        unlock(tasks);
+        ret STATUS_INVALID;
+    }
+    entry.report.running   = entry.running;
+    entry.report.queued    = entry.queued;
+    entry.report.published = entry.published;
+    @output                = entry.report;
+    unlock(tasks);
+    ret STATUS_OK;
+}
+
+pub fun report_error(value: *Report) view.View {
+    if (value == nil || value.error_len == 0 || value.error_len > MAX_ERROR_BYTES) {
+        ret view.view(nil, 0);
+    }
+    ret view.view(?value.error[0], value.error_len);
+}
+
+# how long ago the last completed run ended, at monotonic `now_ns`, or none
+# before the first
+pub fun success_age_ns(value: *Report, now_ns: u64) opt[u64] {
+    if (value == nil || value.last_success_ns == 0) { ret opt[u64].none{}; }
+    if (now_ns <= value.last_success_ns)            { ret opt[u64].some{0}; }
+    ret opt[u64].some{now_ns - value.last_success_ns};
+}
+
+# hands the named secret to `use` for the length of the call. the facility's
+# resolver copies it into scratch storage, which is cleared after `use`
+# returns. a secret that must outlive the call, such as a token an outbound
+# request carries, is copied by `use` into memory the task clears itself.
+# only a run in flight borrows
+pub fun borrow(run: *Run, name: view.View, use: UseFun, use_ctx: ptr) Borrow {
+    if (run == nil || !live(run.tasks) || !name_valid(name) || use == nil) {
+        ret BORROW_INVALID;
+    }
+    val tasks: *Tasks = run.tasks;
+    lock(tasks);
+    val entry:   *Entry  = live_run(tasks, run);
+    val secrets: Secrets = tasks.options.secrets;
+    unlock(tasks);
+    if (entry == nil || secrets.resolve::usize == 0) { ret BORROW_INVALID; }
+    var scratch: [MAX_SECRET_BYTES]u8;
+    val length:  i64    = secrets.resolve(secrets.ctx, name, ?scratch[0], MAX_SECRET_BYTES);
+    var status:  Borrow = BORROW_OK;
+    if (length < 0)                                           { status = BORROW_MISSING; }
+    or (length::u64 >= MAX_SECRET_BYTES::u64)                 { status = BORROW_INVALID; }
+    or (!use(use_ctx, view.view(?scratch[0], length::usize))) { status = BORROW_REFUSED; }
+    clear(?scratch[0], MAX_SECRET_BYTES);
+    ret status;
+}
+
+fun clear(output: *u8, capacity: usize) {
+    var i: usize = 0;
+    for (i < capacity) {
+        output[i] = 0;
+        i         = i + 1;
+    }
+}
+
+fun track_locked(tasks: *Tasks, run: *Run, exchange: *outbound.Exchange) bool {
+    val entry: *Entry = live_run(tasks, run);
+    if (entry == nil) { ret false; }
+    var free: usize = MAX_RUN_EXCHANGES;
+    var i:    usize = 0;
+    for (i < MAX_RUN_EXCHANGES) {
+        if (entry.exchanges[i] == exchange)                         { ret true; }
+        if (entry.exchanges[i] == nil && free == MAX_RUN_EXCHANGES) { free = i; }
+        i = i + 1;
+    }
+    if (free == MAX_RUN_EXCHANGES) { ret false; }
+    entry.exchanges[free] = exchange;
+    ret true;
+}
+
+# begins `request` on the task thread's outbound loop for this run. its
+# timeout is cut to the run's deadline, and the facility finishes the exchange
+# when the run ends however it ended, so a run that is abandoned cannot hold a
+# connection open. the step polls it with `outbound.poll` and reads it with
+# `outbound.response` as usual. at most MAX_RUN_EXCHANGES per run
+pub fun begin(run: *Run, exchange: *outbound.Exchange, request: outbound.Request) outbound.Status {
+    if (run == nil || !live(run.tasks) || exchange == nil || run.loop == nil) {
+        ret outbound.INVALID;
+    }
+    lock(run.tasks);
+    val tracked: bool = track_locked(run.tasks, run, exchange);
+    unlock(run.tasks);
+    if (!tracked) { ret outbound.INVALID; }
+    val now:     time.Instant     = clock.instant();
+    var bounded: outbound.Request = request;
+    if (sel run.deadline.some) {
+        val left: u64 = clock.between_ns(now, run.deadline.some);
+        if (bounded.timeout_ns == 0 || bounded.timeout_ns > left) { bounded.timeout_ns = left; }
+    }
+    ret outbound.begin(exchange, outbound.client(run.loop), bounded, now);
+}
+
+fun running_count(tasks: *Tasks) usize {
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < MAX_TASKS) {
+        if (tasks.entries[i].used && tasks.entries[i].running) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+fun abandoned_count(tasks: *Tasks) usize {
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < MAX_TASKS) {
+        if (tasks.entries[i].used) {
+            count = count + tasks.entries[i].report.abandoned::usize;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+fun drain_locked(tasks: *Tasks, deadline: time.Instant) Drain {
+    if (tasks.stopped) { ret Drain{status: DRAIN_INVALID, abandoned: 0}; }
+    if (!tasks.draining) {
+        tasks.draining = true;
+        tasks.deadline = deadline;
+        cancel.cancel(?tasks.root);
+        var i: usize = 0;
+        for (i < MAX_TASKS) {
+            tasks.entries[i].queued = false;
+            i                       = i + 1;
+        }
+        wake_locked(tasks);
+    }
+    if (running_count(tasks) > 0) {
+        ret Drain{status: DRAIN_PENDING, abandoned: abandoned_count(tasks)};
+    }
+    ret Drain{status: DRAIN_DONE, abandoned: abandoned_count(tasks)};
+}
+
+# the host's alone. the first call cancels every run's scope, refuses further
+# triggers and registrations, and drops queued runs. runs in flight keep being
+# stepped until they end or `deadline`, a monotonic instant, passes, and one
+# still in flight then is abandoned: never stepped again and counted. a later
+# call reports progress against the first call's deadline
+pub fun drain(tasks: *Tasks, deadline: time.Instant) Drain {
+    if (!live(tasks)) { ret Drain{status: DRAIN_INVALID, abandoned: 0}; }
+    lock(tasks);
+    val drained: Drain = drain_locked(tasks, deadline);
+    unlock(tasks);
+    ret drained;
+}
+
+pub fun draining(tasks: *Tasks) bool {
+    if (!live(tasks)) { ret false; }
+    lock(tasks);
+    val value: bool = tasks.draining;
+    unlock(tasks);
+    ret value;
+}
+
+fun leased(tasks: *Tasks) bool {
+    var i: usize = 0;
+    for (i < MAX_TASKS) {
+        if (tasks.entries[i].used) {
+            var slot: usize = 0;
+            for (slot < MAX_SNAPSHOT_SLOTS) {
+                if (tasks.entries[i].refs[slot] != 0) { ret true; }
+                slot = slot + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun close_scope(entry: *Entry) {
+    if (entry.scope_live && operation_ok(cancel.destroy(?entry.scope))) {
+        entry.scope_live = false;
+    }
+}
+
+# the host's alone. refused with STATUS_BUSY until drain is done and every
+# lease is released, and after it every operation is refused
+pub fun stop(tasks: *Tasks) Status {
+    if (!live(tasks)) { ret STATUS_INVALID; }
+    lock(tasks);
+    if (tasks.stopped) {
+        unlock(tasks);
+        ret STATUS_INVALID;
+    }
+    if (!tasks.draining || running_count(tasks) > 0 || leased(tasks)) {
+        unlock(tasks);
+        ret STATUS_BUSY;
+    }
+    var i: usize = 0;
+    for (i < MAX_TASKS) {
+        close_scope(?tasks.entries[i]);
+        i = i + 1;
+    }
+    tasks.stopped = true;
+    unlock(tasks);
+    ret STATUS_OK;
+}
+
+fun copy_error(entry: *Entry, error: view.View) {
+    var len: usize = error.len;
+    if (len > MAX_ERROR_BYTES) { len = MAX_ERROR_BYTES; }
+    if (error.data == nil)     { len = 0; }
+    var i: usize = 0;
+    for (i < len) {
+        entry.report.error[i] = error.data[i];
+        i                     = i + 1;
+    }
+    entry.report.error_len = len;
+}
+
+# every exchange the run began is finished, on the thread its loop belongs to
+fun finish_exchanges(entry: *Entry) {
+    var i: usize = 0;
+    for (i < MAX_RUN_EXCHANGES) {
+        if (entry.exchanges[i] != nil) {
+            outbound.finish(entry.exchanges[i]);
+            entry.exchanges[i] = nil;
+        }
+        i = i + 1;
+    }
+}
+
+fun finish_run(entry: *Entry, outcome: Outcome, now: time.Instant) {
+    entry.running     = false;
+    entry.drafting    = NO_SLOT;
+    entry.report.last = outcome;
+    finish_exchanges(entry);
+    val duration: u64 = clock.between_ns(entry.started, now);
+    entry.report.last_duration_ns = duration;
+    if (duration > entry.report.max_duration_ns) { entry.report.max_duration_ns = duration; }
+    if (outcome == OUTCOME_COMPLETED) {
+        entry.report.completed       = entry.report.completed + 1;
+        entry.report.last_success_ns = clock.to_ns(now);
+        entry.report.error_len       = 0;
+    }
+    if (outcome == OUTCOME_FAILED) { entry.report.failed = entry.report.failed + 1; }
+    if (outcome == OUTCOME_ABANDONED) {
+        entry.report.abandoned = entry.report.abandoned + 1;
+        entry.report.error_len = 0;
+        cancel.timeout(?entry.scope);
+    }
+    close_scope(entry);
+    if (entry.spec.period_ns != 0) { entry.due = clock.after(now, entry.spec.period_ns); }
+}
+
+fun start_run(tasks: *Tasks, index: usize, entry: *Entry, now: time.Instant) bool {
+    var deadline: opt[time.Instant] = opt[time.Instant].none{};
+    if (entry.spec.timeout_ns != 0) {
+        deadline = opt[time.Instant].some{clock.after(now, entry.spec.timeout_ns)};
+    }
+    close_scope(entry);
+    if (entry.scope_live)                                                      { ret false; }
+    if (!operation_ok(cancel.make_child(?entry.scope, ?tasks.root, deadline))) { ret false; }
+    var loop: *outbound.Loop = nil;
+    if (tasks.loop.live) { loop = ?tasks.loop; }
+    entry.scope_live  = true;
+    entry.runs        = entry.runs + 1;
+    entry.report.runs = entry.report.runs + 1;
+    entry.started     = now;
+    entry.run         = Run{task: Handle{slot: index::u32, generation: entry.generation},
+        tasks:    tasks, scope: ?entry.scope, deadline: deadline, cause: entry.cause,
+        sequence: entry.runs, loop: loop};
+    entry.queued  = false;
+    entry.cause   = CAUSE_PERIOD;
+    entry.running = true;
+    ret true;
+}
+
+# the step's answer, applied with the lock held. a run still pending once its
+# own deadline has passed fails
+fun settle_step(entry: *Entry, step: service.Step, now: time.Instant) {
+    if (step.status == service.STEP_DONE) {
+        finish_run(entry, OUTCOME_COMPLETED, now);
+        ret;
+    }
+    if (step.status == service.STEP_FAILED) {
+        copy_error(entry, step.detail);
+        finish_run(entry, OUTCOME_FAILED, now);
+        ret;
+    }
+    if (step.status != service.STEP_PENDING) {
+        copy_error(entry, view.view("invalid step result", 19));
+        finish_run(entry, OUTCOME_FAILED, now);
+        ret;
+    }
+    if (sel entry.run.deadline.some) {
+        if (past(entry.run.deadline.some, now)) {
+            copy_error(entry, view.view("run overran its timeout", 23));
+            finish_run(entry, OUTCOME_FAILED, now);
+        }
+    }
+}
+
+# the drain has settled and nobody was told yet
+fun settling_locked(tasks: *Tasks) bool {
+    if (!tasks.draining || tasks.settled || running_count(tasks) > 0) { ret false; }
+    tasks.settled = true;
+    ret true;
+}
+
+fun tell(tasks: *Tasks) {
+    if (tasks.notify != nil) { tasks.notify(tasks.notify_ctx); }
+}
+
+# one pass at instant `now`: schedules due periods, starts queued runs,
+# abandons runs past the drain deadline and steps each run in flight once, with
+# the lock released around each step. the task thread drives it, and a test
+# drives it by hand with a clock of its own. returns the steps taken, and 0
+# while another pass is under way
+pub fun poll(tasks: *Tasks, now: time.Instant) usize {
+    if (!live(tasks)) { ret 0; }
+    lock(tasks);
+    if (tasks.stopped || tasks.polling) {
+        unlock(tasks);
+        ret 0;
+    }
+    tasks.polling = true;
+    var steps: usize = 0;
+    var i:     usize = 0;
+    for (i < MAX_TASKS) {
+        val entry: *Entry = ?tasks.entries[i];
+        if (entry.used) {
+            if (!entry.scheduled && entry.spec.period_ns != 0) {
+                entry.scheduled = true;
+                entry.due       = clock.after(now, entry.spec.period_ns);
+            }
+            if (!tasks.draining && !entry.running && entry.scheduled && past(entry.due, now)) {
+                entry.queued = true;
+            }
+            if (!tasks.draining && !entry.running && entry.queued) {
+                start_run(tasks, i, entry, now);
+            }
+            if (entry.running) {
+                if (tasks.draining && past(tasks.deadline, now)) {
+                    finish_run(entry, OUTCOME_ABANDONED, now);
+                }
+                or {
+                    cancel.expire(?entry.scope, now);
+                    val step:  StepFun = entry.spec.step;
+                    val state: ptr     = entry.spec.state;
+                    val run:   *Run    = ?entry.run;
+                    unlock(tasks);
+                    val answer: service.Step = step(state, run);
+                    lock(tasks);
+                    settle_step(entry, answer, now);
+                    steps = steps + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    tasks.polling = false;
+    val settled: bool = settling_locked(tasks);
+    unlock(tasks);
+    if (settled) { tell(tasks); }
+    ret steps;
+}
+
+# the earliest instant `poll` has work: now for a queued run, a run in flight
+# after STEP_INTERVAL_NS, a period at its due instant, and a draining run at
+# the drain deadline. none when nothing is scheduled
+pub fun next_due(tasks: *Tasks, now: time.Instant) opt[time.Instant] {
+    if (!live(tasks)) { ret opt[time.Instant].none{}; }
+    lock(tasks);
+    var found: bool         = false;
+    var at:    time.Instant = now;
+    if (!tasks.stopped) {
+        var i: usize = 0;
+        for (i < MAX_TASKS) {
+            val entry:     *Entry            = ?tasks.entries[i];
+            var candidate: opt[time.Instant] = opt[time.Instant].none{};
+            if (entry.used) {
+                if (entry.running) {
+                    var step: time.Instant = clock.after(now, STEP_INTERVAL_NS);
+                    if (tasks.draining && time.instant_before(tasks.deadline, step)) {
+                        step = tasks.deadline;
+                    }
+                    candidate = opt[time.Instant].some{step};
+                }
+                or (!tasks.draining && (entry.queued
+                    || (!entry.scheduled && entry.spec.period_ns != 0))) {
+                    candidate = opt[time.Instant].some{now};
+                }
+                or (!tasks.draining && entry.scheduled) {
+                    candidate = opt[time.Instant].some{entry.due};
+                }
+            }
+            if (sel candidate.some) {
+                if (!found || time.instant_before(candidate.some, at)) { at = candidate.some; }
+                found = true;
+            }
+            i = i + 1;
+        }
+    }
+    unlock(tasks);
+    if (!found) { ret opt[time.Instant].none{}; }
+    ret opt[time.Instant].some{at};
+}
+
+# how long the task thread may wait on its runtime, or -1 for the next wake
+fun wait_ms(tasks: *Tasks) i32 {
+    val now: time.Instant      = clock.instant();
+    val due: opt[time.Instant] = next_due(tasks, now);
+    if (sel due.none) { ret -1; }
+    val left_ns: u64 = clock.between_ns(now, due.some);
+    var left:    u64 = (left_ns + 999999) / 1000000;
+    if (left > 2147483647) { left = 2147483647; }
+    ret left::i32;
+}
+
+fun set_state(tasks: *Tasks, state: ThreadState) {
+    atomic.store(?tasks.state, state);
+    tell(tasks);
+}
+
+# the task thread: open the loop, run the tasks until asked to exit, then
+# finish what the runs left, and close the loop within the close deadline
+fun thread_main(arg: *u8) {
+    val tasks: *Tasks = arg::*Tasks;
+    if (!outbound.open_loop(?tasks.loop, tasks.options.trust)) {
+        set_state(tasks, THREAD_FAILED);
+        ret;
+    }
+    lock(tasks);
+    tasks.wakeable = true;
+    unlock(tasks);
+    set_state(tasks, THREAD_RUNNING);
+    for (atomic.load(?tasks.exiting) == 0) {
+        poll(tasks, clock.instant());
+        if (atomic.load(?tasks.exiting) != 0) { brk; }
+        outbound.turn(?tasks.loop, clock.wait_ms(wait_ms(tasks)));
+    }
+    lock(tasks);
+    tasks.wakeable = false;
+    var i: usize = 0;
+    for (i < MAX_TASKS) {
+        finish_exchanges(?tasks.entries[i]);
+        i = i + 1;
+    }
+    unlock(tasks);
+    var status: outbound.Status = outbound.close_loop(?tasks.loop);
+    for (status == outbound.PENDING && clock.monotonic_ns() < tasks.close_ns) {
+        status = outbound.close_loop(?tasks.loop);
+    }
+    if (status != outbound.OK) {
+        set_state(tasks, THREAD_FAILED);
+        ret;
+    }
+    set_state(tasks, THREAD_CLOSED);
+}
+
+# the supervisor's alone: starts the task thread, which opens its loop and
+# tells `notify` once it runs or has failed, and again once a drain settles
+pub fun spawn(tasks: *Tasks, notify: NotifyFun, notify_ctx: ptr) bool {
+    if (!live(tasks) || tasks.spawned) { ret false; }
+    tasks.notify     = notify;
+    tasks.notify_ctx = notify_ctx;
+    atomic.store(?tasks.state, THREAD_OPENING);
+    var config: thread.Config;
+    thread.config_default(?config);
+    config.name = "hedge-tasks";
+    val spawned: thread.Operation = thread.spawn_with_config(thread_main, tasks::*u8,
+        ?config, ?tasks.thread);
+    if (sel spawned.err) {
+        atomic.store(?tasks.state, THREAD_NONE);
+        ret false;
+    }
+    tasks.spawned = true;
+    ret true;
+}
+
+pub fun thread_state(tasks: *Tasks) ThreadState {
+    if (!live(tasks)) { ret THREAD_NONE; }
+    ret atomic.load(?tasks.state);
+}
+
+# the supervisor's alone, after `stop`: the task thread finishes every exchange
+# the runs left, closes its loop by the monotonic `deadline_ns`, and is joined.
+# false when the loop did not close in time or the thread could not be joined
+pub fun close(tasks: *Tasks, deadline_ns: u64) bool {
+    if (!live(tasks)) { ret false; }
+    var ok: bool = true;
+    if (tasks.spawned) {
+        lock(tasks);
+        tasks.close_ns = deadline_ns;
+        atomic.store(?tasks.exiting, 1);
+        wake_locked(tasks);
+        unlock(tasks);
+        val joined: thread.Operation = thread.join(?tasks.thread);
+        if (sel joined.err) { ok = false; }
+        tasks.spawned = false;
+        if (atomic.load(?tasks.state) != THREAD_CLOSED) { ok = false; }
+    }
+    lock(tasks);
+    tasks.stopped = true;
+    var i: usize = 0;
+    for (i < MAX_TASKS) {
+        close_scope(?tasks.entries[i]);
+        if (tasks.entries[i].scope_live) { ok = false; }
+        i = i + 1;
+    }
+    unlock(tasks);
+    if (!operation_ok(cancel.destroy(?tasks.root))) { ok = false; }
+    tasks.valid = false;
+    ret ok;
+}
+
+#[testing]
+fun at(sec: i64) time.Instant {
+    ret time.Instant{sec: sec, nsec: 0};
+}
+
+# public task state for the tests below
+#[testing]
+rec Probe {
+    hang:      bool;
+    cancelled: bool;
+    published: Status;
+    body:      [5]u8;
+}
+
+#[testing]
+fun probe_step(context: ptr, run: *Run) service.Step {
+    val probe: *Probe = context::*Probe;
+    if (probe.hang) {
+        val reason: cancel.Reason = cancel.reason(run.scope);
+        if (sel reason.cancelled) { probe.cancelled = true; }
+        ret service.Step{status: service.STEP_PENDING, detail: view.view(nil, 0)};
+    }
+    probe.body[4]   = '0' + run.sequence::u8;
+    probe.published = publish(run, view.view(?probe.body[0], 5));
+    ret service.Step{status: service.STEP_DONE, detail: view.view(nil, 0)};
+}
+
+#[testing]
+fun probe_spec(probe: *Probe, slots: *u8) Spec {
+    probe.hang      = false;
+    probe.cancelled = false;
+    probe.published = 0;
+    probe.body[0]   = 'r';
+    probe.body[1]   = 'u';
+    probe.body[2]   = 'n';
+    probe.body[3]   = '-';
+    ret Spec{name: view.view("probe", 5), state: probe::ptr, step: probe_step, period_ns: 0,
+        timeout_ns: 0, slots: slots, slot_bytes: 5, slot_count: 2};
+}
+
+#[testing]
+fun reads(tasks: *Tasks, handle: Handle, lease: *Lease, digit: u8) bool {
+    if (read(tasks, handle, lease) != STATUS_OK) { ret false; }
+    val bytes: view.View = lease_view(lease);
+    ret bytes.len == 5 && bytes.data[4] == digit;
+}
+
+# triggers coalesce into one queued run, every trigger is refused once drain
+# begins, and a run still in flight at the drain deadline is abandoned
+test drain__overrun_abandoned_and_triggers_refused {
+    var tasks: Tasks;
+    if (!make(?tasks, default_options())) { ret 1; }
+    var probe:  Probe;
+    var slots:  [2][5]u8;
+    var spec:   Spec = probe_spec(?probe, ?slots[0][0]);
+    var handle: Handle;
+    probe.hang = true;
+    if (register(?tasks, ?spec, ?handle) != STATUS_OK) { ret 2; }
+    if (trigger(?tasks, handle) != STATUS_OK || trigger(?tasks, handle) != STATUS_COALESCED) {
+        ret 3;
+    }
+    # a trigger while the run is in flight queues one follow-up
+    if (poll(?tasks, at(1)) != 1 || trigger(?tasks, handle) != STATUS_OK
+        || trigger(?tasks, handle) != STATUS_COALESCED) { ret 4; }
+    if (drain(?tasks, at(3)).status != DRAIN_PENDING
+        || trigger(?tasks, handle) != STATUS_DRAINING) { ret 5; }
+    var late: Handle;
+    if (register(?tasks, ?spec, ?late) != STATUS_DRAINING) { ret 6; }
+    if (poll(?tasks, at(2)) != 1 || !probe.cancelled
+        || drain(?tasks, at(3)).status != DRAIN_PENDING) { ret 7; }
+    # the deadline passed: the run is never stepped again, and the queued
+    # follow-up was dropped
+    if (poll(?tasks, at(3)) != 0) { ret 8; }
+    val drained: Drain = drain(?tasks, at(3));
+    if (drained.status != DRAIN_DONE || drained.abandoned != 1) { ret 9; }
+    var outcome: Report;
+    if (report(?tasks, handle, ?outcome) != STATUS_OK || outcome.runs != 1
+        || outcome.abandoned != 1 || outcome.completed != 0 || outcome.coalesced != 2
+        || outcome.last != OUTCOME_ABANDONED || outcome.queued || outcome.running
+        || outcome.last_duration_ns != 2000000000) { ret 10; }
+    if (stop(?tasks) != STATUS_OK || trigger(?tasks, handle) != STATUS_INVALID) { ret 11; }
+    if (!close(?tasks, 0))                                                      { ret 12; }
+    ret 0;
+}
+
+# readers hold leases without waiting on runs. a publish needs a slot that is
+# neither current nor leased, and when none is left it is refused and the
+# current snapshot stays
+test publish__refused_when_every_slot_held {
+    var tasks: Tasks;
+    if (!make(?tasks, default_options())) { ret 1; }
+    var probe:  Probe;
+    var slots:  [2][5]u8;
+    var spec:   Spec = probe_spec(?probe, ?slots[0][0]);
+    var handle: Handle;
+    if (register(?tasks, ?spec, ?handle) != STATUS_OK) { ret 2; }
+    var first: Lease;
+    if (read(?tasks, handle, ?first) != STATUS_EMPTY) { ret 3; }
+    if (trigger(?tasks, handle) != STATUS_OK || poll(?tasks, at(1)) != 1
+        || probe.published != STATUS_OK || !reads(?tasks, handle, ?first, '1')) { ret 4; }
+    if (trigger(?tasks, handle) != STATUS_OK || poll(?tasks, at(2)) != 1
+        || probe.published != STATUS_OK) { ret 5; }
+    # one slot is current and the other leased, so the third run's publish is
+    # refused and readers still get the second snapshot
+    var check: Lease;
+    if (trigger(?tasks, handle) != STATUS_OK || poll(?tasks, at(3)) != 1
+        || probe.published != STATUS_FULL || !reads(?tasks, handle, ?check, '2')
+        || release(?tasks, ?check) != STATUS_OK) { ret 6; }
+    var outcome: Report;
+    if (report(?tasks, handle, ?outcome) != STATUS_OK || outcome.completed != 3
+        || outcome.published != 2 || outcome.last_success_ns != clock.to_ns(at(3))) { ret 7; }
+    val age: opt[u64] = success_age_ns(?outcome, clock.to_ns(at(5)));
+    if (!(sel age.some))        { ret 8; }
+    if (age.some != 2000000000) { ret 8; }
+    # a lease still held keeps the facility from stopping
+    if (drain(?tasks, at(4)).status != DRAIN_DONE || stop(?tasks) != STATUS_BUSY) { ret 9; }
+    if (release(?tasks, ?first) != STATUS_OK || release(?tasks, ?first) != STATUS_INVALID
+        || stop(?tasks) != STATUS_OK || !close(?tasks, 0)) { ret 10; }
+    ret 0;
+}
