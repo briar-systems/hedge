@@ -159,7 +159,7 @@ service.make_applications(?registry, ?slots[0], 1);
 service.register_hosted(?registry, "site", handler, hosted, memory_bytes);
 ```
 
-A registry holds at most `service.MAX_APPLICATIONS` (32), and each name at most once. A configuration routes to an application by naming it as the `application` of a service whose `kind` is `laurel`, the application kind today whatever the framework (see [CONFIGURATION.md](CONFIGURATION.md)). A configuration that names an unregistered application fails with `no application is registered under this name`, at startup or at a reload.
+A registry holds at most `service.MAX_APPLICATIONS` (32), and each name at most once. A configuration routes to an application by naming it as the `application` of a service whose `kind` is `application`, whatever the framework (see [CONFIGURATION.md](CONFIGURATION.md)). A configuration that names an unregistered application fails with `no application is registered under this name`, at startup or at a reload.
 
 `memory_bytes` is the request memory each request to the application may hold, or zero for the server's `call_memory_bytes`. A service's own `memory_bytes` overrides it. See [Request memory](CONFIGURATION.md#request-memory).
 

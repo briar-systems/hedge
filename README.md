@@ -54,8 +54,8 @@ Lightweight does not mean omitting production duties. It means that protocol eng
 - `mach-http` provides HTTP semantics and connection engines.
 - `mach-quic` provides QUIC transport and recovery.
 - `mach-acme` provides certificate issuance and renewal.
-- Laurel provides the production web application framework.
 - `hedge` assembles those libraries into an operated server.
+- Laurel provides the production web application framework, hosted in hedge through `graft`.
 
 See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md) for the dependency contracts.
 
