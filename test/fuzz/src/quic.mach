@@ -6,9 +6,13 @@
 
 use hedge.protocol.quic.routing;
 use hedge.protocol.quic.runtime;
+use hedge_storage: hedge.storage;
 use quic_listener: quic.connection.listener;
 use quic.packet.packet;
+use net_types: std.net.async.types;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 
 use fuzz.guard;
@@ -177,4 +181,374 @@ pub fun answer_local_cid(data: *u8, len: usize) verdict.Verdict {
         i = i + 1;
     }
     ret verdict.answered(2);
+}
+
+var pump:  runtime.Pump;
+var state: runtime.Runtime;
+
+val HELD_MODEL: usize = 64;
+
+var model_class: [runtime.ARRIVAL_CLASSES][HELD_MODEL]u8;
+var model_held:  [runtime.ARRIVAL_CLASSES]usize;
+var model_drops: [runtime.ARRIVAL_CLASSES]u64;
+
+fun model_holds(tag: u8) bool {
+    var class: usize = 0;
+    for (class < runtime.ARRIVAL_CLASSES) {
+        var i: usize = 0;
+        for (i < model_held[class]) {
+            if (model_class[class][i] == tag) { ret true; }
+            i = i + 1;
+        }
+        class = class + 1;
+    }
+    ret false;
+}
+
+fun model_total() usize {
+    var total: usize = 0;
+    var class: usize = 0;
+    for (class < runtime.ARRIVAL_CLASSES) {
+        total = total + model_held[class];
+        class = class + 1;
+    }
+    ret total;
+}
+
+fun model_evict(class: usize) {
+    var i: usize = 1;
+    for (i < model_held[class]) {
+        model_class[class][i - 1] = model_class[class][i];
+        i                         = i + 1;
+    }
+    model_held[class] = model_held[class] - 1;
+}
+
+# the queue holds, per class, exactly the arrivals the model does, oldest first
+fun arrivals_agree() bool {
+    if (pump.arrival_live != model_total()) { ret false; }
+    var class: usize = 0;
+    for (class < runtime.ARRIVAL_CLASSES) {
+        if (pump.arrival_held[class] != model_held[class] ||
+            state.arrivals_dropped[class] != model_drops[class]) { ret false; }
+        var at: usize = pump.arrival_heads[class];
+        var i:  usize = 0;
+        for (i < model_held[class]) {
+            if (at == runtime.NO_CONNECTION) { ret false; }
+            val arrival: *runtime.Arrival = runtime.arrival_at(?pump, at);
+            if (arrival.class != class || arrival.data[0] != model_class[class][i] ||
+                arrival.key.bytes[0] != model_class[class][i]) { ret false; }
+            if (i + 1 == model_held[class] && pump.arrival_tails[class] != at) { ret false; }
+            at = arrival.next;
+            i  = i + 1;
+        }
+        if (at != runtime.NO_CONNECTION) { ret false; }
+        class = class + 1;
+    }
+    ret true;
+}
+
+# the input sets the queue's bound, then each two bytes are an arrival or a
+# preflight: a tag that is both its destination CID and its first payload byte,
+# and whether it is an Initial and carries a token
+pub fun answer_arrivals(data: *u8, len: usize) verdict.Verdict {
+    if (len == 0) { ret verdict.answered(0); }
+    val before: usize = guard.live();
+    if (!runtime.make_arrivals(?pump, guard.allocator())) {
+        ret verdict.violated("arrivals: an empty queue could not be made");
+    }
+    pump.arrival_capacity = (data[0] % 6)::usize + 1;
+    var class: usize = 0;
+    for (class < runtime.ARRIVAL_CLASSES) {
+        model_held[class]             = 0;
+        model_drops[class]            = 0;
+        state.arrivals_dropped[class] = 0;
+        class                         = class + 1;
+    }
+    var payload: [64]u8;
+    var outcome: u64   = pump.arrival_capacity::u64;
+    var at:      usize = 1;
+    for (at + 2 <= len) {
+        val tag:  u8 = data[at];
+        val kind: u8 = data[at + 1];
+        at = at + 2;
+        if ((kind & 3) == 3) {
+            # a preflight takes the oldest arrival of the most valuable class
+            val next:     usize = runtime.next_arrival_class(?pump);
+            var expected: usize = 0;
+            for (expected < runtime.ARRIVAL_CLASSES && model_held[expected] == 0) {
+                expected = expected + 1;
+            }
+            if (next != expected) {
+                ret verdict.violated("arrivals: a preflight took other than the oldest most valuable arrival");
+            }
+            if (next != runtime.ARRIVAL_CLASSES) {
+                if (!runtime.evict_arrival(?pump, next)) {
+                    ret verdict.violated("arrivals: a held arrival could not be taken");
+                }
+                model_evict(next);
+            }
+            outcome = verdict.mix(outcome, 0x40 | next::u64);
+            cnt;
+        }
+        var classified: quic_listener.ClassifiedDatagram;
+        classified.class        = quic_listener.DATAGRAM_NEGOTIATE;
+        classified.token_length = 0;
+        if ((kind & 1) != 0) { classified.class = quic_listener.DATAGRAM_INITIAL; }
+        if ((kind & 2) != 0) { classified.token_length = 16; }
+        payload[0] = tag;
+        val key:    routing.Key = routing.key(?payload[0], 1);
+        val chosen: usize       = runtime.arrival_class(?pump, ?classified, key);
+        # a CID already held is a duplicate whatever it carries
+        var expected: usize = runtime.ARRIVAL_OTHER;
+        if (model_holds(tag)) { expected = runtime.ARRIVAL_DUPLICATE; }
+        or (classified.class == quic_listener.DATAGRAM_INITIAL) {
+            if (classified.token_length != 0) { expected = runtime.ARRIVAL_TOKEN; }
+            or                                { expected = runtime.ARRIVAL_UNTOKEN; }
+        }
+        if (chosen != expected) {
+            ret verdict.violated("arrivals: an arrival was classed other than its header and the queue say");
+        }
+        var packet: net_types.Packet;
+        packet.buffer = ?payload[0];
+        packet.length = (kind >> 2)::usize % 64 + 1;
+        val held: runtime.Status = runtime.hold_arrival(?state, ?pump, ?packet, key, chosen,
+            at::u64);
+        # at the bound an arrival takes the oldest slot of a less valuable class,
+        # and otherwise it is dropped under its own
+        var accepted: bool = true;
+        if (model_total() >= pump.arrival_capacity) {
+            var victim: usize = runtime.ARRIVAL_CLASSES;
+            accepted = false;
+            for (!accepted && victim > chosen + 1) {
+                victim = victim - 1;
+                if (model_held[victim] != 0) {
+                    model_evict(victim);
+                    model_drops[victim] = model_drops[victim] + 1;
+                    accepted            = true;
+                }
+            }
+        }
+        if (accepted) {
+            if (model_held[chosen] >= HELD_MODEL) { brk; }
+            model_class[chosen][model_held[chosen]] = tag;
+            model_held[chosen]                      = model_held[chosen] + 1;
+        }
+        or { model_drops[chosen] = model_drops[chosen] + 1; }
+        if ((held == runtime.OK) != accepted || (!accepted && held != runtime.BLOCKED)) {
+            ret verdict.violated("arrivals: an arrival was held or dropped against the class order");
+        }
+        if (accepted) { verdict.accept(); }
+        outcome = verdict.mix(outcome, (chosen::u64 << 1) | accepted::u64);
+        if (!arrivals_agree()) {
+            ret verdict.violated("arrivals: the queue does not hold what arrived, in order, by class");
+        }
+    }
+    if (!arrivals_agree()) {
+        ret verdict.violated("arrivals: the queue does not hold what arrived, in order, by class");
+    }
+    if (!runtime.destroy_arrivals(?pump) || guard.live() != before) {
+        ret verdict.violated("arrivals: a destroyed queue kept storage");
+    }
+    ret verdict.answered(outcome);
+}
+
+val SENDS: usize = runtime.MAX_STATELESS_PENDING;
+
+var claimed: [SENDS]bool;
+
+# every byte is a claim, or with its top bit set the release of the pending
+# send its low bits pick
+pub fun answer_stateless(data: *u8, len: usize) verdict.Verdict {
+    val before: usize = guard.live();
+    if (!storage_make()) { ret verdict.violated("stateless: an empty table could not be made"); }
+    pump.stateless_generation = 0;
+    pump.stateless_pending    = runtime.NO_CONNECTION;
+    pump.stateless_live       = 0;
+    var i: usize = 0;
+    for (i < SENDS) {
+        claimed[i] = false;
+        i          = i + 1;
+    }
+    var live:    usize = 0;
+    var refused: usize = 0;
+    var at:      usize = 0;
+    for (at < len) {
+        val op: u8 = data[at];
+        at = at + 1;
+        if ((op & 0x80) != 0 && live != 0) {
+            # release the (op & 0x7f)th live send, counted from the lowest
+            var skip:  usize = (op & 0x7f)::usize % live;
+            var index: usize = 0;
+            for (!claimed[index] || skip != 0) {
+                if (claimed[index]) { skip = skip - 1; }
+                index = index + 1;
+            }
+            runtime.release_stateless(?pump, index);
+            claimed[index] = false;
+            live           = live - 1;
+            cnt;
+        }
+        # a claim takes a free slot, up to the ceiling and never past it
+        val index: usize = runtime.claim_stateless(?pump);
+        if (live >= SENDS) {
+            if (index != runtime.NO_CONNECTION) {
+                ret verdict.violated("stateless: a send was claimed past the ceiling");
+            }
+            refused = refused + 1;
+            cnt;
+        }
+        if (index >= SENDS || claimed[index]) {
+            ret verdict.violated("stateless: a claim took a slot that is not free");
+        }
+        verdict.accept();
+        runtime.stateless_at(?pump, index).pending = true;
+        claimed[index]                             = true;
+        live                                       = live + 1;
+    }
+    # the pending list is exactly the live sends
+    var seen: usize = 0;
+    var walk: usize = pump.stateless_pending;
+    for (walk != runtime.NO_CONNECTION && seen <= live) {
+        if (walk >= SENDS || !claimed[walk]) {
+            ret verdict.violated("stateless: the pending list holds a send that is not live");
+        }
+        seen = seen + 1;
+        walk = runtime.stateless_at(?pump, walk).next_pending;
+    }
+    if (seen != live || pump.stateless_live != live) {
+        ret verdict.violated("stateless: the pending list is not the live sends");
+    }
+    i = 0;
+    for (i < SENDS) {
+        if (claimed[i]) { runtime.release_stateless(?pump, i); }
+        i = i + 1;
+    }
+    if (pump.stateless_pending != runtime.NO_CONNECTION || !storage_destroy() ||
+        guard.live() != before) {
+        ret verdict.violated("stateless: an emptied table kept a send or its storage");
+    }
+    ret verdict.answered(verdict.mix(verdict.bucket(live), verdict.bucket(refused)));
+}
+
+fun storage_make() bool {
+    ret hedge_storage.make_table[runtime.StatelessSend](?pump.stateless, guard.allocator());
+}
+
+fun storage_destroy() bool {
+    ret hedge_storage.destroy_table[runtime.StatelessSend](?pump.stateless);
+}
+
+var pending_queue:    runtime.HeldQueue;
+var connection_queue: runtime.HeldQueue;
+var model_pending:    [HELD_MODEL]u8;
+var model_connection: [HELD_MODEL]u8;
+var pending_count:    usize;
+var connection_count: usize;
+
+fun queue_agrees(queue: *runtime.HeldQueue, tags: *u8, count: usize) bool {
+    if (queue.count != count) { ret false; }
+    var at: usize = queue.head;
+    var i:  usize = 0;
+    for (i < count) {
+        if (at == runtime.NO_CONNECTION) { ret false; }
+        val held: *runtime.HeldDatagram = runtime.held_at(?state, at);
+        if (held.data[0] != tags[i])            { ret false; }
+        if (i + 1 == count && queue.tail != at) { ret false; }
+        at = held.next;
+        i  = i + 1;
+    }
+    ret at == runtime.NO_CONNECTION &&
+        (count != 0 || (queue.head == runtime.NO_CONNECTION && queue.tail == runtime.NO_CONNECTION));
+}
+
+# each two bytes are an operation and a tag: hold a datagram for the pending
+# initial or its connection, release either, or promote the initial's held
+# datagrams to the connection
+pub fun answer_pending_initial(data: *u8, len: usize) verdict.Verdict {
+    val before: usize = guard.live();
+    if (!hedge_storage.make_table[runtime.HeldDatagram](?state.held, guard.allocator())) {
+        ret verdict.violated("pending-initial: an empty table could not be made");
+    }
+    runtime.reset_held(?pending_queue);
+    runtime.reset_held(?connection_queue);
+    state.held_dropped = 0;
+    pending_count      = 0;
+    connection_count   = 0;
+    var dropped: u64   = 0;
+    var payload: [8]u8;
+    var outcome: u64   = 0;
+    var at:      usize = 0;
+    for (at + 2 <= len) {
+        val op:  u8 = data[at] % 5;
+        val tag: u8 = data[at + 1];
+        at = at + 2;
+        if (op == 0 || op == 1) {
+            var packet: net_types.Packet;
+            payload[0]    = tag;
+            packet.buffer = ?payload[0];
+            packet.length = 1 + (tag % 8)::usize;
+            # past its ceiling a datagram is dropped and counted, and the
+            # client's retransmit is the retry
+            if (op == 0) {
+                val held: bool = runtime.hold_datagram(?state, ?pending_queue,
+                    runtime.HELD_PER_PENDING, ?packet);
+                if (held != (pending_count < runtime.HELD_PER_PENDING)) {
+                    ret verdict.violated("pending-initial: a datagram was held past its ceiling or dropped under it");
+                }
+                if (held) {
+                    model_pending[pending_count] = tag;
+                    pending_count                = pending_count + 1;
+                }
+                or { dropped = dropped + 1; }
+            }
+            or {
+                val held: bool = runtime.hold_datagram(?state, ?connection_queue,
+                    runtime.HELD_PER_CONNECTION, ?packet);
+                if (held != (connection_count < runtime.HELD_PER_CONNECTION)) {
+                    ret verdict.violated("pending-initial: a datagram was held past its ceiling or dropped under it");
+                }
+                if (held) {
+                    model_connection[connection_count] = tag;
+                    connection_count                   = connection_count + 1;
+                }
+                or { dropped = dropped + 1; }
+            }
+        }
+        or (op == 2) {
+            runtime.release_held(?state, ?pending_queue);
+            pending_count = 0;
+        }
+        or (op == 3) {
+            runtime.release_held(?state, ?connection_queue);
+            connection_count = 0;
+        }
+        or (connection_count == 0) {
+            # a promoted initial's held datagrams become its connection's
+            runtime.move_held(?connection_queue, ?pending_queue);
+            var i: usize = 0;
+            for (i < pending_count) {
+                model_connection[i] = model_pending[i];
+                i                   = i + 1;
+            }
+            connection_count = pending_count;
+            pending_count    = 0;
+        }
+        if (pending_count + connection_count != 0) { verdict.accept(); }
+        outcome = verdict.mix(outcome, (op::u64 << 4) | (pending_count + connection_count)::u64);
+        if (state.held_dropped != dropped ||
+            !queue_agrees(?pending_queue, ?model_pending[0], pending_count) ||
+            !queue_agrees(?connection_queue, ?model_connection[0], connection_count) ||
+            hedge_storage.table_live[runtime.HeldDatagram](?state.held) !=
+            pending_count + connection_count) {
+            ret verdict.violated("pending-initial: the held queues are not what was held, in order");
+        }
+    }
+    runtime.release_held(?state, ?pending_queue);
+    runtime.release_held(?state, ?connection_queue);
+    if (!hedge_storage.destroy_table[runtime.HeldDatagram](?state.held) ||
+        guard.live() != before) {
+        ret verdict.violated("pending-initial: a released table kept storage");
+    }
+    ret verdict.answered(outcome);
 }
