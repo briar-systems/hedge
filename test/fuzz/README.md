@@ -11,7 +11,7 @@ point of hedge. Each directory pairs with a row of the registry in
 | | `cleartext` | `protocol.selection.select_cleartext` |
 | | `acme-response` | `acme.wire.parse_response`, open and closed, GET and HEAD |
 | QUIC and HTTP/3 | `routing` | `protocol.quic.routing` publish, withdraw and lookup |
-| | `local-cid` | `protocol.quic.runtime.adopt_local_cid` |
+| | `server-cid` | `protocol.quic.cid.decode`, and `mint` round-tripped through it |
 | | `arrivals` | `protocol.quic.arrivals`: `class_of`, `hold`, `take` |
 | | `stateless` | `protocol.quic.stateless`: `claim`, `release` |
 | | `pending-initial` | `protocol.quic.holding`: `hold`, `release`, `move` |
