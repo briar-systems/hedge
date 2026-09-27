@@ -12,13 +12,13 @@ point of hedge. Each directory pairs with a row of the registry in
 | | `acme-response` | `acme.wire.parse_response`, open and closed, GET and HEAD |
 | QUIC and HTTP/3 | `routing` | `protocol.quic.routing` publish, withdraw and lookup |
 | | `local-cid` | `protocol.quic.runtime.adopt_local_cid` |
-| | `arrivals` | the runtime's arrival queue: `arrival_class`, `hold_arrival`, `evict_arrival` |
-| | `stateless` | the runtime's pending stateless sends: `claim_stateless`, `release_stateless` |
-| | `pending-initial` | the runtime's held datagrams: `hold_datagram`, `release_held`, `move_held` |
-| | `h3-request-headers` | `protocol.h3.session.copy_request_fields` and `request_target` |
+| | `arrivals` | `protocol.quic.arrivals`: `class_of`, `hold`, `take` |
+| | `stateless` | `protocol.quic.stateless`: `claim`, `release` |
+| | `pending-initial` | `protocol.quic.holding`: `hold`, `release`, `move` |
+| | `h3-request-headers` | `protocol.h3.session.copy_request_fields` |
 | | `h3-response-headers` | `protocol.h3.session.response_headers` |
-| request line and headers | `h2-method`, `h2-target` | `protocol.h2.method_of`, `protocol.h2.target_of` |
-| | `dispatch` | `dispatch.plan.match` against a fixed plan, and `dispatch.outcome_for` |
+| request line and headers | `pseudo-method`, `pseudo-target` | `protocol.pseudo.method_of`, `target_of`, for HTTP/2 and HTTP/3 |
+| | `dispatch` | `dispatch.plan.match` against a fixed plan |
 | | `forwarding` | `proxy.forward.copy_fields` and `copy_request_fields` |
 | | `forwarded` | `proxy.forward.format_forwarded` |
 | | `trace` | `telemetry.trace.parse` and `parse_bounded` |
@@ -41,8 +41,8 @@ point of hedge. Each directory pairs with a row of the registry in
 A boundary whose entry point takes more than one string reads its input as
 lines, and field lines are `name: value`. A field an HTTP parser would refuse is
 dropped, because hedge is only handed fields a parser accepted. The QUIC
-runtime boundaries read their input as a script of operations, answered against
-a model of what the runtime must hold.
+queue boundaries read their input as a script of operations, answered against
+a model of what the queue must hold.
 
 ## Answers
 
@@ -53,14 +53,15 @@ decodes the same from its own bytes and every shorter prefix of it waits, a
 cleartext connection is HTTP/2 only by the exact preface, a Range is served only
 as RFC 9110 resolves it, an accepted HTTP-date names the instant it parsed to, a
 hop-by-hop field never crosses the hop, a resolved static path never leaves its
-root, a route resolves to the binding its owner published, an arrival is held or
+root, a content coding is served exactly when the client gives it a weight, a
+route resolves to the binding its owner published, an arrival is held or
 dropped in class order, and an unauthenticated admin request never reaches
 routing. Breaking any of these is a finding.
 
 Each input is copied so that it ends on the last byte before an unreadable page
 (`std.allocator.testing`), so a parser that reads one byte past its input
 faults on the spot. A harness whose parser writes to its input places a copy per
-parse. The QUIC runtime harnesses allocate from the same guarded allocator and
+parse. The QUIC queue harnesses allocate from the same guarded allocator and
 check that an emptied table gives back everything it took. A crash is a finding.
 So is a hang: every walk a harness drives is bounded by its input's length, and
 the replay runs under a timeout.
@@ -108,7 +109,6 @@ interop harness run, and the interop fixtures' certificates. The `m-*` files
 were retained by `fuzz mutate all 20000 1 --retain`.
 
 A file named for an issue, such as `373-q-zero`, is the minimized input behind
-that issue. It stays in the corpus, so the replay fails until the issue is fixed
-and keeps it fixed after.
+that issue. It stays in the corpus, so the replay keeps the issue fixed.
 
 To retain a new input by hand, put the file in its boundary's directory.
