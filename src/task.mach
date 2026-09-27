@@ -17,10 +17,12 @@
 # tasks are process-scoped: registered once, untouched by a configuration
 # reload, drained with the process and stopped after its hosted applications.
 
+use crypto.contracts;
 use hedge.clock;
 use hedge.outbound;
 use hedge.service;
 use std.chrono.time;
+use std.crypto.ct;
 use io_runtime: std.io.runtime;
 use std.sync.atomic;
 use std.sync.cancel;
@@ -41,6 +43,8 @@ pub val MAX_NAME_BYTES:     usize = 64;
 pub val MAX_ERROR_BYTES:    usize = 128;
 # the longest secret a borrow hands over
 pub val MAX_SECRET_BYTES: usize = 512;
+# the resolvers registered at once, process-wide
+pub val MAX_RESOLVERS: usize = 8;
 # the outbound exchanges one run may have begun at once
 pub val MAX_RUN_EXCHANGES: usize = 4;
 # how soon a run that answered pending is stepped again when nothing woke it
@@ -168,25 +172,82 @@ pub rec Drain {
     abandoned: usize;
 }
 
-# copies the named secret into `output` and returns its length, or -1 when it
-# has no such secret. a length of `capacity` or more is refused as too large
-pub def ResolveFun: fun(ptr, view.View, *u8, usize) i64;
+# copies the named secret into secret `output` and returns its length, or -1
+# when it has no such secret. a length of `capacity` or more is refused as too
+# large
+pub def ResolveFun: fun(ptr, view.View, *^u8, usize) i64;
 
-pub rec Secrets {
+# a resolver is secret welded through its callback type, so it never erases to
+# ptr: only this module's table holds it, and the facility holds the public
+# `Secrets` handle `register_secrets` returns for it
+pub rec Resolver {
     ctx:     ptr;
     resolve: ResolveFun;
 }
 
+# an opaque public name for one registered resolver. it holds no pointer
+pub rec Secrets {
+    slot:       u32;
+    generation: u32;
+}
+
 pub fun no_secrets() Secrets {
-    ret Secrets{ctx: nil, resolve: (0::usize)::ResolveFun};
+    ret Secrets{slot: 0, generation: 0};
 }
 
 # the secret is valid only for the call and is cleared after it
-pub def UseFun: fun(ptr, view.View) bool;
+pub def UseFun: fun(ptr, contracts.SecretBytes) bool;
+
+var resolvers:        [MAX_RESOLVERS]*Resolver;
+var resolver_gens:    [MAX_RESOLVERS]u32;
+var resolver_used:    [MAX_RESOLVERS]bool;
+var resolver_borrows: [MAX_RESOLVERS]usize;
+var resolver_lock:    mutex.Mutex = 0;
+
+# registers a resolver the embedding program keeps live and unchanged until it
+# unregisters it, and names it in `output`
+pub fun register_secrets(resolver: *Resolver, output: *Secrets) bool {
+    if (resolver == nil || resolver.resolve == nil || output == nil) { ret false; }
+    mutex.lock(?resolver_lock);
+    var i: usize = 0;
+    for (i < MAX_RESOLVERS) {
+        if (!resolver_used[i] && resolver_gens[i] != 4294967295) {
+            resolver_gens[i]    = resolver_gens[i] + 1;
+            resolvers[i]        = resolver;
+            resolver_used[i]    = true;
+            resolver_borrows[i] = 0;
+            @output             = Secrets{slot: i::u32, generation: resolver_gens[i]};
+            mutex.unlock(?resolver_lock);
+            ret true;
+        }
+        i = i + 1;
+    }
+    mutex.unlock(?resolver_lock);
+    ret false;
+}
+
+fun resolver_live(source: Secrets) bool {
+    if (source.generation == 0 || source.slot::usize >= MAX_RESOLVERS) { ret false; }
+    ret resolver_used[source.slot::usize]
+        && resolver_gens[source.slot::usize] == source.generation;
+}
+
+# refused while a borrow through it is in flight
+pub fun unregister_secrets(source: Secrets) bool {
+    mutex.lock(?resolver_lock);
+    if (!resolver_live(source) || resolver_borrows[source.slot::usize] != 0) {
+        mutex.unlock(?resolver_lock);
+        ret false;
+    }
+    resolvers[source.slot::usize]     = nil;
+    resolver_used[source.slot::usize] = false;
+    mutex.unlock(?resolver_lock);
+    ret true;
+}
 
 # how the embedding program sets the facility up. `trust` verifies every
 # https peer a task reaches and stays alive while the facility does, and nil
-# refuses https. `secrets` answers `borrow`
+# refuses https. `secrets` names the resolver `borrow` asks
 pub rec Options {
     trust:   *cert.TrustStore;
     secrets: Secrets;
@@ -613,37 +674,43 @@ pub fun success_age_ns(value: *Report, now_ns: u64) opt[u64] {
     ret opt[u64].some{now_ns - value.last_success_ns};
 }
 
-# hands the named secret to `use` for the length of the call. the facility's
-# resolver copies it into scratch storage, which is cleared after `use`
-# returns. a secret that must outlive the call, such as a token an outbound
-# request carries, is copied by `use` into memory the task clears itself.
-# only a run in flight borrows
+# hands the named secret to `use`, secret-typed, for the length of the call.
+# the facility's resolver copies it into secret scratch storage, which is
+# cleared after `use` returns. a secret that must reach an outbound request
+# is declassified there by `outbound.secret_header` and nowhere else. only a
+# run in flight borrows
 pub fun borrow(run: *Run, name: view.View, use: UseFun, use_ctx: ptr) Borrow {
     if (run == nil || !live(run.tasks) || !name_valid(name) || use == nil) {
         ret BORROW_INVALID;
     }
     val tasks: *Tasks = run.tasks;
     lock(tasks);
-    val entry:   *Entry  = live_run(tasks, run);
-    val secrets: Secrets = tasks.options.secrets;
+    val entry:  *Entry  = live_run(tasks, run);
+    val source: Secrets = tasks.options.secrets;
     unlock(tasks);
-    if (entry == nil || secrets.resolve::usize == 0) { ret BORROW_INVALID; }
-    var scratch: [MAX_SECRET_BYTES]u8;
-    val length:  i64    = secrets.resolve(secrets.ctx, name, ?scratch[0], MAX_SECRET_BYTES);
-    var status:  Borrow = BORROW_OK;
-    if (length < 0)                                           { status = BORROW_MISSING; }
-    or (length::u64 >= MAX_SECRET_BYTES::u64)                 { status = BORROW_INVALID; }
-    or (!use(use_ctx, view.view(?scratch[0], length::usize))) { status = BORROW_REFUSED; }
-    clear(?scratch[0], MAX_SECRET_BYTES);
-    ret status;
-}
-
-fun clear(output: *u8, capacity: usize) {
-    var i: usize = 0;
-    for (i < capacity) {
-        output[i] = 0;
-        i         = i + 1;
+    if (entry == nil) { ret BORROW_INVALID; }
+    mutex.lock(?resolver_lock);
+    if (!resolver_live(source)) {
+        mutex.unlock(?resolver_lock);
+        ret BORROW_INVALID;
     }
+    val slot:     usize     = source.slot::usize;
+    val resolver: *Resolver = resolvers[slot];
+    resolver_borrows[slot] = resolver_borrows[slot] + 1;
+    mutex.unlock(?resolver_lock);
+    var scratch: [MAX_SECRET_BYTES]^u8;
+    val length:  i64    = resolver.resolve(resolver.ctx, name, ?scratch[0], MAX_SECRET_BYTES);
+    var status:  Borrow = BORROW_OK;
+    if (length < 0)                           { status = BORROW_MISSING; }
+    or (length::u64 >= MAX_SECRET_BYTES::u64) { status = BORROW_INVALID; }
+    or (!use(use_ctx, contracts.SecretBytes{data: ?scratch[0], len: length::usize})) {
+        status = BORROW_REFUSED;
+    }
+    ct.zeroize(?scratch[0], MAX_SECRET_BYTES);
+    mutex.lock(?resolver_lock);
+    resolver_borrows[slot] = resolver_borrows[slot] - 1;
+    mutex.unlock(?resolver_lock);
+    ret status;
 }
 
 fun track_locked(tasks: *Tasks, run: *Run, exchange: *outbound.Exchange) bool {
