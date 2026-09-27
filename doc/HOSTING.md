@@ -82,7 +82,7 @@ Of these records, a program writes the fields of `Provider`. `Source` and `Provi
 
 Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, the `Bound` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
 
-Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, `allow_tunnel`, `tunnel_owner`, `release_to_tunnel`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), the rest of `hedge.secret` (`resolve`, `clear`, and the per-generation store composition keeps), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
+Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, `allow_tunnel`, `tunnel_owner`, `release_to_tunnel`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), the rest of `hedge.secret` (the per-generation store composition keeps, and the credentials hedge holds for itself), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
 
 ## The handler contract
 
@@ -232,7 +232,7 @@ What hosted code receives from hedge today:
 - **Outbound HTTPS**: a client for requests to other services, verified against anchors the application chooses. See [Outbound HTTPS](#outbound-https).
 - **Background tasks**: work on its own schedule on a thread hedge owns, with snapshots handlers read without waiting. See [Background tasks](#background-tasks).
 - **Secrets**: the secrets the configuration grants the application, borrowed by name from any thread. See [Secrets](#secrets).
-- **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Resolver` in `composition.Options.telemetry.secrets` for the administration credential's `os` and `application` secret providers, a `secret.Providers` in `.providers` for the secrets hosted code borrows, and a log sink in `.telemetry.downstream` that receives hedge's own records.
+- **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Providers` in `composition.Options.providers` that the `os` and `application` secrets resolve through, both the ones hosted code borrows and the administration credential, and a log sink in `.telemetry.downstream` that receives hedge's own records.
 
 Not yet supplied to hosted code:
 
