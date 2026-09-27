@@ -85,10 +85,15 @@ rec Harness {
     failures: i64;
     # whether the one service is a registered application whose lifecycle the
     # supervisor drives
-    hosted:   bool;
-    phases:   Phases;
-    slots:    [1]service.Application;
-    registry: service.Applications;
+    hosted: bool;
+    phases: Phases;
+    # whether the listener's port is `holder`'s, bound without SO_REUSEPORT, so
+    # no worker can bind it
+    taken:      bool;
+    taken_name: [64]u8;
+    holder:     tcp.Listener;
+    slots:      [1]service.Application;
+    registry:   service.Applications;
     # whether the process runs a background task facility, whose job fetches
     # from the process's own TLS listener, verified against the fixture root
     tasked: bool;
@@ -142,7 +147,8 @@ fun origin_factory(context: ptr, configured: *schema.Service,
     ret true;
 }
 
-fun configure(graph: *schema.Graph, body: str, cached: bool, local_address: str) {
+fun configure(graph: *schema.Graph, body: str, cached: bool, local_address: str,
+    address: str) {
     schema.reset_graph(graph);
     schema.set_text(?graph.server_name, "supervision-test");
     graph.listener_count = 1;
@@ -185,6 +191,7 @@ fun configure(graph: *schema.Graph, body: str, cached: bool, local_address: str)
     graph.budgets[0].memory_bytes = 0;
     schema.set_text(?graph.routes[0].budget, "route");
     graph.timeouts.drain_ms = 1000;
+    if (address != nil) { schema.set_text(?public.address, address); }
     if (local_address != nil) {
         schema.set_text(?public.address, local_address);
         public.transport = schema.TRANSPORT_LOCAL;
@@ -230,9 +237,10 @@ fun secure_origin(graph: *schema.Graph) {
 }
 
 fun seal(candidate: *generation.Generation, id: u64, body: str, cached: bool,
-    local_address: str, hosted: bool, tasked: bool, diagnostics: *schema.Diagnostics) bool {
+    local_address: str, address: str, hosted: bool, tasked: bool,
+    diagnostics: *schema.Diagnostics) bool {
     if (!generation.make_candidate(candidate, id)) { ret false; }
-    configure(?candidate.graph, body, cached, local_address);
+    configure(?candidate.graph, body, cached, local_address, address);
     if (tasked) { secure_origin(?candidate.graph); }
     if (hosted) {
         val site: *schema.Service = ?candidate.graph.services[0];
@@ -251,7 +259,7 @@ fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Gene
     val candidate: *generation.Generation = ?harness.generations[target];
     atomic.fetch_add(?harness.loads, 1);
     if (!seal(candidate, id, harness.next_body, harness.cached, local_address(harness),
-        harness.hosted, harness.tasked, ?harness.diagnostics)) {
+        taken_address(harness), harness.hosted, harness.tasked, ?harness.diagnostics)) {
         ret nil;
     }
     if (harness.move_listener) {
@@ -268,6 +276,26 @@ fun supervise(arg: *u8) {
 fun local_address(harness: *Harness) str {
     if (!harness.local) { ret nil; }
     ret ?harness.local_name[0];
+}
+
+fun taken_address(harness: *Harness) str {
+    if (!harness.hosted || !harness.taken) { ret nil; }
+    ret ?harness.taken_name[0];
+}
+
+# a loopback port held without SO_REUSEPORT, which every worker's bind refuses
+fun take_port(harness: *Harness) bool {
+    val held: res[tcp.Listener, io_error.Error] = tcp.listen(ip.endpoint(127, 0, 0, 1, 0), 1);
+    if (sel held.err) { ret false; }
+    harness.holder = held.ok;
+    val bound: res[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?harness.holder);
+    if (sel bound.err) {
+        tcp.listener_close(?harness.holder);
+        ret false;
+    }
+    ip.endpoint_format(bound.ok, ?harness.taken_name[0], 64);
+    harness.taken = true;
+    ret true;
 }
 
 # an abstract socket name this process alone uses, so parallel runs never meet
@@ -320,7 +348,7 @@ fun boot(harness: *Harness, cached: bool) bool {
     if (cached && (!ensure_dir("out") || !ensure_dir(CACHE_ROOT))) { ret false; }
     val initial: *generation.Generation = ?harness.generations[0];
     if (!seal(initial, 1, "hello from one\n", cached, local_address(harness),
-        harness.hosted, harness.tasked, ?harness.diagnostics)) { ret false; }
+        taken_address(harness), harness.hosted, harness.tasked, ?harness.diagnostics)) { ret false; }
     var options: composition.Options = composition.default_options();
     options.native = service.Factory{ctx: (harness)::ptr, build: origin_factory};
     if (harness.hosted) {
@@ -694,8 +722,8 @@ rec Phases {
     drained_at_stop:    bool;
     served:             i64;
     # when set, start registers `lingering`, a periodic task whose runs never
-    # end, and fails once a run is in flight. the task thread counts the steps
-    # it takes after `stop`
+    # end, and finishes once a run is in flight. the task thread counts the
+    # steps it takes after `stop`
     tasks:      *task.Tasks;
     lingering:  task.Spec;
     in_flight:  i64;
@@ -720,7 +748,7 @@ fun phase_start(context: ptr) service.Step {
         }
     }
     if (atomic.load(?phases.in_flight) == 0) { ret step(service.STEP_PENDING); }
-    ret step(service.STEP_FAILED);
+    ret step(service.STEP_DONE);
 }
 
 # the lingering task's period, short so its first run begins soon after start
@@ -772,8 +800,11 @@ fun serve_hosted(context: ptr, active: *call.Call) exchange.ServiceStatus {
 
 # a registered application, not yet started, whose readiness first answers
 # pending and whose drain finishes unless `stuck`. a `lingering` one runs the
-# task facility and starts a task that never ends
+# task facility, starts a task that never ends, and listens on a port already
+# taken, so no worker starts
 fun boot_hosted(harness: *Harness, stuck: bool, lingering: bool) bool {
+    harness.taken = false;
+    if (lingering && !take_port(harness)) { ret false; }
     harness.local     = false;
     harness.hosted    = true;
     harness.tasked    = lingering;
@@ -1030,21 +1061,24 @@ test tasks__unopened_thread_refuses_start_and_closes_clean {
     ret 0;
 }
 
-# a start that fails while a periodic task's run is in flight has no drain
-# window: the run is abandoned at once, and the application stops only after,
-# so the task thread never steps it once `stop` has run (#439)
+# a worker that fails to start leaves no drain window: the periodic task's run
+# in flight is abandoned at once, and the started application drains, then
+# stops, after it, so the task thread never steps a run once `stop` has run
+# (#439)
 test tasks__failed_start_drains_before_hosted_stop {
     var harness: Harness;
     harness.started = composition.START_OK;
     if (boot_hosted(?harness, false, true)) { ret 1; }
     val phases:  *Phases                = ?harness.phases;
     val stopped: composition.StopReport = supervisor.stop(?harness.supervising);
+    tcp.listener_close(?harness.holder);
     bundle.release(?harness.heap, ?harness.anchors);
     if (!task.unregister_secrets(harness.secrets)) { ret 2; }
-    if (harness.started != composition.START_RUNTIME || atomic.load(?phases.in_flight) == 0) {
-        ret 3;
-    }
-    if (phases.stops != 1 || atomic.load(?phases.after_stop) != 0)          { ret 4; }
-    if (stopped.tasks_abandoned != 1 || stopped.reason != lifecycle.FAILED) { ret 5; }
+    if (!harness.taken || harness.started == composition.START_OK
+        || phases.starts == 0 || atomic.load(?phases.in_flight) == 0) { ret 3; }
+    if (phases.stops != 1 || atomic.load(?phases.after_stop) != 0) { ret 4; }
+    # the application drained, and before it stopped
+    if (phases.drains != 1 || !phases.drained_at_stop)                       { ret 5; }
+    if (stopped.tasks_abandoned != 1 || stopped.applications_abandoned != 0) { ret 6; }
     ret 0;
 }
