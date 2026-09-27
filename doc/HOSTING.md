@@ -4,7 +4,7 @@ hedge hosts applications in-process. A hosted application is Mach code linked in
 
 This document is the **host contract**: the part of hedge's public surface a hosted application, or a binding that adapts a framework to hedge, may depend on. It says which items the contract is made of, what hedge promises about each, and what it asks of the code it hosts. Anything it does not name is internal to hedge, even when it is declared `pub`.
 
-This is **host contract version 1.4**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), version 1.2 added background tasks ([Background tasks](#background-tasks)), version 1.3 reports where the listeners bound ([Where the listeners bound](#where-the-listeners-bound)), and version 1.4 lets a handler upgrade its connection ([Upgrades](#upgrades)).
+This is **host contract version 1.5**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), version 1.2 added background tasks ([Background tasks](#background-tasks)), version 1.3 reported where the listeners bound ([Where the listeners bound](#where-the-listeners-bound)), version 1.4 let a handler upgrade its connection ([Upgrades](#upgrades)), and version 1.5 adds secrets for hosted code ([Secrets](#secrets)).
 
 ## Roles
 
@@ -62,9 +62,16 @@ Of these records, a program writes the fields of `Request` and reads those of `R
 
 Of these records, a program writes the fields of `Spec`, `Options` and `Resolver`, and reads those of `Run`, `Draft`, `Lease` and `Report`. `Tasks`, `Handle` and `Secrets` are hedge's.
 
+**`hedge.secret`: secrets for hosted code** (see [Secrets](#secrets))
+
+- borrowing: `Source`, `source`, `borrow`, `UseFun`, `Borrow` and its values (`BORROW_OK`, `BORROW_MISSING`, `BORROW_REFUSED`, `BORROW_INVALID`), `name_valid`, `MAX_SECRET_BYTES`, `MAX_NAME_BYTES`
+- providers: `Provider`, `ProvideFun`, `Providers`, `no_providers`, `register_provider`, `unregister_provider`, `MAX_PROVIDERS`
+
+Of these records, a program writes the fields of `Provider`. `Source` and `Providers` are hedge's.
+
 **Process assembly.** hedge has no single entry point that runs a process around a registry yet, so an embedding program assembles one from these items (see [Running a process](#running-a-process)):
 
-- `hedge.composition`: `Options` (its `applications` and `tasks`), `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`, `Bound`, `bound_count`, `bound`
+- `hedge.composition`: `Options` (its `applications`, `tasks` and `providers`), `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`, `Bound`, `bound_count`, `bound`
 - `hedge.supervisor`: `Supervisor`, `Loader`, `make`, `attach_reloads`, `start`, `run`, `stop`, `request_stop`, `request_reload`
 - `hedge.config.loader`: `Resolver`, `ResolveFun`, `Capabilities`, `build`
 - `hedge.config.schema`: `Graph`, `Diagnostics`, `Diagnostic`, `reset_diagnostics`, `text`, `TRANSPORT_TCP`, `TRANSPORT_QUIC`, `TRANSPORT_LOCAL`, `PROTOCOL_HTTP1`, `PROTOCOL_HTTP2`, `PROTOCOL_HTTP3`
@@ -75,7 +82,7 @@ Of these records, a program writes the fields of `Spec`, `Options` and `Resolver
 
 Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, the `Bound` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
 
-Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, `allow_tunnel`, `tunnel_owner`, `release_to_tunnel`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
+Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, `allow_tunnel`, `tunnel_owner`, `release_to_tunnel`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), the rest of `hedge.secret` (`resolve`, `clear`, and the per-generation store composition keeps), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
 
 ## The handler contract
 
@@ -224,11 +231,11 @@ What hosted code receives from hedge today:
 - **Through the lifecycle**: when to start, a readiness check in the process's health, and a drain deadline.
 - **Outbound HTTPS**: a client for requests to other services, verified against anchors the application chooses. See [Outbound HTTPS](#outbound-https).
 - **Background tasks**: work on its own schedule on a thread hedge owns, with snapshots handlers read without waiting. See [Background tasks](#background-tasks).
-- **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Resolver` in `composition.Options.telemetry.secrets` for the configuration's `os` and `application` secret providers, and a log sink in `.telemetry.downstream` that receives hedge's own records.
+- **Secrets**: the secrets the configuration grants the application, borrowed by name from any thread. See [Secrets](#secrets).
+- **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Resolver` in `composition.Options.telemetry.secrets` for the administration credential's `os` and `application` secret providers, a `secret.Providers` in `.providers` for the secrets hosted code borrows, and a log sink in `.telemetry.downstream` that receives hedge's own records.
 
 Not yet supplied to hosted code:
 
-- **Secrets.** The secrets a configuration declares are resolved for hedge's own use, the administration credential. Hosted code has no way to borrow one, except a background task through the resolver the embedding program gave the task facility.
 - **Configuration.** Hosted code does not read hedge's configuration. What it is told is its registered name and the limits above.
 - **Telemetry.** Hosted code cannot write to hedge's log or metrics, or add health checks beyond the readiness check hedge registers for it.
 
@@ -331,6 +338,43 @@ A facility holds at most `MAX_TASKS` tasks, and registration is refused with `ST
 
 **Telemetry.** `task.report` returns a task's runs by outcome (`completed`, `failed`, `abandoned`), the triggers that coalesced, the last and the longest run's duration, when the last completed run ended (`success_age_ns` gives its age), whether a run is running or queued, the sequence of the current snapshot, and the last failure's detail (`report_error`). Runs abandoned at drain are reported to the operator and to telemetry with component `tasks`.
 
+## Secrets
+
+`hedge.secret` lends hosted code the secrets its configuration grants it. The configuration declares each secret once, in a `[secret]` table, and gives each application the ones it may borrow, under names of its own, in its section (see [Secrets for hosted applications](CONFIGURATION.md#secrets-for-hosted-applications)):
+
+```toml
+[secret.db-password]
+provider = "file"
+key = "/run/secrets/db"
+
+[application.site.secrets]
+database = "db-password"
+```
+
+The embedding program names each application for borrowing once it has registered it, and hands the `Source` to the application's code the way it hands it anything else, typically through the handler's or the lifecycle's `ctx`:
+
+```mach
+var site: secret.Source;
+secret.source(?registry, "site", ?site);
+
+fun connect(context: ptr, password: contracts.SecretBytes) bool {
+    # password.data and password.len are valid for this call only
+    ret open_database(context::*Database, password);
+}
+
+if (secret.borrow(site, view.view("database", 8), connect, (?db)::ptr) != secret.BORROW_OK) {
+    # BORROW_MISSING: nothing is granted under that name
+}
+```
+
+**Scope.** A `Source` names one registered application, and a borrow through it reaches that application's grants and no other's. A name that is not granted to it is `BORROW_MISSING`, whether or not another application holds one by that name, so two applications may use the same name for different secrets. `source` refuses a name the registry does not hold.
+
+**Borrowing.** `borrow(source, name, use, use_ctx)` copies the secret into secret-typed scratch storage, hands it to `use` as `contracts.SecretBytes` for that call only, and clears the storage once `use` returns. `use` answers whether it could use the secret, and a `false` is `BORROW_REFUSED`. A name that is not 1 to `MAX_NAME_BYTES` printable characters without spaces is `BORROW_INVALID`, and so is every borrow before the process has started or after it has stopped. Any thread may borrow, a handler, a lifecycle step or a task, and a borrow never waits on anything but a short lock, since the secret was resolved before its generation was published.
+
+**Secret-typed end to end.** A secret lives in secret-welded memory from the time it is resolved to the time it is cleared, and hosted code sees it only as `^u8`. A `file` secret is read straight into that memory. `os` and `application` secrets come from a `Provider`, whose `provide(ctx, provider, key, output, capacity)` writes the secret the configuration names by `provider` and `key` into secret `output` and returns its length, or -1 for none. A provider mentions a secret in its callback type, so it cannot be erased to `ptr`: the embedding program registers it with `register_provider` into a bounded table (`MAX_PROVIDERS`), and hands hedge the public `Providers` handle in `composition.Options.providers`. `unregister_provider` is refused while hedge is resolving through it. A secret leaves secret-typed memory only where its consumer declassifies it (`:>`) into its own sink, as `outbound.secret_header` does for a request header, and the consumer clears that sink.
+
+**Generations.** Every configuration generation resolves the secrets it grants before it is published, and a secret that cannot be resolved refuses the generation, at startup or at a reload. A borrow reads the generation the process has published. A reload resolves every grant again, beside the ones borrows read now, and the process switches to them when the reload is published, clearing the ones they replace. A secret rotated at its source therefore reaches hosted code with the next reload, and an application that keeps a copy of one, in a connection it opened with it for instance, renews it when its lifecycle or its own schedule says so.
+
 ## Memory rules
 
 - **The registry** and its slot storage, every registered `name`, and every `ctx` of a handler or lifecycle stay live and unchanged from registration until `supervisor.stop` returns. hedge only reads them after startup.
@@ -338,6 +382,7 @@ A facility holds at most `MAX_TASKS` tasks, and registration is refused with `ST
 - **Nothing per request outlives the exchange.** A handler that keeps anything past its request copies it into memory it owns, and synchronizes it as the concurrency rule above requires.
 - **A step's `detail`** is read before the step returns and never kept, so it may point at the application's own storage.
 - **The trace context and the waker** are valid for the exchange and no longer.
+- **A `Source`** is valid while the registry it came from is, and holds no secret. A secret handed to `use` is valid for that call and no longer, and a program that keeps one copies it into secret-typed memory it owns and clears. A registered `Provider` and its `ctx` stay live and unchanged until it is unregistered, which is after `supervisor.stop` returns.
 - **The task facility** and its `Options` stay where they were made, and every registered task's `name`, `state` and snapshot `slots` stay live, until `supervisor.stop` returns. A `Lease`'s bytes are valid until it is released, and a `Draft`'s until it is committed or discarded.
 
 ## Cancellation rules
