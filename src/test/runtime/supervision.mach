@@ -13,7 +13,10 @@ use hedge.generation;
 use hedge.lifecycle;
 use hedge.listener;
 use hedge.service;
+use hosting: hedge.service.laurel;
 use hedge.supervisor;
+use telemetry_health: hedge.telemetry.health;
+use site_fixture:     hedge.test.laurel;
 use hedge.test.runtime.wire;
 use hedge.worker;
 use http.core.exchange;
@@ -22,6 +25,7 @@ use http.core.message;
 use http.core.status;
 use std.allocator;
 use std.allocator.page;
+use std.chrono.duration;
 use std.filesystem;
 use io_error:     std.io.error;
 use io_lifecycle: std.io.lifecycle;
@@ -36,6 +40,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -72,6 +77,13 @@ rec Harness {
     cached:   bool;
     origin:   i64;
     failures: i64;
+    # whether the one service is a laurel application whose lifecycle the
+    # supervisor drives
+    hosted:   bool;
+    site:     site_fixture.Site;
+    adapter:  hosting.Adapter;
+    slots:    [1]service.Application;
+    registry: service.Applications;
 }
 
 val CACHED_BODY: str = "a response every worker reads back from the one disk cache\n";
@@ -162,9 +174,15 @@ fun configure(graph: *schema.Graph, body: str, cached: bool, local_address: str)
 }
 
 fun seal(candidate: *generation.Generation, id: u64, body: str, cached: bool,
-    local_address: str, diagnostics: *schema.Diagnostics) bool {
+    local_address: str, hosted: bool, diagnostics: *schema.Diagnostics) bool {
     if (!generation.make_candidate(candidate, id)) { ret false; }
     configure(?candidate.graph, body, cached, local_address);
+    if (hosted) {
+        val site: *schema.Service = ?candidate.graph.services[0];
+        site.kind = schema.SERVICE_LAUREL;
+        schema.set_text(?site.target, "site");
+        schema.clear_text(?site.content_type);
+    }
     schema.reset_diagnostics(diagnostics);
     ret generation.seal(candidate, diagnostics, nil, (0::usize)::generation.ConstructFun);
 }
@@ -176,7 +194,7 @@ fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Gene
     val candidate: *generation.Generation = ?harness.generations[target];
     atomic.fetch_add(?harness.loads, 1);
     if (!seal(candidate, id, harness.next_body, harness.cached, local_address(harness),
-        ?harness.diagnostics)) {
+        harness.hosted, ?harness.diagnostics)) {
         ret nil;
     }
     if (harness.move_listener) {
@@ -245,13 +263,21 @@ fun boot(harness: *Harness, cached: bool) bool {
     if (cached && (!ensure_dir("out") || !ensure_dir(CACHE_ROOT))) { ret false; }
     val initial: *generation.Generation = ?harness.generations[0];
     if (!seal(initial, 1, "hello from one\n", cached, local_address(harness),
-        ?harness.diagnostics)) { ret false; }
+        harness.hosted, ?harness.diagnostics)) { ret false; }
     var options: composition.Options = composition.default_options();
     options.native = service.Factory{ctx: (harness)::ptr, build: origin_factory};
+    if (harness.hosted) {
+        # registered assembled and not started: the supervisor starts it
+        if (!hosting.make(?harness.adapter, ?harness.site.application)
+            || !service.make_applications(?harness.registry, ?harness.slots[0], 1)
+            || !hosting.register(?harness.registry, "site", ?harness.adapter, 0)) { ret false; }
+        options.applications = ?harness.registry;
+    }
     # two workers, which on a platform whose reuseport balances share the port
     val started: composition.StartReport = composition.start_process(harness.composed,
         ?harness.heap, ?initial.graph, initial.id, ?harness.diagnostics, options, 2);
     if (started.status != composition.START_OK) { ret false; }
+    harness.site.phases.health = ?harness.composed.observability.runtime.health;
     if (!supervisor.make(?harness.supervising, harness.composed, ?harness.heap, true)
         || !supervisor.attach_reloads(?harness.supervising, initial,
         supervisor.Loader{context: (harness)::ptr, load: load})) { ret false; }
@@ -372,7 +398,8 @@ fun published(harness: *Harness, id: u64) bool {
 
 test workers__serve_reload_and_stop {
     var harness: Harness;
-    harness.local = false;
+    harness.local  = false;
+    harness.hosted = false;
     if (!boot(?harness, false)) { ret 1; }
     if (!fetch(?harness, "hello from one")) {
         finish(?harness);
@@ -482,7 +509,8 @@ fun published_fills(harness: *Harness, count: u64) bool {
 # one at a time first, and every request after that is a hit (#329)
 test disk_cache__shared_across_workers {
     var harness: Harness;
-    harness.local = false;
+    harness.local  = false;
+    harness.hosted = false;
     if (!boot(?harness, true)) { ret 1; }
     var path: usize = 0;
     for (path < PATHS) {
@@ -539,6 +567,7 @@ test local_listener__handed_off_and_served {
         ret 0;
     }
     var harness: Harness;
+    harness.hosted = false;
     if (!name_local(?harness))  { ret 1; }
     if (!boot(?harness, false)) { ret 2; }
     var answered: usize = 0;
@@ -565,5 +594,70 @@ test local_listener__handed_off_and_served {
     if (first.serving.rejected != 0 || second.serving.rejected != 0) { ret 8; }
     if (listener.snapshot(?first.serving.owner).leaked_descriptors != 0
         || listener.snapshot(?second.serving.owner).leaked_descriptors != 0) { ret 9; }
+    ret 0;
+}
+
+# a hosted laurel application, assembled but not started, whose readiness first
+# answers not ready and whose drain finishes unless `stuck`
+fun boot_hosted(harness: *Harness, stuck: bool) bool {
+    harness.local  = false;
+    harness.hosted = true;
+    if (!site_fixture.assemble_site(?harness.site, opt[duration.Duration].none{})) {
+        ret false;
+    }
+    harness.site.phases.not_ready = 1;
+    harness.site.phases.stuck     = stuck;
+    ret boot(harness, false);
+}
+
+# the supervisor polls the application's readiness into the process's
+fun ready_eventually(harness: *Harness) bool {
+    var rounds: usize = 0;
+    for (rounds < PUBLISH_ROUNDS) {
+        if (telemetry_health.snapshot(?harness.composed.observability.runtime.health).ready) {
+            ret true;
+        }
+        os.sleep(PUBLISH_PAUSE);
+        rounds = rounds + 1;
+    }
+    ret false;
+}
+
+# the supervisor starts a hosted application before the process accepts,
+# polls it ready, and on shutdown drains it to completion before it stops it
+# and before the process's stop returns (#393)
+test hosted_application__started_ready_drained_stopped {
+    var harness: Harness;
+    if (!boot_hosted(?harness, false)) { ret 1; }
+    val phases: *site_fixture.Phases = ?harness.site.phases;
+    val ready:  bool                 = ready_eventually(?harness);
+    val served: bool                 = fetch_request(?harness,
+        "GET /orders/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1");
+    val stopped: composition.StopReport = finish(?harness);
+    if (phases.starts != 1 || phases.accepting_at_start) { ret 2; }
+    if (!ready || phases.readies < 2)                    { ret 3; }
+    if (!served || harness.site.probe.order != 42)       { ret 4; }
+    if (!stopped.stopped || stopped.reason == lifecycle.FAILED
+        || stopped.reason == lifecycle.DEADLINE || stopped.cleanup_failures != 0
+        || stopped.applications_abandoned != 0) { ret 5; }
+    # readiness had gone before the drain, which finished before the stop
+    if (phases.drains != 1 || !phases.drained || phases.ready_at_drain
+        || phases.stops != 1 || !phases.drained_at_stop) { ret 6; }
+    ret 0;
+}
+
+# a drain still pending at the drain deadline is abandoned, reported in the stop
+# report, and the application is stopped all the same
+test hosted_application__drain_overrun_abandoned {
+    var harness: Harness;
+    if (!boot_hosted(?harness, true)) { ret 1; }
+    val phases:  *site_fixture.Phases   = ?harness.site.phases;
+    val ready:   bool                   = ready_eventually(?harness);
+    val stopped: composition.StopReport = finish(?harness);
+    if (!ready) { ret 2; }
+    if (stopped.applications_abandoned != 1 || stopped.reason != lifecycle.DEADLINE
+        || stopped.cleanup_failures != 0) { ret 3; }
+    if (phases.drains < 2 || phases.drained || phases.stops != 1) { ret 4; }
     ret 0;
 }
