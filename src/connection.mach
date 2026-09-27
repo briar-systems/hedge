@@ -147,11 +147,19 @@ pub rec Storage {
     h2_sessions: storage.Table[h2.Session];
     chunks:      storage.Chunks;
     worker:      usize;
+    # tunnels this worker's connections opened, the ones that ended, and of
+    # those the ones cut while their owner still ran them
+    tunnels_opened:    u64;
+    tunnels_ended:     u64;
+    tunnels_abandoned: u64;
 }
 
 pub fun make_storage(shared: *Storage, a: *A.Allocator, worker: usize) bool {
     if (shared == nil || worker >= secure.MAX_TABLES) { ret false; }
-    shared.worker = worker;
+    shared.worker            = worker;
+    shared.tunnels_opened    = 0;
+    shared.tunnels_ended     = 0;
+    shared.tunnels_abandoned = 0;
     ret storage.make_table[h2.Session](?shared.h2_sessions, a)
         && storage.make_chunks(?shared.chunks, a);
 }
@@ -173,6 +181,8 @@ pub rec Config {
     memory_budgets:      memory.Budgets;
     # how long a connection may wait on memory before it is shed
     memory_wait_ns: u64;
+    # how long a tunnel's bytes may stop moving before it is cut, zero for never
+    tunnel_timeout_ns: u64;
 }
 
 pub fun config_from(graph: *schema.Graph) Config {
@@ -206,7 +216,8 @@ pub fun config_from(graph: *schema.Graph) Config {
         prologue_timeout_ns: graph.timeouts.handshake_ms * 1000000,
         call_memory_bytes:   graph.limits.call_memory_bytes,
         memory_budgets:      split,
-        memory_wait_ns:      graph.timeouts.header_ms * 1000000};
+        memory_wait_ns:      graph.timeouts.header_ms * 1000000,
+        tunnel_timeout_ns:   graph.timeouts.tunnel_ms * 1000000};
 }
 
 # the exchange limits a service sees must admit everything the parser will accept,
@@ -356,6 +367,23 @@ pub rec Connection {
     exchange_call_released: bool;
     secure_operation:       operation.Operation;
     proxy_scratch:          [PROXY_SCRATCH_BYTES]u8;
+    # the tunnel a 101 or a 2xx to CONNECT leaves: reported by the engine with
+    # the bytes past the request, opened once the upgrading exchange settled,
+    # and live while its owner runs it
+    tunnel_owner:      call.TunnelOwner;
+    tunnel:            call.Tunnel;
+    tunnel_reported:   bool;
+    tunnel_open:       bool;
+    tunnel_live:       bool;
+    tunnel_stirred:    bool;
+    tunnel_scope:      cancel.Scope;
+    tunnel_scope_live: bool;
+    # monotonic nanoseconds, zero for none: when the owner asked to be entered
+    # again, and when its bytes have stood still too long
+    tunnel_wake_ns:     u64;
+    tunnel_deadline_ns: u64;
+    # the drain deadline the connection was signalled with, zero before
+    drain_at_ns: u64;
 }
 
 fun no_slot() usize {
@@ -531,6 +559,10 @@ fun settle(context: ptr, token_context: usize, completion: io_runtime.Completion
             ret;
         }
         advance(owner, now);
+        ret;
+    }
+    if (route_tunnel_io(owner, ?settled, now)) {
+        if (runnable(owner)) { advance(owner, now); }
         ret;
     }
     # complete_io settles the transport slot and advances the engine, so the event
@@ -750,6 +782,15 @@ pub fun make(
     owner.rejecting              = false;
     owner.rejected_slot          = no_slot();
     owner.service_pending        = false;
+    owner.tunnel_owner           = call.no_tunnel_owner();
+    owner.tunnel_reported        = false;
+    owner.tunnel_open            = false;
+    owner.tunnel_live            = false;
+    owner.tunnel_stirred         = false;
+    owner.tunnel_scope_live      = false;
+    owner.tunnel_wake_ns         = 0;
+    owner.tunnel_deadline_ns     = 0;
+    owner.drain_at_ns            = 0;
     owner.initialized            = false;
     # every connection is a cancel root of its own. mach-http's transport requires
     # it, and it means no two connections, let alone two workers, share a lock
@@ -827,6 +868,9 @@ pub fun pending_work(owner: *Connection) bool {
     }
     if (owner.h2_session != h2.NO_SESSION) { ret h2.pending_work(h2_of(owner)); }
     if (!owner.engine_live)                { ret false; }
+    # a tunnel whose owner was woken, or one waiting only to be handed over
+    if (owner.tunnel_live)                                                   { ret owner.tunnel_stirred; }
+    if (owner.tunnel_reported && !owner.tunnel_open && !owner.exchange_live) { ret true; }
     # bytes the engine holds to write and has not submitted
     if (owner.engine.write_length != 0 && !owner.engine.write_pending) { ret true; }
     # a request the engine handed over, waiting only for its exchange to start
@@ -839,8 +883,10 @@ pub fun pending_work(owner: *Connection) bool {
     ret owner.exchange_live && owner.service_pending && call.stirred(?owner.active_call);
 }
 
-# the index an HTTP/1 connection's wakes name its one exchange's call by
+# the index an HTTP/1 connection's wakes name its one exchange's call by, and
+# the one they name its tunnel by
 val EXCHANGE_CALL: u32 = 0;
+val TUNNEL_CALL:   u32 = 1;
 
 # a wake named `woken_call` of this connection: its parked service is re-entered
 # on the next step. an HTTP/2 connection names the stream's slot
@@ -853,6 +899,7 @@ pub fun stir(owner: *Connection, woken_call: u32) {
     if (woken_call == EXCHANGE_CALL && owner.exchange_live && owner.service_pending) {
         call.stir(?owner.active_call, call.WAIT_WAKE);
     }
+    if (woken_call == TUNNEL_CALL && owner.tunnel_live) { owner.tunnel_stirred = true; }
 }
 
 # whether a close left waiting would progress with nothing else happening: the
@@ -887,6 +934,12 @@ pub fun next_deadline(owner: *Connection, output: *u64) bool {
     if (owner.memory_deadline_ns != 0) {
         found = earliest(found, owner.memory_deadline_ns, output);
     }
+    if (owner.tunnel_live && owner.tunnel_wake_ns != 0) {
+        found = earliest(found, owner.tunnel_wake_ns, output);
+    }
+    if (owner.tunnel_live && owner.tunnel_deadline_ns != 0) {
+        found = earliest(found, owner.tunnel_deadline_ns, output);
+    }
     var engine_at: u64 = 0;
     if (owner.exchange_live && owner.service_pending
         && call.wait_deadline(?owner.active_call, ?engine_at)) {
@@ -920,6 +973,16 @@ pub fun expire(owner: *Connection, now_ns: u64) {
     }
     if (owner.request_scope_live && owner.exchange_live) {
         cancel.expire(?owner.request_scope, clock.from_ns(now_ns));
+    }
+    if (owner.tunnel_live && owner.tunnel_wake_ns != 0 && now_ns >= owner.tunnel_wake_ns) {
+        owner.tunnel_wake_ns = 0;
+        owner.tunnel_stirred = true;
+    }
+    # a tunnel whose bytes stood still past the tunnel timeout is cut
+    if (owner.tunnel_live && owner.tunnel_deadline_ns != 0
+        && now_ns >= owner.tunnel_deadline_ns) {
+        abandon_tunnel(owner);
+        owner.state = FAILED;
     }
     # shedding a connection that cannot get memory is deliberate: under
     # pressure the pool is kept for the connections that can still finish
@@ -1346,6 +1409,7 @@ fun make_exchange(owner: *Connection, slot: usize, now: time.Instant) u8 {
     if (!call.bind(?owner.active_call, ?owner.exchange, ?owner.memory, ?owner.trace,
         owner.plan.generation, owner.listener_name, owner.vouched,
         hedge_wake.for_call(owner.waker, EXCHANGE_CALL))) { ret SETUP_BIND; }
+    call.allow_tunnel(?owner.active_call);
     owner.active_slot            = slot;
     owner.exchange_live          = true;
     owner.exchange_cancelling    = false;
@@ -1523,7 +1587,15 @@ fun settle_exchange(owner: *Connection, now: time.Instant) bool {
     if (!owner.exchange_live)                                   { ret true; }
     if (exchange.finish(?owner.exchange) != exchange.FINISH_OK) { ret false; }
     release_stage(owner);
-    val finalized: bool = call.release(?owner.active_call);
+    # a written 101, or 2xx to a CONNECT, leaves the connection to the tunnel the
+    # service named, which keeps the request arena
+    var finalized: bool             = false;
+    val named:     call.TunnelOwner = call.tunnel_owner(?owner.active_call);
+    if (owner.engine.state == connection.TUNNEL && named.drive::usize != 0) {
+        owner.tunnel_owner = named;
+        finalized          = call.release_to_tunnel(?owner.active_call);
+    }
+    or { finalized = call.release(?owner.active_call); }
     budget.release(owner.budgets, ?owner.charge);
     connection.release(?owner.engine, owner.active_slot, now);
     owner.exchange_live = false;
@@ -1735,9 +1807,17 @@ fun apply(owner: *Connection, event: connection.Event, now: time.Instant) Step {
     if (event.kind == connection.EVENT_TIMED_OUT && owner.engine.memory_blocked) {
         shed_for_memory(owner);
     }
+    # reported once, with what the client sent past the request. the handoff
+    # follows once the upgrading exchange has settled
+    if (event.kind == connection.EVENT_TUNNEL) {
+        owner.tunnel_reported     = true;
+        owner.tunnel.input        = event.body;
+        owner.tunnel.input_length = event.body_length;
+        ret STEP_PROGRESS;
+    }
     if (event.kind == connection.EVENT_CLOSED || event.kind == connection.EVENT_PEER_CLOSED
         || event.kind == connection.EVENT_ERROR || event.kind == connection.EVENT_TIMED_OUT
-        || event.kind == connection.EVENT_CANCELLED || event.kind == connection.EVENT_TUNNEL) {
+        || event.kind == connection.EVENT_CANCELLED) {
         owner.state = CLOSING;
         ret STEP_DONE;
     }
@@ -1763,6 +1843,111 @@ fun apply(owner: *Connection, event: connection.Event, now: time.Instant) Step {
         ret STEP_PROGRESS;
     }
     ret STEP_PROGRESS;
+}
+
+# --- tunnels: the stream an upgrade or CONNECT leaves, run by its owner ---
+
+# whether a completion is for an operation the engine submitted, not the tunnel
+fun engine_owns(engine: *connection.Engine, token: transport.Token) bool {
+    ret (engine.read_pending && transport.token_equal(engine.read_token, token))
+        || (engine.write_pending && transport.token_equal(engine.write_token, token))
+        || (engine.shutdown_pending && transport.token_equal(engine.shutdown_token, token))
+        || (engine.close_pending && transport.token_equal(engine.close_token, token));
+}
+
+fun arm_tunnel_timeout(owner: *Connection, now: time.Instant) {
+    owner.tunnel_deadline_ns = 0;
+    if (owner.configured.tunnel_timeout_ns != 0) {
+        owner.tunnel_deadline_ns = clock.after_ns(clock.to_ns(now),
+            owner.configured.tunnel_timeout_ns);
+    }
+}
+
+fun end_tunnel_run(owner: *Connection) {
+    owner.tunnel_live          = false;
+    owner.tunnel_stirred       = false;
+    owner.tunnel_wake_ns       = 0;
+    owner.tunnel_deadline_ns   = 0;
+    owner.shared.tunnels_ended = owner.shared.tunnels_ended + 1;
+}
+
+# hedge cuts a tunnel its owner still runs: its timeout, a connection failure,
+# or the drain deadline. what the owner left in flight settles through close
+fun abandon_tunnel(owner: *Connection) {
+    if (!owner.tunnel_live) { ret; }
+    end_tunnel_run(owner);
+    owner.shared.tunnels_abandoned = owner.shared.tunnels_abandoned + 1;
+    val running: call.TunnelOwner = owner.tunnel_owner;
+    if (running.abandon::usize != 0) { running.abandon(running.ctx, ?owner.tunnel); }
+}
+
+# one turn of the tunnel's owner. once it is done the engine closes the
+# connection, gracefully after TUNNEL_DONE and abortively otherwise
+fun drive_tunnel(owner: *Connection, completion: *transport.Completion,
+    now: time.Instant) Step {
+    val running: call.TunnelOwner = owner.tunnel_owner;
+    owner.tunnel.wake_at = opt[time.Instant].none{};
+    owner.tunnel_wake_ns = 0;
+    val driven: call.TunnelStatus = running.drive(running.ctx, ?owner.tunnel, completion);
+    if (driven == call.TUNNEL_PENDING) {
+        if (sel owner.tunnel.wake_at.some) {
+            owner.tunnel_wake_ns = clock.to_ns(owner.tunnel.wake_at.some);
+            if (owner.tunnel_wake_ns == 0) { owner.tunnel_wake_ns = 1; }
+        }
+        ret STEP_BLOCKED;
+    }
+    end_tunnel_run(owner);
+    if (driven == call.TUNNEL_DONE && connection.end_tunnel(?owner.engine)) {
+        ret STEP_PROGRESS;
+    }
+    owner.state = FAILED;
+    ret STEP_ERROR;
+}
+
+# hand the connection to the owner the upgrading exchange named, or close it
+# when it named none
+fun begin_tunnel(owner: *Connection, now: time.Instant) Step {
+    owner.tunnel_open = true;
+    if (owner.tunnel_owner.drive::usize == 0
+        || !operation_ok(cancel.make_child(?owner.tunnel_scope, ?owner.operation_root,
+        opt[time.Instant].none{}))) {
+        owner.state = CLOSING;
+        ret STEP_DONE;
+    }
+    owner.tunnel_scope_live = true;
+    val input:        *u8   = owner.tunnel.input;
+    val input_length: usize = owner.tunnel.input_length;
+    owner.tunnel = call.Tunnel{
+        transport:    ?owner.channel,
+        scope:        ?owner.tunnel_scope,
+        input:        input,
+        input_length: input_length,
+        allocator:    ?owner.memory.allocator,
+        waker:        hedge_wake.for_call(owner.waker, TUNNEL_CALL),
+        wake_at:      opt[time.Instant].none{},
+        draining:     owner.drain_at_ns != 0,
+        drain_at:     clock.from_ns(owner.drain_at_ns),
+    };
+    owner.tunnel_live           = true;
+    owner.tunnel_stirred        = false;
+    owner.shared.tunnels_opened = owner.shared.tunnels_opened + 1;
+    arm_tunnel_timeout(owner, now);
+    ret drive_tunnel(owner, nil, now);
+}
+
+# a tunnel's own operations go to its owner, or settle here once it is gone.
+# true when the completion was the tunnel's
+fun route_tunnel_io(owner: *Connection, settled: *transport.Completion,
+    now: time.Instant) bool {
+    if (!owner.tunnel_open || engine_owns(?owner.engine, settled.token)) { ret false; }
+    if (owner.tunnel_live) {
+        if (settled.status == transport.IO_COMPLETE && settled.count != 0) {
+            arm_tunnel_timeout(owner, now);
+        }
+        drive_tunnel(owner, settled, now);
+    }
+    or { transport.complete(?owner.channel, settled); }
+    ret true;
 }
 
 # advancing the engine is how a request body reaches its terminal state, so the
@@ -1794,7 +1979,7 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
                     owner.state = CLOSING;
                 }
             }
-            or {
+            or (!route_tunnel_io(owner, ?settled, now)) {
                 val event: connection.Event = connection.complete_io(?owner.engine,
                     ?settled, now);
                 if (runnable(owner)) { apply(owner, event, now); }
@@ -1820,6 +2005,17 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         owner.state = CLOSING;
         ret STEP_DONE;
     }
+    # a live tunnel is its owner's until it ends, entered only when woken
+    if (owner.tunnel_live) {
+        if (!owner.tunnel_stirred) {
+            owner.last_step = STEP_BLOCKED;
+            ret STEP_BLOCKED;
+        }
+        owner.tunnel_stirred = false;
+        val driven: Step = drive_tunnel(owner, nil, now);
+        owner.last_step = driven;
+        ret driven;
+    }
     # a parked service is entered again only once what it waits on has moved;
     # until then the connection only keeps its inbound side going
     if (owner.exchange_live && owner.service_pending) {
@@ -1841,6 +2037,11 @@ pub fun step(owner: *Connection, now: time.Instant) Step {
         val inbound: Step = pump_inbound(owner, now);
         owner.last_step = inbound;
         ret inbound;
+    }
+    if (owner.tunnel_reported && !owner.tunnel_open) {
+        val opened: Step = begin_tunnel(owner, now);
+        owner.last_step = opened;
+        ret opened;
     }
     if (owner.rejecting) {
         val answered: Step = pump_rejection(owner, now);
@@ -1907,8 +2108,23 @@ pub fun funded(owner: *Connection) {
     secure.resume(owner.session);
 }
 
-pub fun begin_graceful(owner: *Connection) bool {
+# `drain_at_ns` is the monotonic instant the drain may be cut at, the earliest
+# the connection has been told. a tunnel is told, and winds down on its owner's
+# terms before then
+pub fun drain_toward(owner: *Connection, drain_at_ns: u64) {
+    if (owner == nil || !owner.initialized)                         { ret; }
+    if (owner.drain_at_ns != 0 && owner.drain_at_ns <= drain_at_ns) { ret; }
+    owner.drain_at_ns = drain_at_ns;
+    if (owner.tunnel_live) {
+        owner.tunnel.draining = true;
+        owner.tunnel.drain_at = clock.from_ns(drain_at_ns);
+        owner.tunnel_stirred  = true;
+    }
+}
+
+pub fun begin_graceful(owner: *Connection, drain_at_ns: u64) bool {
     if (owner == nil || !owner.initialized) { ret false; }
+    drain_toward(owner, drain_at_ns);
     # a connection still in its prologue has no engine to signal, so it is
     # simply not admitted any further
     if (!owner.engine_live) {
@@ -1985,6 +2201,10 @@ fun close_h1_engine(owner: *Connection) bool {
         }
         i = i + 1;
     }
+    # what a tunnel left in flight settles before the engine's storage goes
+    if (owner.tunnel_open && transport.snapshot(?owner.channel).lifecycle.outstanding != 0) {
+        ret false;
+    }
     if (!connection.destroy(?owner.engine)) { ret false; }
     owner.engine_live = false;
     owner.active_slot = connection.NO_SLOT;
@@ -2001,7 +2221,9 @@ fun pump_secure_close(owner: *Connection) bool {
     if (owner.h2_session != h2.NO_SESSION) {
         h2.complete_io(h2_of(owner), ?settled, clock.instant());
     }
-    or { connection.complete_io(?owner.engine, ?settled, clock.instant()); }
+    or (!route_tunnel_io(owner, ?settled, clock.instant())) {
+        connection.complete_io(?owner.engine, ?settled, clock.instant());
+    }
     ret true;
 }
 
@@ -2035,6 +2257,7 @@ fun close_h2(owner: *Connection) h2.ReleaseStatus {
 pub fun close(owner: *Connection) bool {
     if (owner == nil || !owner.initialized || owner.state == CLOSED) { ret false; }
     owner.close_wait = CLOSE_READY;
+    abandon_tunnel(owner);
     if (!owner.close_started) {
         owner.close_started = true;
         owner.state         = CLOSING;
@@ -2100,6 +2323,12 @@ pub fun close(owner: *Connection) bool {
     if (owner.request_scope_live) {
         cancel.destroy(?owner.request_scope);
         owner.request_scope_live = false;
+    }
+    # the arena a tunnel kept goes back once nothing of its owner's can run
+    if (owner.tunnel_open && !call.reset_memory(?owner.memory, 0)) { owner.close_failed = true; }
+    if (owner.tunnel_scope_live) {
+        if (!operation_ok(cancel.destroy(?owner.tunnel_scope))) { owner.close_failed = true; }
+        owner.tunnel_scope_live = false;
     }
     if (!operation_ok(cancel.destroy(?owner.engine_scope))
         || !operation_ok(cancel.destroy(?owner.control_scope))
