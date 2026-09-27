@@ -4,7 +4,7 @@ hedge hosts applications in-process. A hosted application is Mach code linked in
 
 This document is the **host contract**: the part of hedge's public surface a hosted application, or a binding that adapts a framework to hedge, may depend on. It says which items the contract is made of, what hedge promises about each, and what it asks of the code it hosts. Anything it does not name is internal to hedge, even when it is declared `pub`.
 
-This is **host contract version 1.1**. Version 1.1 adds the outbound HTTPS client ([Outbound HTTPS](#outbound-https)).
+This is **host contract version 1.2**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), and version 1.2 adds background tasks ([Background tasks](#background-tasks)).
 
 ## Roles
 
@@ -43,15 +43,27 @@ These are the items of the host contract, by module. Types and constants from ma
 
 - the loop: `Loop`, `open_loop`, `client`, `turn`, `fetch`, `close_loop`
 - the client: `Client`, `set_user_agent`, `route`, `Origin`, `no_origin`, `secure_origin`, `cleartext_origin`, `close_kept`, `MAX_CONNECTIONS`, `MAX_ROUTES`, `IDLE_NS`
-- requests and responses: `Request`, `request`, `Response`, `DEFAULT_TIMEOUT_NS`, `MIN_TIMEOUT_NS`
+- requests and responses: `Request`, `request`, `secret_header`, `Response`, `DEFAULT_TIMEOUT_NS`, `MIN_TIMEOUT_NS`
 - the exchange: `Exchange`, `make_exchange`, `begin`, `poll`, `deadline`, `response`, `finish`, `idle`, `releasing`, `destroy_exchange`, `stage`, `cause`, `tls_failure`
 - outcomes: `Status`, `OK`, `PENDING`, `FAILED`, `INVALID`, `Stage` and its values (`IDLE`, `QUEUED`, `RESOLVING`, `CONNECTING`, `HANDSHAKING`, `WRITING`, `READING`, `COMPLETE`, `BROKEN`), `Cause` and its values (`CAUSE_NONE`, `CAUSE_ADDRESS`, `CAUSE_CONNECT`, `CAUSE_WRITE`, `CAUSE_READ`, `CAUSE_PROTOCOL`, `CAUSE_TOO_LARGE`, `CAUSE_TIMEOUT`, `CAUSE_TRUST`, `CAUSE_HANDSHAKE`, `CAUSE_UNTRUSTED`, `CAUSE_REQUEST`, `CAUSE_CAPACITY`)
 
 Of these records, a program writes the fields of `Request` and reads those of `Response`. `Loop`, `Client`, `Exchange` and `Origin` are hedge's.
 
+**`hedge.task`: background tasks** (see [Background tasks](#background-tasks))
+
+- the facility: `Tasks`, `Options`, `default_options`, `make`, `MAX_TASKS`, `MIN_SNAPSHOT_SLOTS`, `MAX_SNAPSHOT_SLOTS`, `MAX_NAME_BYTES`, `MAX_ERROR_BYTES`, `MAX_SECRET_BYTES`, `MAX_RUN_EXCHANGES`, `STEP_INTERVAL_NS`
+- secrets: `Resolver`, `ResolveFun`, `Secrets`, `no_secrets`, `register_secrets`, `unregister_secrets`, `MAX_RESOLVERS`
+- registering and triggering: `Spec`, `StepFun`, `Handle`, `register`, `trigger`, `name_valid`, `spec_valid`
+- a run: `Run`, `Cause` and its values (`CAUSE_PERIOD`, `CAUSE_TRIGGER`), `begin`, `borrow`, `UseFun`, `Borrow` and its values (`BORROW_OK`, `BORROW_MISSING`, `BORROW_REFUSED`, `BORROW_INVALID`), `Draft`, `draft`, `commit`, `discard`, `publish`
+- reading: `Lease`, `read`, `release`, `lease_view`
+- reporting: `Report`, `report`, `report_error`, `success_age_ns`, `draining`, `Outcome` and its values (`OUTCOME_NONE`, `OUTCOME_COMPLETED`, `OUTCOME_FAILED`, `OUTCOME_ABANDONED`)
+- outcomes: `Status` and its values (`STATUS_OK`, `STATUS_INVALID`, `STATUS_DRAINING`, `STATUS_FULL`, `STATUS_EMPTY`, `STATUS_COALESCED`, `STATUS_BUSY`)
+
+Of these records, a program writes the fields of `Spec`, `Options` and `Resolver`, and reads those of `Run`, `Draft`, `Lease` and `Report`. `Tasks`, `Handle` and `Secrets` are hedge's.
+
 **Process assembly.** hedge has no single entry point that runs a process around a registry yet, so an embedding program assembles one from these items (see [Running a process](#running-a-process)):
 
-- `hedge.composition`: `Options`, `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`
+- `hedge.composition`: `Options` (its `applications` and `tasks`), `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`
 - `hedge.supervisor`: `Supervisor`, `Loader`, `make`, `attach_reloads`, `start`, `run`, `stop`, `request_stop`, `request_reload`
 - `hedge.config.loader`: `Resolver`, `ResolveFun`, `Capabilities`, `build`
 - `hedge.config.schema`: `Graph`, `Diagnostics`, `Diagnostic`, `reset_diagnostics`, `text`
@@ -62,7 +74,7 @@ Of these records, a program writes the fields of `Request` and reads those of `R
 
 Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
 
-Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
+Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
 
 ## The handler contract
 
@@ -126,6 +138,7 @@ What each overrun or failure costs:
 | drain overruns its deadline | operation `drain`, code `deadline` | counted in `StopReport.applications_abandoned`, reason `DEADLINE` (exit 75) |
 | stop fails | operation `stop` | counted as a cleanup failure |
 | stop overruns `stop_ms` | operation `stop`, code `deadline` | counted as abandoned and as a cleanup failure |
+| a task run overruns the drain deadline | component `tasks`, operation `drain`, code `deadline` | counted in `StopReport.tasks_abandoned`, reason `DEADLINE` (exit 75) |
 
 Every failure is also printed to stderr with the application's name and the step's `detail`.
 
@@ -169,12 +182,12 @@ What hosted code receives from hedge today:
 - **Per request, through the call**: the request arena (`call.allocator_of`), the exchange's cancellation scope and deadline (`call.scope`, `call.deadline`, `call.cancelled`), the request's trace context (`active.telemetry`, a W3C trace context hedge parsed or started), and a waker (`call.waker`). hedge logs every request it serves, including the ones a hosted handler answers.
 - **Through the lifecycle**: when to start, a readiness check in the process's health, and a drain deadline.
 - **Outbound HTTPS**: a client for requests to other services, verified against anchors the application chooses. See [Outbound HTTPS](#outbound-https).
+- **Background tasks**: work on its own schedule on a thread hedge owns, with snapshots handlers read without waiting. See [Background tasks](#background-tasks).
 - **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Resolver` in `composition.Options.telemetry.secrets` for the configuration's `os` and `application` secret providers, and a log sink in `.telemetry.downstream` that receives hedge's own records.
 
 Not yet supplied to hosted code:
 
-- **Background tasks.** A supervisor-owned task facility is [#305](https://github.com/briar-systems/hedge/issues/305). Until it lands, work that runs on its own schedule belongs to the application's own lifecycle components.
-- **Secrets.** The secrets a configuration declares are resolved for hedge's own use, the administration credential. Hosted code has no way to borrow one.
+- **Secrets.** The secrets a configuration declares are resolved for hedge's own use, the administration credential. Hosted code has no way to borrow one, except a background task through the resolver the embedding program gave the task facility.
 - **Configuration.** Hosted code does not read hedge's configuration. What it is told is its registered name and the limits above.
 - **Telemetry.** Hosted code cannot write to hedge's log or metrics, or add health checks beyond the readiness check hedge registers for it.
 
@@ -219,17 +232,63 @@ for (outbound.close_loop(?loop) == outbound.PENDING) {}
 bundle.release(?heap, ?anchors);
 ```
 
-**Threads.** A loop, its client and the exchanges begun on it belong to the thread that opened the loop, and only that thread turns it or touches them. `turn` with a wait and `fetch` block that thread on the loop's own runtime, so a loop runs on a thread the application owns, started from its lifecycle's `start` and joined from its `stop`. It never runs in a handler, which must not block its worker, or in a lifecycle step, which must not block the supervisor. What the thread fetches reaches handlers as the concurrency rule above requires. The steps themselves never wait: `begin`, `poll` and `turn(loop, 0)` return at once, which is what lets a loop share a thread with other work. A supervisor-owned task thread with its own loop is [#305](https://github.com/briar-systems/hedge/issues/305).
+**Threads.** A loop, its client and the exchanges begun on it belong to the thread that opened the loop, and only that thread turns it or touches them. `turn` with a wait and `fetch` block that thread on the loop's own runtime, so a loop runs on a thread the application owns, started from its lifecycle's `start` and joined from its `stop`. It never runs in a handler, which must not block its worker, or in a lifecycle step, which must not block the supervisor. What the thread fetches reaches handlers as the concurrency rule above requires. The steps themselves never wait: `begin`, `poll` and `turn(loop, 0)` return at once, which is what lets a loop share a thread with other work. The background task thread is such a thread, with a loop of its own that every task reaches (see [Background tasks](#background-tasks)).
 
 **Trust.** An `https` request is verified against the anchors `open_loop` was given, for the host the URL names, typically a system bundle loaded with mach-tls's `tls.cert.bundle`. Without anchors it fails with `CAUSE_TRUST` and never leaves the process. A chain that does not verify, or a certificate that does not name the host, fails with `CAUSE_UNTRUSTED`, and the request is never sent. `route` sends one host's requests to a fixed endpoint, still verified for the URL's host, or in cleartext to a front end that terminates TLS for it, which is only ever a decision the application makes.
 
-**Requests.** The client writes `host`, `content-length` and, unless the request carries one, `user-agent` (`hedge` by default, or `set_user_agent`). A request that supplies `host`, `content-length`, `transfer-encoding`, `connection`, `te`, `upgrade`, `trailer`, `keep-alive` or `proxy-connection`, an invalid field, a body on a `GET` or `HEAD`, or more than the exchange's request buffer holds fails with `CAUSE_REQUEST`. Methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS`.
+**Requests.** A credential goes into a header with `secret_header(field, name, prefix, secret, storage, capacity)`, which writes `prefix` and then the secret-typed `secret` into `storage`, the one place the client declassifies a secret. The client writes `host`, `content-length` and, unless the request carries one, `user-agent` (`hedge` by default, or `set_user_agent`). A request that supplies `host`, `content-length`, `transfer-encoding`, `connection`, `te`, `upgrade`, `trailer`, `keep-alive` or `proxy-connection`, an invalid field, a body on a `GET` or `HEAD`, or more than the exchange's request buffer holds fails with `CAUSE_REQUEST`. Methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS`.
 
 **Responses.** A response is framed by `content-length`, by chunked transfer coding, which is decoded in place, or by the peer closing. Interim `1xx` responses are passed over. A response larger than the request's `max_response_bytes`, or the exchange's response buffer when that is zero, fails with `CAUSE_TOO_LARGE`, and one whose head exceeds 16 KiB or the exchange's field limits does too. An exchange that has not completed by its deadline, `timeout_ns` after `begin` and never less than `MIN_TIMEOUT_NS`, fails with `CAUSE_TIMEOUT`. The two limits are separate causes, as are resolution (`CAUSE_ADDRESS`), connection (`CAUSE_CONNECT`), a malformed response (`CAUSE_PROTOCOL`) and a handshake that failed for a reason other than trust (`CAUSE_HANDSHAKE`).
 
 **Connections.** After a response that delimits itself, from a peer that speaks HTTP/1.1 and did not ask to close, the connection is kept for the next exchange to the same host, port and scheme, for up to `IDLE_NS`. A client keeps at most `MAX_CONNECTIONS`, and gives up the one unused longest to reach another host. A kept connection the peer has closed meanwhile is found out by the exchange that reuses it, which reconnects once when its request is `replay_safe` (by default, when its method is idempotent). TLS sessions are drawn from one bounded table for the whole process, hedge's own certificate manager included, and an exchange that finds it full fails with `CAUSE_CAPACITY`.
 
 **Memory.** The loop and every exchange stay where they were made while in use. The anchors stay alive and unchanged while the loop is open. Every byte a `Request` points at, its headers included, stays alive until the exchange completes. A `Response` points into the exchange's buffers and is valid until `finish`. After `finish` a connection that was cancelled may still write into those buffers until its operations land, which `releasing` reports: a `begin` in the meantime is held until they have, and `destroy_exchange` refuses until then. Every exchange is finished before `close_loop`, which answers `PENDING` until the loop's connections and lookups have settled.
+
+## Background tasks
+
+`hedge.task` runs work on its own schedule next to request handling: a periodic refresh, an on-demand rebuild a handler can fire, and a snapshot every handler reads without waiting. It is one facility for the whole process. The embedding program makes it and hands it to hedge, and hands it to its hosted code as well, typically through a handler's or lifecycle's `ctx`, and hosted code registers its tasks in it:
+
+```mach
+# a module-level record: a resolver is secret welded, so it never erases to ptr
+var vault_resolver: task.Resolver = task.Resolver{ctx: nil, resolve: resolve_from_vault};
+
+var secrets: task.Secrets;
+task.register_secrets(?vault_resolver, ?secrets);
+var tasks: task.Tasks;
+var options: task.Options = task.default_options();
+options.trust   = ?anchors.bundle.store;
+options.secrets = secrets;
+task.make(?tasks, options);
+
+var process: composition.Options = composition.default_options();
+process.tasks = ?tasks;
+```
+
+**Where tasks run.** The supervisor starts one task thread before any hosted application starts, and joins it after the last one has stopped. The thread has an io runtime of its own, which an outbound loop waits on, so a task never runs on a worker or on the supervisor's thread, and a task that misbehaves cannot stall signals, reloads or ACME. Tasks are process-scoped: they are registered once, and a configuration reload never touches them. A process run with `supervisor.start`, `run` and `stop` runs its tasks. The facility is given only through `composition.Options.tasks`, and a process without one has no task thread.
+
+**Registering.** `task.register(tasks, spec, handle)` takes a `Spec` and returns an opaque `Handle`:
+
+- `name` is a printable identifier of at most `MAX_NAME_BYTES`, for reports.
+- `state` is the task's own state, and `step` its function. `state` is erased to `ptr`, so it holds public data only (see Secrets below).
+- `period_ns`, when not zero, runs the task that long after the facility first sees it, then that long after each run ends. A task without a period runs only when triggered, and one that wants an immediate first run triggers it.
+- `timeout_ns`, when not zero, bounds each run.
+- `slots`, `slot_bytes` and `slot_count` are the task's snapshot storage: `slot_count` slots of `slot_bytes` each, from `MIN_SNAPSHOT_SLOTS` to `MAX_SNAPSHOT_SLOTS`. A task with `slot_count` 0 publishes nothing.
+
+A facility holds at most `MAX_TASKS` tasks, and registration is refused with `STATUS_DRAINING` once drain has begun. Every bound is a compile-time constant. A task may be registered before the process starts, from a lifecycle's `start`, or later.
+
+**Steps.** A run is a sequence of non-blocking steps. `step(state, run)` answers a `service.Step`: `STEP_DONE` when the run is complete, `STEP_PENDING` to be stepped again, or `STEP_FAILED` with a `detail` that fails the run. A step that is pending is stepped again when the task thread's loop delivers something, and at least every `STEP_INTERVAL_NS`. A step never blocks, so one task cannot hold up another. `Run` is valid only during the step. It carries the run's cancellation scope, its deadline, its cause (`CAUSE_PERIOD` or `CAUSE_TRIGGER`), a sequence number, and the task thread's outbound loop. The scope is cancelled when drain begins and times out at the run's deadline, and a run still pending once its deadline has passed fails.
+
+**Triggering.** `task.trigger` may be called from any thread, a handler's included, and it never waits on a run. It is single-flight: it returns `STATUS_OK` when it queues a run, and `STATUS_COALESCED` when a run is already queued, in which case that run serves both callers. A trigger while a run is in flight queues one follow-up, so a change that arrives mid-run is never missed and at most one run is ever in flight. Once drain begins, every trigger is refused with `STATUS_DRAINING`.
+
+**Snapshots.** A run publishes with `task.draft`, writing into the slot it returns, and `task.commit`, or with `task.publish` for bytes it already has. The committed slot becomes the task's current snapshot. `task.discard` gives an uncommitted draft back, and a run that ends with one open has it discarded. `task.read` never waits on a run: it returns a `Lease` on the current snapshot, or `STATUS_EMPTY` before the first publish. A lease is a reference on its slot until `task.release`, and a leased slot is never reused, so a handler reads a stable snapshot for as long as it holds the lease. A publish needs a slot that is neither current, leased nor drafting. When every slot is held, `draft` and `publish` return `STATUS_FULL` and the current snapshot stays in place, so a task whose refresh fails keeps serving its last good snapshot.
+
+**Secrets.** mach refuses to erase anything that reaches secret-typed data to `ptr`, so task state, which is erased, holds no secret. A `Resolver` writes the named secret into secret-typed (`^u8`) storage, and since its callback type mentions a secret it cannot be erased either. So the embedding program registers it with `task.register_secrets` into a bounded table (`MAX_RESOLVERS`), and the facility holds only the public `Secrets` handle that call returns, in `Options.secrets`. `task.borrow(run, name, use, use_ctx)` has the resolver fill secret scratch storage of at most `MAX_SECRET_BYTES`, hands it to `use` as `contracts.SecretBytes` for that call only, and clears it once `use` returns. Only a run in flight borrows. `task.unregister_secrets` is refused while a borrow is in flight. A secret an outbound request must carry, such as a bearer token, reaches public memory at exactly one place: `outbound.secret_header` declassifies it (`:>u8`) into header storage the task owns, marks the field sensitive, and the task clears that storage once the exchange is finished.
+
+**Outbound HTTPS.** `task.begin(run, exchange, request)` begins a request on the task thread's loop, verified against `Options.trust` (see [Outbound HTTPS](#outbound-https)). Its timeout is cut to the run's deadline, and the facility finishes the exchange when the run ends, however it ended, so a run that fails or is abandoned never holds a connection open. The step advances the exchange with `outbound.poll` and reads it with `outbound.response` as usual, and routes a host with `outbound.route(outbound.client(run.loop), ...)`. A run begins at most `MAX_RUN_EXCHANGES` at once. The exchange and its buffers are the task's.
+
+**Drain and stop.** When shutdown begins, the supervisor drains the facility toward the same deadline as the workers and the hosted applications. Drain cancels every running task's scope, refuses further triggers and registrations, and drops queued runs. Running tasks keep being stepped until they end or the deadline passes, and a run still in flight at the deadline is **abandoned**: it is never stepped again, its exchanges are finished, its report says `OUTCOME_ABANDONED`, and it is counted in `StopReport.tasks_abandoned`. After the hosted applications have stopped, the facility is stopped, which needs every lease released, and the thread closes its loop within `server.timeouts.stop_ms`. A lease still held, or a loop that did not close in time, counts as a cleanup failure. `task.draining` says whether drain has begun.
+
+**Telemetry.** `task.report` returns a task's runs by outcome (`completed`, `failed`, `abandoned`), the triggers that coalesced, the last and the longest run's duration, when the last completed run ended (`success_age_ns` gives its age), whether a run is running or queued, the sequence of the current snapshot, and the last failure's detail (`report_error`). Runs abandoned at drain are reported to the operator and to telemetry with component `tasks`.
 
 ## Memory rules
 
@@ -238,6 +297,7 @@ bundle.release(?heap, ?anchors);
 - **Nothing per request outlives the exchange.** A handler that keeps anything past its request copies it into memory it owns, and synchronizes it as the concurrency rule above requires.
 - **A step's `detail`** is read before the step returns and never kept, so it may point at the application's own storage.
 - **The trace context and the waker** are valid for the exchange and no longer.
+- **The task facility** and its `Options` stay where they were made, and every registered task's `name`, `state` and snapshot `slots` stay live, until `supervisor.stop` returns. A `Lease`'s bytes are valid until it is released, and a `Draft`'s until it is committed or discarded.
 
 ## Cancellation rules
 

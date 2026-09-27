@@ -256,7 +256,7 @@ worker or timer.
 
 ## Web applications
 
-Hosted applications receive only the common HTTP service exchange, through the handler contract, and a lifecycle the supervisor drives. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities to them through the same contract.
+Hosted applications receive only the common HTTP service exchange, through the handler contract, and a lifecycle the supervisor drives. Hedge supplies background tasks to them through the same contract (see [HOSTING.md](HOSTING.md#background-tasks)), and may supply configuration, secrets, storage and telemetry the same way.
 
 Applications cannot reach listener or connection internals. A reload rebuilds the services that reach an application without restarting the application, and without invalidating exchanges already executing in the old generation. [Hosting applications](HOSTING.md) is the host contract.
 
