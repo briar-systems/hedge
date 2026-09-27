@@ -8,6 +8,7 @@ use http.core.body;
 use http.core.exchange;
 use http.core.field;
 use http.core.message;
+use http.core.transport;
 use std.allocator;
 use std.allocator.page;
 use std.chrono.time;
@@ -343,6 +344,84 @@ pub rec Call {
     wait:             Wait;
     wait_deadline_ns: u64;
     stirred:          Wait;
+    # whether the connection can hand itself to a tunnel, and the owner the
+    # service named for one
+    tunnels:      bool;
+    tunnel_owner: TunnelOwner;
+}
+
+# what a tunnel's owner reports. a pending tunnel is entered again later
+pub def TunnelStatus: u8;
+pub val TUNNEL_PENDING: TunnelStatus = 1;
+pub val TUNNEL_DONE:    TunnelStatus = 2;
+pub val TUNNEL_FAILED:  TunnelStatus = 3;
+
+# the byte stream an upgraded exchange leaves, as its owner sees it
+#
+# transport: the ordered byte stream the owner reads and writes, under scope.
+#            over HTTP/1.1 it is the connection. only hedge shuts it down or
+#            closes it, so it can as well be one stream of a multiplexed one
+# input:     bytes the client sent past the request, valid while the tunnel
+#            lives
+# allocator: the upgrading request's arena, kept for the tunnel's life
+# waker:     wakes this tunnel, as a call's waker wakes its service
+# wake_at:   an instant on hedge.clock the owner asks to be entered again at,
+#            cleared before every entry
+# draining:  hedge is shutting the tunnel's generation down, and cuts it at
+#            drain_at, an instant on hedge.clock
+pub rec Tunnel {
+    transport:    *transport.Transport;
+    scope:        *cancel.Scope;
+    input:        *u8;
+    input_length: usize;
+    allocator:    *allocator.Allocator;
+    waker:        hedge_wake.Waker;
+    wake_at:      opt[time.Instant];
+    draining:     bool;
+    drain_at:     time.Instant;
+}
+
+# drive is entered at the handoff, again with each completion of an operation
+# the owner submitted, and after each wake, wake_at or the start of the drain,
+# with a nil completion. TUNNEL_DONE and TUNNEL_FAILED leave no operation in
+# flight and hand the stream back, to be ended gracefully or abortively. abandon
+# is called exactly once for a tunnel hedge cuts while drive last returned
+# TUNNEL_PENDING, and hedge settles what the owner left in flight
+pub def TunnelFun:        fun(ptr, *Tunnel, *transport.Completion) TunnelStatus;
+pub def TunnelAbandonFun: fun(ptr, *Tunnel);
+
+pub rec TunnelOwner {
+    ctx:     ptr;
+    drive:   TunnelFun;
+    abandon: TunnelAbandonFun;
+}
+
+pub fun no_tunnel_owner() TunnelOwner {
+    ret TunnelOwner{ctx: nil, drive: (0::usize)::TunnelFun,
+        abandon: (0::usize)::TunnelAbandonFun};
+}
+
+# the connection says it can hand itself to a tunnel once this call settles
+pub fun allow_tunnel(call: *Call) {
+    if (call != nil && call.bound) { call.tunnels = true; }
+}
+
+# name who runs the stream a 101 to an upgrade, or a 2xx to a CONNECT, leaves
+# once that response is written and the exchange has settled. false where the
+# connection cannot hand itself over, or once an owner is named. a response that
+# upgrades nothing never enters it
+pub fun tunnel(call: *Call, owner: TunnelOwner) bool {
+    if (call == nil || !call.bound || !call.entered || call.settled || !call.tunnels
+        || call.tunnel_owner.drive::usize != 0 || owner.drive::usize == 0) {
+        ret false;
+    }
+    call.tunnel_owner = owner;
+    ret true;
+}
+
+pub fun tunnel_owner(call: *Call) TunnelOwner {
+    if (call == nil || !call.bound) { ret no_tunnel_owner(); }
+    ret call.tunnel_owner;
 }
 
 # what a pending service waits on. a service that reports itself pending names
@@ -392,6 +471,8 @@ pub fun bind(
     call.bound                = true;
     call.entered              = false;
     call.settled              = false;
+    call.tunnels              = false;
+    call.tunnel_owner         = no_tunnel_owner();
     ret true;
 }
 
@@ -691,7 +772,7 @@ pub fun releasable(call: *Call) bool {
         || state == exchange.FAILED_STATE;
 }
 
-fun finish_call(call: *Call, complete: bool) bool {
+fun finish_call(call: *Call, complete: bool, keep_memory: bool) bool {
     call.settled = true;
     record_end(call, complete);
     if (call.observed && call.observer.end::usize != 0) {
@@ -703,20 +784,29 @@ fun finish_call(call: *Call, complete: bool) bool {
         call.finalizer = no_finalizer();
         finalized      = finalizer.finish(finalizer.ctx, call);
     }
+    if (keep_memory) { ret finalized; }
     val reset: bool = reset_memory(call.memory, 0);
     ret finalized && reset;
 }
 
 pub fun release(call: *Call) bool {
     if (!releasable(call) || call.settled) { ret false; }
-    ret finish_call(call, call.exchange.state == exchange.COMPLETE_STATE);
+    ret finish_call(call, call.exchange.state == exchange.COMPLETE_STATE, false);
+}
+
+# release a call whose exchange upgraded into its named tunnel: it settles as
+# release does, but its arena stays for the tunnel, whose connection resets it
+pub fun release_to_tunnel(call: *Call) bool {
+    if (!releasable(call) || call.settled || call.tunnel_owner.drive::usize == 0
+        || call.exchange.state != exchange.COMPLETE_STATE) { ret false; }
+    ret finish_call(call, true, true);
 }
 
 # a permanently invalid exchange still releases call-owned observers, recorders,
 # finalizers and arena exactly once before its transport owner is discarded
 pub fun abandon(call: *Call) bool {
     if (call == nil || !call.bound || call.settled) { ret false; }
-    ret finish_call(call, false);
+    ret finish_call(call, false, false);
 }
 
 #[testing]
