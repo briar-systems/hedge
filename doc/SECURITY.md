@@ -63,9 +63,11 @@ Certificate private keys support reload without exposing mutable key state to re
 Automatically managed certificate and account keys, and the ephemeral
 TLS-ALPN-01 key, are secret-typed for their whole life. Mach welds secret
 storage transitively: a record that holds it, or a pointer to one, cannot be
-cast to the untyped `ptr`. Every seam ACME keys must reach is such a `ptr`: the
-challenge provider's context, the certification-request signer's context, and
-the worker threads' start argument, from which the manager is reachable.
+cast to the untyped `ptr`. `mach-acme` types the challenge provider's and the
+certification-request signer's contexts, so those seams take a `*Key` directly.
+The worker threads' start argument is still a `ptr`, and the manager that owns
+the keys is reachable from it, so a key record the manager holds must stay
+public.
 
 So the secret half of every key lives in one bounded ring of secret slots in
 `src/acme/keys.mach`, and a `keys.Key` is the public half (point and SPKI) plus
@@ -81,22 +83,28 @@ Key material becomes public at exactly one site, a `:>` declassify in
 `keys.publish`, which produces the durable form. It is forced: `mach-acme`'s
 file store frames and digests public bytes. The published scalar and the
 document encoded around it are wiped as soon as the write returns, and the
-file is created owner-only. The only other crossing is inbound: a key file is
-read into public memory, because `mach-std` reads files there, lifted into its
-slot by `keys.adopt`, and the read buffer is wiped. The material is never
-rendered in diagnostics.
+file is created owner-only. A key file is read back with
+`std.filesystem.read_secret`, straight into secret storage. Its frame (magic,
+version, kind and length) is read in the clear, its digest is checked over the
+secret payload without a branch on it, and `keys.adopt` copies the scalar into
+its slot. The read storage is wiped when it is released, so the material is
+never public on the way in. It is never rendered in diagnostics.
 
 QUIC listener keys (the CID, stateless reset and Retry/NEW_TOKEN keys) are
 secret-typed for their whole life in `src/protocol/quic/keys.mach`. By default
 they are drawn by the secret CSPRNG straight into that storage. An operator's
 key file (`quic_keys`) is the one way they enter from outside. It is refused
-when group or other can read it. It is read into public memory, because
-`mach-std` reads files there, and each key is decoded from it straight into
-secret storage by `src/protocol/quic/keyfile.mach`. The read buffer is wiped
-before the read returns. Nothing writes the keys out or declassifies them. The
-one `:>` in that path is the verdict of a constant-time comparison between a
-key the file holds and the key already in force, which a reload needs in order
-to keep a key it holds unchanged and to refuse one it would change.
+when group or other can read it. It is read with
+`std.filesystem.read_secret`, straight into secret storage, and
+`src/protocol/quic/keyfile.mach` parses it there, decoding each key's hex
+without a branch on a digit. The parser declassifies only the file's layout:
+which bytes separate words and lines, whether a word is a keyword, the numbers
+(codepoints, host ID lengths and generations), and one verdict per key on
+whether it is well-formed hex. The read storage is wiped when it is released.
+Nothing writes the keys out or declassifies them. Beyond the layout, the one
+`:>` in that path is the verdict of a constant-time comparison between a key
+the file holds and the key already in force, which a reload needs in order to
+keep a key it holds unchanged and to refuse one it would change.
 
 ## Reporting
 
