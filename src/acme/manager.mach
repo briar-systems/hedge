@@ -20,16 +20,15 @@ use acme.renewal;
 use acme.renewal_info;
 use acme.storage;
 use crypto.contracts;
-use hedge.acme.anchors;
 use hedge.acme.challenge;
 use hedge.acme.durable;
 use hedge.acme.issue;
 use hedge.acme.keys;
 use hedge.acme.session;
-use hedge.acme.transport;
-use hedge.acme.wire;
 use hedge.clock;
 use hedge.config.schema;
+use hedge.outbound;
+use hedge.outbound.wire;
 use hedge.telemetry;
 use hedge.wake;
 use http.core.field;
@@ -50,6 +49,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
+use tls.cert.bundle;
 
 #[testing]
 fun present(outcome: res[bool, io_error.Error]) bool {
@@ -92,15 +92,20 @@ pub val ADVISING:   State = 4;
 pub val STOPPED:    State = 5;
 
 pub rec Manager {
-    store:             durable.Store;
-    session:           session.Session;
-    engine:            transport.Transport;
-    authority_anchors: anchors.Anchors;
-    run:               issue.Issue;
-    table:             challenge.Http01;
-    zone:              challenge.Dns01;
-    challenge_kind:    u8;
-    provider:          ch.Provider;
+    store:    durable.Store;
+    session:  session.Session;
+    client:   outbound.Client;
+    exchange: outbound.Exchange;
+    link:     session.Link;
+    # the anchors an https authority is verified against, drawn from `heap`
+    anchors:        bundle.Loaded;
+    anchors_live:   bool;
+    heap:           *allocator.Allocator;
+    run:            issue.Issue;
+    table:          challenge.Http01;
+    zone:           challenge.Dns01;
+    challenge_kind: u8;
+    provider:       ch.Provider;
 
     request:  [REQUEST_BYTES]u8;
     response: [RESPONSE_BYTES]u8;
@@ -218,22 +223,35 @@ fun copy_text(target: *u8, capacity: usize, source: *schema.Text,
     ret true;
 }
 
+pub val USER_AGENT: str = "hedge-acme/0.1";
+
+# the authority is reached at the address its name resolves to once, here, so
+# the supervisor's thread never waits on a resolver afterwards. an authority
+# configured with an origin is reached in cleartext through that front end.
 fun configure_authority(manager: *Manager, a: *allocator.Allocator,
     graph: *schema.Graph) bool {
+    var target: wire.Target;
+    if (!wire.split_url(view.view(?manager.directory_url[0],
+        manager.directory_len), ?target)) { ret false; }
     if (graph.acme.origin.len == 0) {
-        val loaded: anchors.Status = anchors.load_bundle(
-            ?manager.authority_anchors, a, schema.text(?graph.acme.trust));
-        if (loaded != anchors.OK || !transport.set_trust(?manager.engine,
-            anchors.store(?manager.authority_anchors))) { ret false; }
-        var target: wire.Target;
-        if (!wire.split_url(view.view(?manager.directory_url[0],
-            manager.directory_len), ?target) || !target.secure) { ret false; }
-        var endpoint: ip.Endpoint;
-        if (!transport.resolve_endpoint(target.host, target.port, ?endpoint)) {
+        if (!target.secure) { ret false; }
+        # a bundle with skipped blocks still loads: the skips are the blocks
+        # this build cannot use as anchors, and at least one anchor is required
+        val loaded: bundle.Status = bundle.load(a, schema.text(?graph.acme.trust),
+            ?manager.anchors);
+        # a bundle with no usable anchor still holds its report of what it skipped
+        if (loaded == bundle.NO_ANCHORS) { bundle.release(a, ?manager.anchors); }
+        if (loaded != bundle.OK)         { ret false; }
+        manager.anchors_live = true;
+        if (!outbound.set_trust(?manager.client, ?manager.anchors.bundle.store)) {
             ret false;
         }
-        ret transport.set_origin(?manager.engine,
-            transport.secure_origin(endpoint));
+        var endpoint: ip.Endpoint;
+        if (!outbound.resolve_now(target.host, target.port, ?endpoint)) {
+            ret false;
+        }
+        ret outbound.route(?manager.client, target.host,
+            outbound.secure_origin(endpoint));
     }
     var text: [64]u8;
     if (graph.acme.origin.len >= 64) { ret false; }
@@ -245,8 +263,8 @@ fun configure_authority(manager: *Manager, a: *allocator.Allocator,
     text[graph.acme.origin.len] = 0;
     val parsed: res[ip.Endpoint, ip.ParseError] = ip.endpoint_parse((?text[0])::str);
     if (sel parsed.err) { ret false; }
-    ret transport.set_origin(?manager.engine, transport.cleartext_origin(
-        parsed.ok));
+    ret outbound.route(?manager.client, target.host,
+        outbound.cleartext_origin(parsed.ok));
 }
 
 # splits a stored chain back into its certificates. the durable record holds
@@ -422,10 +440,20 @@ pub fun open_with_tls_alpn(manager: *Manager, a: *allocator.Allocator,
     ret open_managed(manager, a, graph);
 }
 
+fun release_anchors(manager: *Manager) {
+    if (!manager.anchors_live) { ret; }
+    bundle.release(manager.heap, ?manager.anchors);
+    manager.anchors_live = false;
+}
+
 fun abort_open(manager: *Manager, session_live: bool,
-    transport_live: bool) {
-    if (session_live)   { session.release(?manager.session); }
-    if (transport_live) { transport.destroy(?manager.engine); }
+    client_live: bool) {
+    if (session_live) { session.release(?manager.session); }
+    if (client_live) {
+        outbound.destroy_exchange(?manager.exchange);
+        outbound.shutdown(?manager.client);
+    }
+    release_anchors(manager);
     keys.destroy(?manager.account);
     keys.destroy(?manager.pending_key);
     keys.destroy(?manager.active_key);
@@ -462,11 +490,17 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
     manager.agree_terms = graph.acme.terms_agreed;
     challenge.http01_reset(?manager.table);
     manager.challenge_kind = graph.acme.challenge;
-    if (!transport.make(?manager.engine, ?manager.request[0], REQUEST_BYTES,
-        ?manager.response[0], RESPONSE_BYTES, ?manager.items[0], MAX_FIELDS,
-        session.limits().response_fields, transport.literal_addresses())) {
+    manager.heap           = a;
+    manager.anchors_live   = false;
+    bundle.empty(?manager.anchors);
+    if (!outbound.make(?manager.client, outbound.literal_addresses())
+        || !outbound.set_user_agent(?manager.client, view.view(USER_AGENT, 14))
+        || !outbound.make_exchange(?manager.exchange, ?manager.request[0],
+        REQUEST_BYTES, ?manager.response[0], RESPONSE_BYTES, ?manager.items[0],
+        MAX_FIELDS, session.limits().response_fields)) {
         ret FAILED;
     }
+    manager.link = session.Link{client: ?manager.client, exchange: ?manager.exchange};
     if (!configure_authority(manager, a, graph)) {
         abort_open(manager, false, true);
         ret INVALID;
@@ -525,7 +559,7 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
 fun context(manager: *Manager) issue.Context {
     var value: issue.Context;
     value.session         = ?manager.session;
-    value.engine          = ?manager.engine;
+    value.link            = ?manager.link;
     value.account_key     = ?manager.account;
     value.certificate_key = ?manager.pending_key;
     value.provider        = manager.provider;
@@ -637,7 +671,7 @@ pub fun deadline(manager: *Manager, at_ns: *u64) bool {
     if (manager == nil || !manager.live || manager.state == STOPPED) { ret false; }
     val now_ns: u64 = clock.to_ns(clock.instant());
     var at:     T.Instant;
-    if (transport.deadline(?manager.engine, ?at)) {
+    if (outbound.deadline(?manager.exchange, ?at)) {
         @at_ns = clock.to_ns(at);
         ret true;
     }
@@ -666,13 +700,17 @@ pub fun deadline(manager: *Manager, at_ns: *u64) bool {
 pub fun poll(context_pointer: ptr, now: T.Time) bool {
     val manager: *Manager = context_pointer::*Manager;
     if (manager == nil || !manager.live) { ret false; }
-    if (manager.state == INSTALLING)     { ret true; }
-    if (manager.state == STOPPED)        { ret true; }
+    # between runs the authority is weeks away, so nothing is kept open to it
+    if (manager.state == INSTALLING || manager.state == IDLE) {
+        outbound.close_kept(?manager.client);
+    }
+    if (manager.state == INSTALLING) { ret true; }
+    if (manager.state == STOPPED)    { ret true; }
     if (manager.state == DISCOVERING) {
         val progress: session.Status = session.poll(?manager.session,
-            ?manager.engine, ?manager.account, clock.instant());
+            ?manager.link, ?manager.account, clock.instant());
         if (progress == session.PENDING) { ret true; }
-        session.complete(?manager.session, ?manager.engine);
+        session.complete(?manager.session, ?manager.link);
         if (progress != session.OK) {
             record_failure(manager, session.failure(?manager.session), now);
             ret true;
@@ -744,11 +782,11 @@ pub fun poll(context_pointer: ptr, now: T.Time) bool {
 pub fun attach_driver(manager: *Manager, driver: *net_async.Driver,
     plane: wake.Waker) bool {
     if (manager == nil || !manager.live) { ret false; }
-    ret transport.attach(?manager.engine, driver, plane);
+    ret outbound.attach(?manager.client, driver, plane);
 }
 
 pub fun attached(manager: *Manager) bool {
-    ret manager != nil && manager.live && transport.attached(?manager.engine);
+    ret manager != nil && manager.live && outbound.attached(?manager.client);
 }
 
 # gives up the exchange in flight and releases its socket. PENDING until the
@@ -758,8 +796,11 @@ pub fun quiesce(manager: *Manager) Status {
     issue.cancel(?manager.run);
     session.release(?manager.session);
     manager.state = STOPPED;
-    if (!transport.finish(?manager.engine))   { ret FAILED; }
-    if (transport.releasing(?manager.engine)) { ret PENDING; }
+    if (!outbound.finish(?manager.exchange)) { ret FAILED; }
+    outbound.close_kept(?manager.client);
+    if (outbound.releasing(?manager.exchange) || !outbound.settled(?manager.client)) {
+        ret PENDING;
+    }
     ret OK;
 }
 
@@ -767,7 +808,9 @@ pub fun close(manager: *Manager) bool {
     if (manager == nil || !manager.live) { ret false; }
     issue.cancel(?manager.run);
     session.release(?manager.session);
-    if (!transport.destroy(?manager.engine)) { ret false; }
+    if (!outbound.destroy_exchange(?manager.exchange))     { ret false; }
+    if (outbound.shutdown(?manager.client) != outbound.OK) { ret false; }
+    release_anchors(manager);
     keys.destroy(?manager.account);
     keys.destroy(?manager.pending_key);
     keys.destroy(?manager.active_key);
@@ -1021,7 +1064,7 @@ test open__failure_releases_subsystems {
     schema.clear_text(?graph.acme.storage);
     var manager: Manager;
     if (open(?manager, ?a, ?graph) != INVALID) { ret 2; }
-    if (manager.live || manager.engine.live || manager.session.live
+    if (manager.live || manager.client.live || manager.session.live
         || manager.account.live || manager.pending_key.live
         || manager.active_key.live) { ret 3; }
     ret 0;

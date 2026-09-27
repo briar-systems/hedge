@@ -1,14 +1,12 @@
-# originating TLS connections to ACME authorities
+# originating TLS connections for the outbound client
 #
 # hedge terminates TLS for the connections it serves. this is the other
-# direction, and the only place hedge is a TLS client: reaching the authority
-# that issues its certificates. each certificate manager still performs one
-# exchange at a time, while an active and a superseded configuration generation
-# may each own a manager during reload.
+# direction: the connections the outbound client opens, ACME's among them.
+# every client on every thread draws its sessions from this one bounded table.
 #
 # a mach-tls client holds secret-welded storage, so a record containing one
-# cannot be erased to the untyped `ptr` that the serving plane hands every
-# subsystem. sessions therefore live in a bounded typed table and are addressed
+# cannot be erased to the untyped `ptr` that completion routing hands every
+# owner. sessions therefore live in a bounded typed table and are addressed
 # by an unwelded handle. callback contexts point only to the public channel next
 # to each session, so secret taint never crosses a `ptr`.
 #
@@ -17,11 +15,14 @@
 # come back through whatever loop owns the driver.
 #
 # each session borrows its TLS buffers from a pool of its own, because the
-# managers that originate may run on different workers and a pool is
+# clients that originate may run on different threads and a pool is
 # serialized-use. the pool's budget is twice the session's lane budget, so an
 # oversized exchange fails on its lane budget and never waits on a pool nobody
 # else can release into. a memory wake lands on the pool's ready list, and
 # `poll` resumes the stream from it.
+#
+# a slot is claimed and given back under `table`, since clients on different
+# threads share the table. a live slot belongs to the thread that claimed it.
 
 use crypto.contracts;
 use crypto.secret;
@@ -38,6 +39,7 @@ use std.memory.buffers;
 use net_async: std.net.async;
 use std.net.tcp;
 use std.sync.cancel;
+use std.sync.mutex;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -71,14 +73,14 @@ pub val WIRE_BYTES:            usize = tls_record.HEADER_SIZE + tls_record.MAX_C
 pub val HANDSHAKE_INPUT_BYTES: usize = 16384;
 # what one session's TLS lane may hold: both record buffers, the handshake, and
 # a certificate chain on the oversize path, with room to spare
-pub val SESSION_BYTES:               usize = 262144;
-pub val HANDSHAKE_OUTPUT_BYTES:      usize = 16384;
-pub val HELLO_BYTES:                 usize = 8192;
-pub val PEER_PARAMETER_BYTES:        usize = 2048;
-pub val MAX_CHAIN_BYTES:             usize = 32768;
-pub val MAX_SERVER_NAME:             usize = 253;
-val     AUTHORITY_SIGNATURE_SCHEMES: usize = 5;
-# two overlapping generations can each originate for every tls identity slot
+pub val SESSION_BYTES:          usize = 262144;
+pub val HANDSHAKE_OUTPUT_BYTES: usize = 16384;
+pub val HELLO_BYTES:            usize = 8192;
+pub val PEER_PARAMETER_BYTES:   usize = 2048;
+pub val MAX_CHAIN_BYTES:        usize = 32768;
+pub val MAX_SERVER_NAME:        usize = 253;
+val     SIGNATURE_SCHEMES:      usize = 5;
+# shared by every client in the process
 pub val MAX_SESSIONS: usize = 16;
 pub val NO_SESSION:   usize = MAX_SESSIONS;
 
@@ -160,6 +162,7 @@ var channels:   [MAX_SESSIONS]Channel;
 var sessions:   [MAX_SESSIONS]Session;
 var prepared:   bool;
 var live_count: usize;
+var table:      mutex.Mutex;
 
 pub fun no_handle() Handle {
     ret Handle{index: NO_SESSION, generation: 0};
@@ -189,7 +192,7 @@ fun clear_session(index: usize) {
     sessions[index].account_open   = false;
 }
 
-fun prepare() {
+fun prepare_locked() {
     if (prepared) { ret; }
     page.make(?heap);
     var i: usize = 0;
@@ -203,8 +206,8 @@ fun prepare() {
     prepared   = true;
 }
 
+# a slot the table was never prepared for is zeroed, so it is not live
 fun entry(handle: Handle) *Channel {
-    prepare();
     if (handle.index >= MAX_SESSIONS || handle.generation == 0) { ret nil; }
     val value: *Channel = ?channels[handle.index];
     if (!value.live || value.generation != handle.generation) { ret nil; }
@@ -212,7 +215,8 @@ fun entry(handle: Handle) *Channel {
 }
 
 fun acquire() Handle {
-    prepare();
+    mutex.lock(?table);
+    prepare_locked();
     var i: usize = 0;
     for (i < MAX_SESSIONS) {
         if (!channels[i].live) {
@@ -222,10 +226,12 @@ fun acquire() Handle {
             channels[i].generation = generation;
             channels[i].live       = true;
             live_count             = live_count + 1;
+            mutex.unlock(?table);
             ret Handle{index: i, generation: generation};
         }
         i = i + 1;
     }
+    mutex.unlock(?table);
     ret no_handle();
 }
 
@@ -234,8 +240,11 @@ pub fun capacity() usize {
 }
 
 pub fun live() usize {
-    prepare();
-    ret live_count;
+    mutex.lock(?table);
+    prepare_locked();
+    val count: usize = live_count;
+    mutex.unlock(?table);
+    ret count;
 }
 
 fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
@@ -412,7 +421,7 @@ fun configure(index: usize, trust: *cert.TrustStore) {
     value.groups                  = ?sessions[index].groups[0];
     value.group_len               = 2;
     value.signatures              = ?sessions[index].signatures[0];
-    value.signature_len           = AUTHORITY_SIGNATURE_SCHEMES;
+    value.signature_len           = SIGNATURE_SCHEMES;
     value.client_identity         = nil;
     value.entropy                 = ?sessions[index].entropy;
     value.entropy_context_size    = 0;
@@ -507,13 +516,15 @@ pub fun release(handle: Handle) bool {
         sessions[index].root_live = false;
     }
     if (!close_memory(index)) { ret false; }
+    mutex.lock(?table);
     reset_channel(value, index);
     if (live_count > 0) { live_count = live_count - 1; }
+    mutex.unlock(?table);
     ret true;
 }
 
 # begins one TLS connection over a socket the caller has already connected.
-# `trust` is the anchor set the authority is verified against; without one
+# `trust` is the anchor set the peer is verified against; without one
 # there is nothing to verify against and the connection is refused.
 pub fun begin(output: *Handle, driver: *net_async.Driver, socket: *tcp.Stream,
     server_name: view.View, trust: *cert.TrustStore, owner: ptr,
@@ -700,12 +711,12 @@ test acquire__bounded_reusable_stale_safe {
     ret 0;
 }
 
-test configure__authority_signature_schemes {
+test configure__signature_schemes {
     configure(0, nil);
     val value: tls_config.ClientConfig = sessions[0].configuration;
     if (value.signatures != ?sessions[0].signatures[0]
-        || value.signature_len != AUTHORITY_SIGNATURE_SCHEMES
-        || AUTHORITY_SIGNATURE_SCHEMES > tls_config.MAX_SIGNATURE_SCHEMES) {
+        || value.signature_len != SIGNATURE_SCHEMES
+        || SIGNATURE_SCHEMES > tls_config.MAX_SIGNATURE_SCHEMES) {
         ret 1;
     }
     if (value.signatures[0] != tls13.ED25519

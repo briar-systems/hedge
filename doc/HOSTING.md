@@ -4,7 +4,7 @@ hedge hosts applications in-process. A hosted application is Mach code linked in
 
 This document is the **host contract**: the part of hedge's public surface a hosted application, or a binding that adapts a framework to hedge, may depend on. It says which items the contract is made of, what hedge promises about each, and what it asks of the code it hosts. Anything it does not name is internal to hedge, even when it is declared `pub`.
 
-This is **host contract version 1**.
+This is **host contract version 1.1**. Version 1.1 adds the outbound HTTPS client ([Outbound HTTPS](#outbound-https)).
 
 ## Roles
 
@@ -15,7 +15,7 @@ This is **host contract version 1**.
 
 ## The contract items
 
-These are the items of the host contract, by module. Types and constants from mach-http (`http.core.*`) and std that these items take or return are those projects' own contracts and follow their versions.
+These are the items of the host contract, by module. Types and constants from mach-http (`http.core.*`), mach-tls (`tls.cert.*`) and std that these items take or return are those projects' own contracts and follow their versions.
 
 **`hedge.service`: handlers, lifecycles and the registry**
 
@@ -39,6 +39,16 @@ These are the items of the host contract, by module. Types and constants from ma
 
 **`hedge.clock`**: `instant`, `monotonic_ns`, `to_ns`, `from_ns`, `after`, `after_ns`, `between_ns`.
 
+**`hedge.outbound`: the outbound HTTPS client** (see [Outbound HTTPS](#outbound-https))
+
+- the loop: `Loop`, `open_loop`, `client`, `turn`, `fetch`, `close_loop`
+- the client: `Client`, `set_user_agent`, `route`, `Origin`, `no_origin`, `secure_origin`, `cleartext_origin`, `close_kept`, `MAX_CONNECTIONS`, `MAX_ROUTES`, `IDLE_NS`
+- requests and responses: `Request`, `request`, `Response`, `DEFAULT_TIMEOUT_NS`, `MIN_TIMEOUT_NS`
+- the exchange: `Exchange`, `make_exchange`, `begin`, `poll`, `deadline`, `response`, `finish`, `idle`, `releasing`, `destroy_exchange`, `stage`, `cause`, `tls_failure`
+- outcomes: `Status`, `OK`, `PENDING`, `FAILED`, `INVALID`, `Stage` and its values (`IDLE`, `QUEUED`, `RESOLVING`, `CONNECTING`, `HANDSHAKING`, `WRITING`, `READING`, `COMPLETE`, `BROKEN`), `Cause` and its values (`CAUSE_NONE`, `CAUSE_ADDRESS`, `CAUSE_CONNECT`, `CAUSE_WRITE`, `CAUSE_READ`, `CAUSE_PROTOCOL`, `CAUSE_TOO_LARGE`, `CAUSE_TIMEOUT`, `CAUSE_TRUST`, `CAUSE_HANDSHAKE`, `CAUSE_UNTRUSTED`, `CAUSE_REQUEST`, `CAUSE_CAPACITY`)
+
+Of these records, a program writes the fields of `Request` and reads those of `Response`. `Loop`, `Client`, `Exchange` and `Origin` are hedge's.
+
 **Process assembly.** hedge has no single entry point that runs a process around a registry yet, so an embedding program assembles one from these items (see [Running a process](#running-a-process)):
 
 - `hedge.composition`: `Options`, `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`
@@ -52,7 +62,7 @@ These are the items of the host contract, by module. Types and constants from ma
 
 Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
 
-Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry` and every module under `hedge.acme`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
+Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
 
 ## The handler contract
 
@@ -158,6 +168,7 @@ What hosted code receives from hedge today:
 
 - **Per request, through the call**: the request arena (`call.allocator_of`), the exchange's cancellation scope and deadline (`call.scope`, `call.deadline`, `call.cancelled`), the request's trace context (`active.telemetry`, a W3C trace context hedge parsed or started), and a waker (`call.waker`). hedge logs every request it serves, including the ones a hosted handler answers.
 - **Through the lifecycle**: when to start, a readiness check in the process's health, and a drain deadline.
+- **Outbound HTTPS**: a client for requests to other services, verified against anchors the application chooses. See [Outbound HTTPS](#outbound-https).
 - **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Resolver` in `composition.Options.telemetry.secrets` for the configuration's `os` and `application` secret providers, and a log sink in `.telemetry.downstream` that receives hedge's own records.
 
 Not yet supplied to hosted code:
@@ -168,6 +179,57 @@ Not yet supplied to hosted code:
 - **Telemetry.** Hosted code cannot write to hedge's log or metrics, or add health checks beyond the readiness check hedge registers for it.
 
 Each of these reaches hosted code through this contract when it lands, as a new item in a minor version of it.
+
+## Outbound HTTPS
+
+`hedge.outbound` sends HTTP/1.1 requests, over TLS for an `https` URL, and reads their responses. It is the client hedge's own certificate manager uses to reach its authority.
+
+A **loop** (`outbound.Loop`) is a runtime, name resolution and one client, opened on the thread that drives it. An **exchange** (`outbound.Exchange`) carries one request at a time, in buffers the caller owns. `begin` starts a request, `turn` waits on the loop's runtime and delivers what completed, `poll` advances the exchange, and `finish` ends it. `fetch` does all of that for one request and returns when it has completed or failed.
+
+```mach
+var anchors: bundle.Loaded;
+if (bundle.load(?heap, "/etc/ssl/certs/ca-certificates.crt", ?anchors) != bundle.OK) { ret 1; }
+var loop: outbound.Loop;
+if (!outbound.open_loop(?loop, ?anchors.bundle.store)) { ret 2; }
+
+var request:  [4096]u8;
+var response: [16384]u8;
+var items:    [64]field.Field;
+var exchange: outbound.Exchange;
+outbound.make_exchange(?exchange, ?request[0], 4096, ?response[0], 16384,
+    ?items[0], 64, field.limits(64, 16384, 128, 4096));
+
+var headers: [1]field.Field;
+headers[0] = field.Field{name: view.view("accept", 6),
+    value: view.view("application/vnd.github+json", 27), sensitive: false};
+var zen: outbound.Request = outbound.request(method.GET,
+    view.view("https://api.github.com/zen", 26));
+zen.headers      = ?headers[0];
+zen.header_count = 1;
+zen.timeout_ns   = 10000000000;
+
+if (outbound.fetch(?loop, ?exchange, zen) == outbound.OK) {
+    val answer: outbound.Response = outbound.response(?exchange);
+    # answer.status is 200 and answer.body is one line of zen
+}
+outbound.finish(?exchange);
+for (!outbound.idle(?exchange)) { outbound.turn(?loop, 10); }
+outbound.destroy_exchange(?exchange);
+for (outbound.close_loop(?loop) == outbound.PENDING) {}
+bundle.release(?heap, ?anchors);
+```
+
+**Threads.** A loop, its client and the exchanges begun on it belong to the thread that opened the loop, and only that thread turns it or touches them. `turn` with a wait and `fetch` block that thread on the loop's own runtime, so a loop runs on a thread the application owns, started from its lifecycle's `start` and joined from its `stop`. It never runs in a handler, which must not block its worker, or in a lifecycle step, which must not block the supervisor. What the thread fetches reaches handlers as the concurrency rule above requires. The steps themselves never wait: `begin`, `poll` and `turn(loop, 0)` return at once, which is what lets a loop share a thread with other work. A supervisor-owned task thread with its own loop is [#305](https://github.com/briar-systems/hedge/issues/305).
+
+**Trust.** An `https` request is verified against the anchors `open_loop` was given, for the host the URL names, typically a system bundle loaded with mach-tls's `tls.cert.bundle`. Without anchors it fails with `CAUSE_TRUST` and never leaves the process. A chain that does not verify, or a certificate that does not name the host, fails with `CAUSE_UNTRUSTED`, and the request is never sent. `route` sends one host's requests to a fixed endpoint, still verified for the URL's host, or in cleartext to a front end that terminates TLS for it, which is only ever a decision the application makes.
+
+**Requests.** The client writes `host`, `content-length` and, unless the request carries one, `user-agent` (`hedge` by default, or `set_user_agent`). A request that supplies `host`, `content-length`, `transfer-encoding`, `connection`, `te`, `upgrade`, `trailer`, `keep-alive` or `proxy-connection`, an invalid field, a body on a `GET` or `HEAD`, or more than the exchange's request buffer holds fails with `CAUSE_REQUEST`. Methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS`.
+
+**Responses.** A response is framed by `content-length`, by chunked transfer coding, which is decoded in place, or by the peer closing. Interim `1xx` responses are passed over. A response larger than the request's `max_response_bytes`, or the exchange's response buffer when that is zero, fails with `CAUSE_TOO_LARGE`, and one whose head exceeds 16 KiB or the exchange's field limits does too. An exchange that has not completed by its deadline, `timeout_ns` after `begin` and never less than `MIN_TIMEOUT_NS`, fails with `CAUSE_TIMEOUT`. The two limits are separate causes, as are resolution (`CAUSE_ADDRESS`), connection (`CAUSE_CONNECT`), a malformed response (`CAUSE_PROTOCOL`) and a handshake that failed for a reason other than trust (`CAUSE_HANDSHAKE`).
+
+**Connections.** After a response that delimits itself, from a peer that speaks HTTP/1.1 and did not ask to close, the connection is kept for the next exchange to the same host, port and scheme, for up to `IDLE_NS`. A client keeps at most `MAX_CONNECTIONS`, and gives up the one unused longest to reach another host. A kept connection the peer has closed meanwhile is found out by the exchange that reuses it, which reconnects once when its request is `replay_safe` (by default, when its method is idempotent). TLS sessions are drawn from one bounded table for the whole process, hedge's own certificate manager included, and an exchange that finds it full fails with `CAUSE_CAPACITY`.
+
+**Memory.** The loop and every exchange stay where they were made while in use. The anchors stay alive and unchanged while the loop is open. Every byte a `Request` points at, its headers included, stays alive until the exchange completes. A `Response` points into the exchange's buffers and is valid until `finish`. After `finish` a connection that was cancelled may still write into those buffers until its operations land, which `releasing` reports: a `begin` in the meantime is held until they have, and `destroy_exchange` refuses until then. Every exchange is finished before `close_loop`, which answers `PENDING` until the loop's connections and lookups have settled.
 
 ## Memory rules
 

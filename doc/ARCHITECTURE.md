@@ -277,12 +277,14 @@ per manager on the subsystem's own completion runtime, one protocol decision
 per round, and every wait expressed as a wake time. Nothing in the path blocks
 an accept or a request.
 
-An HTTPS authority is reached through a bounded table of mach-tls client
-sessions and verified for the URL's host against a configured anchor bundle.
-The typed table keeps secret-welded engine state out of callback contexts and
-allows active and superseded configuration generations to originate
-independently. A configured cleartext origin remains available for a local
-conformance authority and is never selected implicitly.
+The authority is reached through hedge's outbound client (`hedge.outbound`),
+the same facility hosted code uses, and verified for the URL's host against a
+configured anchor bundle. Every client draws its TLS sessions from one bounded
+table of mach-tls client sessions, which keeps secret-welded engine state out
+of callback contexts and lets clients on different threads, and active and
+superseded configuration generations, originate independently. A configured
+cleartext origin remains available for a local conformance authority and is
+never selected implicitly.
 
 The subsystem does not own TLS credentials. It produces a verified chain and
 its key material and reports that an installation is ready; the owner of the
