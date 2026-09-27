@@ -1,0 +1,433 @@
+# the request line and headers: HTTP/2 methods and targets, hop-by-hop
+# forwarding and the Forwarded field, trace context, and administration auth
+
+use hedge.protocol.h2;
+use hedge.proxy.forward;
+use hedge.telemetry.admin;
+use hedge.telemetry.health;
+use hedge.telemetry.trace;
+use http.core.field;
+use http.core.method;
+use http.core.target;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+use fuzz.guard;
+use fuzz.input;
+use fuzz.verdict;
+
+fun same_bytes(data: *u8, len: usize, text: str) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (text[i] == 0 || data[i] != text[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret text[len] == 0;
+}
+
+pub fun answer_h2_method(data: *u8, len: usize) verdict.Verdict {
+    val parsed: method.Method = h2.method_of(view.view(data, len));
+    # a method is known exactly when the peer sent its token, case and all
+    var kind:  method.Kind = method.GET;
+    var known: method.Kind = method.EXTENSION;
+    for (kind <= method.PATCH) {
+        val token: view.View = method.from_kind(kind).token;
+        if (token.len == len && same_bytes(data, len, token.data::str)) { known = kind; }
+        kind = kind + 1;
+    }
+    if (parsed.kind != known) {
+        ret verdict.violated("h2-method: a method was known by a token the peer did not send");
+    }
+    if (known == method.EXTENSION &&
+        (parsed.token.data::*u8 != data || parsed.token.len != len)) {
+        ret verdict.violated("h2-method: an extension method is not the token the peer sent");
+    }
+    if (known != method.EXTENSION) { verdict.accept(); }
+    ret verdict.answered(parsed.kind::u64);
+}
+
+pub fun answer_h2_target(data: *u8, len: usize) verdict.Verdict {
+    val parsed: target.Target = h2.target_of(view.view(data, len));
+    if (len == 1 && data[0] == '*') {
+        if (parsed.form != target.ASTERISK) {
+            ret verdict.violated("h2-target: `*` is not the asterisk form");
+        }
+        ret verdict.answered(target.ASTERISK::u64);
+    }
+    verdict.accept();
+    # the path is everything before the first `?` and the query everything after,
+    # and both lie inside what the peer sent
+    var cut: usize = 0;
+    for (cut < len && data[cut] != '?') { cut = cut + 1; }
+    var query: usize = 0;
+    if (cut < len) { query = len - cut - 1; }
+    if (parsed.form != target.ORIGIN || parsed.raw.data::*u8 != data || parsed.raw.len != len ||
+        parsed.path.len != cut || (cut != 0 && parsed.path.data::*u8 != data) ||
+        parsed.query.len != query ||
+        (query != 0 && parsed.query.data::*u8 != ?data[cut + 1])) {
+        ret verdict.violated("h2-target: the path and query are not the split of the target at its first `?`");
+    }
+    var outcome: u64 = verdict.mix(target.ORIGIN::u64, (cut < len)::u64);
+    outcome = verdict.mix(outcome, verdict.bucket(query));
+    ret verdict.answered(outcome);
+}
+
+val MAX_FIELDS: usize = 64;
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun named(name: view.View, text: str) bool {
+    var i: usize = 0;
+    for (i < name.len) {
+        if (text[i] == 0 || lower(name.data[i]) != text[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret text[name.len] == 0;
+}
+
+fun fixed_hop(name: view.View) bool {
+    ret named(name, "connection") || named(name, "keep-alive") ||
+        named(name, "proxy-connection") || named(name, "proxy-authenticate") ||
+        named(name, "proxy-authorization") || named(name, "te") || named(name, "trailer") ||
+        named(name, "transfer-encoding") || named(name, "upgrade") ||
+        named(name, "content-length") || named(name, "host");
+}
+
+fun blank(c: u8) bool {
+    ret c == ' ' || c == '\t';
+}
+
+# is `name` one of the comma-separated members of `list`, ignoring case and the
+# whitespace around each member
+fun listed(list: view.View, name: view.View) bool {
+    if (name.len == 0) { ret false; }
+    var at: usize = 0;
+    for (at + name.len <= list.len) {
+        var ok: bool  = true;
+        var i:  usize = 0;
+        for (ok && i < name.len) {
+            ok = lower(list.data[at + i]) == lower(name.data[i]);
+            i  = i + 1;
+        }
+        if (ok) {
+            var before: usize = at;
+            for (before > 0 && blank(list.data[before - 1])) { before = before - 1; }
+            var after: usize = at + name.len;
+            for (after < list.len && blank(list.data[after])) { after = after + 1; }
+            if ((before == 0 || list.data[before - 1] == ',') &&
+                (after == list.len || list.data[after] == ',')) { ret true; }
+        }
+        at = at + 1;
+    }
+    ret false;
+}
+
+fun hop_by_hop(fields: *field.Fields, name: view.View) bool {
+    if (fixed_hop(name)) { ret true; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        val item: *field.Field = ?fields.items[i];
+        if ((named(item.name, "connection") || named(item.name, "proxy-connection")) &&
+            listed(item.value, name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun traced(name: view.View) bool {
+    ret named(name, "traceparent") || named(name, "tracestate");
+}
+
+# the destination is exactly the end-to-end subsequence of the source, in order,
+# pointing at the source's own bytes
+fun copied_exactly(source: *field.Fields, copied: *field.Fields, request: bool) bool {
+    var next: usize = 0;
+    var i:    usize = 0;
+    for (i < source.len) {
+        val item: *field.Field = ?source.items[i];
+        val kept: bool         = !hop_by_hop(source, item.name) && !(request && traced(item.name));
+        if (forward.forwardable(source, item.name) != !hop_by_hop(source, item.name)) {
+            ret false;
+        }
+        if (kept) {
+            if (next >= copied.len || copied.items[next].name.data != item.name.data ||
+                copied.items[next].value.data != item.value.data ||
+                copied.items[next].value.len != item.value.len) { ret false; }
+            next = next + 1;
+        }
+        i = i + 1;
+    }
+    ret next == copied.len;
+}
+
+pub fun answer_forwarding(data: *u8, len: usize) verdict.Verdict {
+    var source_items: [MAX_FIELDS]field.Field;
+    var source:       field.Fields = field.init(?source_items[0], MAX_FIELDS, input.limits());
+    input.fields(data, len, 0, ?source);
+    var response_items: [MAX_FIELDS]field.Field;
+    var response:       field.Fields = field.init(?response_items[0], MAX_FIELDS,
+        input.limits());
+    var request_items: [MAX_FIELDS]field.Field;
+    var request:       field.Fields = field.init(?request_items[0], MAX_FIELDS, input.limits());
+    if (!forward.copy_fields(?source, ?response) ||
+        !forward.copy_request_fields(?source, ?request)) {
+        ret verdict.violated("forwarding: a copy into room for every field was refused");
+    }
+    if (!copied_exactly(?source, ?response, false) || !copied_exactly(?source, ?request, true)) {
+        ret verdict.violated("forwarding: a hop-by-hop field crossed the hop or an end-to-end one was dropped");
+    }
+    if (request.len != 0) { verdict.accept(); }
+    var outcome: u64 = verdict.bucket(source.len);
+    outcome = verdict.mix(outcome, verdict.bucket(source.len - response.len));
+    outcome = verdict.mix(outcome, verdict.bucket(response.len - request.len));
+    ret verdict.answered(outcome);
+}
+
+fun quotable(value: view.View) bool {
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (c == '"' || c == '\\' || c < ' ' || c == 127) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun put(expected: *u8, at: usize, text: str) usize {
+    var i: usize = 0;
+    for (text[i] != 0) {
+        expected[at + i] = text[i]::u8;
+        i                = i + 1;
+    }
+    ret at + i;
+}
+
+fun put_view(expected: *u8, at: usize, value: view.View) usize {
+    var i: usize = 0;
+    for (i < value.len) {
+        expected[at + i] = value.data[i];
+        i                = i + 1;
+    }
+    ret at + value.len;
+}
+
+val FORWARDED_ROOM: usize = 8192;
+
+# `for="<address>";proto=<scheme>[;host="<host>"]` exactly, and a quote the
+# peer controls can never close one of them
+fun format_one(peer: forward.Peer, capacity: usize, outcome: *u64) bool {
+    var expected: [FORWARDED_ROOM]u8;
+    var at:       usize = put(?expected[0], 0, "for=\"");
+    at = put_view(?expected[0], at, peer.address);
+    at = put(?expected[0], at, "\";proto=");
+    if (peer.secure) { at = put(?expected[0], at, "https"); }
+    or               { at = put(?expected[0], at, "http"); }
+    if (peer.host.len != 0) {
+        at = put(?expected[0], at, ";host=\"");
+        at = put_view(?expected[0], at, peer.host);
+        at = put(?expected[0], at, "\"");
+    }
+    val formable: bool = peer.address.len != 0 && quotable(peer.address) &&
+        quotable(peer.host) && at < capacity;
+    var output:  [FORWARDED_ROOM]u8;
+    val written: usize = forward.format_forwarded(peer, ?output[0], capacity);
+    @outcome = verdict.mix(@outcome, (written != 0)::u64);
+    if (!formable) { ret written == 0; }
+    verdict.accept();
+    if (written != at || output[at] != 0) { ret false; }
+    var i: usize = 0;
+    for (i < at) {
+        if (output[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun answer_forwarded(data: *u8, len: usize) verdict.Verdict {
+    val first:  usize = input.line_end(data, len, 0);
+    val second: usize = input.line_end(data, len, input.next_line(len, first));
+    var peer:   forward.Peer;
+    peer.address = input.slice(data, 0, first);
+    peer.host    = input.slice(data, input.next_line(len, first), second);
+    peer.secure  = second < len && second + 1 < len && data[second + 1] == 's';
+    if (peer.address.len + peer.host.len + 64 > FORWARDED_ROOM) {
+        ret verdict.answered(0xf0f0);
+    }
+    var outcome: u64 = 0;
+    # room for the whole field, exactly its length with its terminator, and one short
+    val whole: usize = peer.address.len + peer.host.len + 30;
+    if (!format_one(peer, forward.MAX_FORWARDED_BYTES, ?outcome) ||
+        !format_one(peer, whole, ?outcome) || !format_one(peer, whole - 1, ?outcome) ||
+        !format_one(peer, peer.address.len + 14, ?outcome)) {
+        ret verdict.violated("forwarded: the field is not exactly the observed peer, quoted, within its room");
+    }
+    ret verdict.answered(outcome);
+}
+
+fun hex(c: u8) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+}
+
+fun hex_value(c: u8) u8 {
+    if (c <= '9') { ret c - '0'; }
+    ret c - 'a' + 10;
+}
+
+pub fun answer_trace(data: *u8, len: usize) verdict.Verdict {
+    val first:      usize = input.line_end(data, len, 0);
+    val state:      usize = input.next_line(len, first);
+    val parent:     *u8   = guard.text(data, first);
+    var tracestate: *u8   = nil;
+    if (first < len)                                         { tracestate = guard.text(?data[state], len - state); }
+    if (parent == nil || (first < len && tracestate == nil)) { ret verdict.answered(0x70); }
+    var context: trace.Context;
+    val parsed:  bool = trace.parse(parent::str, tracestate::str, ?context);
+    var alone:   trace.Context;
+    # the state never decides whether the parent is accepted
+    if (trace.parse(parent::str, nil, ?alone) != parsed) {
+        ret verdict.violated("trace: tracestate changed whether traceparent was accepted");
+    }
+    if (!parsed) { ret verdict.answered(1); }
+    verdict.accept();
+    # an accepted parent formats back to what the peer sent, with only the
+    # sampled flag kept
+    var formatted: [64]u8;
+    if (trace.format(?context, ?formatted[0], 64) != trace.TRACEPARENT_LENGTH) {
+        ret verdict.violated("trace: an accepted context does not format");
+    }
+    var i: usize = 0;
+    for (i < 53) {
+        if (formatted[i] != parent[i]) {
+            ret verdict.violated("trace: an accepted traceparent does not round-trip");
+        }
+        i = i + 1;
+    }
+    if (!hex(parent[53]) || !hex(parent[54]) || formatted[53] != '0' ||
+        formatted[54] != '0' + (hex_value(parent[54]) & 1)) {
+        ret verdict.violated("trace: the propagated flags are not the sampled bit the peer sent");
+    }
+    var outcome: u64 = verdict.mix(2, context.flags::u64);
+    if (tracestate == nil) {
+        if (!context.tracestate_valid || context.tracestate_len != 0) {
+            ret verdict.violated("trace: an absent tracestate is not an empty one");
+        }
+        ret verdict.answered(outcome);
+    }
+    val state_len: usize = len - state;
+    outcome = verdict.mix(outcome, context.tracestate_valid::u64);
+    if (context.tracestate_valid) {
+        # a kept state is the peer's own, byte for byte, within its budget
+        if (context.tracestate_len != state_len || state_len > trace.TRACESTATE_CAPACITY ||
+            context.tracestate[state_len] != 0) {
+            ret verdict.violated("trace: a kept tracestate is not the one the peer sent");
+        }
+        i = 0;
+        for (i < state_len) {
+            if (context.tracestate[i] != tracestate[i]) {
+                ret verdict.violated("trace: a kept tracestate is not the one the peer sent");
+            }
+            i = i + 1;
+        }
+        # and a budget one byte short of it keeps none of it
+        if (state_len > 0) {
+            var bounded: trace.Context;
+            if (!trace.parse_bounded(parent::str, tracestate::str, state_len - 1, ?bounded) ||
+                bounded.tracestate_valid) {
+                ret verdict.violated("trace: a tracestate over its budget was kept");
+            }
+        }
+    }
+    or (context.tracestate_len != 0) {
+        ret verdict.violated("trace: a refused tracestate left bytes behind");
+    }
+    ret verdict.answered(outcome);
+}
+
+var credential_bytes: str = "s3cret-token";
+var renders:          usize;
+
+fun count_render(context: ptr, output: *u8, capacity: usize) usize {
+    renders = renders + 1;
+    if (capacity < 2) { ret 0; }
+    output[0] = 'o';
+    output[1] = 'k';
+    ret 2;
+}
+
+fun text_is(text: *u8, expected: str) bool {
+    var i: usize = 0;
+    for (expected[i] != 0) {
+        if (text[i] != expected[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret text[i] == 0;
+}
+
+val ADMIN_ROOM: usize = 128;
+
+pub fun answer_admin(data: *u8, len: usize) verdict.Verdict {
+    var parts: [4]*u8;
+    var at:    usize = 0;
+    var part:  usize = 0;
+    for (part < 4) {
+        val end: usize = input.line_end(data, len, at);
+        parts[part] = guard.text(?data[at], end - at);
+        if (parts[part] == nil) { ret verdict.answered(0xad); }
+        at   = input.next_line(len, end);
+        part = part + 1;
+    }
+    var checks: [1]health.Check;
+    var state:  health.Health;
+    health.make(?state, ?checks[0], 1);
+    health.begin_accepting(?state);
+    var credential: admin.Credential = admin.Credential{data: credential_bytes::*u8, len: 12};
+    val policy:     admin.Policy     = admin.Policy{
+        listener:           "admin",
+        auth_context:       (?credential)::ptr,
+        authenticate:       admin.authenticate_bearer,
+        metrics_context:    nil,
+        render_metrics:     count_render,
+        state_context:      nil,
+        render_state:       count_render,
+        max_response_bytes: ADMIN_ROOM,
+    };
+    var handler: admin.Handler;
+    if (!admin.make(?handler, policy, ?state)) {
+        ret verdict.violated("admin: a valid policy was refused");
+    }
+    var output:   [ADMIN_ROOM]u8;
+    var response: admin.Response;
+    renders = 0;
+    val request: admin.Request = admin.Request{listener: parts[0]::str, method: parts[1]::str,
+        path: parts[2]::str, authorization: parts[3]::str};
+    if (!admin.handle(?handler, request, ?output[0], ADMIN_ROOM, ?response)) {
+        ret verdict.violated("admin: a request was left unanswered");
+    }
+    val listener: bool = text_is(parts[0], "admin");
+    val bearer:   bool = text_is(parts[3], "Bearer s3cret-token");
+    if (admin.authenticate_bearer((?credential)::ptr, parts[3]::str) != bearer) {
+        ret verdict.violated("admin: a credential other than the configured one authenticated");
+    }
+    # nothing is routed, rendered or disclosed before authentication
+    if ((!listener || !bearer) && (renders != 0 || response.status == 200)) {
+        ret verdict.violated("admin: an unauthenticated request reached routing");
+    }
+    if (!listener && response.status != 404) {
+        ret verdict.violated("admin: another listener's request was answered");
+    }
+    if (listener && !bearer && response.status != 401) {
+        ret verdict.violated("admin: a wrong credential was not refused");
+    }
+    if (response.length > ADMIN_ROOM) {
+        ret verdict.violated("admin: a response overran its room");
+    }
+    if (response.status == 200) { verdict.accept(); }
+    ret verdict.answered(verdict.mix(response.status::u64, renders::u64));
+}
