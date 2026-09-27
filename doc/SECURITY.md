@@ -98,6 +98,18 @@ credential generation it lives in secret storage there and never returns to
 public bytes, and the per-call classification buffers are the only other place
 the material appears.
 
+QUIC listener keys (the CID, stateless reset and Retry/NEW_TOKEN keys) are
+secret-typed for their whole life in `src/protocol/quic/keys.mach`. By default
+they are drawn by the secret CSPRNG straight into that storage. An operator's
+key file (`quic_keys`) is the one way they enter from outside. It is refused
+when group or other can read it. It is read into public memory, because
+`mach-std` reads files there, and each key is decoded from it straight into
+secret storage by `src/protocol/quic/keyfile.mach`. The read buffer is wiped
+before the read returns. Nothing writes the keys out or declassifies them. The
+one `:>` in that path is the verdict of a constant-time comparison between a
+key the file holds and the key already in force, which a reload needs in order
+to keep a key it holds unchanged and to refuse one it would change.
+
 ## Reporting
 
 Before public release, this section will name a private security contact, expected acknowledgment interval, supported versions, disclosure process, and encrypted reporting channel.
