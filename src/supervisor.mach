@@ -89,6 +89,8 @@ val HOSTED_STOPPED: HostedPhase = 6;
 rec Hosted {
     phase: HostedPhase;
     check: telemetry_health.Token;
+    # a published reload the application's reload step has not yet taken
+    reload: bool;
 }
 
 pub def ReloadState: u8;
@@ -599,7 +601,8 @@ fun start_hosted(supervisor: *Supervisor) worker.StartStatus {
     var i: usize = 0;
     for (i < registry.len) {
         val item: *service.Application = ?registry.items[i];
-        supervisor.hosted[i].phase = HOSTED_NONE;
+        supervisor.hosted[i].phase  = HOSTED_NONE;
+        supervisor.hosted[i].reload = false;
         if (item.live && service.has_lifecycle(item.lifecycle)) {
             if (!telemetry_health.register(health(supervisor), item.name, true, false,
                 ?supervisor.hosted[i].check)) {
@@ -665,12 +668,49 @@ fun poll_hosted_ready(supervisor: *Supervisor) {
     }
 }
 
+# a reload has published: every running application with a reload step is
+# told, and asked again while it answers pending
+fun mark_hosted_reload(supervisor: *Supervisor) {
+    var i: usize = 0;
+    for (i < supervisor.hosted_count) {
+        val phase: HostedPhase = supervisor.hosted[i].phase;
+        if ((phase == HOSTED_STARTED || phase == HOSTED_READY)
+            && hosted_application(supervisor, i).lifecycle.reload::usize != 0) {
+            supervisor.hosted[i].reload = true;
+        }
+        i = i + 1;
+    }
+}
+
+# a reload step that fails is reported and leaves the application running on
+# what it had
+fun poll_hosted_reload(supervisor: *Supervisor) {
+    var i: usize = 0;
+    for (i < supervisor.hosted_count) {
+        val current: *Hosted = ?supervisor.hosted[i];
+        if (current.reload
+            && (current.phase == HOSTED_STARTED || current.phase == HOSTED_READY)) {
+            val hosted: *service.Lifecycle = ?hosted_application(supervisor, i).lifecycle;
+            val step:   service.Step       = hosted.reload(hosted.ctx);
+            if (step.status == service.STEP_DONE) { current.reload = false; }
+            or (step.status != service.STEP_PENDING) {
+                report_hosted(supervisor, i, "reload", "failed", "failed to take a reload",
+                    step.detail);
+                current.reload = false;
+            }
+        }
+        or { current.reload = false; }
+        i = i + 1;
+    }
+}
+
 # whether a hosted step is waiting to be asked again
 fun hosted_polling(supervisor: *Supervisor) bool {
     var i: usize = 0;
     for (i < supervisor.hosted_count) {
         val phase: HostedPhase = supervisor.hosted[i].phase;
-        if (phase == HOSTED_DRAINING || (phase == HOSTED_STARTED && !supervisor.shutdown_sent)) {
+        if (phase == HOSTED_DRAINING || (phase == HOSTED_STARTED && !supervisor.shutdown_sent)
+            || (supervisor.hosted[i].reload && !supervisor.shutdown_sent)) {
             ret true;
         }
         i = i + 1;
@@ -687,10 +727,9 @@ fun hosted_draining(supervisor: *Supervisor) bool {
     ret false;
 }
 
-# shutdown has begun: every running application drains toward the same
-# deadline the workers drain toward
-fun begin_hosted_drain(supervisor: *Supervisor) {
-    supervisor.hosted_deadline = clock.after(clock.instant(), supervisor.drain_timeout_ns);
+# shutdown has begun: every running application drains toward `deadline`
+fun begin_hosted_drain(supervisor: *Supervisor, deadline: time.Instant) {
+    supervisor.hosted_deadline = deadline;
     var i: usize = 0;
     for (i < supervisor.hosted_count) {
         val phase: HostedPhase = supervisor.hosted[i].phase;
@@ -724,6 +763,19 @@ fun drive_hosted_drain(supervisor: *Supervisor) {
             }
         }
         i = i + 1;
+    }
+}
+
+# settle every started application's drain before any stops. a drain begun by
+# shutdown settles against its deadline, and a stop that never began one has
+# no drain window, so it drains toward a deadline already passed and a drain
+# still pending is abandoned at once
+fun settle_hosted_drain(supervisor: *Supervisor) {
+    if (!supervisor.shutdown_sent) { begin_hosted_drain(supervisor, clock.instant()); }
+    drive_hosted_drain(supervisor);
+    for (hosted_draining(supervisor)) {
+        if (!deliver(supervisor, HOSTED_POLL_MS)) { brk; }
+        drive_hosted_drain(supervisor);
     }
 }
 
@@ -833,10 +885,11 @@ fun drive_task_drain(supervisor: *Supervisor) {
     settle_tasks(supervisor, task.drain(tasks_of(supervisor), supervisor.hosted_deadline));
 }
 
-# stop the task facility once no worker serves and every hosted application
-# has stopped, then join its thread, whose loop closes within the stop timeout.
-# runs abandoned at the drain deadline make the process's reason DEADLINE
-fun stop_tasks(supervisor: *Supervisor, report: *worker.StopReport) {
+# settle the task drain before any hosted application stops, so no run is in
+# flight or begins once one has. a drain begun by shutdown settles against its
+# deadline, and a stop that never began one has no drain window, so it drains
+# toward a deadline already passed. waits at most the stop timeout
+fun settle_task_drain(supervisor: *Supervisor) {
     val tasks: *task.Tasks = tasks_of(supervisor);
     if (tasks == nil) { ret; }
     val deadline_ns: u64          = clock.after_ns(clock.monotonic_ns(), supervisor.stop_timeout_ns);
@@ -850,6 +903,15 @@ fun stop_tasks(supervisor: *Supervisor, report: *worker.StopReport) {
         drained = task.drain(tasks, until);
     }
     settle_tasks(supervisor, drained);
+}
+
+# stop the task facility once no worker serves and every hosted application
+# has stopped, then join its thread, whose loop closes within the stop timeout.
+# runs abandoned at the drain deadline make the process's reason DEADLINE
+fun stop_tasks(supervisor: *Supervisor, report: *worker.StopReport) {
+    val tasks: *task.Tasks = tasks_of(supervisor);
+    if (tasks == nil) { ret; }
+    val deadline_ns: u64 = clock.after_ns(clock.monotonic_ns(), supervisor.stop_timeout_ns);
     if (task.stop(tasks) != task.STATUS_OK) {
         print.eprintln("hedge: background tasks could not stop: a run is in flight or a snapshot is still leased");
         report.cleanup_failures = report.cleanup_failures + 1;
@@ -865,13 +927,14 @@ fun stop_tasks(supervisor: *Supervisor, report: *worker.StopReport) {
     }
 }
 
-# every worker is asked to finish, once
-fun fan_shutdown(supervisor: *Supervisor) {
+# every worker is asked to finish, once, and the hosted applications and the
+# task facility drain for `window_ns`. a start that failed has no drain window
+fun fan_shutdown(supervisor: *Supervisor, window_ns: u64) {
     if (supervisor.shutdown_sent) { ret; }
     supervisor.shutdown_sent = true;
     # readiness goes false before any worker stops accepting
     telemetry.begin_drain(?supervisor.composed.observability.runtime);
-    begin_hosted_drain(supervisor);
+    begin_hosted_drain(supervisor, clock.after(clock.instant(), window_ns));
     # triggers are refused from here on, and running tasks are cancelled
     if (tasks_of(supervisor) != nil) {
         val drained: task.Drain = task.drain(tasks_of(supervisor), supervisor.hosted_deadline);
@@ -909,7 +972,9 @@ fun post_all(supervisor: *Supervisor, request: i64, id: u64) {
     }
 }
 
+# every refusal drops what a reload staged for hosted applications
 fun reject(supervisor: *Supervisor, message: str) {
+    composition.discard_hosted(supervisor.composed);
     print.eprint("hedge: reload rejected, ");
     print.eprintln(message);
 }
@@ -952,6 +1017,12 @@ fun begin_reload(supervisor: *Supervisor) {
     if (!composition.reload_compatible(supervisor.composed, ?candidate.graph)) {
         generation.reject(?supervisor.store, id, nil);
         reject(supervisor, "startup-owned configuration changed; restart required");
+        ret;
+    }
+    val staged: str = composition.stage_hosted(supervisor.composed, ?candidate.graph, id);
+    if (staged != nil) {
+        generation.reject(?supervisor.store, id, nil);
+        reject(supervisor, staged);
         ret;
     }
     supervisor.candidate    = candidate;
@@ -1018,7 +1089,7 @@ fun step_reload(supervisor: *Supervisor) {
             }
             print.eprintln("hedge: reload failed after a worker published it, stopping");
             supervisor.reload_state = RELOAD_IDLE;
-            fan_shutdown(supervisor);
+            fan_shutdown(supervisor, supervisor.drain_timeout_ns);
             ret;
         }
         supervisor.commit_next = supervisor.commit_next + 1;
@@ -1033,6 +1104,7 @@ fun step_reload(supervisor: *Supervisor) {
         supervisor.previous = published.previous;
         supervisor.active   = supervisor.candidate;
         composition.reloaded(supervisor.composed, ?supervisor.candidate.graph, id);
+        mark_hosted_reload(supervisor);
         supervisor.reload_state = RELOAD_IDLE;
         print.eprintln("hedge: reloaded");
         ret;
@@ -1150,7 +1222,6 @@ pub fun start(supervisor: *Supervisor) worker.StartStatus {
         if (spawn(supervisor, 0, ?config)) { status = await_started(supervisor); }
     }
     if (status == worker.START_OK && count > 1) {
-        composition.record_endpoints(composed);
         var i: usize = 1;
         for (i < count && status == worker.START_OK) {
             if (!spawn(supervisor, i, ?config)) { status = worker.START_RUNTIME; }
@@ -1159,7 +1230,7 @@ pub fun start(supervisor: *Supervisor) worker.StartStatus {
         if (status == worker.START_OK) { status = await_started(supervisor); }
     }
     if (status != worker.START_OK) {
-        fan_shutdown(supervisor);
+        fan_shutdown(supervisor, 0);
         ret status;
     }
     # the process is ready once every worker serves and, through their readiness
@@ -1196,7 +1267,7 @@ pub fun run(supervisor: *Supervisor) {
     for (!all_stopped(supervisor) || hosted_draining(supervisor) || tasks_draining(supervisor)) {
         deliver(supervisor, run_wait_ms(supervisor));
         if (atomic.load(?supervisor.stop_requested) != 0 || any_draining(supervisor)) {
-            fan_shutdown(supervisor);
+            fan_shutdown(supervisor, supervisor.drain_timeout_ns);
         }
         if (supervisor.shutdown_sent) {
             drive_hosted_drain(supervisor);
@@ -1212,6 +1283,7 @@ pub fun run(supervisor: *Supervisor) {
             drive_certificates(supervisor);
             install_certificates(supervisor);
             poll_hosted_ready(supervisor);
+            poll_hosted_reload(supervisor);
         }
     }
 }
@@ -1275,7 +1347,11 @@ pub fun stop(supervisor: *Supervisor) worker.StopReport {
         }
         i = i + 1;
     }
-    # no request reaches an application once every worker has stopped
+    # no request reaches an application once every worker has stopped, and no
+    # task run once the task drain has settled. every started application has
+    # drained before it stops, on every path to here
+    settle_task_drain(supervisor);
+    settle_hosted_drain(supervisor);
     stop_hosted(supervisor, ?merged);
     # nor a lease on a task's snapshot once every application has stopped
     stop_tasks(supervisor, ?merged);

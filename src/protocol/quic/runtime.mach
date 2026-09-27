@@ -49,6 +49,7 @@ use tls.tls13;
 
 use quic.connection.admission;
 use quic.connection.assembly;
+use cid_api:          quic.connection.cid;
 use quic_core:        quic.connection.core;
 use test_credentials: quic.connection.credentials_simulated;
 use quic_listener:    quic.connection.listener;
@@ -531,10 +532,12 @@ pub rec Connection {
     transport_finished: bool;
     timer_disarmed:     bool;
     routes_removed:     bool;
-    # the codepoint `local_cid` was minted under, counted against its retirement
-    # while `minted`
-    codepoint:          u8;
-    minted:             bool;
+    # the codepoints the connection's routed IDs were minted under, one bit
+    # each, every one counted against its retirement
+    codepoints: u8;
+    # the codepoint new IDs are minted under, and every ID at or above the
+    # connection's retire_prior_to was
+    issuing:            u8;
     tls_live:           bool;
     assembly_attempted: bool;
     assembly_released:  bool;
@@ -890,7 +893,7 @@ fun reset_connection(value: *Connection) {
     value.ready_next           = NO_CONNECTION;
     value.ready_prev           = NO_CONNECTION;
     value.routes_removed       = false;
-    value.minted               = false;
+    value.codepoints           = 0;
     value.tls_live             = false;
     value.assembly_attempted   = false;
     value.assembly_released    = false;
@@ -2206,7 +2209,7 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
     value.transport_finished      = false;
     value.timer_disarmed          = false;
     value.routes_removed          = false;
-    value.minted                  = false;
+    value.codepoints              = 0;
     value.tls_live                = false;
     value.assembly_attempted      = false;
     value.assembly_released       = false;
@@ -2253,10 +2256,8 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     }
     if (runtime.live_total != 0) { runtime.live_total = runtime.live_total - 1; }
     release_superseded(runtime, ?value.superseded);
-    if (value.minted && value.pump < MAX_PUMPS) {
-        quic_keys.count(controls.pumps[value.pump].keys, runtime.worker,
-            value.codepoint::usize, -1);
-        value.minted = false;
+    if (value.pump < MAX_PUMPS) {
+        hold_codepoints(runtime, ?controls.pumps[value.pump], value, 0);
     }
     value.lease                    = process_admission.no_lease();
     value.policy                   = nil;
@@ -2638,10 +2639,78 @@ fun mint_local_cid(runtime: *Runtime, pump: *Pump, value: *Connection,
     index: usize) bool {
     val codepoint: u8 = cid.mint(?pump.codec, index::u32, ?value.storage.local_cid[0]);
     if (codepoint == quic_keys.UNROUTABLE) { ret false; }
-    value.codepoint = codepoint;
-    value.minted    = true;
-    quic_keys.count(pump.keys, runtime.worker, codepoint::usize, 1);
+    value.issuing = codepoint;
+    hold_codepoints(runtime, pump, value, (1::u8 << codepoint));
     ret true;
+}
+
+# count the connection under the codepoints of `held` and no others
+fun hold_codepoints(runtime: *Runtime, pump: *Pump, value: *Connection, held: u8) {
+    var i: usize = 0;
+    for (i < quic_keys.CODEPOINTS) {
+        val bit: u8 = 1::u8 << i::u8;
+        if ((held & bit) != 0 && (value.codepoints & bit) == 0) {
+            quic_keys.count(pump.keys, runtime.worker, i, 1);
+        }
+        or ((held & bit) == 0 && (value.codepoints & bit) != 0) {
+            quic_keys.count(pump.keys, runtime.worker, i, -1);
+        }
+        i = i + 1;
+    }
+    value.codepoints = held;
+}
+
+# the codepoints of the IDs the connection's routes hold. an ID is routed from
+# before its NEW_CONNECTION_ID leaves until the peer retires it, which is
+# exactly while a datagram may still name it
+fun routed_codepoints(value: *Connection) u8 {
+    if (!value.assembly.initialized) { ret value.codepoints; }
+    val snapshot: assembly.RoutingSnapshot = assembly.routing_snapshot(?value.assembly);
+    if (!snapshot.initialized) { ret value.codepoints; }
+    var held: u8    = 0;
+    var i:    usize = 0;
+    for (i < snapshot.capacity && i < assembly.CONNECTION_ID_CAPACITY) {
+        val route: assembly.Route = assembly.route_at(?value.assembly, i);
+        if (route.active && route.id.length == cid.BYTES) {
+            val codepoint: u8 = cid.codepoint_of(?route.id.data[0]);
+            if (codepoint::usize < quic_keys.CODEPOINTS) { held = held | (1::u8 << codepoint); }
+        }
+        i = i + 1;
+    }
+    ret held;
+}
+
+# the spare IDs a connection offers its peer (RFC 9000 5.1.1), each minted for
+# its slot as its first was, so every worker decodes it to this one. once the
+# listener rotates, retire_prior_to rises past every ID minted before and the
+# new ones are minted under the new codepoint, so the peer moves off the old
+# one and it is released when the peer retires its IDs, not when the
+# connection closes. one entry of the ID table is kept free, because a raised
+# retire_prior_to reaches the peer only on a new ID's NEW_CONNECTION_ID
+fun tend_connection_ids(runtime: *Runtime, pump: *Pump, value: *Connection, index: usize) {
+    if (!value.assembly.initialized) { ret; }
+    val current: u8 = quic_keys.current(pump.keys);
+    if (current != value.issuing) {
+        val before: assembly.ConnectionIds = assembly.connection_ids(?value.assembly);
+        if (before.next_sequence != 0
+            && assembly.retire_connection_ids_prior_to(?value.assembly, before.next_sequence)) {
+            value.issuing = current;
+        }
+    }
+    var wanted: usize = 0;
+    if (current == value.issuing) { wanted = assembly.connection_ids(?value.assembly).wanted; }
+    for (wanted > 0 && assembly.routing_snapshot(?value.assembly).active
+        < assembly.CONNECTION_ID_CAPACITY - 1) {
+        var id: [CONNECTION_ID_BYTES]u8;
+        # a rotation landing since `current` was read waits for the next turn
+        if (cid.mint(?pump.codec, index::u32, ?id[0]) != value.issuing) { brk; }
+        var token: [16]u8;
+        if (!cid.reset_token(pump.keys, ?id[0], ?token[0])
+            || !assembly.issue_connection_id(?value.assembly, ?id[0], CONNECTION_ID_BYTES,
+            token).ok) { brk; }
+        wanted = wanted - 1;
+    }
+    hold_codepoints(runtime, pump, value, routed_codepoints(value));
 }
 
 fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index: usize,
@@ -3777,6 +3846,7 @@ fun progress_connection(controls: *ControlView, runtime: *Runtime, index: usize,
             value.h3_deadline_ns = due;
         }
     }
+    tend_connection_ids(runtime, ?controls.pumps[value.pump], value, index);
     val sends_ok: bool = generate_sends(controls, runtime, index, now_ns);
     if (value.handshake != NO_HANDSHAKE && assembly.tls_released(?value.assembly)
         && !release_handshake(controls, runtime, index, true, now_ns)) { ret false; }
@@ -7456,6 +7526,196 @@ test accept__mints_its_own_id_beside_the_retry_source {
         ?wire[0], established.count, CONNECTION_ID_BYTES);
     if (short.class != quic_listener.DATAGRAM_ESTABLISHED || short.long_header
         || !cid.same(?short.destination.data[0], ?value.storage.local_cid[0])) { ret 21; }
+    ret 0;
+}
+
+# every route of a connection's IDs names its owner to any worker (#404)
+#[testing]
+fun test_routes_decode(controls: *ControlView, runtime: *Runtime, pump: *Pump,
+    value: *Connection, index: usize) bool {
+    var other: cid.Codec;
+    if (!cid.make(?other, pump.keys, 1)) { ret false; }
+    var found: usize = 0;
+    var i:     usize = 0;
+    for (i < assembly.CONNECTION_ID_CAPACITY) {
+        var route: assembly.Route = assembly.route_at(?value.assembly, i);
+        i = i + 1;
+        if (!route.active) { cnt; }
+        val named: cid.Decoded = cid.decode(?other, ?route.id.data[0], route.id.length);
+        if (route.id.length != CONNECTION_ID_BYTES || named.status != cid.DECODED
+            || named.worker != 0 || named.slot != index::u32
+            || owner_of(controls, runtime, 0, named.slot, ?route.id.data[0]) != index) {
+            cid.destroy(?other);
+            ret false;
+        }
+        found = found + 1;
+    }
+    cid.destroy(?other);
+    ret found != 0;
+}
+
+# a connection offers its peer spare IDs minted for its slot, up to the peer's
+# limit. the client moves to one, and a datagram on it that another worker
+# decoded reaches the connection. a rotation then moves the connection off its
+# codepoint: once the client retires the old IDs the codepoint is held by
+# nothing, and the next rotation retires it with the connection still open
+test connection_ids__spares_route_to_the_owner_and_rotation_moves_them {
+    var fixture:      TestControls;
+    val controls:     *ControlView = test_controls(?fixture);
+    var runtime:      Runtime;
+    var pump_storage: PumpStorage;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols:      [1]tls_config.ProtocolName;
+    var policy:         hedge_tls.Policy;
+    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
+    var spare_plan: plan.Plan;
+    spare_plan.generation = 1;
+    spare_plan.sealed     = true;
+    var budgets: budget.Set;
+    var config:  PumpConfig = test_pump_config(40, ?policy, ?spare_plan, ?budgets);
+    val pump:    *Pump      = ?controls.pumps[0];
+    if (!test_prepare_pump(?runtime, pump, ?pump_storage, 1, ?config)) { ret 1; }
+    var tls_server: TestServer;
+    val loaded:     i32 = test_server_credentials(?tls_server);
+    if (loaded != 0) { ret loaded; }
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret 2; }
+    val value: *Connection = connection_at(controls, index);
+    if (!mint_local_cid(?runtime, pump, value, index)) { ret 3; }
+    val first_codepoint: u8                      = value.issuing;
+    val accepted:        *quic_listener.Accepted = ?tls_server.accepted;
+    accepted.action = quic_listener.ACTION_ACCEPT;
+    packet.set_connection_id(?accepted.original_destination, ?tls_server.initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_destination, ?tls_server.initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_source, ?tls_server.peer_id[0], 8);
+    accepted.peer           = ip.endpoint(192, 0, 2, 2, 55000);
+    accepted.version        = packet.VERSION_1;
+    accepted.peer_validated = true;
+    val prepared: i32 = test_server_accept(?tls_server, ?fixture, controls, index, accepted,
+        ?value.storage.local_cid[0], CONNECTION_ID_BYTES);
+    if (prepared != 0) { ret prepared; }
+    var now_ns:      u64                 = 1000000000;
+    val initialized: assembly.InitResult = assembly.init_server(
+        ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
+        ?tls_server.scratch, ?pump.secret_scratch,
+        memory.borrowed_source(?value.storage.borrower),
+        memory.borrowed_secret_source(?value.storage.borrower),
+        handshake_at(controls, value.handshake),
+        ?value.storage.scope, clock.from_ns(now_ns));
+    if (!initialized.ok || !value.assembly.initialized) { ret 4; }
+    value.tls_live           = true;
+    value.assembly_attempted = true;
+    val server_at: ip.Endpoint = ip.endpoint(192, 0, 2, 1, 4433);
+    val client_at: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
+    var wire:      [assembly.MAX_UDP_PAYLOAD]u8;
+    val dialed:    usize       = test_dial(?tls_server, ?pump.secret_scratch, ?wire[0],
+        assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns));
+    if (dialed == 0) { ret 5; }
+    val server_driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
+    val client_driver: *qt.Driver[binding.Binding] = ?dialer.driver;
+    var input:         qt.Datagram;
+    now_ns            = now_ns + 1000;
+    input.local       = server_at;
+    input.peer        = client_at;
+    input.data        = ?wire[0];
+    input.length      = dialed;
+    input.received_at = clock.from_ns(now_ns);
+    input.ecn         = 0;
+    if (qt.receive_datagram[binding.Binding](server_driver, ?input).status != qt.STATUS_OK) {
+        ret 6;
+    }
+    var round: usize = 0;
+    for (round < 24 && (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE
+        || qt.snapshot[binding.Binding](client_driver).state != qt.ACTIVE)) {
+        if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
+            server_at, ?now_ns)
+            || !test_carry(client_driver, ?dialer_scope, server_driver, server_at,
+            client_at, ?now_ns)) { ret 7; }
+        round = round + 1;
+    }
+    if (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE) { ret 8; }
+    # the client's limit is two, so one spare joins the connection's own ID
+    tend_connection_ids(?runtime, pump, value, index);
+    if (assembly.routing_snapshot(?value.assembly).active != 2
+        || assembly.connection_ids(?value.assembly).wanted != 0) { ret 9; }
+    if (!test_routes_decode(controls, ?runtime, pump, value, index)) { ret 10; }
+    round = 0;
+    for (round < 4) {
+        if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
+            server_at, ?now_ns)
+            || !test_carry(client_driver, ?dialer_scope, server_driver, server_at,
+            client_at, ?now_ns)) { ret 11; }
+        round = round + 1;
+    }
+    # the client moves to the spare
+    if (!cid_api.peer_rotation_available(?dialer.cids)
+        || cid_api.rotate_peer_scoped(?dialer.cids, dialer.core.config.source).status
+        != cid_api.STATUS_OK) { ret 12; }
+    val opened: qt.OpenResult = qt.open_stream[binding.Binding](client_driver,
+        qt.UNIDIRECTIONAL);
+    var byte: [1]u8 = [1]u8{0};
+    if (opened.status != qt.STATUS_OK
+        || qt.write_stream[binding.Binding](client_driver, opened.stream, ?byte[0], 1).count != 1) {
+        ret 13;
+    }
+    now_ns = now_ns + 1000;
+    val moved: qt.Generated = qt.generate[binding.Binding](client_driver, ?dialer_scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns), 0);
+    if (moved.status != qt.STATUS_OK || moved.count == 0
+        || qt.complete_send[binding.Binding](client_driver, moved.token, qt.SEND_SENT,
+        moved.count, clock.from_ns(now_ns)).status != qt.STATUS_OK) { ret 14; }
+    val short: quic_listener.ClassifiedDatagram = quic_listener.classify_datagram(
+        ?wire[0], moved.count, CONNECTION_ID_BYTES);
+    if (short.class != quic_listener.DATAGRAM_ESTABLISHED
+        || cid.same(?short.destination.data[0], ?value.storage.local_cid[0])) { ret 15; }
+    # another worker decodes the spare to this one, which takes the datagram it
+    # forwarded to the connection, and the connection reads it
+    var other: cid.Codec;
+    if (!cid.make(?other, pump.keys, 1)) { ret 16; }
+    val named: cid.Decoded = cid.decode(?other, ?short.destination.data[0],
+        CONNECTION_ID_BYTES);
+    cid.destroy(?other);
+    if (named.status != cid.DECODED || named.worker != 0 || named.slot != index::u32) {
+        ret 17;
+    }
+    var forwarded: net_types.Packet;
+    forwarded.buffer   = ?wire[0];
+    forwarded.capacity = moved.count;
+    forwarded.length   = moved.count;
+    forwarded.peer     = client_at;
+    val unroutable: u64 = runtime.unroutable;
+    if (process_datagram(controls, ?runtime, 0, ?forwarded, true, now_ns,
+        clock.from_ns(now_ns), now_ns) != OK || runtime.unroutable != unroutable) { ret 18; }
+    if (value.held.count != 0)                                          { holding.pop(?runtime.held, ?value.held); }
+    if (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE) { ret 19; }
+    # a rotation raises retire_prior_to and mints the next IDs under the new
+    # codepoint
+    if (!quic_keys.rotate(pump.keys, now_ns, 0, 1)) { ret 20; }
+    val rotated: u8 = quic_keys.current(pump.keys);
+    round = 0;
+    for (round < 6) {
+        tend_connection_ids(?runtime, pump, value, index);
+        if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
+            server_at, ?now_ns)
+            || !test_carry(client_driver, ?dialer_scope, server_driver, server_at,
+            client_at, ?now_ns)) { ret 21; }
+        round = round + 1;
+    }
+    tend_connection_ids(?runtime, pump, value, index);
+    if (value.issuing != rotated || value.codepoints != (1::u8 << rotated)
+        || assembly.connection_ids(?value.assembly).retire_prior_to == 0
+        || !test_routes_decode(controls, ?runtime, pump, value, index)) { ret 22; }
+    if (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE) { ret 23; }
+    # nothing holds the first codepoint now, so the next rotation retires it
+    if (!quic_keys.rotate(pump.keys, now_ns + 1, 0, 1)) { ret 24; }
+    var key:       [quic_keys.CID_KEY_BYTES]^u8;
+    var host_bits: u8  = 0;
+    val keyed:     i64 = quic_keys.take_cid_key(pump.keys, first_codepoint::usize, ?key[0],
+        ?host_bits);
+    ct.zeroize(?key[0], quic_keys.CID_KEY_BYTES);
+    if (keyed != 0) { ret 25; }
     ret 0;
 }
 
