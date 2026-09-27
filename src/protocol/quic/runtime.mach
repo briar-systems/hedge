@@ -76,11 +76,14 @@ use hedge_operation: hedge.operation;
 use h3_session:      hedge.protocol.h3.session;
 use arrival_queue:   hedge.protocol.quic.arrivals;
 use quic_capacity:   hedge.protocol.quic.capacity;
+use hedge.protocol.quic.cid;
 use hedge.protocol.quic.holding;
+use quic_keys: hedge.protocol.quic.keys;
 use hedge.protocol.quic.routing;
 use stateless_sends: hedge.protocol.quic.stateless;
-use hedge_tls:       hedge.protocol.tls;
-use hedge_storage:   hedge.storage;
+use hedge.protocol.quic.steering;
+use hedge_tls:     hedge.protocol.tls;
+use hedge_storage: hedge.storage;
 use hedge.telemetry;
 use wheel:      hedge.timer;
 use hedge_wake: hedge.wake;
@@ -126,7 +129,7 @@ pub val RECEIVE_BATCH:   usize = 64;
 # waits out anyway
 pub val TEARDOWN_BUDGET:       usize = RECEIVE_BATCH;
 pub val MAX_STATELESS_PENDING: usize = quic_capacity.MAX_STATELESS_PENDING;
-pub val CONNECTION_ID_BYTES:   usize = 20;
+pub val CONNECTION_ID_BYTES:   usize = cid.BYTES;
 # how long one closed connection may linger before the transport abandons it.
 # this is a per-connection RFC 9000 close period, not the process drain budget:
 # sourcing it from the shutdown budget held every finished connection open for
@@ -156,6 +159,8 @@ pub val MIN_INITIAL_BYTES: usize = 1200;
 # turn's arrival work is bounded in time as well, by what the last unit of
 # handshake work cost, so a burst of Initials takes at most half the worker
 pub val PREFLIGHT_BUDGET: usize = 4 * RECEIVE_BATCH;
+# datagrams other workers forwarded, taken per turn at most
+pub val FORWARD_BUDGET: usize = 4 * RECEIVE_BATCH;
 
 pub def Status: u8;
 pub val OK:      Status = 1;
@@ -200,6 +205,9 @@ pub rec RuntimeConfig {
     handshakes:      *process_admission.Shared;
     handshake_slots: *allowance.Pool;
     worker:          usize;
+    # where a datagram for another worker's connection is handed to it, or nil
+    # when this worker serves QUIC alone
+    steering: *steering.Board;
 }
 
 # a wheel owner is tagged as QUIC so a worker sharing one wheel can route it
@@ -280,12 +288,16 @@ pub rec ConnectionStorage {
     # assembly, so it stays put until the storage is released
     borrower:         memory.Borrower;
     local_parameters: [assembly.PARAMETER_CAPACITY]u8;
-    local_cid:        [CONNECTION_ID_BYTES]u8;
-    peer_text:        [ENDPOINT_BYTES]u8;
-    local_text:       [ENDPOINT_BYTES]u8;
-    listener_name:    [schema.TEXT_CAP]u8;
-    sends:            [assembly.SEND_CAPACITY]SendOperation;
-    published:        [assembly.CONNECTION_ID_CAPACITY]PublishedRoute;
+    # the connection ID minted for this connection at accept
+    local_cid:     [CONNECTION_ID_BYTES]u8;
+    peer_text:     [ENDPOINT_BYTES]u8;
+    local_text:    [ENDPOINT_BYTES]u8;
+    listener_name: [schema.TEXT_CAP]u8;
+    sends:         [assembly.SEND_CAPACITY]SendOperation;
+    # the ID the client's Initials carry until the handshake is done: the
+    # Retry's source, or the client's own choice without a Retry. minted IDs
+    # route by decoding, and this one through the table
+    handshake_route: PublishedRoute;
 }
 
 pub rec PendingConfig {
@@ -517,6 +529,10 @@ pub rec Connection {
     transport_finished: bool;
     timer_disarmed:     bool;
     routes_removed:     bool;
+    # the codepoint `local_cid` was minted under, counted against its retirement
+    # while `minted`
+    codepoint:          u8;
+    minted:             bool;
     tls_live:           bool;
     assembly_attempted: bool;
     assembly_released:  bool;
@@ -527,7 +543,11 @@ pub rec Pump {
     storage:    *PumpStorage;
     backing:    *A.Allocator;
     admissions: [ADMISSION_BANKS]AdmissionGeneration;
-    token_key:  [token.KEY_SIZE]^u8;
+    # the listener this pump serves, whose keys every worker shares, and this
+    # worker's codec for its connection IDs
+    listener: usize;
+    keys:     *quic_keys.Listener;
+    codec:    cid.Codec;
     # the secret half of the per-call buffers this pump's connections share
     secret_scratch:           assembly.SecretScratch;
     driver:                   *net_async.Driver;
@@ -551,7 +571,6 @@ pub rec Pump {
     queued_initials:          usize;
     generation:               u64;
     active_admission:         usize;
-    token_generation:         u64;
     # Retries and version negotiations in flight, up to MAX_STATELESS_PENDING
     stateless: stateless_sends.Sends[CompletionContext];
     # a per-pump monotonic generation stamped on each send, so a completion for a
@@ -630,6 +649,17 @@ pub rec Runtime {
     arrivals_dropped:    [arrival_queue.CLASSES]u64;
     # Retry-token Initials refused because a replay store was full
     replay_full: u64;
+    # the worker this runtime serves for and where it hands other workers'
+    # datagrams, with what it received, forwarded and took from other workers,
+    # what it dropped forwarding by reason, and what named no connection it
+    # could reach
+    worker:          usize;
+    steering:        *steering.Board;
+    received:        u64;
+    forwarded_out:   u64;
+    forwarded_in:    u64;
+    forward_dropped: [steering.DROP_REASONS]u64;
+    unroutable:      u64;
     # the queued initials, so a sweep costs what is queued rather than what
     # the configured connection limit reserved
     pending_live_head:     usize;
@@ -860,6 +890,7 @@ fun reset_connection(value: *Connection) {
     value.waiting_next         = NO_CONNECTION;
     value.waiting_prev         = NO_CONNECTION;
     value.routes_removed       = false;
+    value.minted               = false;
     value.tls_live             = false;
     value.assembly_attempted   = false;
     value.assembly_released    = false;
@@ -917,7 +948,10 @@ fun claim_handshake(controls: *ControlView) usize {
 fun release_handshake(controls: *ControlView, runtime: *Runtime, index: usize,
     completed: bool, now_ns: u64) bool {
     val value: *Connection = connection_at(controls, index);
-    if (value.handshake == NO_HANDSHAKE) { ret true; }
+    # the client carries the minted ID once its handshake is done, and the ID
+    # it used before routes nowhere
+    if (!unpublish_route(runtime, ?value.storage.handshake_route)) { connection_failed(runtime); }
+    if (value.handshake == NO_HANDSHAKE)                           { ret true; }
     if (!hedge_storage.secret_table_release[server.Handshake](controls.handshakes,
         value.handshake)) { ret false; }
     value.handshake = NO_HANDSHAKE;
@@ -1160,11 +1194,7 @@ fun arm_connection_storage(value: *Connection) {
         value.storage.sends[i].context.prev_pending       = nil;
         i                                                 = i + 1;
     }
-    i = 0;
-    for (i < assembly.CONNECTION_ID_CAPACITY) {
-        value.storage.published[i].live = false;
-        i                               = i + 1;
-    }
+    value.storage.handshake_route.live = false;
 }
 
 # the live list is intrusive and doubly linked, so a connection leaves it in
@@ -1306,6 +1336,7 @@ fun unlink_live(controls: *ControlView, runtime: *Runtime, index: usize) {
 pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) bool {
     if (runtime == nil || runtime.initialized || config.chunks == nil
         || config.memory == nil || config.backing == nil || config.timers == nil
+        || config.worker >= steering.workers(config.steering)
         || !view_valid(controls)) { ret false; }
     if (!hedge_storage.make_table[PendingInitial](?runtime.pending_initials,
         config.backing)
@@ -1345,7 +1376,18 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.superseded_total  = 0;
     runtime.stateless_dropped = 0;
     clear_arrival_drops(runtime);
-    runtime.replay_full           = 0;
+    runtime.replay_full   = 0;
+    runtime.worker        = config.worker;
+    runtime.steering      = config.steering;
+    runtime.received      = 0;
+    runtime.forwarded_out = 0;
+    runtime.forwarded_in  = 0;
+    runtime.unroutable    = 0;
+    var reason: usize = 0;
+    for (reason < steering.DROP_REASONS) {
+        runtime.forward_dropped[reason] = 0;
+        reason                          = reason + 1;
+    }
     runtime.datagram_failures     = 0;
     runtime.connection_failures   = 0;
     runtime.pending_live_head     = NO_CONNECTION;
@@ -1520,6 +1562,36 @@ fun abandon_admission_parts(bank: *AdmissionGeneration,
     ret success;
 }
 
+# the bank's token manager holds the listener's token key, which every worker's
+# pump shares so a token sealed on one worker opens on another, and the key
+# before it, so a token sealed before the last rotation still opens
+fun initialize_tokens(pump: *Pump, bank: *AdmissionGeneration,
+    config: *PumpConfig) bool {
+    val keys:     *quic_keys.Listener = pump.keys;
+    val settings: token.Config        = token.Config{
+        source:          config.admission_generation,
+        retry_max_age:   config.retry_max_age_ns::i64 * duration.NANOSECOND,
+        address_max_age: config.address_max_age_ns::i64 * duration.NANOSECOND,
+        max_replay:      config.max_replay
+    };
+    if (keys.token_previous_generation == 0) {
+        ret token.initialize(?bank.tokens, settings, pump.backing, keys.token_generation,
+            contracts.SecretBytes{data: ?keys.token_key[0], len: token.KEY_SIZE});
+    }
+    if (!token.initialize(?bank.tokens, settings, pump.backing,
+        keys.token_previous_generation,
+        contracts.SecretBytes{data: ?keys.token_previous[0], len: token.KEY_SIZE})) {
+        ret false;
+    }
+    if (!token.rotate(?bank.tokens, keys.token_generation,
+        contracts.SecretBytes{data: ?keys.token_key[0], len: token.KEY_SIZE})) {
+        token.begin_close(?bank.tokens);
+        token.finish_close(?bank.tokens);
+        ret false;
+    }
+    ret true;
+}
+
 fun initialize_admission_inner(pump: *Pump, bank_index: usize,
     config: *PumpConfig, require_policy_identity: bool) bool {
     if (pump == nil || pump.backing == nil || bank_index >= ADMISSION_BANKS
@@ -1535,15 +1607,7 @@ fun initialize_admission_inner(pump: *Pump, bank_index: usize,
         max_connections_per_peer: config.max_connections_per_peer
     },
         pump.backing)) { ret false; }
-    if (!token.initialize(?bank.tokens, token.Config{
-        source:          config.admission_generation,
-        retry_max_age:   config.retry_max_age_ns::i64 * duration.NANOSECOND,
-        address_max_age: config.address_max_age_ns::i64 * duration.NANOSECOND,
-        max_replay:      config.max_replay
-    },
-        pump.backing, pump.token_generation, contracts.SecretBytes{
-        data: ?pump.token_key[0], len: token.KEY_SIZE
-    })) {
+    if (!initialize_tokens(pump, bank, config)) {
         abandon_admission_parts(bank, false, true, false);
         ret false;
     }
@@ -1604,7 +1668,7 @@ fun abandon_attached_pump(pump: *Pump) bool {
             pump.scope_live = false;
         }
     }
-    ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+    cid.destroy(?pump.codec);
     if (!stateless_sends.destroy[CompletionContext](?pump.stateless)) {
         success = false;
     }
@@ -1627,6 +1691,24 @@ fun abandon_attached_pump(pump: *Pump) bool {
     ret true;
 }
 
+# a pump that failed before its scope was made gives back its queues
+fun abandon_new_pump(runtime: *Runtime, pump: *Pump) {
+    if (!stateless_sends.destroy[CompletionContext](?pump.stateless)
+        || !arrival_queue.destroy(?pump.arrivals)) {
+        connection_failed(runtime);
+    }
+}
+
+# the live pump serving listener `listener`, or NO_PUMP
+fun pump_of(controls: *ControlView, listener: usize) usize {
+    var i: usize = 0;
+    for (i < MAX_PUMPS) {
+        if (controls.pumps[i].live && controls.pumps[i].listener == listener) { ret i; }
+        i = i + 1;
+    }
+    ret NO_PUMP;
+}
+
 fun free_pump(controls: *ControlView, runtime: *Runtime) usize {
     var i: usize = 0;
     for (i < MAX_PUMPS) {
@@ -1636,27 +1718,30 @@ fun free_pump(controls: *ControlView, runtime: *Runtime) usize {
     ret NO_PUMP;
 }
 
+# `listener` is the listener's index, and `keys` the keys every worker's pump
+# for it shares
 pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Driver,
-    socket: *udp.Socket, root: *cancel.Scope, local: ip.Endpoint,
-    config: PumpConfig, storage: *PumpStorage,
+    socket: *udp.Socket, root: *cancel.Scope, local: ip.Endpoint, listener: usize,
+    keys: *quic_keys.Listener, config: PumpConfig, storage: *PumpStorage,
     output: *PumpHandle) Status {
     if (runtime == nil || !runtime.initialized || runtime.stopping
         || driver == nil || socket == nil || root == nil || storage == nil
-        || output == nil
+        || output == nil || keys == nil || pump_of(controls, listener) != NO_PUMP
         || !pump_config_valid(?config)) { ret INVALID; }
     val index: usize = free_pump(controls, runtime);
     if (index == NO_PUMP) { ret BLOCKED; }
     val pump: *Pump = ?controls.pumps[index];
-    pump.storage          = storage;
-    pump.backing          = runtime.backing;
-    pump.generation       = next_generation(pump.generation);
-    pump.token_generation = next_generation(pump.token_generation);
-    pump.live             = false;
-    pump.scope_live       = false;
-    pump.receive_pending  = false;
-    pump.started          = false;
-    pump.draining         = false;
-    pump.cancelling       = false;
+    pump.storage         = storage;
+    pump.backing         = runtime.backing;
+    pump.generation      = next_generation(pump.generation);
+    pump.listener        = listener;
+    pump.keys            = keys;
+    pump.live            = false;
+    pump.scope_live      = false;
+    pump.receive_pending = false;
+    pump.started         = false;
+    pump.draining        = false;
+    pump.cancelling      = false;
     if (!stateless_sends.make[CompletionContext](?pump.stateless, pump.backing,
         MAX_STATELESS_PENDING)) {
         ret FAILED;
@@ -1674,14 +1759,14 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
         pump.admissions[i].retiring = false;
         i                           = i + 1;
     }
-    val keyed: err[io_error.Error] = memory_secret.random_fill(?pump.token_key[0], token.KEY_SIZE);
-    if (sel keyed.err) {
-        ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+    if (!cid.make(?pump.codec, keys, runtime.worker)) {
+        abandon_new_pump(runtime, pump);
         ret FAILED;
     }
     if (!operation_ok(cancel.make_child(?pump.storage.scope, root,
         opt[time.Instant].none{}))) {
-        ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+        cid.destroy(?pump.codec);
+        abandon_new_pump(runtime, pump);
         ret FAILED;
     }
     pump.scope_live         = true;
@@ -1739,6 +1824,9 @@ pub fun start(controls: *ControlView, runtime: *Runtime, handle: PumpHandle) Sta
     }
     val bank: *AdmissionGeneration = ?pump.admissions[pump.active_admission];
     if (bank.live) { bank.listener_published = true; }
+    # the first pump receiving is when other workers' datagrams have somewhere
+    # to go
+    steering.open(runtime.steering, runtime.worker);
     ret status;
 }
 
@@ -2119,6 +2207,7 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
     value.transport_finished      = false;
     value.timer_disarmed          = false;
     value.routes_removed          = false;
+    value.minted                  = false;
     value.tls_live                = false;
     value.assembly_attempted      = false;
     value.assembly_released       = false;
@@ -2165,6 +2254,11 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     }
     if (runtime.live_total != 0) { runtime.live_total = runtime.live_total - 1; }
     release_superseded(runtime, ?value.superseded);
+    if (value.minted && value.pump < MAX_PUMPS) {
+        quic_keys.count(controls.pumps[value.pump].keys, runtime.worker,
+            value.codepoint::usize, -1);
+        value.minted = false;
+    }
     value.lease                    = process_admission.no_lease();
     value.policy                   = nil;
     value.plan                     = nil;
@@ -2212,26 +2306,6 @@ fun connection_for(controls: *ControlView, runtime: *Runtime, index: usize,
     ret value;
 }
 
-fun same_route_binding(left: routing.Binding,
-    right: routing.Binding) bool {
-    ret left.connection_slot == right.connection_slot
-        && left.connection_generation == right.connection_generation
-        && left.route_index == right.route_index
-        && left.route_generation == right.route_generation
-        && left.route_sequence == right.route_sequence
-        && left.pump_generation == right.pump_generation
-        && left.pending == right.pending;
-}
-
-fun route_binding(value: *Connection, slot: usize,
-    route: assembly.Route) routing.Binding {
-    ret routing.Binding{connection_slot: slot,
-        connection_generation: value.generation,
-        route_index:           route.index, route_generation: route.generation,
-        route_sequence:        route.sequence,
-        pump_generation:       value.pump_generation};
-}
-
 fun unpublish_route(runtime: *Runtime,
     published: *PublishedRoute) bool {
     if (!published.live) { ret true; }
@@ -2244,60 +2318,68 @@ fun unpublish_route(runtime: *Runtime,
     ret true;
 }
 
-# the copied table is reconciled after every operation that can mutate core
-# state. each route is read once: the table is this connection's and only its
-# own operations move it, so a second read in the same pass reads the same
-fun reconcile_routes(controls: *ControlView, runtime: *Runtime, index: usize) bool {
-    val value: *Connection = connection_at(controls, index);
-    if (!value.live || !value.assembly.initialized) { ret false; }
-    val snapshot: assembly.RoutingSnapshot =
-        assembly.routing_snapshot(?value.assembly);
-    if (!snapshot.initialized
-        || snapshot.capacity > assembly.CONNECTION_ID_CAPACITY) { ret false; }
-    var routes: [assembly.CONNECTION_ID_CAPACITY]assembly.Route;
-    var i:      usize = 0;
-    for (i < assembly.CONNECTION_ID_CAPACITY) {
-        var route: assembly.Route;
-        if (i < snapshot.capacity) { route = assembly.route_at(?value.assembly, i); }
-        if (route.active && (route.id.length == 0
-            || route.id.length > routing.MAX_CID_BYTES)) { ret false; }
-        routes[i] = route;
-        # every stale route leaves before any is published, so a CID that
-        # moved between slots is never published twice
-        val published: *PublishedRoute = ?value.storage.published[i];
-        if (published.live && !(route.active
-            && route.id.length == published.key.length
-            && same_route_binding(published.binding,
-            route_binding(value, index, route)))) {
-            if (!unpublish_route(runtime, published)) { ret false; }
-        }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < assembly.CONNECTION_ID_CAPACITY) {
-        val route:     *assembly.Route = ?routes[i];
-        val published: *PublishedRoute = ?value.storage.published[i];
-        if (route.active && !published.live) {
-            val key:           routing.Key     = routing.key(?route.id.data[0], route.id.length);
-            val binding_value: routing.Binding = route_binding(value, index, @route);
-            if (routing.publish(?runtime.routes, key,
-                binding_value) != routing.ROUTE_OK) { ret false; }
-            published.key     = key;
-            published.binding = binding_value;
-            published.live    = true;
-        }
-        i = i + 1;
-    }
-    ret true;
+fun handshake_binding(value: *Connection, index: usize) routing.Binding {
+    ret routing.Binding{connection_slot: index,
+        connection_generation: value.generation, route_index: 0,
+        route_generation:      1, route_sequence: 0,
+        pump_generation:       value.pump_generation, pending: false};
+}
+
+# the client's Initials carry `id` until it takes the ID the connection was
+# minted, so the table routes it here until the handshake is done. one that
+# cannot be published costs the client's retransmitted Initials, which reach
+# the unknown path and are dropped as replays, as a pending initial's do
+fun publish_handshake_route(runtime: *Runtime, value: *Connection, index: usize,
+    id: *packet.ConnectionId) {
+    val key: routing.Key = routing.key(?id.data[0], id.len::usize);
+    if (!key.valid) { ret; }
+    val binding: routing.Binding = handshake_binding(value, index);
+    if (routing.publish(?runtime.routes, key, binding) != routing.ROUTE_OK) { ret; }
+    value.storage.handshake_route.key     = key;
+    value.storage.handshake_route.binding = binding;
+    value.storage.handshake_route.live    = true;
 }
 
 fun remove_routes(runtime: *Runtime, value: *Connection) bool {
+    ret unpublish_route(runtime, ?value.storage.handshake_route);
+}
+
+# the live connection of `pump_index` a handshake route names, or NO_CONNECTION
+fun handshake_owner(controls: *ControlView, runtime: *Runtime, pump_index: usize,
+    found: routing.Lookup) usize {
+    if (found.status != routing.ROUTE_OK || found.binding.pending) { ret NO_CONNECTION; }
+    val index: usize       = found.binding.connection_slot;
+    val value: *Connection = connection_for(controls, runtime, index,
+        found.binding.connection_generation);
+    if (value == nil || value.pump != pump_index
+        || value.pump_generation != found.binding.pump_generation
+        || !value.storage.handshake_route.live) { ret NO_CONNECTION; }
+    ret index;
+}
+
+# the live connection of `pump_index` in `slot` when it holds `id`, or
+# NO_CONNECTION. the decoded slot proves nothing until the connection's own
+# routes hold these bytes
+fun owner_of(controls: *ControlView, runtime: *Runtime, pump_index: usize, slot: u32,
+    id: *u8) usize {
+    if (slot == cid.NO_SLOT || slot::usize >= hedge_storage.pair_capacity[ConnectionStorage,
+        Connection](controls.connections)) { ret NO_CONNECTION; }
+    val index: usize       = slot::usize;
+    val value: *Connection = connection_at(controls, index);
+    if (value == nil || !value.live || value.pump != pump_index
+        || !controls.pumps[pump_index].live
+        || controls.pumps[pump_index].generation != value.pump_generation
+        || !value.assembly.initialized) { ret NO_CONNECTION; }
+    val snapshot: assembly.RoutingSnapshot = assembly.routing_snapshot(?value.assembly);
+    if (!snapshot.initialized) { ret NO_CONNECTION; }
     var i: usize = 0;
-    for (i < assembly.CONNECTION_ID_CAPACITY) {
-        if (!unpublish_route(runtime, ?value.storage.published[i])) { ret false; }
+    for (i < snapshot.capacity && i < assembly.CONNECTION_ID_CAPACITY) {
+        var route: assembly.Route = assembly.route_at(?value.assembly, i);
+        if (route.active && route.id.length == cid.BYTES && cid.same(?route.id.data[0], id)
+            && assembly.route_valid(?value.assembly, ?route)) { ret index; }
         i = i + 1;
     }
-    ret true;
+    ret NO_CONNECTION;
 }
 
 pub fun timer_owner(index: usize) u64 {
@@ -2448,8 +2530,7 @@ fun deliver_held(controls: *ControlView, runtime: *Runtime, index: usize,
             ?value.assembly.driver, ?packet, value.local, clock.from_ns(now_ns), 0);
         # released after delivery: a release may compact the chunk the data is in
         holding.pop(?runtime.held, ?value.held);
-        if (delivered.status == qt.STATUS_ERROR
-            || !reconcile_routes(controls, runtime, index)) {
+        if (delivered.status == qt.STATUS_ERROR) {
             fail_connection(controls, runtime, index, now_ns);
         }
     }
@@ -2483,6 +2564,7 @@ fun set_waiting(controls: *ControlView, runtime: *Runtime, index: usize, waiting
 pub fun has_ready(runtime: *Runtime) bool {
     ret runtime != nil && runtime.initialized
         && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil
+        || steering.signalled(runtime.steering, runtime.worker)
         || runtime.pending_ready_head != NO_CONNECTION
         || runtime.handshake_ready_head != NO_CONNECTION
         || runtime.retire_head != NO_CONNECTION || promotable(runtime));
@@ -2563,20 +2645,17 @@ fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize) b
     ret true;
 }
 
-# the client addresses this connection by the id the server chose in its Retry,
-# and the production core carries exactly one local routing id, so the
-# connection adopts that id rather than inventing a second one nothing is sent
-# to. short headers are parsed at a fixed local id length, so a peer-chosen
-# length is refused rather than silently mis-routed.
-pub fun adopt_local_cid(value: *Connection,
-    accepted: *quic_listener.Accepted) bool {
-    val id: *packet.ConnectionId = ?accepted.initial_destination;
-    if (id.len::usize != CONNECTION_ID_BYTES) { ret false; }
-    var i: usize = 0;
-    for (i < CONNECTION_ID_BYTES) {
-        value.storage.local_cid[i] = id.data[i];
-        i                          = i + 1;
-    }
+# the connection's own ID, minted for its slot so every worker's decode names
+# it. the client learns it from the server's first Initial and carries it from
+# then on (RFC 9000 7.2), and until then its Initials carry the Retry's source,
+# or its own choice without a Retry, which the table routes here
+fun mint_local_cid(runtime: *Runtime, pump: *Pump, value: *Connection,
+    index: usize) bool {
+    val codepoint: u8 = cid.mint(?pump.codec, index::u32, ?value.storage.local_cid[0]);
+    if (codepoint == quic_keys.UNROUTABLE) { ret false; }
+    value.codepoint = codepoint;
+    value.minted    = true;
+    quic_keys.count(pump.keys, runtime.worker, codepoint::usize, 1);
     ret true;
 }
 
@@ -2612,7 +2691,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
         memory.LANES, config_snapshot.memory_budgets);
     if (value.handshake == NO_HANDSHAKE
         || !copy_listener_name(value, config_snapshot.listener_name)
-        || !adopt_local_cid(value, accepted)
+        || !mint_local_cid(runtime, pump, value, index)
         || !operation_ok(cancel.make_child(?value.storage.scope, ?pump.storage.scope,
         opt[time.Instant].none{}))) {
         value.state = CONNECTION_CLEANUP;
@@ -2679,8 +2758,8 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     }
     value.tls_live = false;
     value.state    = CONNECTION_LIVE;
-    if (!reconcile_routes(controls, runtime, index)
-        || !refresh_timer(controls, runtime, index)) {
+    publish_handshake_route(runtime, value, index, ?accepted.initial_destination);
+    if (!refresh_timer(controls, runtime, index)) {
         fail_connection(controls, runtime, index, now_ns);
         ret false;
     }
@@ -2727,10 +2806,13 @@ fun submit_stateless(controls: *ControlView, runtime: *Runtime, pump_index: usiz
     ret OK;
 }
 
-fun retry_identity(request: *quic_listener.Request) bool {
+# a Retry's source is minted here with no slot, so the client's next Initial,
+# which carries it, reaches this worker and the replay store that holds its
+# token's nonce
+fun retry_identity(pump: *Pump, request: *quic_listener.Request) bool {
     var source: [CONNECTION_ID_BYTES]u8;
     var nonce:  u64 = 0;
-    if (!filled(random.fill(?source[0], CONNECTION_ID_BYTES))
+    if (cid.mint(?pump.codec, cid.NO_SLOT, ?source[0]) == quic_keys.UNROUTABLE
         || !filled(random.fill((?nonce)::*u8, 8)) || nonce == 0
         || !quic_listener.set_retry_source(request, ?source[0],
         CONNECTION_ID_BYTES)) { ret false; }
@@ -3085,8 +3167,7 @@ fun deliver_initial(controls: *ControlView, runtime: *Runtime, index: usize,
         ?value.assembly.driver, received, value.local, clock.from_ns(now_ns), 0);
     # a cancel that does not start the close never arms the drain deadline, so
     # the connection would hold its slot and its lease and block shutdown
-    if (delivered.status == qt.STATUS_ERROR
-        || !reconcile_routes(controls, runtime, index)) {
+    if (delivered.status == qt.STATUS_ERROR) {
         fail_connection(controls, runtime, index, now_ns);
         ret false;
     }
@@ -3155,11 +3236,8 @@ fun preflight_arrival(controls: *ControlView, runtime: *Runtime, pump_index: usi
     # a route published since it was held claims it: a retransmission of an
     # Initial whose first copy was admitted from this same queue
     val found: routing.Lookup = routing.lookup(?runtime.routes, key);
-    if (found.status == routing.ROUTE_OK && found.binding.pending) {
-        ret deliver_pending(runtime, found, ?received);
-    }
     if (found.status == routing.ROUTE_OK) {
-        ret deliver_known(controls, runtime, ?received, found, now, now_ns);
+        ret deliver_routed(controls, runtime, pump_index, ?received, found, now, now_ns);
     }
     ret handle_unknown(controls, runtime, pump_index, ?received, key, now,
         now_ns, copy.arrival_ns);
@@ -3222,7 +3300,7 @@ fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     request.version_negotiation_bits = 0x5a;
     request.output                   = ?pump.storage.preflight_output[0];
     request.output_capacity          = assembly.MAX_UDP_PAYLOAD;
-    if (!retry_identity(?request)) { ret FAILED; }
+    if (!retry_identity(pump, ?request)) { ret FAILED; }
     val result: quic_listener.Result =
         quic_listener.preflight(?bank.listener, ?request);
     if (result.action == quic_listener.ACTION_RETRY
@@ -3316,28 +3394,6 @@ fun abandon_admission(controls: *ControlView, runtime: *Runtime, pump_index: usi
     ret OK;
 }
 
-fun route_is_current(controls: *ControlView, runtime: *Runtime, found: routing.Lookup) bool {
-    if (found.status != routing.ROUTE_OK) { ret false; }
-    val value: *Connection =
-        connection_at(controls, found.binding.connection_slot);
-    if (value == nil || !value.live
-        || value.generation != found.binding.connection_generation
-        || value.pump >= MAX_PUMPS
-        || value.pump_generation != found.binding.pump_generation
-        || !controls.pumps[value.pump].live
-        || controls.pumps[value.pump].generation != value.pump_generation
-        || found.binding.route_index >= assembly.CONNECTION_ID_CAPACITY
-        || !value.storage.published[found.binding.route_index].live
-        || !same_route_binding(
-        value.storage.published[found.binding.route_index].binding,
-        found.binding)) { ret false; }
-    val route: assembly.Route = assembly.route_at(?value.assembly,
-        found.binding.route_index);
-    ret route.active && route.generation == found.binding.route_generation
-        && route.sequence == found.binding.route_sequence
-        && assembly.route_valid(?value.assembly, ?route);
-}
-
 fun mark_close_started(value: *Connection, now_ns: u64) {
     if (!value.close_started) {
         value.close_started     = true;
@@ -3411,7 +3467,6 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
     value.timer_disarmed = true;
     arm_timer(runtime, value, now_ns);
     if (!value.routes_removed) {
-        reconcile_routes(controls, runtime, index);
         if (!remove_routes(runtime, value)) { ret FAILED; }
         value.routes_removed = true;
     }
@@ -3673,14 +3728,11 @@ fun generate_sends(controls: *ControlView, runtime: *Runtime, index: usize,
         val generated: qt.Generated = qt.generate[binding.Binding](
             ?value.assembly.driver, ?value.storage.scope, ?operation.buffer[0],
             assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns), operation.generation::usize);
-        # a datagram's routes are published before it goes out. with nothing
-        # to send, the reconcile that ends the service pass covers the table
         if (generated.status == qt.STATUS_EMPTY
             || generated.status == qt.STATUS_BLOCKED
             || generated.status == qt.STATUS_CLOSED
             || generated.status == qt.STATUS_CANCELLED) { ret true; }
-        if (generated.status != qt.STATUS_OK
-            || !reconcile_routes(controls, runtime, index)) { ret false; }
+        if (generated.status != qt.STATUS_OK) { ret false; }
         operation.token = generated.token;
         fill_send_packet(operation, generated);
         if (!make_context(?operation.context, runtime, COMPLETION_SEND,
@@ -3696,7 +3748,6 @@ fun generate_sends(controls: *ControlView, runtime: *Runtime, index: usize,
         if (sel submitted.err) {
             qt.complete_send[binding.Binding](?value.assembly.driver,
                 generated.token, qt.SEND_FAILED, 0, clock.from_ns(now_ns));
-            reconcile_routes(controls, runtime, index);
             ret false;
         }
         operation.pending = true;
@@ -3740,15 +3791,12 @@ fun progress_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     if (value.handshake != NO_HANDSHAKE && assembly.tls_released(?value.assembly)
         && !release_handshake(controls, runtime, index, true, now_ns)) { ret false; }
     observe_memory(value, now_ns);
-    if (!reconcile_routes(controls, runtime, index)
-        || !refresh_timer(controls, runtime, index)) { ret false; }
+    if (!refresh_timer(controls, runtime, index)) { ret false; }
     ret h3_ok && sends_ok;
 }
 
 fun deliver_known(controls: *ControlView, runtime: *Runtime, received: *net_types.Packet,
-    found: routing.Lookup, now: time.Instant, now_ns: u64) Status {
-    if (!route_is_current(controls, runtime, found)) { ret STALE; }
-    val index: usize       = found.binding.connection_slot;
+    index: usize, now: time.Instant, now_ns: u64) Status {
     val value: *Connection = connection_at(controls, index);
     # a connection mid-handshake takes its datagrams on the worker's handshake
     # turn, so the receive path spends no crypto and reads on
@@ -3759,40 +3807,122 @@ fun deliver_known(controls: *ControlView, runtime: *Runtime, received: *net_type
     }
     val delivered: qt.OperationResult = qt.receive_native[binding.Binding](
         ?value.assembly.driver, received, value.local, clock.from_ns(now_ns), 0);
-    if (delivered.status == qt.STATUS_ERROR
-        || !reconcile_routes(controls, runtime, index)) {
+    if (delivered.status == qt.STATUS_ERROR) {
         fail_connection(controls, runtime, index, now_ns);
     }
     mark_ready(controls, runtime, index);
     ret OK;
 }
 
+# a datagram the table routes: a pending initial's or a handshake's Initial
+fun deliver_routed(controls: *ControlView, runtime: *Runtime, pump_index: usize,
+    received: *net_types.Packet, found: routing.Lookup, now: time.Instant,
+    now_ns: u64) Status {
+    if (found.binding.pending) { ret deliver_pending(runtime, found, received); }
+    val index: usize = handshake_owner(controls, runtime, pump_index, found);
+    if (index == NO_CONNECTION) { ret STALE; }
+    ret deliver_known(controls, runtime, received, index, now, now_ns);
+}
+
+# hand a datagram for another worker's connection to that worker
+fun forward(runtime: *Runtime, pump: *Pump, target: usize, received: *net_types.Packet,
+    arrival_ns: u64) Status {
+    val outcome: steering.Outcome = steering.forward(runtime.steering, runtime.worker,
+        target, pump.listener, received, arrival_ns);
+    if (outcome == steering.FORWARDED) {
+        runtime.forwarded_out = runtime.forwarded_out + 1;
+        ret OK;
+    }
+    val reason: usize = outcome::usize - 1;
+    runtime.forward_dropped[reason] = runtime.forward_dropped[reason] + 1;
+    ret BLOCKED;
+}
+
+# where a datagram goes: an Initial the table knows to what it names, since its
+# connection ID may be the client's own and decode to any worker by chance;
+# then an ID minted for another worker to that worker; an Initial nothing knows
+# to the arrival queue; and an ID minted here to the connection in its slot. a
+# datagram another worker forwarded is never forwarded again
 fun process_datagram(controls: *ControlView, runtime: *Runtime, pump_index: usize,
-    received: *net_types.Packet, now: time.Instant, now_ns: u64) Status {
+    received: *net_types.Packet, forwarded: bool, arrival_ns: u64, now: time.Instant,
+    now_ns: u64) Status {
     if (received == nil || received.truncated || received.zero_length
         || received.length == 0
         || received.length > assembly.MAX_UDP_PAYLOAD) { ret INVALID; }
+    val pump:       *Pump                            = ?controls.pumps[pump_index];
     val classified: quic_listener.ClassifiedDatagram =
         quic_listener.classify_datagram(received.buffer, received.length,
         CONNECTION_ID_BYTES);
     if (classified.class == quic_listener.DATAGRAM_MALFORMED) { ret OK; }
     val key: routing.Key = routing.key(?classified.destination.data[0],
         classified.destination.length);
-    val found: routing.Lookup = routing.lookup(?runtime.routes, key);
-    if (found.status == routing.ROUTE_OK && found.binding.pending) {
-        ret deliver_pending(runtime, found, received);
+    val initial: bool = classified.class == quic_listener.DATAGRAM_INITIAL
+        || classified.class == quic_listener.DATAGRAM_NEGOTIATE;
+    if (initial) {
+        val found: routing.Lookup = routing.lookup(?runtime.routes, key);
+        if (found.status == routing.ROUTE_OK) {
+            ret deliver_routed(controls, runtime, pump_index, received, found, now, now_ns);
+        }
     }
-    if (found.status == routing.ROUTE_OK) {
-        ret deliver_known(controls, runtime, received, found, now, now_ns);
+    val decoded: cid.Decoded = cid.decode(?pump.codec, ?classified.destination.data[0],
+        classified.destination.length);
+    val routable: bool = decoded.status == cid.DECODED
+        && decoded.worker < steering.workers(runtime.steering);
+    if (routable && decoded.worker != runtime.worker) {
+        if (forwarded) {
+            runtime.unroutable = runtime.unroutable + 1;
+            ret OK;
+        }
+        ret forward(runtime, pump, decoded.worker, received, arrival_ns);
     }
-    if (classified.class == quic_listener.DATAGRAM_INITIAL
-        || classified.class == quic_listener.DATAGRAM_NEGOTIATE) {
-        val pump: *Pump = ?controls.pumps[pump_index];
+    if (initial) {
         if (pump.draining || pump.cancelling) { ret STOPPED; }
         ret hold_arrival(runtime, pump, received, key,
             arrival_queue.class_of(?pump.arrivals, ?classified, key), now_ns);
     }
-    ret OK;
+    if (!routable) {
+        runtime.unroutable = runtime.unroutable + 1;
+        ret OK;
+    }
+    val index: usize = owner_of(controls, runtime, pump_index, decoded.slot,
+        ?classified.destination.data[0]);
+    if (index == NO_CONNECTION) {
+        runtime.unroutable = runtime.unroutable + 1;
+        ret STALE;
+    }
+    ret deliver_known(controls, runtime, received, index, now, now_ns);
+}
+
+# the datagrams other workers forwarded here since the last turn, each to the
+# pump that serves its listener, up to a turn's bound so this worker's own
+# socket is read between turns
+fun take_forwarded(controls: *ControlView, runtime: *Runtime, now: time.Instant,
+    now_ns: u64) {
+    if (!steering.signalled(runtime.steering, runtime.worker)) { ret; }
+    # what another worker forwarded may answer a datagram this one sent since
+    # its io was last read, and the transport learns a datagram went out only
+    # when its send settles: a PATH_RESPONSE taken first finds its challenge
+    # not yet sent and is dropped. the io is read first, as a receive from the
+    # socket is only ever read after it
+    read_on(controls, runtime, now, now_ns);
+    steering.begin(runtime.steering, runtime.worker);
+    var budget: usize = FORWARD_BUDGET;
+    var taken:  steering.Taken;
+    for (budget != 0 && steering.take(runtime.steering, runtime.worker, ?taken)) {
+        runtime.forwarded_in = runtime.forwarded_in + 1;
+        val pump_index: usize = pump_of(controls, taken.datagram.listener);
+        if (pump_index != NO_PUMP) {
+            var packet: net_types.Packet = steering.packet(?taken);
+            if (process_datagram(controls, runtime, pump_index, ?packet, true,
+                taken.datagram.arrival_ns, now, now_ns) == FAILED) {
+                runtime.datagram_failures = runtime.datagram_failures + 1;
+            }
+        }
+        or { runtime.unroutable = runtime.unroutable + 1; }
+        steering.release(?taken);
+        budget = budget - 1;
+    }
+    if (budget == 0) { steering.resignal(runtime.steering, runtime.worker); }
 }
 
 fun context_current(controls: *ControlView, runtime: *Runtime, context: *CompletionContext) bool {
@@ -3822,10 +3952,11 @@ fun settle_receive(controls: *ControlView, runtime: *Runtime, context: *Completi
         val started_ns:     u64   = monotonic_ns();
         val held_before:    usize = arrival_queue.live(?pump.arrivals);
         val dropped_before: u64   = arrivals_dropped_total(runtime);
-        var i:              usize = 0;
+        runtime.received = runtime.received + completion.items::u64;
+        var i: usize = 0;
         for (i < completion.items) {
             val applied: Status = process_datagram(controls, runtime, context.pump,
-                ?pump.storage.receive_packets[i], now, now_ns);
+                ?pump.storage.receive_packets[i], false, now_ns, now, now_ns);
             if (applied == FAILED) {
                 runtime.datagram_failures = runtime.datagram_failures + 1;
             }
@@ -3891,8 +4022,7 @@ fun settle_send(controls: *ControlView, runtime: *Runtime, context: *CompletionC
         ?value.assembly.driver, operation.token, send_status, count,
         clock.from_ns(now_ns));
     operation.pending = false;
-    if (settled.status == qt.STATUS_ERROR
-        || !reconcile_routes(controls, runtime, context.connection)) {
+    if (settled.status == qt.STATUS_ERROR) {
         fail_connection(controls, runtime, context.connection, now_ns);
     }
     settle_transport(controls, runtime, context.connection, now, now_ns);
@@ -4044,8 +4174,7 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     if (qt.snapshot[binding.Binding](?value.assembly.driver).state !=
         qt.CLOSED) { ret BLOCKED; }
     if (!value.routes_removed) {
-        if (!reconcile_routes(controls, runtime, index)
-            || !remove_routes(runtime, value)) { ret FAILED; }
+        if (!remove_routes(runtime, value)) { ret FAILED; }
         value.routes_removed = true;
     }
     val pump: *Pump                = ?controls.pumps[value.pump];
@@ -4434,8 +4563,7 @@ pub fun fire(controls: *ControlView, runtime: *Runtime, owner: u64, now_ns: u64)
             && timed.status != qt.STATUS_OK) {
             fail_connection(controls, runtime, index, now_ns);
         }
-        if (!reconcile_routes(controls, runtime, index)
-            || !refresh_timer(controls, runtime, index)) {
+        if (!refresh_timer(controls, runtime, index)) {
             fail_connection(controls, runtime, index, now_ns);
         }
     }
@@ -4499,7 +4627,8 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
     if (runtime == nil || !runtime.initialized || now_ns == 0) { ret INVALID; }
     val now:    time.Instant = clock.from_ns(now_ns);
     val status: Status       = drain_completions(controls, runtime, now, now_ns);
-    var i:      usize        = runtime.waiting_head;
+    take_forwarded(controls, runtime, now, now_ns);
+    var i: usize = runtime.waiting_head;
     for (i != NO_CONNECTION) {
         mark_ready(controls, runtime, i);
         i = connection_at(controls, i).waiting_next;
@@ -4545,6 +4674,24 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
     }
     advance_teardown(controls, runtime, now, now_ns);
     ret status;
+}
+
+# the datagrams this worker read, forwarded to other workers and took from them,
+# what it dropped forwarding by reason and what named no connection it could
+# reach, read every turn
+pub fun steering_report(runtime: *Runtime) telemetry.SteeringReport {
+    var value: telemetry.SteeringReport;
+    if (runtime == nil || !runtime.initialized) { ret value; }
+    value.received      = runtime.received;
+    value.forwarded_out = runtime.forwarded_out;
+    value.forwarded_in  = runtime.forwarded_in;
+    value.unroutable    = runtime.unroutable;
+    var reason: usize = 0;
+    for (reason < steering.DROP_REASONS) {
+        value.forward_dropped[reason] = runtime.forward_dropped[reason];
+        reason                        = reason + 1;
+    }
+    ret value;
 }
 
 # the handshake admission counters, read every turn, so they cost no walk
@@ -4695,7 +4842,8 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
         pump.scope_live = false;
     }
     unqueue_completion(runtime, ?pump.storage.receive_context);
-    ct.zeroize(?pump.token_key[0], token.KEY_SIZE);
+    cid.destroy(?pump.codec);
+    pump.keys          = nil;
     pump.driver        = nil;
     pump.socket        = nil;
     pump.root          = nil;
@@ -4729,6 +4877,7 @@ pub fun release(controls: *ControlView, runtime: *Runtime) Status {
         i = i + 1;
     }
     if (runtime.sessions.live != 0 || runtime.pump_count != 0) { ret BLOCKED; }
+    steering.close(runtime.steering, runtime.worker);
     # each part is released once, so a refused release retries only what remains
     if (!hedge_storage.destroy_table[PendingInitial](?runtime.pending_initials)
         || (runtime.routes.initialized && !routing.destroy(?runtime.routes))
@@ -4910,14 +5059,23 @@ fun test_allocator() *A.Allocator {
     ret ?test_backing;
 }
 
+# one listener's keys, made once for every test in this module
+#[testing]
+fun test_listener_keys() *quic_keys.Listener {
+    if (!quic_keys.made()) { quic_keys.make(1); }
+    ret quic_keys.listener_at(0);
+}
+
 #[testing]
 fun test_prepare_pump(runtime: *Runtime, pump: *Pump, storage: *PumpStorage,
     generation: u64, config: *PumpConfig) bool {
-    pump.storage                = storage;
-    pump.backing                = test_allocator();
-    pump.generation             = generation;
-    pump.token_generation       = 1;
-    pump.live                   = true;
+    pump.storage    = storage;
+    pump.backing    = test_allocator();
+    pump.generation = generation;
+    pump.listener   = 0;
+    pump.keys       = test_listener_keys();
+    pump.live       = true;
+    cid.make(?pump.codec, pump.keys, 0);
     pump.active_admission       = 0;
     pump.active_connections     = 0;
     pump.queued_initials        = 0;
@@ -5188,7 +5346,23 @@ rec TestServer {
 #[testing]
 fun test_prepare_server(prepared: *TestServer, fixture: *TestControls,
     controls: *ControlView, index: usize) i32 {
-    val value: *Connection = connection_at(controls, index);
+    val loaded: i32 = test_server_credentials(prepared);
+    if (loaded != 0) { ret loaded; }
+    val accepted: *quic_listener.Accepted = ?prepared.accepted;
+    accepted.action = quic_listener.ACTION_ACCEPT;
+    packet.set_connection_id(?accepted.original_destination, ?prepared.initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_destination, ?prepared.initial_id[0], 8);
+    packet.set_connection_id(?accepted.initial_source, ?prepared.peer_id[0], 8);
+    accepted.peer           = ip.endpoint(192, 0, 2, 2, 55000);
+    accepted.version        = packet.VERSION_1;
+    accepted.peer_validated = true;
+    ret test_server_accept(prepared, fixture, controls, index, accepted,
+        ?prepared.local_id[0], 8);
+}
+
+# the server's credentials and TLS configuration, and the IDs a dial uses
+#[testing]
+fun test_server_credentials(prepared: *TestServer) i32 {
     prepared.owner = secret.system_allocator();
     if (!test_credentials.load_credentials(?prepared.identity, ?prepared.chain[0], ?prepared.key,
         ?prepared.owner)) { ret 3; }
@@ -5226,40 +5400,42 @@ fun test_prepare_server(prepared: *TestServer, fixture: *TestControls,
     tls_configuration.limits               = hedge_tls.listener_limits();
     prepared.tls_clock_source              = tls_clock.system();
     tls_configuration.clock                = ?prepared.tls_clock_source;
-    value.handshake                        = claim_handshake(controls);
+    prepared.local_id                      = [8]u8{1, 2, 3, 4, 5, 6, 7, 8};
+    prepared.peer_id                       = [8]u8{9, 10, 11, 12, 13, 14, 15, 16};
+    prepared.initial_id                    = [8]u8{17, 18, 19, 20, 21, 22, 23, 24};
+    ret 0;
+}
+
+# the connection in `index` takes `accepted` with `local` as its own ID: its
+# handshake record, its TLS server over the parameters that acceptance and ID
+# give, and its scope
+#[testing]
+fun test_server_accept(prepared: *TestServer, fixture: *TestControls,
+    controls: *ControlView, index: usize, accepted: *quic_listener.Accepted,
+    local: *u8, local_length: usize) i32 {
+    val value: *Connection = connection_at(controls, index);
+    value.handshake = claim_handshake(controls);
     if (value.handshake == NO_HANDSHAKE) { ret 4; }
     val engine: *server.Handshake = handshake_at(controls, value.handshake);
     prepared.conn_budgets = memory.no_budgets();
     memory.borrower(?value.storage.borrower, ?fixture.memory, timer_owner(index),
         memory.LANES, prepared.conn_budgets);
-    prepared.local_id   = [8]u8{1, 2, 3, 4, 5, 6, 7, 8};
-    prepared.peer_id    = [8]u8{9, 10, 11, 12, 13, 14, 15, 16};
-    prepared.initial_id = [8]u8{17, 18, 19, 20, 21, 22, 23, 24};
-    val local:  ip.Endpoint      = ip.endpoint(192, 0, 2, 1, 4433);
-    val peer:   ip.Endpoint      = ip.endpoint(192, 0, 2, 2, 55000);
     val config: *assembly.Config = ?prepared.config;
-    @config                     = assembly.default_config(81, local, peer);
-    config.local_source         = ?prepared.local_id[0];
-    config.local_source_length  = 8;
+    @config = assembly.default_config(81,
+        ip.endpoint(192, 0, 2, 1, 4433), accepted.peer);
+    config.local_source         = local;
+    config.local_source_length  = local_length;
     config.alpn                 = ?prepared.protocol_bytes[0];
     config.alpn_length          = 2;
     config.entropy_context_size = 0;
     config.account_handle       = timer_owner(index);
     config.extra_budgets        = ?prepared.conn_budgets.lanes[quic_supply.LANES::usize];
     config.extra_lanes          = memory.LANES::usize - quic_supply.LANES::usize;
-    val accepted: *quic_listener.Accepted = ?prepared.accepted;
-    accepted.action = quic_listener.ACTION_ACCEPT;
-    packet.set_connection_id(?accepted.original_destination, ?prepared.initial_id[0], 8);
-    packet.set_connection_id(?accepted.initial_destination, ?prepared.initial_id[0], 8);
-    packet.set_connection_id(?accepted.initial_source, ?prepared.peer_id[0], 8);
-    accepted.peer           = peer;
-    accepted.version        = packet.VERSION_1;
-    accepted.peer_validated = true;
     if (!assembly.apply_server_acceptance(config, accepted)) { ret 4; }
     val encoded: transport_parameters.EncodeResult =
         assembly.encode_parameters(config, qt.SERVER,
         ?value.storage.local_parameters[0], assembly.PARAMETER_CAPACITY);
-    if (!encoded.ok || !server.init(engine, tls_configuration,
+    if (!encoded.ok || !server.init(engine, ?prepared.tls_configuration,
         assembly.tls_lease(?value.assembly),
         server.ExtraExtension{kind: server.QUIC_TRANSPORT_PARAMETERS,
         data: contracts.Bytes{
@@ -5773,7 +5949,7 @@ test storage__idle_holds_none_and_rearms {
     # marks a stale owner left behind, which arming the storage has to clear
     storage.sends[0].pending                    = true;
     storage.sends[0].context.completion_pending = true;
-    storage.published[0].live                   = true;
+    storage.handshake_route.live                = true;
     return_connection(controls, ?runtime, taken);
     # releasing the only connection compacts both halves away; the plain chunk is
     # kept for the next grow, stale, so the next claim must arm it again
@@ -5785,7 +5961,7 @@ test storage__idle_holds_none_and_rearms {
     val rearmed: *Connection = connection_at(controls, again);
     if (again != taken || rearmed == nil || rearmed.storage != storage
         || storage.sends[0].pending || storage.sends[0].context.completion_pending
-        || storage.published[0].live) { ret 5; }
+        || storage.handshake_route.live) { ret 5; }
     return_connection(controls, ?runtime, again);
     if (release(controls, ?runtime) != OK) { ret 6; }
     ret 0;
@@ -7064,6 +7240,165 @@ fun test_carry(source: *qt.Driver[binding.Binding], scope: *cancel.Scope,
         guard = guard + 1;
     }
     ret false;
+}
+
+# the first Retry-then-accept round trip hedge runs with a connection ID it
+# mints at accept (#174). the Retry's source is minted with no slot, the client
+# answers it with an Initial addressed to it, and the connection takes a fresh
+# ID for its slot as its own, which the client carries from the server's first
+# Initial on: RFC 9000 7.2 lets the server's Initial source differ from the
+# Retry's, and the transport takes the client's Initials under the Retry ID
+test accept__mints_its_own_id_beside_the_retry_source {
+    var fixture:      TestControls;
+    val controls:     *ControlView = test_controls(?fixture);
+    var runtime:      Runtime;
+    var pump_storage: PumpStorage;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
+    var protocols:      [1]tls_config.ProtocolName;
+    var policy:         hedge_tls.Policy;
+    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
+    var retry_plan: plan.Plan;
+    retry_plan.generation = 1;
+    retry_plan.sealed     = true;
+    var budgets: budget.Set;
+    var config:  PumpConfig = test_pump_config(40, ?policy, ?retry_plan, ?budgets);
+    config.require_retry = true;
+    val pump: *Pump = ?controls.pumps[0];
+    if (!test_prepare_pump(?runtime, pump, ?pump_storage, 1, ?config)) { ret 1; }
+    val listener:   *quic_listener.Listener = ?pump.admissions[0].listener;
+    var tls_server: TestServer;
+    val loaded:     i32                     = test_server_credentials(?tls_server);
+    if (loaded != 0) { ret loaded; }
+    val server_at: ip.Endpoint = ip.endpoint(192, 0, 2, 1, 4433);
+    val client_at: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
+    var now_ns:    u64         = 1000000000;
+    var wire:      [assembly.MAX_UDP_PAYLOAD]u8;
+    val first:     usize       = test_dial(?tls_server, ?pump.secret_scratch, ?wire[0],
+        assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns));
+    if (first == 0) { ret 2; }
+    # the first Initial is answered with a Retry whose source names this
+    # worker and no slot
+    var request: quic_listener.Request;
+    request.peer                     = client_at;
+    request.data                     = ?wire[0];
+    request.length                   = first;
+    request.now                      = clock.from_ns(now_ns);
+    request.version_negotiation_bits = 0x5a;
+    request.output                   = ?pump_storage.preflight_output[0];
+    request.output_capacity          = assembly.MAX_UDP_PAYLOAD;
+    if (!retry_identity(pump, ?request)) { ret 3; }
+    var retry_source: [CONNECTION_ID_BYTES]u8;
+    var i:            usize = 0;
+    for (i < CONNECTION_ID_BYTES) {
+        retry_source[i] = request.retry_source.data[i];
+        i               = i + 1;
+    }
+    val retry_named: cid.Decoded = cid.decode(?pump.codec, ?retry_source[0],
+        CONNECTION_ID_BYTES);
+    if (retry_named.status != cid.DECODED || retry_named.worker != 0
+        || retry_named.slot != cid.NO_SLOT) { ret 4; }
+    val retried: quic_listener.Result = quic_listener.preflight(listener, ?request);
+    if (retried.action != quic_listener.ACTION_RETRY) { ret 5; }
+    val client_driver: *qt.Driver[binding.Binding] = ?dialer.driver;
+    var input:         qt.Datagram;
+    now_ns            = now_ns + 1000;
+    input.local       = client_at;
+    input.peer        = server_at;
+    input.data        = ?pump_storage.preflight_output[0];
+    input.length      = retried.output_count;
+    input.received_at = clock.from_ns(now_ns);
+    input.ecn         = 0;
+    if (qt.receive_datagram[binding.Binding](client_driver, ?input).status != qt.STATUS_OK) {
+        ret 6;
+    }
+    # the client's answer carries the token and is addressed to the Retry's source
+    now_ns = now_ns + 1000;
+    val second: qt.Generated = qt.generate[binding.Binding](client_driver, ?dialer_scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns), 0);
+    if (second.status != qt.STATUS_OK || second.count == 0
+        || qt.complete_send[binding.Binding](client_driver, second.token, qt.SEND_SENT,
+        second.count, clock.from_ns(now_ns)).status != qt.STATUS_OK) { ret 7; }
+    val addressed: quic_listener.ClassifiedDatagram = quic_listener.classify_datagram(
+        ?wire[0], second.count, CONNECTION_ID_BYTES);
+    if (addressed.class != quic_listener.DATAGRAM_INITIAL
+        || addressed.destination.length != CONNECTION_ID_BYTES
+        || !cid.same(?addressed.destination.data[0], ?retry_source[0])) { ret 8; }
+    request.data   = ?wire[0];
+    request.length = second.count;
+    request.now    = clock.from_ns(now_ns);
+    if (!retry_identity(pump, ?request)) { ret 9; }
+    val admitted: quic_listener.Result = quic_listener.preflight(listener, ?request);
+    if (admitted.action != quic_listener.ACTION_ACCEPT) { ret 10; }
+    var accepted: quic_listener.Accepted = quic_listener.commit(listener,
+        admitted.acceptance);
+    if (accepted.action != quic_listener.ACTION_ACCEPT || !accepted.retry_source_present
+        || accepted.initial_destination.len::usize != CONNECTION_ID_BYTES
+        || !cid.same(?accepted.initial_destination.data[0], ?retry_source[0])) { ret 11; }
+    # the connection mints its own ID for its slot, beside the Retry's
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret 12; }
+    val value: *Connection = connection_at(controls, index);
+    if (!mint_local_cid(?runtime, pump, value, index)
+        || cid.same(?value.storage.local_cid[0], ?retry_source[0])) { ret 13; }
+    val own_named: cid.Decoded = cid.decode(?pump.codec, ?value.storage.local_cid[0],
+        CONNECTION_ID_BYTES);
+    if (own_named.status != cid.DECODED || own_named.worker != 0
+        || own_named.slot != index::u32) { ret 14; }
+    val prepared: i32 = test_server_accept(?tls_server, ?fixture, controls, index,
+        ?accepted, ?value.storage.local_cid[0], CONNECTION_ID_BYTES);
+    if (prepared != 0) { ret prepared; }
+    val initialized: assembly.InitResult = assembly.init_server(
+        ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
+        ?tls_server.scratch, ?pump.secret_scratch,
+        memory.borrowed_source(?value.storage.borrower),
+        memory.borrowed_secret_source(?value.storage.borrower),
+        handshake_at(controls, value.handshake),
+        ?value.storage.scope, clock.from_ns(now_ns));
+    if (!initialized.ok || !value.assembly.initialized) { ret 15; }
+    value.tls_live           = true;
+    value.assembly_attempted = true;
+    # the transport takes the Initial addressed to the Retry's source
+    val server_driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
+    now_ns            = now_ns + 1000;
+    input.local       = server_at;
+    input.peer        = client_at;
+    input.data        = ?wire[0];
+    input.length      = second.count;
+    input.received_at = clock.from_ns(now_ns);
+    if (qt.receive_datagram[binding.Binding](server_driver, ?input).status != qt.STATUS_OK) {
+        ret 16;
+    }
+    var round: usize = 0;
+    for (round < 24 && (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE
+        || qt.snapshot[binding.Binding](client_driver).state != qt.ACTIVE)) {
+        if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
+            server_at, ?now_ns)
+            || !test_carry(client_driver, ?dialer_scope, server_driver, server_at,
+            client_at, ?now_ns)) { ret 17; }
+        round = round + 1;
+    }
+    if (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE
+        || qt.snapshot[binding.Binding](client_driver).state != qt.ACTIVE) { ret 18; }
+    # what the client sends once established is addressed to the minted ID,
+    # which every worker decodes to this slot
+    val opened: qt.OpenResult = qt.open_stream[binding.Binding](client_driver,
+        qt.UNIDIRECTIONAL);
+    var byte: [1]u8 = [1]u8{0};
+    if (opened.status != qt.STATUS_OK
+        || qt.write_stream[binding.Binding](client_driver, opened.stream, ?byte[0], 1).count != 1) {
+        ret 19;
+    }
+    now_ns = now_ns + 1000;
+    val established: qt.Generated = qt.generate[binding.Binding](client_driver, ?dialer_scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns), 0);
+    if (established.status != qt.STATUS_OK || established.count == 0) { ret 20; }
+    val short: quic_listener.ClassifiedDatagram = quic_listener.classify_datagram(
+        ?wire[0], established.count, CONNECTION_ID_BYTES);
+    if (short.class != quic_listener.DATAGRAM_ESTABLISHED || short.long_header
+        || !cid.same(?short.destination.data[0], ?value.storage.local_cid[0])) { ret 21; }
+    ret 0;
 }
 
 #[testing]
