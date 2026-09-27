@@ -13,6 +13,13 @@
 # refusal before anything was published leaves the process as it was. a
 # failure after one worker published cannot be taken back, so it stops the
 # process in order, which is what one worker did on its own before.
+#
+# the supervisor also drives the lifecycle of every hosted application in the
+# registry the process was composed with: each is started before any worker
+# serves, its readiness is polled into the process's, it is drained within the
+# drain deadline once shutdown begins, and it is stopped after the last worker
+# has. the registry lives for the whole process, so a reload rebuilds the
+# services that reach an application but never restarts the application.
 
 use acme: hedge.acme.manager;
 use hedge.clock;
@@ -24,10 +31,13 @@ use hedge.operation;
 use quic_runtime: hedge.protocol.quic.runtime;
 use hedge_tls:    hedge.protocol.tls;
 use hedge.serve;
+use hedge.service;
 use hedge.telemetry;
-use hedge_wake: hedge.wake;
+use telemetry_health: hedge.telemetry.health;
+use hedge_wake:       hedge.wake;
 use hedge.worker;
 use std.allocator;
+use std.chrono.time;
 use io_error:   std.io.error;
 use io_runtime: std.io.runtime;
 use net_async:  std.net.async;
@@ -51,6 +61,28 @@ val RUNTIME_CAPACITY: usize = 64;
 # a worker's stack, as large as the main thread's usual one
 val WORKER_STACK_BYTES: usize = 8388608;
 val WAKE_BATCH:         usize = 16;
+
+# how often a hosted application's step that answered pending is asked again,
+# since its lifecycle is polled and has no wake of its own
+val HOSTED_POLL_MS: i32 = 10;
+
+# a hosted application's progress, which only the supervisor's thread moves
+def HostedPhase: u8;
+# no lifecycle, or not started
+val HOSTED_NONE:     HostedPhase = 0;
+val HOSTED_STARTING: HostedPhase = 1;
+# started and not yet ready
+val HOSTED_STARTED:  HostedPhase = 2;
+val HOSTED_READY:    HostedPhase = 3;
+val HOSTED_DRAINING: HostedPhase = 4;
+# drained, abandoned past the deadline, or failed: only its stop is left
+val HOSTED_SETTLED: HostedPhase = 5;
+val HOSTED_STOPPED: HostedPhase = 6;
+
+rec Hosted {
+    phase: HostedPhase;
+    check: telemetry_health.Token;
+}
 
 pub def ReloadState: u8;
 pub val RELOAD_IDLE:       ReloadState = 0;
@@ -98,6 +130,7 @@ pub rec Supervisor {
     stop_requested:   i64;
     shutdown_sent:    bool;
     stop_timeout_ns:  u64;
+    drain_timeout_ns: u64;
     seats:            *Seat;
     threads:          *thread.Thread;
     spawned:          usize;
@@ -108,6 +141,12 @@ pub rec Supervisor {
     # the workers asked to take part in the step under way
     posted:      usize;
     commit_next: usize;
+    # every hosted application's progress, by its index in the registry
+    hosted:           [service.MAX_APPLICATIONS]Hosted;
+    hosted_count:     usize;
+    hosted_deadline:  time.Instant;
+    hosted_failed:    bool;
+    hosted_abandoned: usize;
 }
 
 fun runtime_ok(outcome: err[io_error.Error]) bool {
@@ -169,14 +208,18 @@ pub fun make(supervisor: *Supervisor, composed: *composition.Runtime,
     supervisor.acme_due     = true;
     atomic.store(?supervisor.reload_requested, 0);
     atomic.store(?supervisor.stop_requested, 0);
-    supervisor.shutdown_sent   = false;
-    supervisor.stop_timeout_ns = composed.graph.timeouts.stop_ms * 1000000;
-    supervisor.seats           = nil;
-    supervisor.threads         = nil;
-    supervisor.spawned         = 0;
-    supervisor.reload_state    = RELOAD_IDLE;
-    supervisor.candidate       = nil;
-    supervisor.commit_next     = 0;
+    supervisor.shutdown_sent    = false;
+    supervisor.stop_timeout_ns  = composed.graph.timeouts.stop_ms * 1000000;
+    supervisor.drain_timeout_ns = composed.graph.timeouts.drain_ms * 1000000;
+    supervisor.hosted_count     = 0;
+    supervisor.hosted_failed    = false;
+    supervisor.hosted_abandoned = 0;
+    supervisor.seats            = nil;
+    supervisor.threads          = nil;
+    supervisor.spawned          = 0;
+    supervisor.reload_state     = RELOAD_IDLE;
+    supervisor.candidate        = nil;
+    supervisor.commit_next      = 0;
     if (signals && os.ignore_sigpipe() < 0) { ret false; }
     if (!runtime_ok(io_runtime.make(?supervisor.runtime, heap, RUNTIME_CAPACITY))) {
         ret false;
@@ -493,12 +536,237 @@ pub fun drive(supervisor: *Supervisor, timeout_ms: i32) bool {
     ret true;
 }
 
+# --- hosted applications ---
+
+fun hosted_application(supervisor: *Supervisor, index: usize) *service.Application {
+    ret ?supervisor.composed.options.applications.items[index];
+}
+
+fun health(supervisor: *Supervisor) *telemetry_health.Health {
+    ret ?supervisor.composed.observability.runtime.health;
+}
+
+# name what went wrong with a hosted application, to the operator and to telemetry
+fun report_hosted(supervisor: *Supervisor, index: usize, operation: str, code: str,
+    message: str, detail: view.View) {
+    val name: str = hosted_application(supervisor, index).name;
+    print.eprint("hedge: application ");
+    print.eprint(name);
+    print.eprint(" ");
+    if (detail.len == 0) { print.eprintln(message); }
+    or {
+        var text:   [128]u8;
+        var length: usize = 0;
+        for (length < detail.len && length < 127) {
+            text[length] = detail.data[length];
+            length       = length + 1;
+        }
+        text[length] = 0;
+        print.eprint(message);
+        print.eprint(": ");
+        print.eprintln((?text[0])::str);
+    }
+    telemetry.error(?supervisor.composed.observability.runtime, telemetry.Failure{
+        component: name, operation: operation, code: code, message: message,
+        trace_id:  nil
+    });
+}
+
+# start every hosted application before any worker serves, and register the
+# readiness each one reports. a failed start, or a stop asked for while one is
+# still pending, refuses the process's start
+fun start_hosted(supervisor: *Supervisor) worker.StartStatus {
+    val registry: *service.Applications = supervisor.composed.options.applications;
+    if (registry == nil) { ret worker.START_OK; }
+    supervisor.hosted_count = registry.len;
+    var i: usize = 0;
+    for (i < registry.len) {
+        val item: *service.Application = ?registry.items[i];
+        supervisor.hosted[i].phase = HOSTED_NONE;
+        if (item.live && service.has_lifecycle(item.lifecycle)) {
+            if (!telemetry_health.register(health(supervisor), item.name, true, false,
+                ?supervisor.hosted[i].check)) {
+                report_hosted(supervisor, i, "start", "readiness",
+                    "readiness could not be registered", view.view(nil, 0));
+                ret worker.START_RUNTIME;
+            }
+            supervisor.hosted[i].phase = HOSTED_STARTING;
+        }
+        i = i + 1;
+    }
+    for (true) {
+        var pending: bool = false;
+        i = 0;
+        for (i < supervisor.hosted_count) {
+            if (supervisor.hosted[i].phase == HOSTED_STARTING) {
+                val hosted: *service.Lifecycle = ?hosted_application(supervisor, i).lifecycle;
+                val step:   service.Step       = hosted.start(hosted.ctx);
+                if (step.status == service.STEP_DONE) {
+                    supervisor.hosted[i].phase = HOSTED_STARTED;
+                }
+                or (step.status == service.STEP_PENDING) { pending = true; }
+                or {
+                    report_hosted(supervisor, i, "start", "failed", "failed to start",
+                        step.detail);
+                    supervisor.hosted[i].phase = HOSTED_SETTLED;
+                    supervisor.hosted_failed   = true;
+                    ret worker.START_RUNTIME;
+                }
+            }
+            i = i + 1;
+        }
+        if (!pending) { brk; }
+        if (!deliver(supervisor, HOSTED_POLL_MS)
+            || atomic.load(?supervisor.stop_requested) != 0) { ret worker.START_RUNTIME; }
+    }
+    poll_hosted_ready(supervisor);
+    ret worker.START_OK;
+}
+
+# ask every started application whether it is ready, and mark its readiness
+# check once it is. an application whose readiness fails stops the process
+fun poll_hosted_ready(supervisor: *Supervisor) {
+    var i: usize = 0;
+    for (i < supervisor.hosted_count) {
+        val current: *Hosted = ?supervisor.hosted[i];
+        if (current.phase == HOSTED_STARTED) {
+            val hosted: *service.Lifecycle = ?hosted_application(supervisor, i).lifecycle;
+            val step:   service.Step       = hosted.ready(hosted.ctx);
+            if (step.status == service.STEP_DONE) {
+                current.phase = HOSTED_READY;
+                telemetry_health.set_ready(health(supervisor), current.check, true);
+            }
+            or (step.status == service.STEP_FAILED) {
+                report_hosted(supervisor, i, "ready", "failed", "failed its readiness",
+                    step.detail);
+                current.phase            = HOSTED_SETTLED;
+                supervisor.hosted_failed = true;
+                atomic.store(?supervisor.stop_requested, 1);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# whether a hosted step is waiting to be asked again
+fun hosted_polling(supervisor: *Supervisor) bool {
+    var i: usize = 0;
+    for (i < supervisor.hosted_count) {
+        val phase: HostedPhase = supervisor.hosted[i].phase;
+        if (phase == HOSTED_DRAINING || (phase == HOSTED_STARTED && !supervisor.shutdown_sent)) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun hosted_draining(supervisor: *Supervisor) bool {
+    var i: usize = 0;
+    for (i < supervisor.hosted_count) {
+        if (supervisor.hosted[i].phase == HOSTED_DRAINING) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# shutdown has begun: every running application drains toward the same
+# deadline the workers drain toward
+fun begin_hosted_drain(supervisor: *Supervisor) {
+    supervisor.hosted_deadline = clock.after(clock.instant(), supervisor.drain_timeout_ns);
+    var i: usize = 0;
+    for (i < supervisor.hosted_count) {
+        val phase: HostedPhase = supervisor.hosted[i].phase;
+        if (phase == HOSTED_STARTED || phase == HOSTED_READY) {
+            supervisor.hosted[i].phase = HOSTED_DRAINING;
+        }
+        i = i + 1;
+    }
+}
+
+# one turn of every drain still under way. a drain still pending once the
+# deadline has passed is abandoned and left to its stop
+fun drive_hosted_drain(supervisor: *Supervisor) {
+    var i: usize = 0;
+    for (i < supervisor.hosted_count) {
+        val current: *Hosted = ?supervisor.hosted[i];
+        if (current.phase == HOSTED_DRAINING) {
+            val hosted: *service.Lifecycle = ?hosted_application(supervisor, i).lifecycle;
+            val step:   service.Step       = hosted.drain(hosted.ctx, supervisor.hosted_deadline);
+            if (step.status == service.STEP_DONE) { current.phase = HOSTED_SETTLED; }
+            or (step.status == service.STEP_FAILED) {
+                report_hosted(supervisor, i, "drain", "failed", "failed to drain", step.detail);
+                current.phase            = HOSTED_SETTLED;
+                supervisor.hosted_failed = true;
+            }
+            or (!time.instant_before(clock.instant(), supervisor.hosted_deadline)) {
+                report_hosted(supervisor, i, "drain", "deadline",
+                    "drain overran the deadline and was abandoned", step.detail);
+                current.phase               = HOSTED_SETTLED;
+                supervisor.hosted_abandoned = supervisor.hosted_abandoned + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# stop every application that was started, once no worker serves, within the
+# stop timeout, and fold how their lifecycles ended into the process's report
+fun stop_hosted(supervisor: *Supervisor, report: *worker.StopReport) {
+    val deadline: u64 = clock.after_ns(clock.monotonic_ns(), supervisor.stop_timeout_ns);
+    for (true) {
+        var pending: bool  = false;
+        var i:       usize = 0;
+        for (i < supervisor.hosted_count) {
+            val current: *Hosted = ?supervisor.hosted[i];
+            if (current.phase != HOSTED_NONE && current.phase != HOSTED_STOPPED) {
+                val hosted: *service.Lifecycle = ?hosted_application(supervisor, i).lifecycle;
+                val step:   service.Step       = hosted.stop(hosted.ctx);
+                if (step.status == service.STEP_PENDING) { pending = true; }
+                or {
+                    if (step.status == service.STEP_FAILED) {
+                        report_hosted(supervisor, i, "stop", "failed", "failed to stop",
+                            step.detail);
+                        report.cleanup_failures = report.cleanup_failures + 1;
+                    }
+                    current.phase = HOSTED_STOPPED;
+                }
+            }
+            i = i + 1;
+        }
+        if (!pending) { brk; }
+        var left: i32 = wait_before(deadline);
+        if (left > HOSTED_POLL_MS) { left = HOSTED_POLL_MS; }
+        if (left == 0 || !deliver(supervisor, left)) {
+            i = 0;
+            for (i < supervisor.hosted_count) {
+                val current: *Hosted = ?supervisor.hosted[i];
+                if (current.phase != HOSTED_NONE && current.phase != HOSTED_STOPPED) {
+                    report_hosted(supervisor, i, "stop", "deadline",
+                        "stop overran the stop timeout and was abandoned", view.view(nil, 0));
+                    report.applications_abandoned = report.applications_abandoned + 1;
+                    report.cleanup_failures       = report.cleanup_failures + 1;
+                    current.phase                 = HOSTED_STOPPED;
+                }
+                i = i + 1;
+            }
+            brk;
+        }
+    }
+    report.applications_abandoned = report.applications_abandoned + supervisor.hosted_abandoned;
+    if (supervisor.hosted_failed) { report.reason = lifecycle.FAILED; }
+    or (supervisor.hosted_abandoned != 0 && report.reason != lifecycle.FAILED) {
+        report.reason = lifecycle.DEADLINE;
+    }
+}
+
 # every worker is asked to finish, once
 fun fan_shutdown(supervisor: *Supervisor) {
     if (supervisor.shutdown_sent) { ret; }
     supervisor.shutdown_sent = true;
     # readiness goes false before any worker stops accepting
     telemetry.begin_drain(?supervisor.composed.observability.runtime);
+    begin_hosted_drain(supervisor);
     var i: usize = 0;
     for (i < supervisor.spawned) {
         atomic.store(?worker_of(supervisor, i).control.shutdown, 1);
@@ -744,8 +1012,12 @@ pub fun start(supervisor: *Supervisor) worker.StartStatus {
     thread.config_default(?config);
     config.stack_reserve = WORKER_STACK_BYTES;
     config.name          = "hedge-worker";
-    var status: worker.StartStatus = worker.START_RUNTIME;
-    if (spawn(supervisor, 0, ?config)) { status = await_started(supervisor); }
+    # every hosted application has started before a worker binds a listener
+    var status: worker.StartStatus = start_hosted(supervisor);
+    if (status == worker.START_OK) {
+        status = worker.START_RUNTIME;
+        if (spawn(supervisor, 0, ?config)) { status = await_started(supervisor); }
+    }
     if (status == worker.START_OK && count > 1) {
         composition.record_endpoints(composed);
         var i: usize = 1;
@@ -759,7 +1031,8 @@ pub fun start(supervisor: *Supervisor) worker.StartStatus {
         fan_shutdown(supervisor);
         ret status;
     }
-    # the process is ready once every worker serves
+    # the process is ready once every worker serves and, through their readiness
+    # checks, every hosted application reports ready
     telemetry.begin_ready(?composed.observability.runtime);
     ret worker.START_OK;
 }
@@ -776,13 +1049,25 @@ pub fun request_stop(supervisor: *Supervisor) {
     wake_supervisor(supervisor);
 }
 
-# supervise until every worker has stopped
+# how long a turn of `run` may wait: until ACME is next due, or until a hosted
+# step that answered pending is asked again
+fun run_wait_ms(supervisor: *Supervisor) i32 {
+    val wait: i32 = wait_ms(supervisor);
+    if (hosted_polling(supervisor) && (wait < 0 || wait > HOSTED_POLL_MS)) {
+        ret HOSTED_POLL_MS;
+    }
+    ret wait;
+}
+
+# supervise until every worker has stopped and every hosted application's
+# drain has settled
 pub fun run(supervisor: *Supervisor) {
-    for (!all_stopped(supervisor)) {
-        deliver(supervisor, wait_ms(supervisor));
+    for (!all_stopped(supervisor) || hosted_draining(supervisor)) {
+        deliver(supervisor, run_wait_ms(supervisor));
         if (atomic.load(?supervisor.stop_requested) != 0 || any_draining(supervisor)) {
             fan_shutdown(supervisor);
         }
+        if (supervisor.shutdown_sent) { drive_hosted_drain(supervisor); }
         # a reload under way is carried to its end even once the process is
         # stopping, so what the supervisor records matches what every worker
         # published. none begins once a stop has been asked for
@@ -792,6 +1077,7 @@ pub fun run(supervisor: *Supervisor) {
                 && atomic.load(?supervisor.reload_requested) != 0) { begin_reload(supervisor); }
             drive_certificates(supervisor);
             install_certificates(supervisor);
+            poll_hosted_ready(supervisor);
         }
     }
 }
@@ -833,7 +1119,8 @@ pub fun release(supervisor: *Supervisor) bool {
 # reported into one
 pub fun stop(supervisor: *Supervisor) worker.StopReport {
     var merged: worker.StopReport = worker.StopReport{stopped: true,
-        reason:           lifecycle.IMMEDIATE, abandoned: 0, serve_failures: 0,
+        reason:           lifecycle.IMMEDIATE, abandoned: 0, applications_abandoned: 0,
+        serve_failures:   0,
         cleanup_failures: 0};
     var i:        usize = 0;
     var reasoned: bool  = false;
@@ -854,6 +1141,8 @@ pub fun stop(supervisor: *Supervisor) worker.StopReport {
         }
         i = i + 1;
     }
+    # no request reaches an application once every worker has stopped
+    stop_hosted(supervisor, ?merged);
     if (!quiesce_certificates(supervisor)) {
         merged.cleanup_failures = merged.cleanup_failures + 1;
     }

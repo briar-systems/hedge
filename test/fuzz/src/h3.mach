@@ -1,0 +1,225 @@
+# HTTP/3 request and response headers
+#
+# a request's input is its decoded header block: `:name value` lines for the
+# pseudo-header fields, then `name: value` lines. a response's input is its
+# status on the first line, then its fields
+
+use hedge.protocol.h3.session;
+use hedge.protocol.names;
+use hedge.protocol.pseudo;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.section;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+use fuzz.input;
+use fuzz.verdict;
+
+var storage: session.RequestStorage;
+var slot:    session.RequestSlot;
+
+fun prepare() {
+    slot.storage = ?storage;
+    session.reset_request(?slot);
+}
+
+fun named(line: view.View, name: str, length: usize) bool {
+    if (line.len < length + 1 || line.data[length] != ' ') { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (line.data[i] != name[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun value_after(line: view.View, length: usize) view.View {
+    ret input.slice(line.data, length + 1, line.len);
+}
+
+val MAX_BLOCK: usize = 64;
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun owned(value: view.View) bool {
+    ret value.len == 0 || verdict.view_inside(value, ?storage.request_strings[0],
+        session.REQUEST_STRING_BYTES);
+}
+
+pub fun answer_request_headers(data: *u8, len: usize) verdict.Verdict {
+    var block:  section.Block = section.empty();
+    var items:  [MAX_BLOCK]field.Field;
+    var fields: field.Fields  = field.init(?items[0], MAX_BLOCK, input.limits());
+    var at:     usize         = 0;
+    for (at < len && data[at] == ':') {
+        val end:  usize     = input.line_end(data, len, at);
+        val line: view.View = input.slice(data, at + 1, end);
+        if (named(line, "method", 6))    { block.method = value_after(line, 6); }
+        or (named(line, "scheme", 6))    { block.scheme = value_after(line, 6); }
+        or (named(line, "path", 4))      { block.path = value_after(line, 4); }
+        or (named(line, "authority", 9)) { block.authority = value_after(line, 9); }
+        or (named(line, "protocol", 8))  { block.protocol = value_after(line, 8); }
+        at = input.next_line(len, end);
+    }
+    # a decoder hands over only values a field may carry
+    if (!field.valid_value(block.method) || !field.valid_value(block.scheme) ||
+        !field.valid_value(block.path) || !field.valid_value(block.authority) ||
+        !field.valid_value(block.protocol)) { ret verdict.answered(0xbad); }
+    input.fields(data, len, at, ?fields);
+    block.fields = ?items[0];
+    block.count  = fields.len;
+    prepare();
+    var method_name: view.View;
+    var raw_target:  view.View;
+    val limits:      field.Limits = field.limits(session.REQUEST_FIELD_SLOTS, 16384, 256, 4096);
+    val copied:      bool         = session.copy_request_fields(?slot, block, limits,
+        ?method_name, ?raw_target);
+    # what fits the slot's storage is always copied
+    val parsed: method.Method = pseudo.method_of(block.method);
+    var source: view.View     = block.path;
+    if (parsed.kind == method.CONNECT) { source = block.authority; }
+    var bytes:    usize = block.method.len + source.len;
+    var has_host: bool  = false;
+    var i:        usize = 0;
+    for (i < fields.len) {
+        bytes = bytes + fields.items[i].name.len + fields.items[i].value.len;
+        if (field.name_equal(fields.items[i].name, view.view("host", 4))) { has_host = true; }
+        i = i + 1;
+    }
+    val adds_host: bool = !has_host && block.authority.len != 0;
+    if (adds_host && parsed.kind != method.CONNECT) { bytes = bytes + block.authority.len; }
+    val fits: bool = bytes <= session.REQUEST_STRING_BYTES &&
+        fields.len + adds_host::usize <= session.REQUEST_FIELD_SLOTS;
+    if (fits && !copied) {
+        ret verdict.violated("h3-request-headers: a header block that fits its slot was refused");
+    }
+    if (!copied) { ret verdict.answered(0); }
+    verdict.accept();
+    # every view is the slot's own copy of what the peer sent, and an authority
+    # with no Host field becomes one
+    if (!owned(method_name) || !owned(raw_target) || !verdict.same(method_name, block.method) ||
+        !verdict.same(raw_target, source) ||
+        slot.request_fields.len != fields.len + adds_host::usize) {
+        ret verdict.violated("h3-request-headers: the copied request is not the peer's, in the slot's storage");
+    }
+    i = 0;
+    for (i < slot.request_fields.len) {
+        val item: *field.Field = ?slot.request_fields.items[i];
+        if (i < fields.len) {
+            if (!owned(item.name) || !owned(item.value) ||
+                !verdict.same(item.name, fields.items[i].name) ||
+                !verdict.same(item.value, fields.items[i].value)) {
+                ret verdict.violated("h3-request-headers: a field is not the slot's copy of the peer's");
+            }
+        }
+        or (!field.name_equal(item.name, view.view("host", 4)) ||
+            !verdict.same(item.value, block.authority)) {
+            ret verdict.violated("h3-request-headers: the authority did not become the Host field");
+        }
+        i = i + 1;
+    }
+    var outcome: u64 = verdict.mix(parsed.kind::u64, adds_host::u64);
+    ret verdict.answered(verdict.mix(outcome, verdict.bucket(fields.len)));
+}
+
+fun connection_specific(name: view.View) bool {
+    ret field.name_equal(name, view.view("connection", 10)) ||
+        field.name_equal(name, view.view("transfer-encoding", 17)) ||
+        field.name_equal(name, view.view("keep-alive", 10)) ||
+        field.name_equal(name, view.view("upgrade", 7)) ||
+        field.name_equal(name, view.view("proxy-connection", 16));
+}
+
+pub fun answer_response_headers(data: *u8, len: usize) verdict.Verdict {
+    prepare();
+    val end:  usize = input.line_end(data, len, 0);
+    var code: usize = 0;
+    var i:    usize = 0;
+    for (i < end && i < 3) {
+        if (data[i] < '0' || data[i] > '9') { ret verdict.answered(0); }
+        code = code * 10 + (data[i] - '0')::usize;
+        i    = i + 1;
+    }
+    if (end != 3) { ret verdict.answered(0); }
+    if (!message.init_response(?slot.response, ?storage.response_fields[0],
+        session.RESPONSE_FIELD_SLOTS, ?storage.response_trailers[0],
+        session.RESPONSE_TRAILER_SLOTS, 1, message.limits_default()) ||
+        message.set_status(?slot.response, code::u16) != message.RESPONSE_OK) {
+        ret verdict.answered(1);
+    }
+    var items:  [MAX_BLOCK]field.Field;
+    var fields: field.Fields = field.init(?items[0], MAX_BLOCK, input.limits());
+    input.fields(data, len, input.next_line(len, end), ?fields);
+    i = 0;
+    for (i < fields.len) {
+        message.add_field(?slot.response, fields.items[i]);
+        i = i + 1;
+    }
+    # names with an uppercase byte are lowered into a scratch of fixed room
+    var lowered: usize = 0;
+    i = 0;
+    for (i < slot.response.fields.len) {
+        val name: view.View = slot.response.fields.items[i].name;
+        var j:    usize     = 0;
+        for (j < name.len && lower(name.data[j]) == name.data[j]) { j = j + 1; }
+        if (j < name.len && !connection_specific(name)) { lowered = lowered + name.len; }
+        i = i + 1;
+    }
+    # a list whose lowered names outgrow the scratch is refused whole, with
+    # nothing written past it, and every other list is offered
+    var count:   usize = 0;
+    val offered: bool  = session.response_headers(?slot, ?count);
+    if (storage.names.used > names.NAME_BYTES) {
+        ret verdict.violated("h3-response-headers: lowered names were written past their scratch");
+    }
+    if (offered == (lowered > names.NAME_BYTES)) {
+        ret verdict.violated("h3-response-headers: a list was offered or refused against the room its lowered names need");
+    }
+    if (!offered) { ret verdict.answered(2); }
+    verdict.accept();
+    # `:status` first, then every field that is not connection-specific, in
+    # order, named in lowercase
+    val first: *field.Field = ?storage.header_items[0];
+    if (!verdict.same(first.name, view.view(":status", 7)) || first.value.len != 3 ||
+        first.value.data[0] != data[0] || first.value.data[1] != data[1] ||
+        first.value.data[2] != data[2]) {
+        ret verdict.violated("h3-response-headers: `:status` is not the response's status");
+    }
+    var next: usize = 1;
+    i = 0;
+    for (i < slot.response.fields.len) {
+        val item: *field.Field = ?slot.response.fields.items[i];
+        if (!connection_specific(item.name)) {
+            if (next >= count) {
+                ret verdict.violated("h3-response-headers: an end-to-end field was dropped");
+            }
+            val offered: *field.Field = ?storage.header_items[next];
+            if (offered.name.len != item.name.len || offered.value.data != item.value.data ||
+                offered.value.len != item.value.len) {
+                ret verdict.violated("h3-response-headers: an offered field is not the response's");
+            }
+            var j: usize = 0;
+            for (j < item.name.len) {
+                if (offered.name.data[j] != lower(item.name.data[j])) {
+                    ret verdict.violated("h3-response-headers: an offered name is not lowercase");
+                }
+                j = j + 1;
+            }
+            next = next + 1;
+        }
+        i = i + 1;
+    }
+    if (next != count) {
+        ret verdict.violated("h3-response-headers: a connection-specific field was offered");
+    }
+    ret verdict.answered(verdict.mix(code::u64 / 100, verdict.bucket(count)));
+}

@@ -1,0 +1,307 @@
+# paths: static path resolution and content negotiation, media type lookup, and
+# the ACME challenge path
+
+use hedge.acme.challenge;
+use hedge.http.media;
+use hedge.service.static;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
+
+use fuzz.guard;
+use fuzz.input;
+use fuzz.verdict;
+
+# a resolved path is relative, its segments separated by exactly one `/`, and
+# none of them is `.`, `..`, or holds a byte a filesystem would read as a
+# separator or a terminator
+fun confined(output: *u8, length: usize) bool {
+    if (output[length] != 0) { ret false; }
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i <= length) {
+        if (i == length || output[i] == '/') {
+            val segment: usize = i - start;
+            if (segment == 0 && length != 0)                                      { ret false; }
+            if (segment == 1 && output[start] == '.')                             { ret false; }
+            if (segment == 2 && output[start] == '.' && output[start + 1] == '.') { ret false; }
+            start = i + 1;
+        }
+        or {
+            val c: u8 = output[i];
+            if (c == 0 || c == '\\' || c < ' ' || c == 127) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+val ROOM: usize = 1024;
+
+pub fun answer_static_path(data: *u8, len: usize) verdict.Verdict {
+    var output:   [ROOM + 1]u8;
+    val resolved: static.Path = static.resolve(view.view(data, len), ?output[0], ROOM);
+    var outcome:  u64         = verdict.mix(resolved.status::u64, resolved.directory::u64);
+    if (resolved.status != static.PATH_OK) {
+        if (resolved.status != static.PATH_INVALID && resolved.status != static.PATH_TOO_LONG) {
+            ret verdict.violated("static-path: a refusal is not a named one");
+        }
+        ret verdict.answered(outcome);
+    }
+    verdict.accept();
+    if (resolved.length >= ROOM || !confined(?output[0], resolved.length)) {
+        ret verdict.violated("static-path: a resolved path escapes its root or holds a byte it must not");
+    }
+    # a room with space for the path, a separator it may strip and its
+    # terminator holds the same path, and a room short of the path refuses it
+    var tight: [ROOM + 2]u8;
+    val room:  usize       = resolved.length + 2;
+    val again: static.Path = static.resolve(view.view(data, len), ?tight[0], room);
+    if (again.status != static.PATH_OK || again.length != resolved.length ||
+        !verdict.same(view.view(?tight[0], again.length), view.view(?output[0], resolved.length))) {
+        ret verdict.violated("static-path: the path changed with the room it was written into");
+    }
+    if (resolved.length > 0) {
+        val short: static.Path = static.resolve(view.view(data, len), ?tight[0], resolved.length);
+        if (short.status != static.PATH_TOO_LONG) {
+            ret verdict.violated("static-path: a path longer than its room was not refused as too long");
+        }
+    }
+    outcome = verdict.mix(outcome, verdict.bucket(resolved.length));
+    ret verdict.answered(outcome);
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun space(c: u8) bool {
+    ret c == ' ' || c == '\t';
+}
+
+val NO_WEIGHT: usize = 1001;
+
+# a qvalue in thousandths per RFC 9110 section 12.4.2: `0` with up to three
+# decimals, or `1` with up to three zeros. NO_WEIGHT when it is not one
+fun weight_of(value: view.View, from: usize, to: usize) usize {
+    if (from >= to || to - from > 5) { ret NO_WEIGHT; }
+    val lead: u8 = value.data[from];
+    if (lead != '0' && lead != '1')  { ret NO_WEIGHT; }
+    if (to - from == 1)              { ret (lead - '0')::usize * 1000; }
+    if (value.data[from + 1] != '.') { ret NO_WEIGHT; }
+    var weight: usize = (lead - '0')::usize * 1000;
+    var place:  usize = 100;
+    var at:     usize = from + 2;
+    for (at < to) {
+        val c: u8 = value.data[at];
+        if (c < '0' || c > '9' || (lead == '1' && c != '0')) { ret NO_WEIGHT; }
+        weight = weight + (c - '0')::usize * place;
+        place  = place / 10;
+        at     = at + 1;
+    }
+    ret weight;
+}
+
+# the weight a member's parameters give it: 1 unless a `q` says otherwise, and
+# NO_WEIGHT when a parameter is not `name=value` or its `q` is not a qvalue
+fun member_weight(value: view.View, from: usize, to: usize) usize {
+    var weight: usize = 1000;
+    var at:     usize = from;
+    for (true) {
+        for (at < to && space(value.data[at])) { at = at + 1; }
+        if (at == to)              { ret weight; }
+        if (value.data[at] != ';') { ret NO_WEIGHT; }
+        at = at + 1;
+        for (at < to && space(value.data[at])) { at = at + 1; }
+        val name: usize = at;
+        for (at < to && value.data[at] != '=' && value.data[at] != ';' && !space(value.data[at])) {
+            at = at + 1;
+        }
+        if (at == name || at == to || value.data[at] != '=') { ret NO_WEIGHT; }
+        val q: bool = at == name + 1 && lower(value.data[name]) == 'q';
+        at = at + 1;
+        val start: usize = at;
+        for (at < to && value.data[at] != ';' && !space(value.data[at])) { at = at + 1; }
+        if (q) {
+            weight = weight_of(value, start, at);
+            if (weight == NO_WEIGHT) { ret NO_WEIGHT; }
+        }
+    }
+    ret weight;
+}
+
+fun names_coding(value: view.View, from: usize, to: usize, coding: str) bool {
+    val length: usize = str_len(coding);
+    if (to - from != length) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (lower(value.data[from + i]) != coding[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# RFC 9110 section 12.5.3: a coding weighs what its own member says, else what
+# `*` says, else nothing, and a coding named more than once takes its lowest
+# weight. a member whose parameters are malformed says nothing. a coding is
+# acceptable when its weight is not zero
+fun acceptable(value: view.View, coding: str) bool {
+    var named: usize = NO_WEIGHT;
+    var any:   usize = NO_WEIGHT;
+    var at:    usize = 0;
+    for (at < value.len) {
+        var end: usize = at;
+        for (end < value.len && value.data[end] != ',') { end = end + 1; }
+        var first: usize = at;
+        for (first < end && space(value.data[first])) { first = first + 1; }
+        var last: usize = first;
+        for (last < end && value.data[last] != ';' && !space(value.data[last])) { last = last + 1; }
+        if (last != first) {
+            val weight: usize = member_weight(value, last, end);
+            if (weight != NO_WEIGHT) {
+                if (names_coding(value, first, last, coding)) {
+                    if (weight < named) { named = weight; }
+                }
+                or (last - first == 1 && value.data[first] == '*' && weight < any) { any = weight; }
+            }
+        }
+        at = end + 1;
+    }
+    if (named != NO_WEIGHT) { ret named != 0; }
+    if (any != NO_WEIGHT)   { ret any != 0; }
+    ret false;
+}
+
+pub fun answer_negotiation(data: *u8, len: usize) verdict.Verdict {
+    val value:   view.View = view.view(data, len);
+    val brotli:  bool      = static.accepts(value, "br");
+    val gzipped: bool      = static.accepts(value, "gzip");
+    # a precompressed variant is served exactly when the client gives its
+    # coding a weight
+    if (brotli != acceptable(value, "br") || gzipped != acceptable(value, "gzip")) {
+        ret verdict.violated("accept-encoding: a coding was served against the weight the client gave it");
+    }
+    if (brotli || gzipped) { verdict.accept(); }
+    ret verdict.answered((brotli::u64 << 1) | gzipped::u64);
+}
+
+rec Known {
+    extension: str;
+    kind:      str;
+}
+
+var known: [22]Known = [22]Known{
+    Known{extension: "html", kind: "text/html; charset=utf-8"},
+    Known{extension: "htm", kind: "text/html; charset=utf-8"},
+    Known{extension: "css", kind: "text/css; charset=utf-8"},
+    Known{extension: "js", kind: "text/javascript; charset=utf-8"},
+    Known{extension: "mjs", kind: "text/javascript; charset=utf-8"},
+    Known{extension: "json", kind: "application/json"},
+    Known{extension: "txt", kind: "text/plain; charset=utf-8"},
+    Known{extension: "md", kind: "text/plain; charset=utf-8"},
+    Known{extension: "mach", kind: "text/plain; charset=utf-8"},
+    Known{extension: "sh", kind: "application/x-sh"},
+    Known{extension: "xml", kind: "application/xml"},
+    Known{extension: "svg", kind: "image/svg+xml"},
+    Known{extension: "png", kind: "image/png"},
+    Known{extension: "jpg", kind: "image/jpeg"},
+    Known{extension: "jpeg", kind: "image/jpeg"},
+    Known{extension: "gif", kind: "image/gif"},
+    Known{extension: "webp", kind: "image/webp"},
+    Known{extension: "ico", kind: "image/x-icon"},
+    Known{extension: "woff2", kind: "font/woff2"},
+    Known{extension: "woff", kind: "font/woff"},
+    Known{extension: "ttf", kind: "font/ttf"},
+    Known{extension: "wasm", kind: "application/wasm"},
+};
+
+fun text_equal(a: str, b: str) bool {
+    var i: usize = 0;
+    for (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    ret a[i] == b[i];
+}
+
+# the final segment ends in `.<extension>`, ignoring case, and the dot is not
+# the segment's first byte
+fun ends_with(data: *u8, len: usize, extension: str) bool {
+    val length: usize = str_len(extension);
+    if (len < length + 1) { ret false; }
+    val dot: usize = len - length - 1;
+    if (data[dot] != '.' || dot == 0 || data[dot - 1] == '/') { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        val c: u8 = data[dot + 1 + i];
+        if (lower(c) != extension[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    var at: usize = dot + 1;
+    for (at < len) {
+        if (data[at] == '/' || data[at] == '.') { ret false; }
+        at = at + 1;
+    }
+    ret true;
+}
+
+# a type is only ever named for a file whose extension names it, so a file an
+# attacker named cannot be served as markup
+pub fun answer_media(data: *u8, len: usize) verdict.Verdict {
+    val named: str = media.for_path(view.view(data, len));
+    if (text_equal(named, media.DEFAULT_TYPE)) {
+        var i: usize = 0;
+        for (i < 22) {
+            if (ends_with(data, len, known[i].extension)) {
+                ret verdict.violated("media: a known extension was served as the generic type");
+            }
+            i = i + 1;
+        }
+        ret verdict.answered(0);
+    }
+    verdict.accept();
+    var i: usize = 0;
+    for (i < 22) {
+        if (text_equal(named, known[i].kind) && ends_with(data, len, known[i].extension)) {
+            if (!media.has_extension(view.view(data, len), known[i].extension)) {
+                ret verdict.violated("media: the extension a type was named for is not the path's extension");
+            }
+            ret verdict.answered((i + 1)::u64);
+        }
+        i = i + 1;
+    }
+    if (ends_with(data, len, "pdf") || ends_with(data, len, "zip") || ends_with(data, len, "gz")) {
+        ret verdict.answered(0x100);
+    }
+    ret verdict.violated("media: a type was named for a path whose extension does not name it");
+}
+
+fun token_char(c: u8) bool {
+    ret (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '-' || c == '_';
+}
+
+pub fun answer_challenge_path(data: *u8, len: usize) verdict.Verdict {
+    var token:    view.View;
+    val answered: bool = challenge.http01_token(view.view(data, len), ?token);
+    # a challenge is exactly the well-known prefix and one base64url token
+    val prefix:   usize = challenge.CHALLENGE_PREFIX_BYTES;
+    var expected: bool  = len > prefix && len - prefix <= challenge.MAX_TOKEN_BYTES;
+    var i:        usize = 0;
+    for (expected && i < len) {
+        if (i < prefix) { expected = data[i] == challenge.CHALLENGE_PREFIX[i]::u8; }
+        or              { expected = token_char(data[i]); }
+        i = i + 1;
+    }
+    if (answered != expected) {
+        ret verdict.violated("acme-challenge-path: a path was taken as a challenge or refused against its grammar");
+    }
+    if (!answered) { ret verdict.answered(0); }
+    verdict.accept();
+    if (token.data::*u8 != ?data[prefix] || token.len != len - prefix) {
+        ret verdict.violated("acme-challenge-path: the token is not the path's last segment");
+    }
+    ret verdict.answered(verdict.bucket(token.len));
+}
