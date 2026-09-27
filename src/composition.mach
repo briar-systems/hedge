@@ -20,6 +20,7 @@ use hedge.dispatch.plan;
 use hedge.handoff;
 use hedge.lifecycle;
 use hedge.listener;
+use hedge.protocol.quic.keyfile;
 use quic_keys:    hedge.protocol.quic.keys;
 use quic_runtime: hedge.protocol.quic.runtime;
 use hedge.protocol.quic.steering;
@@ -114,8 +115,11 @@ pub rec Runtime {
     board:  handoff.Board;
     # the board datagrams cross workers on, and whether the process keyed its
     # QUIC listeners (hedge.protocol.quic.keys), made only when one is configured
-    steering:        steering.Board;
-    quic_keyed:      bool;
+    steering:   steering.Board;
+    quic_keyed: bool;
+    # why the last reload kept each filed QUIC listener's keys, nil where it
+    # took its key file
+    quic_keys_kept:  [schema.MAX_LISTENERS]str;
     connections:     process_admission.Shared;
     handshakes:      process_admission.Shared;
     handshake_slots: allowance.Pool;
@@ -229,6 +233,45 @@ fun make_quic_caps(runtime: *Runtime, configured: *schema.Graph, workers: usize)
     }
     runtime.quic_keyed = true;
     ret true;
+}
+
+# every QUIC listener that names a key file takes its keys from it. a refusal
+# is diagnosed against the listener
+fun file_quic_keys(runtime: *Runtime, configured: *schema.Graph,
+    diagnostics: *schema.Diagnostics) bool {
+    var i: usize = 0;
+    for (i < schema.MAX_LISTENERS) {
+        runtime.quic_keys_kept[i] = nil;
+        i                         = i + 1;
+    }
+    if (!runtime.quic_keyed) { ret true; }
+    val now_ns: u64  = clock.monotonic_ns();
+    var ok:     bool = true;
+    i = 0;
+    for (i < configured.listener_count) {
+        val listener: *schema.Listener = ?configured.listeners[i];
+        if (listener.transport == schema.TRANSPORT_QUIC && listener.quic_keys.len > 0) {
+            var file:   quic_keys.File;
+            var reason: str            = nil;
+            val read:   keyfile.Status = keyfile.read(schema.text(?listener.quic_keys), ?file);
+            if (read != keyfile.OK) { reason = keyfile.message(read); }
+            or {
+                var host: u32 = 0;
+                if (sel listener.quic_host_id.some) { host = listener.quic_host_id.some::u32; }
+                val filed: quic_keys.Status = quic_keys.start_filed(
+                    quic_keys.listener_at(i), host, ?file, now_ns);
+                if (filed != quic_keys.KEYED) { reason = quic_keys.message(filed); }
+            }
+            quic_keys.wipe_file(?file);
+            if (reason != nil) {
+                schema.add_diagnostic(diagnostics, schema.ERROR, schema.INVALID_VALUE,
+                    "quic_keys", schema.text(?listener.name), reason);
+                ok = false;
+            }
+        }
+        i = i + 1;
+    }
+    ret ok;
 }
 
 # what worker `index` shares with the others
@@ -399,6 +442,9 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
     runtime.caps_live = false;
     if (!make_caps(runtime, configured, generation_id, workers)) {
         ret worker.failed(worker.START_CONFIG, "admission caps could not be constructed");
+    }
+    if (!file_quic_keys(runtime, configured, diagnostics)) {
+        ret fail(runtime, nil, worker.START_CONFIG, "a QUIC listener's key file was refused");
     }
     var i: usize = 0;
     for (i < workers) {
@@ -664,10 +710,11 @@ pub fun stage_reload(runtime: *Runtime, configured: *schema.Graph,
 }
 
 # every reload moves each QUIC listener's connection IDs and tokens onto fresh
-# keys. the old codepoint decodes on until nothing can carry it: no live
-# connection holds it, and a Retry minted under it has outlived its token and
-# the handshake that could follow. a rotation that finds no free codepoint
-# leaves the current keys and is counted
+# keys, or onto what its key file now holds. the old codepoint decodes on until
+# nothing can carry it: no live connection holds it, and a Retry minted under it
+# has outlived its token and the handshake that could follow. a rotation that
+# finds no free codepoint leaves the current keys and is counted, and a key file
+# that is refused leaves them too, and says why in `quic_keys_kept`
 fun rotate_quic_keys(runtime: *Runtime, configured: *schema.Graph) {
     if (!runtime.quic_keyed) { ret; }
     val grace_ns: u64 = serve.QUIC_RETRY_MAX_AGE_NS
@@ -675,12 +722,34 @@ fun rotate_quic_keys(runtime: *Runtime, configured: *schema.Graph) {
     val now_ns: u64   = clock.monotonic_ns();
     var i:      usize = 0;
     for (i < configured.listener_count) {
-        if (configured.listeners[i].transport == schema.TRANSPORT_QUIC) {
-            quic_keys.rotate(quic_keys.listener_at(i), now_ns, grace_ns,
-                runtime.worker_count);
+        val listener: *schema.Listener    = ?configured.listeners[i];
+        val keys:     *quic_keys.Listener = quic_keys.listener_at(i);
+        runtime.quic_keys_kept[i] = nil;
+        if (listener.transport == schema.TRANSPORT_QUIC && keys.filed) {
+            var file: quic_keys.File;
+            val read: keyfile.Status = keyfile.read(schema.text(?listener.quic_keys), ?file);
+            if (read != keyfile.OK) { runtime.quic_keys_kept[i] = keyfile.message(read); }
+            or {
+                val adopted: quic_keys.Status = quic_keys.adopt(keys, ?file, now_ns,
+                    grace_ns, runtime.worker_count);
+                if (adopted != quic_keys.KEYED) {
+                    runtime.quic_keys_kept[i] = quic_keys.message(adopted);
+                }
+            }
+            quic_keys.wipe_file(?file);
+        }
+        or (listener.transport == schema.TRANSPORT_QUIC) {
+            quic_keys.rotate(keys, now_ns, grace_ns, runtime.worker_count);
         }
         i = i + 1;
     }
+}
+
+# why the last reload kept listener `index`'s key file keys rather than take its
+# file, or nil when it took it or has none
+pub fun quic_keys_kept(runtime: *Runtime, index: usize) str {
+    if (runtime == nil || index >= schema.MAX_LISTENERS) { ret nil; }
+    ret runtime.quic_keys_kept[index];
 }
 
 # the first step of a reload, on worker `index`'s thread: build the candidate's
