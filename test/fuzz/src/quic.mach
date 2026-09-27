@@ -1,0 +1,180 @@
+# QUIC peer input: destination CID routing and local CID adoption
+#
+# a peer chooses every connection ID hedge routes on. the routing input is a
+# script of operations against a table, answered against a model of what the
+# table must hold
+
+use hedge.protocol.quic.routing;
+use hedge.protocol.quic.runtime;
+use quic_listener: quic.connection.listener;
+use quic.packet.packet;
+use std.types.bool.bool;
+use std.types.size.usize;
+
+use fuzz.guard;
+use fuzz.verdict;
+
+val MODEL: usize = 128;
+
+var model_keys:     [MODEL]routing.Key;
+var model_bindings: [MODEL]routing.Binding;
+var model_count:    usize;
+
+fun same_key(a: *routing.Key, b: *routing.Key) bool {
+    ret routing.key_equal(a, b);
+}
+
+fun same_binding(a: routing.Binding, b: routing.Binding) bool {
+    ret a.connection_slot == b.connection_slot &&
+        a.connection_generation == b.connection_generation &&
+        a.route_index == b.route_index && a.route_generation == b.route_generation &&
+        a.route_sequence == b.route_sequence && a.pump_generation == b.pump_generation &&
+        a.pending == b.pending;
+}
+
+fun find(key: *routing.Key) usize {
+    var i: usize = 0;
+    for (i < model_count) {
+        if (same_key(?model_keys[i], key)) { ret i; }
+        i = i + 1;
+    }
+    ret MODEL;
+}
+
+# the bits of one byte as a binding: slot, generation (zero is invalid),
+# whether the pump generation is valid, the sequence, and pending
+fun binding_of(bits: u8) routing.Binding {
+    var value:      routing.Binding;
+    val generation: u64 = ((bits >> 2) & 3)::u64;
+    value.connection_slot       = (bits & 3)::usize;
+    value.connection_generation = generation;
+    value.route_index           = (bits & 3)::usize;
+    value.route_generation      = generation;
+    value.route_sequence        = ((bits >> 5) & 1)::u64;
+    value.pump_generation       = 1;
+    if ((bits & 0x10) != 0) { value.pump_generation = 0; }
+    value.pending = (bits & 0x40) != 0;
+    ret value;
+}
+
+fun valid_binding(value: routing.Binding) bool {
+    ret value.connection_generation != 0 && value.route_generation != 0 &&
+        value.pump_generation != 0;
+}
+
+# each operation is an op byte, a key length, the key's bytes and a binding
+# byte: publish, unpublish, or look up
+pub fun answer_routing(data: *u8, len: usize) verdict.Verdict {
+    var table:  routing.Table;
+    val before: usize = guard.live();
+    if (!routing.make(?table, guard.allocator())) {
+        ret verdict.violated("routing: an empty table could not be made");
+    }
+    model_count = 0;
+    var outcome: u64   = 0;
+    var at:      usize = 0;
+    for (at + 2 <= len && model_count < MODEL) {
+        val op:     u8    = data[at] % 3;
+        val length: usize = (data[at + 1] % 22)::usize;
+        at = at + 2;
+        if (at + length + 1 > len) { brk; }
+        val key:     routing.Key     = routing.key(?data[at], length);
+        val binding: routing.Binding = binding_of(data[at + length]);
+        at = at + length + 1;
+        if (key.valid != (length != 0 && length <= routing.MAX_CID_BYTES)) {
+            ret verdict.violated("routing: a key's validity is not its length's");
+        }
+        var copy:     routing.Key    = key;
+        val found:    usize          = find(?copy);
+        var status:   routing.Status = 0;
+        var expected: routing.Status = routing.ROUTE_OK;
+        if (op == 0) {
+            status = routing.publish(?table, key, binding);
+            if (!key.valid || !valid_binding(binding)) { expected = routing.ROUTE_INVALID; }
+            or (found != MODEL && !same_binding(model_bindings[found], binding)) {
+                expected = routing.ROUTE_CONFLICT;
+            }
+            if (status == routing.ROUTE_OK && found == MODEL) {
+                model_keys[model_count]     = key;
+                model_bindings[model_count] = binding;
+                model_count                 = model_count + 1;
+            }
+        }
+        or (op == 1) {
+            status = routing.unpublish(?table, key, binding);
+            if (!key.valid)                                    { expected = routing.ROUTE_INVALID; }
+            or (found == MODEL)                                { expected = routing.ROUTE_MISSING; }
+            or (!same_binding(model_bindings[found], binding)) { expected = routing.ROUTE_STALE; }
+            if (status == routing.ROUTE_OK && found != MODEL) {
+                model_count           = model_count - 1;
+                model_keys[found]     = model_keys[model_count];
+                model_bindings[found] = model_bindings[model_count];
+            }
+        }
+        or {
+            val looked: routing.Lookup = routing.lookup(?table, key);
+            status = looked.status;
+            if (!key.valid)     { expected = routing.ROUTE_INVALID; }
+            or (found == MODEL) { expected = routing.ROUTE_MISSING; }
+            or (!same_binding(looked.binding, model_bindings[found])) {
+                ret verdict.violated("routing: a route resolved to a binding nobody published for it");
+            }
+        }
+        if (status != expected) {
+            ret verdict.violated("routing: an operation answered other than the routes published");
+        }
+        if (status == routing.ROUTE_OK) { verdict.accept(); }
+        outcome = verdict.mix(outcome, ((op::u64) << 4) | status::u64);
+    }
+    # every route the model holds is still there, and once they are all
+    # withdrawn the table gives back everything it took
+    if (table.len != model_count) {
+        ret verdict.violated("routing: the table holds a different number of routes than were published");
+    }
+    var i: usize = 0;
+    for (i < model_count) {
+        if (routing.unpublish(?table, model_keys[i], model_bindings[i]) != routing.ROUTE_OK) {
+            ret verdict.violated("routing: a published route could not be withdrawn by its owner");
+        }
+        i = i + 1;
+    }
+    if (!routing.destroy(?table) || guard.live() != before) {
+        ret verdict.violated("routing: an emptied table kept storage");
+    }
+    ret verdict.answered(verdict.mix(outcome, verdict.bucket(model_count)));
+}
+
+var connection: runtime.Connection;
+var storage:    runtime.ConnectionStorage;
+
+pub fun answer_local_cid(data: *u8, len: usize) verdict.Verdict {
+    var accepted: quic_listener.Accepted;
+    if (!packet.set_connection_id(?accepted.initial_destination, data, len)) {
+        if (len <= packet.MAX_CONNECTION_ID) {
+            ret verdict.violated("local-cid: a connection ID of a valid length was refused");
+        }
+        ret verdict.answered(0);
+    }
+    connection.storage = ?storage;
+    var i: usize = 0;
+    for (i < runtime.CONNECTION_ID_BYTES) {
+        storage.local_cid[i] = 0;
+        i                    = i + 1;
+    }
+    val adopted: bool = runtime.adopt_local_cid(?connection, ?accepted);
+    # only the one length short headers are parsed at becomes a route, and it is
+    # exactly the id the client addressed
+    if (adopted != (len == runtime.CONNECTION_ID_BYTES)) {
+        ret verdict.violated("local-cid: an id was adopted at a length short headers do not parse");
+    }
+    if (!adopted) { ret verdict.answered(1); }
+    verdict.accept();
+    i = 0;
+    for (i < runtime.CONNECTION_ID_BYTES) {
+        if (storage.local_cid[i] != data[i]) {
+            ret verdict.violated("local-cid: the adopted id is not the one the client addressed");
+        }
+        i = i + 1;
+    }
+    ret verdict.answered(2);
+}
