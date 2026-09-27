@@ -4,7 +4,7 @@ hedge hosts applications in-process. A hosted application is Mach code linked in
 
 This document is the **host contract**: the part of hedge's public surface a hosted application, or a binding that adapts a framework to hedge, may depend on. It says which items the contract is made of, what hedge promises about each, and what it asks of the code it hosts. Anything it does not name is internal to hedge, even when it is declared `pub`.
 
-This is **host contract version 1.3**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), version 1.2 added background tasks ([Background tasks](#background-tasks)), and version 1.3 reports where the listeners bound ([Where the listeners bound](#where-the-listeners-bound)).
+This is **host contract version 1.4**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), version 1.2 added background tasks ([Background tasks](#background-tasks)), version 1.3 reports where the listeners bound ([Where the listeners bound](#where-the-listeners-bound)), and version 1.4 lets a handler upgrade its connection ([Upgrades](#upgrades)).
 
 ## Roles
 
@@ -32,6 +32,7 @@ These are the items of the host contract, by module. Types and constants from ma
 - waiting: `Wait`, `WAIT_BODY`, `WAIT_WAKE`, `park`, `yield_turn`, `waker`
 - cancellation: `scope`, `deadline`, `cancelled`, `entered`
 - per-request state: `Finalizer`, `FinalizeFun`, `attach_finalizer`, `finalizer_state`, `detach_finalizer`
+- upgrades (see [Upgrades](#upgrades)): `tunnel`, `TunnelOwner`, `no_tunnel_owner`, `TunnelFun`, `TunnelAbandonFun`, `Tunnel`, `TunnelStatus`, `TUNNEL_PENDING`, `TUNNEL_DONE`, `TUNNEL_FAILED`, of which a program writes the fields of `TunnelOwner` and `Tunnel.wake_at`, and reads the rest of `Tunnel`
 
 **`hedge.telemetry.trace`**: `Context`, read-only, of which a handler reads `trace_id`, `parent_id` and `flags`.
 
@@ -74,7 +75,7 @@ Of these records, a program writes the fields of `Spec`, `Options` and `Resolver
 
 Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, the `Bound` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
 
-Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
+Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, `allow_tunnel`, `tunnel_owner`, `release_to_tunnel`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
 
 ## The handler contract
 
@@ -106,6 +107,34 @@ hedge calls `serve(ctx, active)` for each request routed to the handler. `active
 A handler that is entered again resumes the request, it does not start it over. hedge gives it no memory of its own between entries, so a handler keeps its per-request state in the request arena and finds it again through the finalizer slot: it attaches a `Finalizer` on the first entry, and on each later entry `call.finalizer_state(active, finish)` returns the state it attached. The finalizer runs exactly once when the exchange settles, however it settled, and it is where the handler releases what it holds for the request.
 
 **Concurrency.** Every worker is handed the same registry, so one handler is entered by every worker at once, with the same `ctx` on each. A request belongs to one worker, and only that worker enters, resumes or finalizes it. Anything a handler shares between requests (its `ctx` and whatever it reaches) must therefore be safe to use from several threads at once: atomic, locked, or written before the process starts and only read after.
+
+## Upgrades
+
+A handler can answer a request by giving up HTTP on its connection: a `101 Switching Protocols` to a request that asked to upgrade, a WebSocket's for instance, or a `2xx` to a `CONNECT`. The connection is then a byte stream the application runs, a **tunnel**. It has the shape of mach-http's `Handler.tunnel` (see mach-http's `doc/server.md`, Tunnels), so a binding whose framework already runs tunnels on mach-http's server passes them through:
+
+```mach
+pub def TunnelFun:        fun(ptr, *Tunnel, *transport.Completion) TunnelStatus;
+pub def TunnelAbandonFun: fun(ptr, *Tunnel);
+pub rec TunnelOwner { ctx: ptr; drive: TunnelFun; abandon: TunnelAbandonFun; }
+```
+
+**Asking for one.** Before it commits the response, the handler names who will run the tunnel with `call.tunnel(active, owner)`. It answers false where the connection cannot hand itself over, and the handler then answers without upgrading. Once the response is written and the exchange has settled, finalizer included, hedge hands the stream to `owner` as a `Tunnel`. A response that upgrades nothing, or an exchange that fails before its response is written, never enters the owner, and a `101` whose handler named no owner closes the connection after it. A `CONNECT` reaches a handler only through a route that matches its authority-form target, and a configured route path cannot match one yet, so today a hosted handler's tunnel follows an upgrade.
+
+- `transport` is the stream, an `http.core.transport.Transport`, and `scope` the scope to submit its operations under. The owner reads and writes through it, and settles every completion it is handed with `transport.complete`. Only hedge shuts it down or closes it.
+- `input` holds the bytes the client sent past the request, valid while the tunnel lives.
+- `allocator` is the upgrading request's arena, which the tunnel keeps: what the handler allocated there while negotiating, the owner's `ctx` included, lives as long as the tunnel does.
+- `waker` wakes the tunnel as a call's waker wakes its handler, by `wake.wake` on the worker and `wake.post` from any other thread. `wake_at` is an instant on `hedge.clock` the owner asks to be entered again at, cleared before every entry.
+- `draining` says the tunnel's generation is shutting down, and `drain_at` is an instant on `hedge.clock` before which hedge does not cut it.
+
+**Driving.** `drive` is entered at the handoff, again with each completion of an operation the owner submitted, and after each wake, `wake_at` or the start of a drain, with a nil completion. It returns `TUNNEL_PENDING` while it runs. `TUNNEL_DONE` hands the stream back with nothing of the owner's in flight, and hedge ends it gracefully. `TUNNEL_FAILED` ends it abortively. `abandon` is called exactly once for a tunnel hedge cuts while `drive` last returned `TUNNEL_PENDING`, and hedge then cancels and settles what the owner left in flight before the tunnel's memory goes. Both run on the worker that owns the connection, and never block it.
+
+**Bounds.** A tunnel holds its connection, which counts against `max_connections` and the per-peer limit, its request arena within the request memory it was admitted with, and the connection's buffers within the worker's memory. It holds no exchange, so it gives back its route's budget when the upgrading exchange settles. `server.timeouts.tunnel_ms` cuts one whose bytes have stood still in both directions for that long.
+
+**Drain.** When shutdown begins, or a reload supersedes the tunnel's generation, the owner is entered with `draining` set and `drain_at` the drain deadline, so it winds down on its own terms, a WebSocket with a `1001` close for instance. A shutdown that begins while a reload's drain runs brings `drain_at` forward, and the owner is entered again when it does. Where the configuration gives the drain no time, `drain_at` is the instant it began. At the deadline hedge cuts every tunnel still running, as it cuts every exchange.
+
+**Telemetry.** The upgrading request is logged and counted as any request. hedge reports the tunnels open (`hedge_tunnels_open`), opened (`hedge_tunnels_total`) and cut while their owner ran them (`hedge_tunnels_abandoned_total`).
+
+**Protocols.** HTTP/1.1 connections, in cleartext and over TLS, hand themselves over today. On HTTP/2 and HTTP/3 `call.tunnel` answers false. The contract is shaped for their extended `CONNECT` (RFC 8441, RFC 9220), where the tunnel is one stream of a multiplexed connection: `transport` is then that stream, `input` whatever arrived on it with the request, `TUNNEL_DONE` ends the stream and `TUNNEL_FAILED` resets it, and the connection's other streams go on. An owner that neither shuts down nor closes its transport, and settles only its own completions, runs unchanged on either.
 
 ## The lifecycle hooks
 
@@ -305,7 +334,7 @@ A facility holds at most `MAX_TASKS` tasks, and registration is refused with `ST
 ## Memory rules
 
 - **The registry** and its slot storage, every registered `name`, and every `ctx` of a handler or lifecycle stay live and unchanged from registration until `supervisor.stop` returns. hedge only reads them after startup.
-- **The request arena** (`call.allocator_of`) lives until the exchange settles, and hedge reclaims it then in one step. A handler allocates its per-request state and response bytes there and frees nothing. Bytes a handler hands to `respond_with_bytes` must live until the exchange settles, which arena bytes do. An allocation the arena refuses is the request's bound running out: `call.memory_refused` says so, and the handler fails or answers without it.
+- **The request arena** (`call.allocator_of`) lives until the exchange settles, and hedge reclaims it then in one step, or, for an exchange that upgraded into a tunnel, once the tunnel has ended. A handler allocates its per-request state and response bytes there and frees nothing. Bytes a handler hands to `respond_with_bytes` must live until the exchange settles, which arena bytes do. An allocation the arena refuses is the request's bound running out: `call.memory_refused` says so, and the handler fails or answers without it.
 - **Nothing per request outlives the exchange.** A handler that keeps anything past its request copies it into memory it owns, and synchronizes it as the concurrency rule above requires.
 - **A step's `detail`** is read before the step returns and never kept, so it may point at the application's own storage.
 - **The trace context and the waker** are valid for the exchange and no longer.

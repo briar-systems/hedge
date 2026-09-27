@@ -190,8 +190,10 @@ pub rec Runtime {
     previous: LiveList;
     # slots whose connection is in teardown: spoken for but about to be free
     retiring: usize;
-    # the wheel entry that ends the previous generation's drain (#182)
-    drain_timer: hedge_timer.Handle;
+    # the wheel entry that ends the previous generation's drain (#182), and the
+    # monotonic instant it ends at, which its connections' tunnels are told
+    drain_timer:       hedge_timer.Handle;
+    previous_drain_ns: u64;
     # the wheel entry that ends a wait at the shutdown's drain deadline, so the
     # sequence cancels when it is due rather than on some later event (#273)
     shutdown_timer: hedge_timer.Handle;
@@ -361,12 +363,13 @@ pub fun make(
     runtime.retiring       = 0;
     # each entry is claimed at the first deadline it holds, so an idle worker
     # holds no wheel storage until a plane has one, a reload or a shutdown lands
-    runtime.drain_timer    = hedge_timer.no_handle();
-    runtime.shutdown_timer = hedge_timer.no_handle();
-    runtime.plane_timer    = hedge_timer.no_handle();
-    runtime.plane_due      = true;
-    runtime.ready_head     = NO_SLOT;
-    runtime.ready_tail     = NO_SLOT;
+    runtime.drain_timer       = hedge_timer.no_handle();
+    runtime.previous_drain_ns = 0;
+    runtime.shutdown_timer    = hedge_timer.no_handle();
+    runtime.plane_timer       = hedge_timer.no_handle();
+    runtime.plane_due         = true;
+    runtime.ready_head        = NO_SLOT;
+    runtime.ready_tail        = NO_SLOT;
     var i: usize = 0;
     for (i < schema.MAX_LISTENERS) {
         runtime.quic_handle_live[i] = false;
@@ -1197,7 +1200,7 @@ fun drive(runtime: *Runtime, index: usize, now: time.Instant) bool {
     # it finishes what it is doing and closes, and nobody walked to tell it
     if (!slot.signalled && slot.connection.generation != runtime.generation) {
         slot.signalled = true;
-        if (!connection.begin_graceful(?slot.connection)) {
+        if (!connection.begin_graceful(?slot.connection, runtime.previous_drain_ns)) {
             runtime.teardown_failures = runtime.teardown_failures + 1;
         }
     }
@@ -1369,6 +1372,8 @@ pub fun poll(controls: *quic_runtime.ControlView, runtime: *Runtime, timeout_ms:
             runtime.refused_memory);
         telemetry.timers(runtime.recorder, hedge_timer.claimed_count(?runtime.timers),
             hedge_timer.armed_count(?runtime.timers));
+        telemetry.tunnels(runtime.recorder, runtime.storage.tunnels_opened,
+            runtime.storage.tunnels_ended, runtime.storage.tunnels_abandoned);
     }
     run_ready(controls, runtime, settled);
     if (lifecycle.serving(?runtime.shutdown)) {
@@ -1483,12 +1488,27 @@ fun signal_list(runtime: *Runtime, list: *LiveList) bool {
         val slot: *Slot = slot_at(runtime, i);
         if (slot.live && !slot.signalled) {
             slot.signalled = true;
-            if (!connection.begin_graceful(?slot.connection)) { ok = false; }
+            if (!connection.begin_graceful(?slot.connection, shutdown_drain_ns(runtime))) {
+                ok = false;
+            }
+            mark_ready(runtime, i);
+        }
+        # one a reload already signalled may now be cut sooner, and its tunnel
+        # is told so
+        or (slot.live) {
+            connection.drain_toward(?slot.connection, shutdown_drain_ns(runtime));
             mark_ready(runtime, i);
         }
         i = slot.next_live;
     }
     ret ok;
+}
+
+# the monotonic instant the shutdown's drain is cut at, or now for a drain the
+# configuration gives no time
+fun shutdown_drain_ns(runtime: *Runtime) u64 {
+    if (runtime.shutdown.has_deadline) { ret clock.to_ns(runtime.shutdown.deadline); }
+    ret clock.monotonic_ns();
 }
 
 fun cancel_list(runtime: *Runtime, list: *LiveList) {
@@ -1726,13 +1746,16 @@ pub fun reload(controls: *quic_runtime.ControlView, runtime: *Runtime, generatio
     runtime.drain_timeout_ns = drain_timeout_ns;
     runtime.stop_timeout_ns  = stop_timeout_ns;
     var armed: bool = true;
+    # a drain the configuration gives no time has no cut, and its tunnels are
+    # told to wind down from now
+    runtime.previous_drain_ns = clock.monotonic_ns() + drain_timeout_ns;
     if (runtime.previous.count != 0 && drain_timeout_ns != 0) {
         if (runtime.drain_timer.index == hedge_timer.NONE) {
             runtime.drain_timer = hedge_timer.claim(?runtime.timers, DRAIN_OWNER);
         }
         armed = runtime.drain_timer.index != hedge_timer.NONE
             && hedge_timer.arm(?runtime.timers, runtime.drain_timer,
-            clock.monotonic_ns() + drain_timeout_ns) == hedge_timer.OK;
+            runtime.previous_drain_ns) == hedge_timer.OK;
     }
     # publication already happened, so a failure here cannot be reported as a
     # rejected reload. enter the ordered shutdown path and surface it there.
