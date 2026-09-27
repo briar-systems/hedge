@@ -71,8 +71,8 @@ Every secret hedge holds, and where it becomes public:
   made public only by `keys.publish` for the durable form
 - QUIC listener keys: secret-typed storage, never declassified beyond a key
   file's layout and a reload's comparison verdict
-- configured TLS private keys: read into public scratch, which is wiped once
-  the key is copied into secret storage for `mach-tls`
+- configured TLS private keys: read with `std.filesystem.read_secret` straight
+  into welded storage, parsed by `mach-tls` from there, never declassified
 - session ticket keys: drawn from the operating system entropy source into
   `mach-tls`'s key ring, which owns their storage
 
