@@ -43,7 +43,7 @@ These are the items of the host contract, by module. Types and constants from ma
 
 - the loop: `Loop`, `open_loop`, `client`, `turn`, `fetch`, `close_loop`
 - the client: `Client`, `set_user_agent`, `route`, `Origin`, `no_origin`, `secure_origin`, `cleartext_origin`, `close_kept`, `MAX_CONNECTIONS`, `MAX_ROUTES`, `IDLE_NS`
-- requests and responses: `Request`, `request`, `Response`, `DEFAULT_TIMEOUT_NS`, `MIN_TIMEOUT_NS`
+- requests and responses: `Request`, `request`, `secret_header`, `Response`, `DEFAULT_TIMEOUT_NS`, `MIN_TIMEOUT_NS`
 - the exchange: `Exchange`, `make_exchange`, `begin`, `poll`, `deadline`, `response`, `finish`, `idle`, `releasing`, `destroy_exchange`, `stage`, `cause`, `tls_failure`
 - outcomes: `Status`, `OK`, `PENDING`, `FAILED`, `INVALID`, `Stage` and its values (`IDLE`, `QUEUED`, `RESOLVING`, `CONNECTING`, `HANDSHAKING`, `WRITING`, `READING`, `COMPLETE`, `BROKEN`), `Cause` and its values (`CAUSE_NONE`, `CAUSE_ADDRESS`, `CAUSE_CONNECT`, `CAUSE_WRITE`, `CAUSE_READ`, `CAUSE_PROTOCOL`, `CAUSE_TOO_LARGE`, `CAUSE_TIMEOUT`, `CAUSE_TRUST`, `CAUSE_HANDSHAKE`, `CAUSE_UNTRUSTED`, `CAUSE_REQUEST`, `CAUSE_CAPACITY`)
 
@@ -51,14 +51,15 @@ Of these records, a program writes the fields of `Request` and reads those of `R
 
 **`hedge.task`: background tasks** (see [Background tasks](#background-tasks))
 
-- the facility: `Tasks`, `Options`, `default_options`, `make`, `Secrets`, `ResolveFun`, `no_secrets`, `MAX_TASKS`, `MIN_SNAPSHOT_SLOTS`, `MAX_SNAPSHOT_SLOTS`, `MAX_NAME_BYTES`, `MAX_ERROR_BYTES`, `MAX_SECRET_BYTES`, `MAX_RUN_EXCHANGES`, `STEP_INTERVAL_NS`
+- the facility: `Tasks`, `Options`, `default_options`, `make`, `MAX_TASKS`, `MIN_SNAPSHOT_SLOTS`, `MAX_SNAPSHOT_SLOTS`, `MAX_NAME_BYTES`, `MAX_ERROR_BYTES`, `MAX_SECRET_BYTES`, `MAX_RUN_EXCHANGES`, `STEP_INTERVAL_NS`
+- secrets: `Resolver`, `ResolveFun`, `Secrets`, `no_secrets`, `register_secrets`, `unregister_secrets`, `MAX_RESOLVERS`
 - registering and triggering: `Spec`, `StepFun`, `Handle`, `register`, `trigger`, `name_valid`, `spec_valid`
 - a run: `Run`, `Cause` and its values (`CAUSE_PERIOD`, `CAUSE_TRIGGER`), `begin`, `borrow`, `UseFun`, `Borrow` and its values (`BORROW_OK`, `BORROW_MISSING`, `BORROW_REFUSED`, `BORROW_INVALID`), `Draft`, `draft`, `commit`, `discard`, `publish`
 - reading: `Lease`, `read`, `release`, `lease_view`
 - reporting: `Report`, `report`, `report_error`, `success_age_ns`, `draining`, `Outcome` and its values (`OUTCOME_NONE`, `OUTCOME_COMPLETED`, `OUTCOME_FAILED`, `OUTCOME_ABANDONED`)
 - outcomes: `Status` and its values (`STATUS_OK`, `STATUS_INVALID`, `STATUS_DRAINING`, `STATUS_FULL`, `STATUS_EMPTY`, `STATUS_COALESCED`, `STATUS_BUSY`)
 
-Of these records, a program writes the fields of `Spec`, `Options` and `Secrets`, and reads those of `Run`, `Draft`, `Lease` and `Report`. `Tasks` and `Handle` are hedge's.
+Of these records, a program writes the fields of `Spec`, `Options` and `Resolver`, and reads those of `Run`, `Draft`, `Lease` and `Report`. `Tasks`, `Handle` and `Secrets` are hedge's.
 
 **Process assembly.** hedge has no single entry point that runs a process around a registry yet, so an embedding program assembles one from these items (see [Running a process](#running-a-process)):
 
@@ -235,7 +236,7 @@ bundle.release(?heap, ?anchors);
 
 **Trust.** An `https` request is verified against the anchors `open_loop` was given, for the host the URL names, typically a system bundle loaded with mach-tls's `tls.cert.bundle`. Without anchors it fails with `CAUSE_TRUST` and never leaves the process. A chain that does not verify, or a certificate that does not name the host, fails with `CAUSE_UNTRUSTED`, and the request is never sent. `route` sends one host's requests to a fixed endpoint, still verified for the URL's host, or in cleartext to a front end that terminates TLS for it, which is only ever a decision the application makes.
 
-**Requests.** The client writes `host`, `content-length` and, unless the request carries one, `user-agent` (`hedge` by default, or `set_user_agent`). A request that supplies `host`, `content-length`, `transfer-encoding`, `connection`, `te`, `upgrade`, `trailer`, `keep-alive` or `proxy-connection`, an invalid field, a body on a `GET` or `HEAD`, or more than the exchange's request buffer holds fails with `CAUSE_REQUEST`. Methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS`.
+**Requests.** A credential goes into a header with `secret_header(field, name, prefix, secret, storage, capacity)`, which writes `prefix` and then the secret-typed `secret` into `storage`, the one place the client declassifies a secret. The client writes `host`, `content-length` and, unless the request carries one, `user-agent` (`hedge` by default, or `set_user_agent`). A request that supplies `host`, `content-length`, `transfer-encoding`, `connection`, `te`, `upgrade`, `trailer`, `keep-alive` or `proxy-connection`, an invalid field, a body on a `GET` or `HEAD`, or more than the exchange's request buffer holds fails with `CAUSE_REQUEST`. Methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS`.
 
 **Responses.** A response is framed by `content-length`, by chunked transfer coding, which is decoded in place, or by the peer closing. Interim `1xx` responses are passed over. A response larger than the request's `max_response_bytes`, or the exchange's response buffer when that is zero, fails with `CAUSE_TOO_LARGE`, and one whose head exceeds 16 KiB or the exchange's field limits does too. An exchange that has not completed by its deadline, `timeout_ns` after `begin` and never less than `MIN_TIMEOUT_NS`, fails with `CAUSE_TIMEOUT`. The two limits are separate causes, as are resolution (`CAUSE_ADDRESS`), connection (`CAUSE_CONNECT`), a malformed response (`CAUSE_PROTOCOL`) and a handshake that failed for a reason other than trust (`CAUSE_HANDSHAKE`).
 
@@ -248,10 +249,15 @@ bundle.release(?heap, ?anchors);
 `hedge.task` runs work on its own schedule next to request handling: a periodic refresh, an on-demand rebuild a handler can fire, and a snapshot every handler reads without waiting. It is one facility for the whole process. The embedding program makes it and hands it to hedge, and hands it to its hosted code as well, typically through a handler's or lifecycle's `ctx`, and hosted code registers its tasks in it:
 
 ```mach
+# a module-level record: a resolver is secret welded, so it never erases to ptr
+var vault_resolver: task.Resolver = task.Resolver{ctx: nil, resolve: resolve_from_vault};
+
+var secrets: task.Secrets;
+task.register_secrets(?vault_resolver, ?secrets);
 var tasks: task.Tasks;
 var options: task.Options = task.default_options();
 options.trust   = ?anchors.bundle.store;
-options.secrets = task.Secrets{ctx: vault, resolve: resolve_from_vault};
+options.secrets = secrets;
 task.make(?tasks, options);
 
 var process: composition.Options = composition.default_options();
@@ -276,7 +282,7 @@ A facility holds at most `MAX_TASKS` tasks, and registration is refused with `ST
 
 **Snapshots.** A run publishes with `task.draft`, writing into the slot it returns, and `task.commit`, or with `task.publish` for bytes it already has. The committed slot becomes the task's current snapshot. `task.discard` gives an uncommitted draft back, and a run that ends with one open has it discarded. `task.read` never waits on a run: it returns a `Lease` on the current snapshot, or `STATUS_EMPTY` before the first publish. A lease is a reference on its slot until `task.release`, and a leased slot is never reused, so a handler reads a stable snapshot for as long as it holds the lease. A publish needs a slot that is neither current, leased nor drafting. When every slot is held, `draft` and `publish` return `STATUS_FULL` and the current snapshot stays in place, so a task whose refresh fails keeps serving its last good snapshot.
 
-**Secrets.** mach refuses to erase anything that reaches secret-typed data to `ptr`, so task state, which is erased, holds no secret. The facility owns the resolver instead: `task.borrow(run, name, use, use_ctx)` asks `Options.secrets` for the named secret, hands it to `use` for that call only, in scratch storage of at most `MAX_SECRET_BYTES` that is cleared once `use` returns. Only a run in flight borrows. A secret that must outlive the call, such as a token an outbound request carries until its exchange completes, is copied by `use` into memory the task owns and cleared by the task once the exchange is finished.
+**Secrets.** mach refuses to erase anything that reaches secret-typed data to `ptr`, so task state, which is erased, holds no secret. A `Resolver` writes the named secret into secret-typed (`^u8`) storage, and since its callback type mentions a secret it cannot be erased either. So the embedding program registers it with `task.register_secrets` into a bounded table (`MAX_RESOLVERS`), and the facility holds only the public `Secrets` handle that call returns, in `Options.secrets`. `task.borrow(run, name, use, use_ctx)` has the resolver fill secret scratch storage of at most `MAX_SECRET_BYTES`, hands it to `use` as `contracts.SecretBytes` for that call only, and clears it once `use` returns. Only a run in flight borrows. `task.unregister_secrets` is refused while a borrow is in flight. A secret an outbound request must carry, such as a bearer token, reaches public memory at exactly one place: `outbound.secret_header` declassifies it (`:>u8`) into header storage the task owns, marks the field sensitive, and the task clears that storage once the exchange is finished.
 
 **Outbound HTTPS.** `task.begin(run, exchange, request)` begins a request on the task thread's loop, verified against `Options.trust` (see [Outbound HTTPS](#outbound-https)). Its timeout is cut to the run's deadline, and the facility finishes the exchange when the run ends, however it ended, so a run that fails or is abandoned never holds a connection open. The step advances the exchange with `outbound.poll` and reads it with `outbound.response` as usual, and routes a host with `outbound.route(outbound.client(run.loop), ...)`. A run begins at most `MAX_RUN_EXCHANGES` at once. The exchange and its buffers are the task's.
 
