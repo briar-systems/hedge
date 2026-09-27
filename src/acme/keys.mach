@@ -6,19 +6,21 @@
 # authority admits the certificate key for revocation, so sharing them would
 # let anyone holding a certificate act as the account.
 #
-# where the key material lives is decided by the language, not by preference.
-# a mach record that transitively contains secret-qualified storage is
-# secret-welded and cannot be erased to `ptr`. every seam this subsystem hangs
-# from is a `ptr` callback: the serving loop's plane, the service handler, the
-# acme challenge provider, and the durable store's callbacks. so a key that any
-# of those must reach cannot be held in secret storage at all. it is held as
-# public bytes and classified into a secret stack buffer for the exact call
-# that consumes it, which the caller then zeroizes. the same crossing is what
-# makes the key persistable, because mach-std exposes no secret-aware file
-# interface either.
+# the scalar and its pkcs#8 encoding are secret-typed for the key's whole life.
+# a record holding secret storage is welded and never erases to `ptr`, and
+# every seam a key must reach is one: the challenge provider and the
+# certification-request signer take `ptr` contexts, and the manager that owns
+# the account and certificate keys is reachable from the worker threads'
+# `*u8` start argument. so the secret half lives here, in a bounded ring of
+# secret slots, and a `Key` is the public half plus a handle to its slot. a
+# handle names a slot and a generation, is not an address, and unlocks nothing
+# but the operations below.
 #
-# every classification point is one of the `scratch` arguments below. there are
-# no others, and no key material is copied anywhere else.
+# the material is drawn straight into its slot, signed with in place, and
+# handed to mach-tls as secret bytes. it becomes public at exactly one `:>`
+# site, `publish`, the durable form, because mach-acme's file store encodes
+# public bytes. the only other crossing is inbound: `adopt` lifts a scalar read
+# from disk into its slot.
 
 use cert: acme.certificate;
 use acme.jose;
@@ -26,9 +28,9 @@ use crypto.contracts;
 use crypto.group.p256;
 use crypto.signature;
 use std.crypto.ct;
-use std.crypto.rand;
 use io_error: std.io.error;
-use std.memory;
+use std.memory.secret;
+use std.sync.mutex;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -67,7 +69,7 @@ fun write_spki_prefix(output: *u8) {
 
 # rfc 5958 privateKeyInfo wrapping the rfc 5915 ecPrivateKey, with the public
 # point included so a loader never re-derives it
-fun write_pkcs8_frame(output: *u8) {
+fun write_pkcs8_frame(output: *^u8) {
     val head: [36]u8 = [36]u8{
         0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13,
         0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
@@ -88,92 +90,181 @@ fun write_pkcs8_frame(output: *u8) {
     }
 }
 
-pub rec Key {
-    material: [SCALAR_BYTES]u8;
-    pkcs8:    [PKCS8_BYTES]u8;
-    point:    [POINT_BYTES]u8;
-    spki:     [SPKI_BYTES]u8;
-    live:     bool;
+# every key alive in the process at once: a manager holds three and a
+# tls-alpn-01 presentation one
+pub val MAX_KEYS: usize = 64;
+
+rec Slot {
+    material: ^[SCALAR_BYTES]u8;
+    pkcs8:    ^[PKCS8_BYTES]u8;
 }
 
-fun derive(key: *Key) bool {
-    var scratch: [SCALAR_BYTES]^u8;
-    var i:       usize = 0;
-    for (i < SCALAR_BYTES) {
-        scratch[i] = key.material[i];
-        i          = i + 1;
+# a slot is claimed and given back under `ring_lock`, since keys are drawn on
+# more than one thread. a claimed slot belongs to the key that holds it.
+var ring:       [MAX_KEYS]Slot;
+var claimed:    [MAX_KEYS]bool;
+var generation: [MAX_KEYS]u64;
+var ring_lock:  mutex.Mutex;
+
+pub rec Key {
+    point:      [POINT_BYTES]u8;
+    spki:       [SPKI_BYTES]u8;
+    slot:       usize;
+    generation: u64;
+    live:       bool;
+}
+
+# marks a key record in storage that was never zeroed as holding nothing. a
+# zeroed record already does, since no slot is ever at generation zero.
+pub fun clear(key: *Key) {
+    if (key == nil) { ret; }
+    key.slot       = MAX_KEYS;
+    key.generation = 0;
+    key.live       = false;
+}
+
+fun claim(key: *Key) bool {
+    mutex.lock(?ring_lock);
+    var i: usize = 0;
+    for (i < MAX_KEYS) {
+        if (!claimed[i]) {
+            claimed[i]     = true;
+            generation[i]  = generation[i] + 1;
+            key.slot       = i;
+            key.generation = generation[i];
+            mutex.unlock(?ring_lock);
+            ret true;
+        }
+        i = i + 1;
     }
+    mutex.unlock(?ring_lock);
+    ret false;
+}
+
+# the slot a key holds, or nil for a key that holds none
+fun slot_of(key: *Key) *Slot {
+    if (key == nil || key.slot >= MAX_KEYS) { ret nil; }
+    mutex.lock(?ring_lock);
+    val held: bool = claimed[key.slot] && generation[key.slot] == key.generation;
+    mutex.unlock(?ring_lock);
+    if (!held) { ret nil; }
+    ret ?ring[key.slot];
+}
+
+fun release(key: *Key) {
+    val slot: *Slot = slot_of(key);
+    if (slot != nil) {
+        ct.zeroize(?slot.material[0], SCALAR_BYTES);
+        ct.zeroize(?slot.pkcs8[0], PKCS8_BYTES);
+        mutex.lock(?ring_lock);
+        claimed[key.slot] = false;
+        mutex.unlock(?ring_lock);
+    }
+    key.slot       = MAX_KEYS;
+    key.generation = 0;
+}
+
+fun derive(key: *Key, slot: *Slot) bool {
     val derived: contracts.Operation = p256.derive_public(
-        contracts.SecretBytes{data: ?scratch[0], len: SCALAR_BYTES},
+        contracts.SecretBytes{data: ?slot.material[0], len: SCALAR_BYTES},
         contracts.Buffer{data: ?key.point[0], capacity: POINT_BYTES});
-    ct.zeroize(?scratch[0], SCALAR_BYTES);
     if (derived.error != contracts.OK || derived.written != POINT_BYTES) {
         ret false;
     }
     write_spki_prefix(?key.spki[0]);
-    i = 0;
+    var i: usize = 0;
     for (i < POINT_BYTES) {
         key.spki[SPKI_PREFIX + i] = key.point[i];
         i                         = i + 1;
     }
-    write_pkcs8_frame(?key.pkcs8[0]);
+    write_pkcs8_frame(?slot.pkcs8[0]);
     i = 0;
     for (i < SCALAR_BYTES) {
-        key.pkcs8[PKCS8_SCALAR_AT + i] = key.material[i];
-        i                              = i + 1;
+        slot.pkcs8[PKCS8_SCALAR_AT + i] = slot.material[i];
+        i                               = i + 1;
     }
     i = 0;
     for (i < POINT_BYTES) {
-        key.pkcs8[PKCS8_POINT_AT + i] = key.point[i];
-        i                             = i + 1;
+        slot.pkcs8[PKCS8_POINT_AT + i] = key.point[i];
+        i                              = i + 1;
     }
     key.live = true;
     ret true;
 }
 
-# adopts key material recovered from durable storage
+# adopts key material recovered from durable storage, replacing whatever `key`
+# held. the bytes arrive public, because mach-std reads files into public
+# memory, and the caller wipes them.
 pub fun adopt(key: *Key, material: *u8) bool {
     if (key == nil || material == nil) { ret false; }
-    key.live = false;
-    var i: usize = 0;
+    destroy(key);
+    if (!claim(key)) { ret false; }
+    val slot: *Slot = ?ring[key.slot];
+    var i:    usize = 0;
     for (i < SCALAR_BYTES) {
-        key.material[i] = material[i];
-        i               = i + 1;
+        slot.material[i] = material[i];
+        i                = i + 1;
     }
-    if (!derive(key)) {
+    if (!derive(key, slot)) {
         destroy(key);
         ret false;
     }
     ret true;
 }
 
-# draws a new key. a scalar the curve rejects is discarded and drawn again
-# rather than clamped, because clamping biases the key.
+# draws a new key, replacing whatever `key` held. a scalar the curve rejects is
+# discarded and drawn again rather than clamped, because clamping biases the key.
 pub fun generate(key: *Key) bool {
     if (key == nil) { ret false; }
-    key.live = false;
+    destroy(key);
+    if (!claim(key)) { ret false; }
+    val slot:     *Slot = ?ring[key.slot];
     var attempts: usize = 0;
     for (attempts < 8) {
-        if (!filled(rand.fill(?key.material[0], SCALAR_BYTES))) { ret false; }
-        if (derive(key))                                        { ret true; }
+        if (!filled(secret.random_fill(?slot.material[0], SCALAR_BYTES))) {
+            brk;
+        }
+        if (derive(key, slot)) { ret true; }
         attempts = attempts + 1;
     }
     destroy(key);
     ret false;
 }
 
+# wipes the key's slot and gives it back. a key that holds no slot is only
+# marked dead.
 pub fun destroy(key: *Key) bool {
     if (key == nil) { ret false; }
-    memory.raw_zero((?key.material[0])::ptr, SCALAR_BYTES);
-    memory.raw_zero((?key.pkcs8[0])::ptr, PKCS8_BYTES);
+    release(key);
     key.live = false;
     ret true;
 }
 
-# the durable form. the caller writes these bytes with owner-only permissions
-# and zeroizes nothing here, because this is the record's own storage.
-pub fun material(key: *Key) view.View {
-    ret view.view(?key.material[0], SCALAR_BYTES);
+# moves `source` into `target`, destroying what `target` held and leaving
+# `source` holding nothing. the secret half never moves.
+pub fun replace(target: *Key, source: *Key) bool {
+    if (target == nil || source == nil || !source.live
+        || slot_of(source) == nil) { ret false; }
+    destroy(target);
+    @target     = @source;
+    source.slot = MAX_KEYS;
+    source.live = false;
+    ret true;
+}
+
+# the durable form, written into the caller's `output` of SCALAR_BYTES. the
+# caller persists it and wipes it.
+pub fun publish(key: *Key, output: *u8) bool {
+    if (key == nil || !key.live || output == nil) { ret false; }
+    val slot: *Slot = slot_of(key);
+    if (slot == nil) { ret false; }
+    var i: usize = 0;
+    for (i < SCALAR_BYTES) {
+        # declassify: the scalar is persisted through mach-acme's public file store
+        output[i] = slot.material[i]:>u8;
+        i         = i + 1;
+    }
+    ret true;
 }
 
 # every member is set by name. an unset one would be whatever the frame held,
@@ -194,38 +285,32 @@ pub fun signer(key: *Key) jose.Signer {
     ret jose.signer(public_key(key));
 }
 
-# classifies the scalar into the caller's secret buffer for one signing call.
-# the caller owns `scratch` for the whole call and zeroizes it after.
-pub fun private_key(key: *Key, scratch: *^u8) jose.PrivateKey {
+# the scalar in its slot, for one signing call. a dead key yields an empty
+# scalar, which every signer refuses.
+pub fun private_key(key: *Key) jose.PrivateKey {
     var value: jose.PrivateKey;
     value.algorithm    = jose.ES256;
     value.secret_owner = key::ptr;
-    value.value        = contracts.SecretBytes{data: scratch, len: SCALAR_BYTES};
+    value.value        = contracts.SecretBytes{data: nil, len: 0};
     value.rsa          = signature.RsaPrivateKey{
         modulus:          contracts.Bytes{data: nil, len: 0},
         public_exponent:  contracts.Bytes{data: nil, len: 0},
         private_exponent: contracts.SecretBytes{data: nil, len: 0}
     };
-    if (key == nil || scratch == nil) { ret value; }
-    var i: usize = 0;
-    for (i < SCALAR_BYTES) {
-        scratch[i] = key.material[i];
-        i          = i + 1;
-    }
+    val slot: *Slot = slot_of(key);
+    if (slot == nil || !key.live) { ret value; }
+    value.value = contracts.SecretBytes{data: ?slot.material[0],
+        len: SCALAR_BYTES};
     ret value;
 }
 
-# classifies the encoded private key so mach-tls can load a served identity
-pub fun private_der(key: *Key, scratch: *^u8) contracts.SecretBytes {
-    if (key == nil || scratch == nil) {
-        ret contracts.SecretBytes{data: scratch, len: 0};
+# the encoded private key in its slot, so mach-tls can load a served identity
+pub fun private_der(key: *Key) contracts.SecretBytes {
+    val slot: *Slot = slot_of(key);
+    if (slot == nil || !key.live) {
+        ret contracts.SecretBytes{data: nil, len: 0};
     }
-    var i: usize = 0;
-    for (i < PKCS8_BYTES) {
-        scratch[i] = key.pkcs8[i];
-        i          = i + 1;
-    }
-    ret contracts.SecretBytes{data: scratch, len: PKCS8_BYTES};
+    ret contracts.SecretBytes{data: ?slot.pkcs8[0], len: PKCS8_BYTES};
 }
 
 pub fun public_der(key: *Key) view.View {
@@ -236,17 +321,12 @@ fun sign_csr(context: ptr, tbs: *u8, tbs_len: usize, output: *u8,
     capacity: usize) usize {
     val key: *Key = context::*Key;
     if (key == nil || !key.live || tbs == nil || output == nil) { ret 0; }
-    var scratch: [SCALAR_BYTES]^u8;
-    var i:       usize = 0;
-    for (i < SCALAR_BYTES) {
-        scratch[i] = key.material[i];
-        i          = i + 1;
-    }
+    val slot: *Slot = slot_of(key);
+    if (slot == nil) { ret 0; }
     val signed: contracts.Operation = signature.sign_ecdsa_p256_sha256(
-        contracts.SecretBytes{data: ?scratch[0], len: SCALAR_BYTES},
+        contracts.SecretBytes{data: ?slot.material[0], len: SCALAR_BYTES},
         contracts.Bytes{data: tbs, len: tbs_len},
         contracts.Buffer{data: output, capacity: capacity});
-    ct.zeroize(?scratch[0], SCALAR_BYTES);
     if (signed.error != contracts.OK) { ret 0; }
     ret signed.written;
 }
@@ -262,22 +342,19 @@ pub fun csr_signer(key: *Key) cert.CsrSigner {
 
 test generate__valid_signer_and_encodings {
     var key: Key;
-    if (!generate(?key))                { ret 1; }
-    if (!key.live || key.point[0] != 4) { ret 2; }
-    if (!jose.valid(signer(?key)))      { ret 3; }
-    var scratch: [SCALAR_BYTES]^u8;
-    val private: jose.PrivateKey = private_key(?key, ?scratch[0]);
-    if (!jose.key_pair_valid(public_key(?key), private)) { ret 4; }
-    ct.zeroize(?scratch[0], SCALAR_BYTES);
+    if (!generate(?key))                                           { ret 1; }
+    if (!key.live || key.point[0] != 4)                            { ret 2; }
+    if (!jose.valid(signer(?key)))                                 { ret 3; }
+    if (!jose.key_pair_valid(public_key(?key), private_key(?key))) { ret 4; }
     val encoded: view.View = public_der(?key);
     if (encoded.len != SPKI_BYTES || encoded.data[0] != 0x30) { ret 5; }
     var i: usize = 0;
     for (i < POINT_BYTES) {
-        if (key.spki[SPKI_PREFIX + i] != key.point[i]
-            || key.pkcs8[PKCS8_POINT_AT + i] != key.point[i]) { ret 6; }
+        if (key.spki[SPKI_PREFIX + i] != key.point[i]) { ret 6; }
         i = i + 1;
     }
-    if (!destroy(?key)) { ret 7; }
+    if (private_der(?key).len != PKCS8_BYTES) { ret 7; }
+    if (!destroy(?key))                       { ret 8; }
     ret 0;
 }
 
@@ -285,26 +362,38 @@ test adopt__reproduces_the_key {
     var first: Key;
     if (!generate(?first)) { ret 1; }
     var carried: [SCALAR_BYTES]u8;
-    val durable: view.View = material(?first);
-    var i:       usize     = 0;
-    for (i < SCALAR_BYTES) {
-        carried[i] = durable.data[i];
-        i          = i + 1;
-    }
+    if (!publish(?first, ?carried[0])) { ret 2; }
     var second: Key;
-    if (!adopt(?second, ?carried[0])) { ret 2; }
-    i = 0;
+    if (!adopt(?second, ?carried[0])) { ret 3; }
+    if (second.slot == first.slot)    { ret 4; }
+    var i: usize = 0;
     for (i < POINT_BYTES) {
-        if (first.point[i] != second.point[i]) { ret 3; }
+        if (first.point[i] != second.point[i]) { ret 5; }
         i = i + 1;
     }
+    var again: [SCALAR_BYTES]u8;
+    if (!publish(?second, ?again[0])) { ret 6; }
     i = 0;
-    for (i < PKCS8_BYTES) {
-        if (first.pkcs8[i] != second.pkcs8[i]) { ret 4; }
+    for (i < SCALAR_BYTES) {
+        if (carried[i] != again[i]) { ret 7; }
         i = i + 1;
     }
     destroy(?first);
     destroy(?second);
+    ret 0;
+}
+
+test replace__moves_the_key {
+    var active:  Key;
+    var pending: Key;
+    if (!generate(?active) || !generate(?pending)) { ret 1; }
+    val moved: usize = pending.slot;
+    val freed: usize = active.slot;
+    if (!replace(?active, ?pending))                        { ret 2; }
+    if (!active.live || pending.live)                       { ret 3; }
+    if (active.slot != moved || replace(?active, ?pending)) { ret 4; }
+    if (claimed[freed] || private_der(?active).len == 0)    { ret 5; }
+    destroy(?active);
     ret 0;
 }
 
@@ -331,17 +420,55 @@ test csr_signer__verifiable_signature {
 test destroy__stops_signing_and_zeroes {
     var key: Key;
     if (!generate(?key)) { ret 1; }
-    val csr: cert.CsrSigner = csr_signer(?key);
+    val held: usize          = key.slot;
+    val csr:  cert.CsrSigner = csr_signer(?key);
     destroy(?key);
     var i: usize = 0;
     for (i < SCALAR_BYTES) {
-        if (key.material[i] != 0) { ret 2; }
+        # declassify: test assertion that the wipe reached the slot
+        if ((ring[held].material[i]:>u8) != 0) { ret 2; }
         i = i + 1;
     }
     var message:  [4]u8 = [4]u8{9, 9, 9, 9};
     var produced: [MAX_SIGNATURE_BYTES]u8;
     if (csr.sign(csr.ctx, ?message[0], 4, ?produced[0], MAX_SIGNATURE_BYTES)
         != 0) { ret 3; }
+    var published: [SCALAR_BYTES]u8;
+    if (publish(?key, ?published[0]) || private_der(?key).len != 0
+        || private_key(?key).value.len != 0) { ret 4; }
+    ret 0;
+}
+
+test generate__stale_handle_holds_nothing {
+    var first: Key;
+    if (!generate(?first)) { ret 1; }
+    var stale: Key = first;
+    destroy(?first);
+    var second: Key;
+    if (!generate(?second) || second.slot != stale.slot) { ret 2; }
+    if (private_der(?stale).len != 0 || destroy(?stale) == false
+        || private_der(?second).len != PKCS8_BYTES) { ret 3; }
+    destroy(?second);
+    ret 0;
+}
+
+test generate__refused_when_the_ring_is_full {
+    var held: [MAX_KEYS]Key;
+    var i:    usize = 0;
+    for (i < MAX_KEYS) {
+        if (!generate(?held[i])) { ret 1; }
+        i = i + 1;
+    }
+    var extra: Key;
+    if (generate(?extra) || extra.live) { ret 2; }
+    destroy(?held[3]);
+    if (!generate(?extra) || extra.slot != 3) { ret 3; }
+    destroy(?extra);
+    i = 0;
+    for (i < MAX_KEYS) {
+        destroy(?held[i]);
+        i = i + 1;
+    }
     ret 0;
 }
 
