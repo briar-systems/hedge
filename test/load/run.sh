@@ -34,7 +34,35 @@ quic_rate="${LOAD_QUIC_RATE:-1k}"
 quic_served="${LOAD_QUIC_SERVED:-1}"
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-trap cleanup_load EXIT
+
+# an origin behind a proxy route whose every response carries a field section
+# past what hedge's HTTP/3 encoder takes, in two fields the proxy relays whole
+origin_pid=""
+start_origin() {
+    python3 -c 'import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Origin(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *_):
+        pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("X-Oversized-1", "a" * 3000)
+        self.send_header("X-Oversized-2", "a" * 3000)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+HTTPServer(("127.0.0.1", int(sys.argv[1])), Origin).serve_forever()' "$1" \
+        >"$work/origin.log" 2>&1 &
+    origin_pid=$!
+}
+stop_origin() {
+    if [ -z "$origin_pid" ]; then return 0; fi
+    kill "$origin_pid" 2>/dev/null || true
+    wait "$origin_pid" 2>/dev/null || true
+    origin_pid=""
+}
+trap 'stop_origin; cleanup_load' EXIT
 
 CLEARTEXT_PORT=19100
 SECURE_PORT=19101
@@ -42,6 +70,7 @@ QUIC_PORT=19102
 CAPPED_CLEARTEXT_PORT=19103
 CAPPED_SECURE_PORT=19104
 CAPPED_QUIC_PORT=19105
+ORIGIN_PORT=19106
 # the capped server admits this many connections across every transport
 CAP=48
 CAP_TCP=32
@@ -60,7 +89,19 @@ write_config "$work/hedge.toml" \
 memory_bytes = $((quic_connections * 4 * 1048576))" \
     "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
     "handshake_ms = 60000
-request_ms = 120000"
+request_ms = 120000" \
+    "[server.features]
+proxy = true
+
+[service.oversized]
+kind = \"proxy\"
+upstream = \"127.0.0.1:$ORIGIN_PORT\"" "" \
+    "[[route]]
+name = \"oversized\"
+host = \"site\"
+path = \"/oversized\"
+service = \"oversized\""
+start_origin "$ORIGIN_PORT"
 start_hedge "$work/hedge.toml"
 
 echo "binary $binary"
@@ -95,6 +136,26 @@ for i in 1 2 3 4 5; do
 done
 test "$smoke" = 5
 report $? "a small body is served over HTTP/3 ($smoke of 5)"
+
+# a response head HTTP/3 cannot encode fails its own stream alone (#388). curl
+# multiplexes both transfers onto one connection, and the rate limit keeps the
+# body's stream open while the proxied head is refused beside it. the refused
+# one is answered 502 in its place, and the body completes on the connection
+"$h3curl" --http3-only --insecure --silent --max-time 30 --parallel \
+    --connect-to "::127.0.0.1:$QUIC_PORT" --limit-rate 16k \
+    --write-out '%{url.path} %{http_code} %{size_download} %{num_connects}\n' \
+    --output /dev/null "https://pair.load.test:$QUIC_PORT/body" \
+    --output /dev/null "https://pair.load.test:$QUIC_PORT/oversized" \
+    >"$work/pair.out" 2>"$work/pair.err"
+awk -v bytes="$BODY_BYTES" '
+    { connects += $4 }
+    $1 == "/body" && $2 == 200 && $3 == bytes { body = 1 }
+    $1 == "/oversized" && $2 == 502 { refused = 1 }
+    END {
+        printf "h3-pair: body=%d refused=%d connections=%d\n", body, refused, connects
+        exit !(body && refused && connects == 1)
+    }' "$work/pair.out"
+report $? "an HTTP/3 head too large to encode fails only its own stream"
 
 if [ "$quic_served" = 1 ]; then
     # no limit is configured, so every one of these has to be admitted, held open

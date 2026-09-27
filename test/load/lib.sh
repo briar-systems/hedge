@@ -401,9 +401,11 @@ prepare_load() {
 # per-peer limit is always raised to the global one or past the load. the
 # optional sixth argument is the body of a [server.timeouts] table, and the
 # optional seventh is appended whole (an admin listener, telemetry).
-# `workers`, when given, fixes the worker count; otherwise one serves per CPU
+# `workers`, when given, fixes the worker count; otherwise one serves per CPU.
+# `routes`, when given, is placed ahead of the catch-all body route, which would
+# otherwise shadow them
 write_config() {
-    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}" workers="${8:-}"
+    local path="$1" limits="$2" cleartext="$3" secure="$4" quic="$5" timeouts="${6:-}" extra="${7:-}" workers="${8:-}" routes="${9:-}"
     local cache_service="" cache_table="" cache_memory=$((BODY_BYTES * 4))
     # LOAD_CACHE=memory caches the content in memory. LOAD_CACHE=disk halves the
     # memory budget so the large body (past a quarter of it) is kept on disk and
@@ -484,6 +486,8 @@ names = ["localhost", "*.load.test"]
 kind = "static"
 root = "$work/content"
 $cache_service
+
+$routes
 
 [[route]]
 name = "body"
