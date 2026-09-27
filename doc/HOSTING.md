@@ -4,7 +4,7 @@ hedge hosts applications in-process. A hosted application is Mach code linked in
 
 This document is the **host contract**: the part of hedge's public surface a hosted application, or a binding that adapts a framework to hedge, may depend on. It says which items the contract is made of, what hedge promises about each, and what it asks of the code it hosts. Anything it does not name is internal to hedge, even when it is declared `pub`.
 
-This is **host contract version 1.5**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), version 1.2 added background tasks ([Background tasks](#background-tasks)), version 1.3 reported where the listeners bound ([Where the listeners bound](#where-the-listeners-bound)), version 1.4 let a handler upgrade its connection ([Upgrades](#upgrades)), and version 1.5 adds secrets for hosted code ([Secrets](#secrets)).
+This is **host contract version 1.7**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), version 1.2 added background tasks ([Background tasks](#background-tasks)), version 1.3 reported where the listeners bound ([Where the listeners bound](#where-the-listeners-bound)), version 1.4 let a handler upgrade its connection ([Upgrades](#upgrades)), version 1.5 added secrets for hosted code ([Secrets](#secrets)), version 1.6 added an application's settings and the lifecycle's reload step ([Settings](#settings)), and version 1.7 adds logs, metrics and health checks from hosted code ([Telemetry](#telemetry)).
 
 ## Roles
 
@@ -20,7 +20,7 @@ These are the items of the host contract, by module. Types and constants from ma
 **`hedge.service`: handlers, lifecycles and the registry**
 
 - `Handler`, `ServeFun`, `no_handler`, `has_handler`
-- `Lifecycle`, `StepFun`, `DrainFun`, `Step`, `StepStatus`, `STEP_DONE`, `STEP_PENDING`, `STEP_FAILED`, `no_lifecycle`, `has_lifecycle`
+- `Lifecycle` (its optional `reload` step since 1.6), `StepFun`, `DrainFun`, `Step`, `StepStatus`, `STEP_DONE`, `STEP_PENDING`, `STEP_FAILED`, `no_lifecycle`, `has_lifecycle`
 - `Application`, `Applications`, `MAX_APPLICATIONS`, `make_applications`, `register_hosted`, `register_application`, `find_application`
 - the response helpers: `commit`, `commit_bodyless`, `respond`, `respond_with_bytes`, `respond_with_text`, `add_field`, `arena_bytes`, `arena_number`, `text_view`
 
@@ -69,6 +69,22 @@ Of these records, a program writes the fields of `Spec`, `Options` and `Resolver
 
 Of these records, a program writes the fields of `Provider`. `Source` and `Providers` are hedge's.
 
+**`hedge.settings`: an application's settings** (see [Settings](#settings))
+
+- `Source`, `source`, `View`, `current`, `key_valid`, `MAX_KEY_BYTES`
+- reading: `read`, `Read`, `read_integer`, `read_float`, `read_boolean`, `Kind` and its values (`KIND_STRING`, `KIND_INTEGER`, `KIND_FLOAT`, `KIND_BOOLEAN`, `KIND_ARRAY`, `KIND_TABLE`, `KIND_SECRET`), `Status` and its values (`READ_FOUND`, `READ_MISSING`, `READ_TOO_LARGE`, `READ_INVALID`, `READ_SECRET`, `READ_MISMATCH`)
+
+Of these records, a program reads the fields of `Read`. `Source` and `View` are hedge's.
+
+**`hedge.observe`: logs, metrics and health checks from hosted code** (see [Telemetry](#telemetry))
+
+- `Source`, `source`, `Status` and its values (`STATUS_OK`, `STATUS_INVALID`, `STATUS_FULL`, `STATUS_OFF`)
+- logs: `log`, `MAX_LOG_FIELDS`
+- metrics: `metric`, `Metric`, `Kind` and its values (`COUNTER`, `GAUGE`, `HISTOGRAM`), `Label`, `add`, `set`, `record_value`, `MAX_APPLICATION_SERIES`, `MAX_METRIC_NAME_BYTES`, `MAX_LABELS`, `MAX_BUCKETS`
+- health: `check`, `Check`, `set_ready`, `MAX_APPLICATION_CHECKS`
+
+Of these records, a program writes the fields of `Label`. `Source`, `Metric` and `Check` are hedge's. The log fields are std's `std.log.record.Field` and levels `std.log.record.Level`.
+
 **Process assembly.** hedge has no single entry point that runs a process around a registry yet, so an embedding program assembles one from these items (see [Running a process](#running-a-process)):
 
 - `hedge.composition`: `Options` (its `applications`, `tasks` and `providers`), `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`, `Bound`, `bound_count`, `bound`
@@ -82,7 +98,7 @@ Of these records, a program writes the fields of `Provider`. `Source` and `Provi
 
 Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, the `Bound` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
 
-Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, `allow_tunnel`, `tunnel_owner`, `release_to_tunnel`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), the rest of `hedge.secret` (the per-generation store composition keeps, and the credentials hedge holds for itself), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
+Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, `allow_tunnel`, `tunnel_owner`, `release_to_tunnel`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), the rest of `hedge.secret` (the per-generation store composition keeps, and the credentials hedge holds for itself), the rest of `hedge.settings` (its store), the rest of `hedge.observe` (`open`, `close`), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
 
 ## The handler contract
 
@@ -154,6 +170,7 @@ pub rec Lifecycle {
     ready: StepFun;   # fun(ptr) Step
     drain: DrainFun;  # fun(ptr, time.Instant) Step
     stop:  StepFun;   # fun(ptr) Step
+    reload: StepFun;  # optional: fun(ptr) Step
 }
 ```
 
@@ -180,7 +197,7 @@ Every failure is also printed to stderr with the application's name and the step
 
 **Steps run on the supervisor's thread.** That thread also takes signals, reloads the configuration and drives ACME, and the steps are polled in its loop. A step that blocks stalls all of that, and a blocked drain or stop cannot be abandoned, since abandoning it needs the step to return. A step therefore does its work elsewhere and answers pending until that work is done.
 
-**Reloads.** The registry lives for the whole process. A reload rebuilds the services that reach an application, and resolves each against the same registry again, but never restarts, drains or stops the application.
+**Reloads.** The registry lives for the whole process. A reload rebuilds the services that reach an application, and resolves each against the same registry again, but never restarts, drains or stops the application. It hands the application the new generation instead: once a reload has published, the optional `reload` step of every started application that has one is called, and called again every 10 ms while it answers pending. From then on `settings.current` names the new generation and a secret borrow reads its secrets. A reload step that fails is reported with operation `reload` and leaves the application running on what it had. A lifecycle that sets `reload` must set the other four steps too.
 
 ## Registering and running
 
@@ -232,14 +249,9 @@ What hosted code receives from hedge today:
 - **Outbound HTTPS**: a client for requests to other services, verified against anchors the application chooses. See [Outbound HTTPS](#outbound-https).
 - **Background tasks**: work on its own schedule on a thread hedge owns, with snapshots handlers read without waiting. See [Background tasks](#background-tasks).
 - **Secrets**: the secrets the configuration grants the application, borrowed by name from any thread. See [Secrets](#secrets).
-- **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Providers` in `composition.Options.providers` that the `os` and `application` secrets resolve through, both the ones hosted code borrows and the administration credential, and a log sink in `.telemetry.downstream` that receives hedge's own records.
-
-Not yet supplied to hosted code:
-
-- **Configuration.** Hosted code does not read hedge's configuration. What it is told is its registered name and the limits above.
-- **Telemetry.** Hosted code cannot write to hedge's log or metrics, or add health checks beyond the readiness check hedge registers for it.
-
-Each of these reaches hosted code through this contract when it lands, as a new item in a minor version of it.
+- **Settings**: the application's own section of the configuration, read by key per generation. See [Settings](#settings).
+- **Telemetry**: structured log records, metric series and health checks in hedge's own sinks, attributed to the application. See [Telemetry](#telemetry).
+- **Through the embedding program**: the program supplies hedge with things, rather than receiving them. It can hand a `loader.Resolver` that answers the configuration's environment references, a `secret.Providers` in `composition.Options.providers` that the `os` and `application` secrets resolve through, both the ones hosted code borrows and the administration credential, and a log sink in `.telemetry.downstream` that receives hedge's own records and those hosted code writes.
 
 ## Outbound HTTPS
 
@@ -375,6 +387,42 @@ if (secret.borrow(site, view.view("database", 8), connect, (?db)::ptr) != secret
 
 **Generations.** Every configuration generation resolves the secrets it grants before it is published, and a secret that cannot be resolved refuses the generation, at startup or at a reload. A borrow reads the generation the process has published. A reload resolves every grant again, beside the ones borrows read now, and the process switches to them when the reload is published, clearing the ones they replace. A secret rotated at its source therefore reaches hosted code with the next reload, and an application that keeps a copy of one, in a connection it opened with it for instance, renews it when its lifecycle or its own schedule says so.
 
+## Settings
+
+`hedge.settings` hands hosted code its own section of the configuration. hedge carries the section's `settings` table without interpreting it, checks it only for its shape, and flattens it under dotted keys (see [Application settings](CONFIGURATION.md#application-settings)):
+
+```toml
+[application.site.settings]
+greeting = "hello"
+peers = ["a", "b"]
+
+[application.site.settings.database]
+pool = 8
+password = "${SECRET:database}"
+```
+
+reads as `greeting`, `peers` (an array of 2), `peers.0`, `peers.1`, `database` (a table of 2), `database.pool` and `database.password`. The embedding program names an application with `settings.source(registry, name, source)`, as it does for secrets, and hands the `Source` to the application's code.
+
+**Generations.** `settings.current(source)` is a `View` of the application's settings in the generation the process has published. A view keeps reading that generation, whole, through the next reload, and once a second reload has published every read through it answers `READ_INVALID`. An application that reads settings outside a request takes `current` again in its lifecycle's `reload` step, which a published reload calls (see [The lifecycle hooks](#the-lifecycle-hooks)). A handler takes `current` per request, so a request reads one generation from start to finish.
+
+**Reading.** `read(view, key, output, capacity)` copies the value's text and answers a `Read` with its `status`, its `kind` and its length: a string as written, an integer in decimal, a float in its shortest round-trip decimal, a boolean as `true` or `false`, and an array's or a table's member count. A value longer than `capacity` answers `READ_TOO_LARGE` with the length it needs, and a key the section does not hold answers `READ_MISSING`, whether or not another application's section holds it. `read_integer`, `read_float` and `read_boolean` answer the typed value, or `READ_MISMATCH` for a value of another kind. A key that is not 1 to `MAX_KEY_BYTES` printable characters without spaces, dotted without an empty segment, answers `READ_INVALID`.
+
+**Secret references.** A string value `${SECRET:name}` names one of the application's own grants, and a configuration whose reference names anything else is refused. It is never read as the secret: `read` answers `READ_SECRET`, `kind` `KIND_SECRET`, and the grant's name, which the application then borrows through `hedge.secret` (see [Secrets](#secrets)).
+
+Any thread may read. A read never waits on anything but a short lock, since a generation's settings were copied before it was published.
+
+## Telemetry
+
+`hedge.observe` lets hosted code write to the log, the metrics and the health hedge writes its own to, so what it reports reaches the operator's pipeline alongside hedge's. The embedding program names an application with `observe.source(registry, name, source)`, as it does for secrets and settings. Everything here may be called from any thread, and everything is attributed to the application the `Source` names.
+
+**Logs.** `log(source, level, message, fields, count, trace)` writes one record to hedge's log sink, under the same bounds, queue and overload policy as hedge's own records. hedge adds `kind="application"`, `application` with the application's name, and, when `trace` is a request's trace context (`active.telemetry`), its `trace_id`, which is the one hedge's access record for that request carries. Those three keys are hedge's: a record that sets one, or that carries more than `MAX_LOG_FIELDS` fields, is `STATUS_INVALID`. A record below the configured level, one the sink drops under overload, and any record when the operator turned logs off answer `STATUS_OFF`. hedge redacts nothing inside a record, and a secret never reaches one unless the code declassifies it (`:>`) into a field itself.
+
+**Metrics.** `metric(source, kind, name, labels, label_count, bounds, bucket_count, metric)` registers a series and returns its `Metric`, or finds the one registered already with the same kind, name and labels. The series is named `app_<name>`, where `name` is up to `MAX_METRIC_NAME_BYTES` of `[a-zA-Z_][a-zA-Z0-9_]*`. It is labelled `application` with the application's name beside at most `MAX_LABELS` labels of its own, whose keys are sorted and never `application`. So one application's series can never be taken for another's or for hedge's. A histogram takes up to `MAX_BUCKETS` ascending `bounds`. `add`, `set` and `record_value` update a counter, a gauge and a histogram. Every distinct set of label values is a series of its own, and an application registers at most `MAX_APPLICATION_SERIES` (64), which bounds its cardinality. Past that, a new series is `STATUS_FULL` while the ones it has keep working. Hosted series share the process's `telemetry.metric_series` with hedge's built-in series, and a registration that finds it spent is `STATUS_FULL` too. With metrics off, `metric` is `STATUS_OFF`. Series are process-scoped: a reload keeps them.
+
+**Health checks.** `check(source, name, required, ready, check)` adds a check named `<application>.<name>` beside the readiness check hedge registers under the application's name, and `set_ready(check, ready)` moves it. A required check that is not ready holds the process's readiness, exactly as a hosted readiness does. An application adds at most `MAX_APPLICATION_CHECKS` (4) checks, and a check lives for the process.
+
+**Traces.** hedge starts a trace for every request and hands it to the handler as `active.telemetry`. A framework's request span joins it by taking its `trace_id` and parenting on its `parent_id`, which is hedge's span for the request, and a record logged with that context carries the same `trace_id`. hedge exports no spans itself (see [CONFIGURATION.md](CONFIGURATION.md#telemetry-and-administration)).
+
 ## Memory rules
 
 - **The registry** and its slot storage, every registered `name`, and every `ctx` of a handler or lifecycle stay live and unchanged from registration until `supervisor.stop` returns. hedge only reads them after startup.
@@ -382,7 +430,7 @@ if (secret.borrow(site, view.view("database", 8), connect, (?db)::ptr) != secret
 - **Nothing per request outlives the exchange.** A handler that keeps anything past its request copies it into memory it owns, and synchronizes it as the concurrency rule above requires.
 - **A step's `detail`** is read before the step returns and never kept, so it may point at the application's own storage.
 - **The trace context and the waker** are valid for the exchange and no longer.
-- **A `Source`** is valid while the registry it came from is, and holds no secret. A secret handed to `use` is valid for that call and no longer, and a program that keeps one copies it into secret-typed memory it owns and clears. A registered `Provider` and its `ctx` stay live and unchanged until it is unregistered, which is after `supervisor.stop` returns.
+- **A `Source`**, a secret's or a setting's, is valid while the registry it came from is, and holds no secret. A settings `View` is a value, valid to read as long as its generation is kept. A `Metric` and a `Check` are values, valid until `supervisor.stop` returns, after which nothing here may be called. The fields handed to `log` are read before it returns. A secret handed to `use` is valid for that call and no longer, and a program that keeps one copies it into secret-typed memory it owns and clears. A registered `Provider` and its `ctx` stay live and unchanged until it is unregistered, which is after `supervisor.stop` returns.
 - **The task facility** and its `Options` stay where they were made, and every registered task's `name`, `state` and snapshot `slots` stay live, until `supervisor.stop` returns. A `Lease`'s bytes are valid until it is released, and a `Draft`'s until it is committed or discarded.
 
 ## Cancellation rules

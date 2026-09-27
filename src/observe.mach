@@ -1,0 +1,487 @@
+# logs, metrics and health checks from hosted code, through hedge's own
+#
+# a hosted application writes to the same log sink, metrics registry and
+# health as hedge does, attributed to it: every record carries its name, every
+# series it registers is `app_` prefixed and labelled with it, and every check
+# it adds is named under it. an application registers at most
+# `MAX_APPLICATION_SERIES` series and `MAX_APPLICATION_CHECKS` checks, and every
+# distinct set of label values is a series, so its cardinality is bounded
+
+use hedge.config.schema;
+use hedge.dispatch.call;
+use hedge.secret;
+use hedge.service;
+use hedge.telemetry;
+use telemetry_admin:   hedge.telemetry.admin;
+use telemetry_health:  hedge.telemetry.health;
+use telemetry_log:     hedge.telemetry.log;
+use telemetry_metrics: hedge.telemetry.metrics;
+use telemetry_trace:   hedge.telemetry.trace;
+use http.core.exchange;
+use std.log.record;
+use std.log.sink;
+use std.sync.atomic;
+use std.sync.mutex;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+# the series and the health checks one application may register
+pub val MAX_APPLICATION_SERIES: usize = 64;
+pub val MAX_APPLICATION_CHECKS: usize = 4;
+# the fields a record may carry beside the three hedge adds
+pub val MAX_LOG_FIELDS: usize = telemetry_log.MAX_FIELDS - 3;
+# the longest metric name, before hedge's `app_` prefix
+pub val MAX_METRIC_NAME_BYTES: usize = telemetry_metrics.NAME_CAPACITY - 5;
+# the labels a series may carry beside `application`
+pub val MAX_LABELS:  usize = telemetry_metrics.MAX_LABELS - 1;
+pub val MAX_BUCKETS: usize = telemetry_metrics.MAX_BUCKETS;
+
+pub def Status: u8;
+pub val STATUS_OK: Status = 1;
+# the argument broke a documented rule, or the process is not running
+pub val STATUS_INVALID: Status = 2;
+# the application's bound, or the process's, is spent
+pub val STATUS_FULL: Status = 3;
+# the operator turned this signal off, or the record was dropped at the sink
+pub val STATUS_OFF: Status = 4;
+
+pub def Kind: u8;
+pub val COUNTER:   Kind = telemetry_metrics.COUNTER;
+pub val GAUGE:     Kind = telemetry_metrics.GAUGE;
+pub val HISTOGRAM: Kind = telemetry_metrics.HISTOGRAM;
+
+pub rec Label {
+    key:   str;
+    value: str;
+}
+
+# the application a record, series or check is attributed to
+pub rec Source {
+    application: *service.Application;
+}
+
+# one registered series
+pub rec Metric {
+    index:      u32;
+    generation: u32;
+}
+
+# one registered health check
+pub rec Check {
+    index:      u32;
+    generation: u32;
+}
+
+rec Usage {
+    application: *service.Application;
+    series:      usize;
+    checks:      usize;
+}
+
+var runtime:     *telemetry.Runtime = nil;
+var live:        i64                = 0;
+var usage:       [service.MAX_APPLICATIONS]Usage;
+var usage_count: usize              = 0;
+var lock:        mutex.Mutex        = 0;
+
+# names the registered application `name` for everything here
+pub fun source(registry: *service.Applications, name: str, output: *Source) bool {
+    if (registry == nil || name == nil || output == nil) { ret false; }
+    val found: *service.Application = service.find_application(registry, name);
+    if (found == nil) { ret false; }
+    @output = Source{application: found};
+    ret true;
+}
+
+# hosted code writes to `observed` from here until `close`
+pub fun open(observed: *telemetry.Runtime) bool {
+    if (observed == nil || !observed.initialized) { ret false; }
+    mutex.lock(?lock);
+    runtime     = observed;
+    usage_count = 0;
+    atomic.store(?live, 1);
+    mutex.unlock(?lock);
+    ret true;
+}
+
+pub fun close() {
+    mutex.lock(?lock);
+    atomic.store(?live, 0);
+    runtime     = nil;
+    usage_count = 0;
+    mutex.unlock(?lock);
+}
+
+fun usage_locked(application: *service.Application) *Usage {
+    var i: usize = 0;
+    for (i < usage_count) {
+        if (usage[i].application == application) { ret ?usage[i]; }
+        i = i + 1;
+    }
+    if (usage_count >= service.MAX_APPLICATIONS) { ret nil; }
+    usage[usage_count] = Usage{application: application, series: 0, checks: 0};
+    usage_count        = usage_count + 1;
+    ret ?usage[usage_count - 1];
+}
+
+fun reserved(key: str) bool {
+    ret key == nil || str_len(key) == 0
+        || (str_len(key) == 4 && key[0] == 'k' && key[1] == 'i' && key[2] == 'n' && key[3] == 'd')
+        || named(key, "application") || named(key, "trace_id");
+}
+
+fun named(key: str, name: str) bool {
+    val length: usize = str_len(name);
+    if (str_len(key) != length) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (key[i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# writes one record to hedge's log sink, with `kind` `application`, the
+# application's name, and the request's trace id when `trace` is given. the
+# keys `kind`, `application` and `trace_id` are hedge's
+pub fun log(from: Source, level: record.Level, message: str, fields: *record.Field,
+    count: usize, trace: *telemetry_trace.Context) Status {
+    if (from.application == nil || message == nil || level > record.ERROR
+        || count > MAX_LOG_FIELDS || (count != 0 && fields == nil)) { ret STATUS_INVALID; }
+    var i: usize = 0;
+    for (i < count) {
+        if (reserved(fields[i].key)) { ret STATUS_INVALID; }
+        i = i + 1;
+    }
+    val observed: *telemetry.Runtime = runtime;
+    if (atomic.load(?live) == 0 || observed == nil) { ret STATUS_INVALID; }
+    if (!observed.logs_enabled)                     { ret STATUS_OFF; }
+    var all: [telemetry_log.MAX_FIELDS]record.Field;
+    all[0] = record.field_string("kind", "application");
+    all[1] = record.field_string("application", from.application.name);
+    var total: usize = 2;
+    var id:    [33]u8;
+    if (trace != nil && telemetry_trace.format_id(trace, ?id[0], 33) != 0) {
+        all[2] = record.field_string("trace_id", (?id[0])::str);
+        total  = 3;
+    }
+    i = 0;
+    for (i < count) {
+        all[total] = fields[i];
+        total      = total + 1;
+        i          = i + 1;
+    }
+    val report: sink.WriteReport = telemetry_log.emit(?observed.logger, level, message,
+        ?all[0], total);
+    if ((sel report.status.persisted) || (sel report.status.enqueued)) { ret STATUS_OK; }
+    if ((sel report.status.suppressed) || (sel report.status.dropped)) { ret STATUS_OFF; }
+    ret STATUS_INVALID;
+}
+
+fun metric_name(name: str, output: *u8) bool {
+    if (name == nil) { ret false; }
+    val length: usize = str_len(name);
+    if (length == 0 || length > MAX_METRIC_NAME_BYTES) { ret false; }
+    output[0] = 'a';
+    output[1] = 'p';
+    output[2] = 'p';
+    output[3] = '_';
+    var i: usize = 0;
+    for (i < length) {
+        val byte: u8 = name[i];
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || byte == '_'
+            || (i != 0 && byte >= '0' && byte <= '9'))) { ret false; }
+        output[4 + i] = byte;
+        i             = i + 1;
+    }
+    output[4 + length] = 0;
+    ret true;
+}
+
+# whether `left` sorts before "application", byte by byte
+fun before_application(left: str) bool {
+    val name:   str   = "application";
+    val length: usize = str_len(left);
+    var i:      usize = 0;
+    for (i < length && i < 11) {
+        if (left[i] != name[i]) { ret left[i] < name[i]; }
+        i = i + 1;
+    }
+    ret length < 11;
+}
+
+# registers a series of `kind` named `app_<name>`, labelled with the
+# application and `labels`, whose keys are sorted and never `application`, or
+# finds the one already registered. a histogram takes `bounds`, ascending
+pub fun metric(from: Source, kind: Kind, name: str, labels: *Label, label_count: usize,
+    bounds: *u64, bucket_count: usize, output: *Metric) Status {
+    var full_name: [telemetry_metrics.NAME_CAPACITY]u8;
+    if (from.application == nil || output == nil || label_count > MAX_LABELS
+        || (label_count != 0 && labels == nil) || !metric_name(name, ?full_name[0])) {
+        ret STATUS_INVALID;
+    }
+    var all:    [telemetry_metrics.MAX_LABELS]telemetry_metrics.LabelView;
+    var total:  usize = 0;
+    var placed: bool  = false;
+    var i:      usize = 0;
+    for (i < label_count) {
+        if (labels[i].key == nil || labels[i].value == nil || named(labels[i].key, "application")) {
+            ret STATUS_INVALID;
+        }
+        if (!placed && !before_application(labels[i].key)) {
+            all[total] = telemetry_metrics.LabelView{key: "application",
+                value: from.application.name};
+            total  = total + 1;
+            placed = true;
+        }
+        all[total] = telemetry_metrics.LabelView{key: labels[i].key, value: labels[i].value};
+        total      = total + 1;
+        i          = i + 1;
+    }
+    if (!placed) {
+        all[total] = telemetry_metrics.LabelView{key: "application",
+            value: from.application.name};
+        total = total + 1;
+    }
+    mutex.lock(?lock);
+    if (atomic.load(?live) == 0) {
+        mutex.unlock(?lock);
+        ret STATUS_INVALID;
+    }
+    if (!runtime.metrics_enabled) {
+        mutex.unlock(?lock);
+        ret STATUS_OFF;
+    }
+    val used: *Usage = usage_locked(from.application);
+    if (used == nil) {
+        mutex.unlock(?lock);
+        ret STATUS_FULL;
+    }
+    val registry: *telemetry_metrics.Registry = ?runtime.own.metrics;
+    val before:   usize                       = telemetry_metrics.stats(registry).series;
+    var token:    telemetry_metrics.Token;
+    if (used.series >= MAX_APPLICATION_SERIES) {
+        # an application at its bound may still find what it registered
+        if (!telemetry_metrics.find(registry, kind, (?full_name[0])::str, ?all[0], total,
+            ?token)) {
+            mutex.unlock(?lock);
+            ret STATUS_FULL;
+        }
+    }
+    or (!telemetry_metrics.register(registry, kind, (?full_name[0])::str, ?all[0], total,
+        bounds, bucket_count, ?token)) {
+        val full: bool = telemetry_metrics.stats(registry).series >= registry.capacity;
+        mutex.unlock(?lock);
+        if (full) { ret STATUS_FULL; }
+        ret STATUS_INVALID;
+    }
+    if (telemetry_metrics.stats(registry).series > before) { used.series = used.series + 1; }
+    mutex.unlock(?lock);
+    @output = Metric{index: token.index, generation: token.generation};
+    ret STATUS_OK;
+}
+
+fun registry_of() *telemetry_metrics.Registry {
+    val observed: *telemetry.Runtime = runtime;
+    if (atomic.load(?live) == 0 || observed == nil) { ret nil; }
+    ret ?observed.own.metrics;
+}
+
+fun token(value: Metric) telemetry_metrics.Token {
+    ret telemetry_metrics.Token{index: value.index, generation: value.generation};
+}
+
+# adds to a counter
+pub fun add(series: Metric, amount: u64) bool {
+    val registry: *telemetry_metrics.Registry = registry_of();
+    ret registry != nil && telemetry_metrics.counter_add(registry, token(series), amount);
+}
+
+# sets a gauge
+pub fun set(series: Metric, value: i64) bool {
+    val registry: *telemetry_metrics.Registry = registry_of();
+    ret registry != nil && telemetry_metrics.gauge_set(registry, token(series), value);
+}
+
+# records one observation in a histogram
+pub fun record_value(series: Metric, value: u64) bool {
+    val registry: *telemetry_metrics.Registry = registry_of();
+    ret registry != nil && telemetry_metrics.observe(registry, token(series), value);
+}
+
+# adds a health check named `<application>.<name>`, which the process's
+# readiness waits on when `required`
+pub fun check(from: Source, name: str, required: bool, ready: bool, output: *Check) Status {
+    if (from.application == nil || name == nil || output == nil) { ret STATUS_INVALID; }
+    val prefix: usize = str_len(from.application.name);
+    val length: usize = str_len(name);
+    if (length == 0 || prefix + 1 + length >= telemetry_health.NAME_CAPACITY) { ret STATUS_INVALID; }
+    var full: [telemetry_health.NAME_CAPACITY]u8;
+    var i:    usize = 0;
+    for (i < prefix) {
+        full[i] = from.application.name[i];
+        i       = i + 1;
+    }
+    full[prefix] = '.';
+    i            = 0;
+    for (i < length) {
+        full[prefix + 1 + i] = name[i];
+        i                    = i + 1;
+    }
+    full[prefix + 1 + length] = 0;
+    mutex.lock(?lock);
+    if (atomic.load(?live) == 0) {
+        mutex.unlock(?lock);
+        ret STATUS_INVALID;
+    }
+    val used: *Usage = usage_locked(from.application);
+    if (used == nil || used.checks >= MAX_APPLICATION_CHECKS) {
+        mutex.unlock(?lock);
+        ret STATUS_FULL;
+    }
+    var registered: telemetry_health.Token;
+    if (!telemetry_health.register(?runtime.health, (?full[0])::str, required, ready,
+        ?registered)) {
+        mutex.unlock(?lock);
+        ret STATUS_INVALID;
+    }
+    used.checks = used.checks + 1;
+    mutex.unlock(?lock);
+    @output = Check{index: registered.index, generation: registered.generation};
+    ret STATUS_OK;
+}
+
+pub fun set_ready(value: Check, ready: bool) bool {
+    val observed: *telemetry.Runtime = runtime;
+    if (atomic.load(?live) == 0 || observed == nil) { ret false; }
+    ret telemetry_health.set_ready(?observed.health,
+        telemetry_health.Token{index: value.index, generation: value.generation}, ready);
+}
+
+#[testing]
+rec TestOutput {
+    len:    usize;
+    buffer: [2048]u8;
+}
+
+#[testing]
+fun test_publish(context: ptr, data: *u8, length: usize) sink.WriteReport {
+    val output: *TestOutput = context::*TestOutput;
+    var i:      usize       = 0;
+    for (i < length && output.len < 2048) {
+        output.buffer[output.len] = data[i];
+        output.len                = output.len + 1;
+        i                         = i + 1;
+    }
+    ret sink.persisted(length);
+}
+
+#[testing]
+fun contains(data: *u8, length: usize, needle: str) bool {
+    val size: usize = str_len(needle);
+    var i:    usize = 0;
+    for (i + size <= length) {
+        var j: usize = 0;
+        for (j < size && data[i + j] == needle[j]) { j = j + 1; }
+        if (j == size) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+#[testing]
+fun test_serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    ret exchange.SERVICE_FAILED;
+}
+
+test hosted__attributed_and_bounded {
+    var slots:    [2]service.Application;
+    var registry: service.Applications;
+    val handler:  service.Handler = service.Handler{ctx: nil, serve: test_serve};
+    var site:     Source;
+    var other:    Source;
+    if (!service.make_applications(?registry, ?slots[0], 2)
+        || !service.register_application(?registry, "site", handler, 0)
+        || !service.register_application(?registry, "other", handler, 0)
+        || !source(?registry, "site", ?site) || !source(?registry, "other", ?other)) { ret 1; }
+
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs             = true;
+    graph.telemetry.metrics          = true;
+    graph.telemetry.metric_series    = 256;
+    graph.telemetry.log_record_bytes = 1024;
+    var target:   TestOutput;
+    val contract: sink.Contract = sink.Contract{delivery: sink.DELIVERY_DIRECT, max_record: 1024,
+        oversize:       record.OVERSIZE_REJECT, adapter: sink.ADAPTER_CUSTOM, target_atomic_limit: 0,
+        queue_capacity: 0, overload: sink.OVERLOAD_REJECT_NEW};
+    var output: sink.Sink = sink.Sink{ctx: (?target)::ptr, f_publish: test_publish,
+        contract: contract};
+    var series:   [256]telemetry_metrics.Series;
+    var checks:   [4]telemetry_health.Check;
+    var observed: telemetry.Runtime;
+    if (!telemetry.make(?observed, ?graph, ?output, ?series[0], 256, ?checks[0], 4,
+        secret.no_held(), nil,
+        (0::usize)::telemetry_admin.RenderFun, (0::usize)::telemetry_admin.RenderFun,
+        nil, (0::usize)::telemetry.FlushFun) || !open(?observed)) { ret 2; }
+
+    # a record carries the application, and hedge's keys stay hedge's
+    var fields: [1]record.Field;
+    fields[0] = record.field_u64("order", 42);
+    if (log(site, record.INFO, "order placed", ?fields[0], 1, nil) != STATUS_OK
+        || !contains(?target.buffer[0], target.len, "application=\"site\"")
+        || !contains(?target.buffer[0], target.len, "kind=\"application\"")) { ret 3; }
+    fields[0] = record.field_string("application", "other");
+    if (log(site, record.INFO, "spoofed", ?fields[0], 1, nil) != STATUS_INVALID) { ret 4; }
+
+    # a series is prefixed and labelled with its application, whatever it asks
+    var labels: [1]Label;
+    labels[0] = Label{key: "status", value: "paid"};
+    var orders: Metric;
+    var theirs: Metric;
+    if (metric(site, COUNTER, "orders_total", ?labels[0], 1, nil, 0, ?orders) != STATUS_OK
+        || metric(other, COUNTER, "orders_total", ?labels[0], 1, nil, 0, ?theirs) != STATUS_OK
+        || (orders.index == theirs.index) || !add(orders, 3) || !add(theirs, 1)) { ret 5; }
+    labels[0] = Label{key: "application", value: "other"};
+    if (metric(site, COUNTER, "orders_total", ?labels[0], 1, nil, 0, ?theirs) != STATUS_INVALID
+        || metric(site, COUNTER, "bad-name", nil, 0, nil, 0, ?theirs) != STATUS_INVALID) { ret 6; }
+    var text:     [8192]u8;
+    val rendered: telemetry_metrics.Rendered = telemetry_metrics.render(?observed.own.metrics,
+        ?text[0], 8192);
+    if (!rendered.ok || !contains(?text[0], rendered.len,
+        "app_orders_total{application=\"site\",status=\"paid\"} 3")) { ret 7; }
+
+    # every distinct label value is a series, and an application's are bounded
+    var value: [4]u8;
+    var i:     usize = 1;
+    for (i < MAX_APPLICATION_SERIES) {
+        value[0]  = 'a' + (i / 26)::u8;
+        value[1]  = 'a' + (i % 26)::u8;
+        value[2]  = 0;
+        labels[0] = Label{key: "status", value: (?value[0])::str};
+        if (metric(site, COUNTER, "orders_total", ?labels[0], 1, nil, 0, ?theirs) != STATUS_OK) { ret 8; }
+        i = i + 1;
+    }
+    labels[0] = Label{key: "status", value: "zz"};
+    if (metric(site, COUNTER, "orders_total", ?labels[0], 1, nil, 0, ?theirs) != STATUS_FULL) { ret 9; }
+    labels[0] = Label{key: "status", value: "paid"};
+    var again: Metric;
+    if (metric(site, COUNTER, "orders_total", ?labels[0], 1, nil, 0, ?again) != STATUS_OK
+        || again.index != orders.index) { ret 10; }
+
+    # a required check holds the process's readiness under the application's name
+    var database: Check;
+    if (check(site, "database", true, false, ?database) != STATUS_OK
+        || !telemetry.begin_ready(?observed)) { ret 11; }
+    val waiting: telemetry_health.Snapshot = telemetry_health.snapshot(?observed.health);
+    if (waiting.ready || waiting.first_unavailable.len != 13
+        || waiting.first_unavailable.data[4] != '.' || !set_ready(database, true)
+        || !telemetry_health.snapshot(?observed.health).ready) { ret 12; }
+    close();
+    if (add(orders, 1) || log(site, record.INFO, "late", nil, 0, nil) != STATUS_INVALID) { ret 13; }
+    ret 0;
+}

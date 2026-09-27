@@ -7,6 +7,8 @@ use http.core.field;
 use std.allocator;
 use std.allocator.fixed;
 use std.data.toml;
+use std.format;
+use std.io.writer;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -1036,6 +1038,20 @@ fun parse_secrets(graph: *schema.Graph, section: *toml.Table, resolver: *Resolve
     }
 }
 
+fun granted(application: *schema.Application, name: *u8, length: usize) bool {
+    var g: usize = 0;
+    for (g < application.grant_count) {
+        val grant: *schema.Text = ?application.grants[g].name;
+        if (grant.len == length) {
+            var i: usize = 0;
+            for (i < length && grant.data[i] == name[i]) { i = i + 1; }
+            if (i == length) { ret true; }
+        }
+        g = g + 1;
+    }
+    ret false;
+}
+
 # a name a hosted application borrows a secret by: printable, without spaces
 fun grant_name_valid(name: str) bool {
     val n: usize = str_len(name);
@@ -1073,6 +1089,183 @@ fun parse_grants(application: *schema.Application, section: *toml.Table, resolve
     }
 }
 
+# a float's text, into a buffer that always has room for it
+rec FloatText {
+    data: [64]u8;
+    len:  usize;
+}
+
+fun float_text_write(context: ptr, buf: *u8, len: usize) res[usize, writer.WriteError] {
+    val text: *FloatText = context::*FloatText;
+    var i:    usize      = 0;
+    for (i < len && text.len < 64) {
+        text.data[text.len] = buf[i];
+        text.len            = text.len + 1;
+        i                   = i + 1;
+    }
+    ret res[usize, writer.WriteError].ok{len};
+}
+
+# a `${SECRET:name}` reference's name, or an empty view for any other string
+fun secret_reference(raw: str) view.View {
+    val n: usize = str_len(raw);
+    if (n < 11 || raw[0] != '$' || raw[1] != '{' || raw[2] != 'S' || raw[3] != 'E'
+        || raw[4] != 'C' || raw[5] != 'R' || raw[6] != 'E' || raw[7] != 'T'
+        || raw[8] != ':' || raw[n - 1] != '}') { ret view.view(nil, 0); }
+    ret view.view(?raw[9], n - 10);
+}
+
+# appends one setting, or says which bound it broke
+fun add_setting(graph: *schema.Graph, key: *u8, key_len: usize, kind: schema.SettingKind,
+    value: *u8, value_len: usize, integer: i64, float: f64,
+    diagnostics: *schema.Diagnostics, source: str) bool {
+    val settings: *schema.Settings = ?graph.settings;
+    if (settings.count >= schema.MAX_SETTINGS
+        || key_len + value_len > schema.MAX_SETTING_BYTES - settings.used) {
+        diagnose(diagnostics, schema.RESOURCE_LIMIT, source, "application.settings", "application settings exceed the configured bound");
+        ret false;
+    }
+    val item: *schema.Setting = ?settings.items[settings.count];
+    item.kind    = kind;
+    item.key_at  = settings.used;
+    item.key_len = key_len;
+    var i: usize = 0;
+    for (i < key_len) {
+        settings.bytes[settings.used + i] = key[i];
+        i                                 = i + 1;
+    }
+    settings.used  = settings.used + key_len;
+    item.value_at  = settings.used;
+    item.value_len = value_len;
+    i              = 0;
+    for (i < value_len) {
+        settings.bytes[settings.used + i] = value[i];
+        i                                 = i + 1;
+    }
+    settings.used  = settings.used + value_len;
+    item.integer   = integer;
+    item.float     = float;
+    settings.count = settings.count + 1;
+    ret true;
+}
+
+# the decimal text of `value` into `output`, which holds 20 bytes
+fun decimal(value: i64, output: *u8) usize {
+    var digits: [20]u8;
+    var count:  usize = 0;
+    var rest:   u64   = value::u64;
+    if (value < 0) { rest = 0 - value::u64; }
+    for {
+        digits[count] = '0' + (rest % 10)::u8;
+        count         = count + 1;
+        rest          = rest / 10;
+        if (rest == 0) { brk; }
+    }
+    var length: usize = 0;
+    if (value < 0) {
+        output[0] = '-';
+        length    = 1;
+    }
+    for (count > 0) {
+        count          = count - 1;
+        output[length] = digits[count];
+        length         = length + 1;
+    }
+    ret length;
+}
+
+# appends `segment` to the dotted key in `key`, or says why it cannot address
+# a setting: every segment is printable, without spaces or dots
+fun extend_key(key: *u8, key_len: usize, segment: *u8, segment_len: usize,
+    diagnostics: *schema.Diagnostics, source: str) usize {
+    var length: usize = key_len;
+    if (key_len != 0) { length = length + 1; }
+    if (segment_len == 0 || length + segment_len > schema.MAX_SETTING_KEY_BYTES) {
+        diagnose(diagnostics, schema.INVALID_VALUE, source, "application.settings", "an application setting's key must be 1 to 128 bytes");
+        ret 0;
+    }
+    var i: usize = 0;
+    for (i < segment_len) {
+        if (segment[i] < 0x21 || segment[i] > 0x7e || segment[i] == '.') {
+            diagnose(diagnostics, schema.INVALID_VALUE, source, "application.settings", "an application setting's key segments must be printable, without spaces or dots");
+            ret 0;
+        }
+        i = i + 1;
+    }
+    if (key_len != 0) { key[key_len] = '.'; }
+    i = 0;
+    for (i < segment_len) {
+        key[length + i] = segment[i];
+        i               = i + 1;
+    }
+    ret length + segment_len;
+}
+
+# flattens one value of a settings section under its dotted key. hedge reads
+# only its shape, never what it means
+fun flatten_setting(graph: *schema.Graph, key: *u8, key_len: usize, item: *toml.Value,
+    diagnostics: *schema.Diagnostics, source: str) bool {
+    var text: [20]u8;
+    if (item.tag == toml.TYPE_STRING) {
+        val reference: view.View = secret_reference(item.data.string);
+        if (reference.len != 0) {
+            ret add_setting(graph, key, key_len, schema.SETTING_SECRET, reference.data,
+                reference.len, 0, 0.0, diagnostics, source);
+        }
+        ret add_setting(graph, key, key_len, schema.SETTING_STRING, item.data.string,
+            str_len(item.data.string), 0, 0.0, diagnostics, source);
+    }
+    if (item.tag == toml.TYPE_INTEGER) {
+        ret add_setting(graph, key, key_len, schema.SETTING_INTEGER, ?text[0],
+            decimal(item.data.integer, ?text[0]), item.data.integer, 0.0, diagnostics, source);
+    }
+    if (item.tag == toml.TYPE_BOOL) {
+        if (item.data.boolean) {
+            ret add_setting(graph, key, key_len, schema.SETTING_BOOLEAN, "true", 4, 1, 0.0,
+                diagnostics, source);
+        }
+        ret add_setting(graph, key, key_len, schema.SETTING_BOOLEAN, "false", 5, 0, 0.0,
+            diagnostics, source);
+    }
+    if (item.tag == toml.TYPE_FLOAT) {
+        var float:  FloatText     = FloatText{len: 0};
+        var output: writer.Writer = writer.Writer{ctx: (?float)::ptr, f_write: float_text_write};
+        format.write_f64(?output, item.data.float);
+        ret add_setting(graph, key, key_len, schema.SETTING_FLOAT, ?float.data[0], float.len, 0,
+            item.data.float, diagnostics, source);
+    }
+    if (item.tag == toml.TYPE_ARRAY) {
+        val count: usize = toml.array_len(?item.data.array);
+        if (!add_setting(graph, key, key_len, schema.SETTING_ARRAY, ?text[0],
+            decimal(count::i64, ?text[0]), count::i64, 0.0, diagnostics, source)) { ret false; }
+        var i: usize = 0;
+        for (i < count) {
+            val length: usize = extend_key(key, key_len, ?text[0], decimal(i::i64, ?text[0]),
+                diagnostics, source);
+            if (length == 0 || !flatten_setting(graph, key, length, array_at(?item.data.array, i),
+                diagnostics, source)) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    if (item.tag == toml.TYPE_TABLE) {
+        val count: usize = toml.table_len(?item.data.table);
+        if (key_len != 0 && !add_setting(graph, key, key_len, schema.SETTING_TABLE, ?text[0],
+            decimal(count::i64, ?text[0]), count::i64, 0.0, diagnostics, source)) { ret false; }
+        var i: usize = 0;
+        for (i < count) {
+            val name:   str   = key_at(?item.data.table, i);
+            val length: usize = extend_key(key, key_len, name, str_len(name), diagnostics, source);
+            if (length == 0 || !flatten_setting(graph, key, length, value_at(?item.data.table, i),
+                diagnostics, source)) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    diagnose(diagnostics, schema.WRONG_TYPE, source, "application.settings", "an application setting has a kind hedge cannot carry");
+    ret false;
+}
+
 fun parse_applications(graph: *schema.Graph, section: *toml.Table, resolver: *Resolver, diagnostics: *schema.Diagnostics, source: str) {
     if (section == nil) { ret; }
     var i: usize = 0;
@@ -1086,13 +1279,26 @@ fun parse_applications(graph: *schema.Graph, section: *toml.Table, resolver: *Re
             diagnose(diagnostics, schema.RESOURCE_LIMIT, source, name, "application count exceeds the configured bound");
         }
         or {
-            var allowed: [1]str = [1]str{"secrets"};
-            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 1);
+            var allowed: [2]str = [2]str{"secrets", "settings"};
+            validate_fields(?item.data.table, diagnostics, source, ?allowed[0], 2);
             val application: *schema.Application = ?graph.applications[graph.application_count];
-            graph.application_count = graph.application_count + 1;
-            application.grant_count = 0;
+            graph.application_count   = graph.application_count + 1;
+            application.grant_count   = 0;
+            application.setting_first = graph.settings.count;
+            application.setting_count = 0;
             resolve_text(?application.name, name, resolver, diagnostics, source, "application.name");
             parse_grants(application, optional_table(?item.data.table, "secrets", diagnostics, source), resolver, diagnostics, source);
+            val settings: *toml.Value = value(?item.data.table, "settings");
+            if (settings != nil) {
+                if (settings.tag != toml.TYPE_TABLE) {
+                    diagnose(diagnostics, schema.WRONG_TYPE, source, "settings", "field must be a table");
+                }
+                or {
+                    var key: [schema.MAX_SETTING_KEY_BYTES]u8;
+                    flatten_setting(graph, ?key[0], 0, settings, diagnostics, source);
+                }
+            }
+            application.setting_count = graph.settings.count - application.setting_first;
         }
         i = i + 1;
     }
@@ -1785,6 +1991,15 @@ pub fun validate(graph: *schema.Graph, capabilities: Capabilities, diagnostics: 
             }
             g = g + 1;
         }
+        var k: usize = 0;
+        for (k < application.setting_count) {
+            val setting: *schema.Setting = ?graph.settings.items[application.setting_first + k];
+            if (setting.kind == schema.SETTING_SECRET && !granted(application,
+                ?graph.settings.bytes[setting.value_at], setting.value_len)) {
+                diagnose(diagnostics, schema.UNRESOLVED_REFERENCE, "validation", schema.text(?application.name), "an application setting references a secret the application is not granted");
+            }
+            k = k + 1;
+        }
         i = i + 1;
     }
     if (graph.telemetry.log_record_bytes > 8192 || graph.telemetry.log_queue_depth > 65536 || graph.telemetry.metric_series > 1048576 || graph.telemetry.trace_state_bytes > 512
@@ -2229,7 +2444,7 @@ test admin__isolated_listener {
     ret 0;
 }
 
-test application__secret_grants {
+test application__secret_grants_and_settings {
     var memory:      [1048576]u8;
     var fixed_state: fixed.FixedState;
     var a:           allocator.Allocator;
@@ -2239,12 +2454,19 @@ test application__secret_grants {
     val capabilities: Capabilities = Capabilities{quic: true, local_transport: true, environment_secrets: true, file_secrets: true, os_secrets: true, application_secrets: true};
     val base:         str          = "[server]\nname = \"apps\"\n\n[[listener]]\nname = \"public\"\naddress = \"127.0.0.1:8080\"\nprotocols = [\"http/1.1\"]\n\n[host.site]\nlistener = \"public\"\n\n[secret.db]\nprovider = \"file\"\nkey = \"/run/db\"\n\n";
     var source:       [2048]u8;
-    if (!join_source(?source[0], 2048, base, "[application.site.secrets]\ndatabase = \"db\"\n")
+    if (!join_source(?source[0], 2048, base, "[application.site.secrets]\ndatabase = \"db\"\n\n[application.site.settings]\nname = \"shop\"\nratio = 0.5\npeers = [\"a\", \"b\"]\n\n[application.site.settings.db]\npassword = \"${SECRET:database}\"\npool = 8\n")
         || !build(?graph, ?diagnostics, ?a, "apps.toml", (?source[0])::str, nil, capabilities)) { ret 1; }
     val site: *schema.Application = schema.find_application(?graph, "site");
     if (graph.application_count != 1 || site == nil || site.grant_count != 1
         || !schema.text_equals(?site.grants[0].name, "database")
         || !schema.text_equals(?site.grants[0].secret, "db")) { ret 2; }
+    # name, ratio, peers, peers.0, peers.1, db, db.password, db.pool
+    if (site.setting_count != 8 || !setting_is(?graph, 4, "peers.1", schema.SETTING_STRING, "b")
+        || !setting_is(?graph, 1, "ratio", schema.SETTING_FLOAT, "0.5")
+        || !setting_is(?graph, 2, "peers", schema.SETTING_ARRAY, "2")
+        || !setting_is(?graph, 6, "db.password", schema.SETTING_SECRET, "database")
+        || !setting_is(?graph, 7, "db.pool", schema.SETTING_INTEGER, "8")
+        || graph.settings.items[7].integer != 8) { ret 5; }
 
     fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
     if (!join_source(?source[0], 2048, base, "[application.site.secrets]\ndatabase = \"missing\"\n")
@@ -2255,7 +2477,37 @@ test application__secret_grants {
     if (!join_source(?source[0], 2048, base, "[application.site]\nlisten = true\n")
         || build(?graph, ?diagnostics, ?a, "apps.toml", (?source[0])::str, nil, capabilities)
         || !has_diagnostic(?diagnostics, schema.UNKNOWN_FIELD, "listen")) { ret 4; }
+
+    # a setting may reference only a secret granted to its own application, and
+    # every key segment must be addressable
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    if (!join_source(?source[0], 2048, base, "[application.site.settings]\ntoken = \"${SECRET:database}\"\n")
+        || build(?graph, ?diagnostics, ?a, "apps.toml", (?source[0])::str, nil, capabilities)
+        || !has_diagnostic(?diagnostics, schema.UNRESOLVED_REFERENCE, "site")) { ret 6; }
+    fixed.make(?a, ?fixed_state, ?memory[0], 1048576);
+    if (!join_source(?source[0], 2048, base, "[application.site.settings]\n\"a.b\" = 1\n")
+        || build(?graph, ?diagnostics, ?a, "apps.toml", (?source[0])::str, nil, capabilities)
+        || !has_diagnostic(?diagnostics, schema.INVALID_VALUE, "application.settings")) { ret 7; }
     ret 0;
+}
+
+#[testing]
+fun setting_is(graph: *schema.Graph, index: usize, key: str, kind: schema.SettingKind,
+    value: str) bool {
+    val item: *schema.Setting = ?graph.settings.items[index];
+    if (item.kind != kind || item.key_len != str_len(key)
+        || item.value_len != str_len(value)) { ret false; }
+    var i: usize = 0;
+    for (i < item.key_len) {
+        if (graph.settings.bytes[item.key_at + i] != key[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < item.value_len) {
+        if (graph.settings.bytes[item.value_at + i] != value[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 #[testing]
