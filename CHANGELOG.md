@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.12.0] - 2026-09-26
+
+### Security
+
+- A proxy no longer passes a client's own forwarding fields to the upstream (#355). A client could send `Forwarded`, `X-Forwarded-For` or `X-Real-IP` and the upstream read them ahead of hedge's `Forwarded` element, so any upstream that trusted the first element could be told the wrong client address. An inbound `Forwarded`, every `X-Forwarded-*` field and `X-Real-IP` now reach the upstream only when the peer that wrote the request is vouched for: its socket address is in the listener's `trusted_peers` and no PROXY header replaced it. A vouched peer's fields pass as it wrote them and hedge appends its own `Forwarded` element after them, extending the RFC 7239 chain. Otherwise they are dropped, as inbound `traceparent` already was, and the upstream sees only hedge's element. A peer named by a PROXY header is never vouched for, and HTTP/3 requests never are. `doc/CONFIGURATION.md` states the rule beside `trusted_peers`.
+
+### Added
+
+- A `static` service sets `Cache-Control` on what it serves (#306). `cache_control` is the default value and `cache_control_rules`, an ordered array of `{ path, value }`, overrides it per file: the first rule whose glob matches the served file's path relative to the root wins, so `/` matches as `/index.html` and a precompressed variant as the file it stands for. `*` matches within a segment and `**` across segments. The field goes on 200, 206 and 304 responses, for GET and HEAD. A service holds at most 8 rules, each value must be a valid field value, and a reload that changes the policy rebuilds the service.
+- A `static` service serves a custom 404 page and takes media type overrides (#307). `not_found = "/404.html"` answers every miss (a missing path, no index, not a regular file, a symlink, a refused target) with that page and status 404, with no validators or Cache-Control, ignoring conditions and ranges. A page that cannot be opened at request time gives an empty 404. `media_types = { ext = "type" }` holds up to 8 extensions, tried before the built-in table for served files and for the page. The built-in table gains `.sh` as `application/x-sh` and `.mach` as `text/plain; charset=utf-8`. `doc/CONFIGURATION.md` gains a "Static files" section covering these keys, `cache_control`, `index` and `precompressed`.
+
+### Fixed
+
+- An HTTP/2 connection whose peer opens more streams than it may before it has seen hedge's SETTINGS keeps serving the streams it accepted (#346). With the default two concurrent streams and four HEADERS sent with the preface, the engine refused stream 5 on its one inline reserve, and hedge never released a refused stream it held no slot for, so stream 7's refusal found no reserve and the engine failed the connection with ENHANCE_YOUR_CALM before streams 1 and 3 were answered. hedge now releases a stream the engine reset or refused that the plane never took, and streams 1 and 3 are served while 5 and 7 get RST_STREAM REFUSED_STREAM.
+- The cache revalidates a response that is still fresh but not fresh enough for a request's `min-fresh` (#356). `policy.reuse` took the stale path whenever `age + min_fresh` reached the lifetime, so a response still inside its lifetime computed `age - lifetime`, which wrapped, and a bare `max-stale` served it as stale. Such a response now answers `REVALIDATE`, since RFC 9111 makes it not fresh for this request and `max-stale` and `stale-while-revalidate` apply only past the lifetime.
+- A range-spec whose last position is below its first, such as `bytes=5-3`, is ignored and the full representation served with 200, where it was answered 416 (#357). RFC 9110 §14.1.1 makes such a spec invalid, not unsatisfiable, and every other invalid spec was already ignored.
+- An HTTP-date with a wrong byte where a separator belongs is no longer parsed as a date (#358). The IMF-fixdate, RFC 850 and asctime parsers now check every `SP` RFC 9110 §5.6.7 fixes, so `Sun, 06xNovx1994x08:49:37xGMT` is not a date and a conditional or cache field carrying it is ignored as the RFC requires.
+
+### Changed
+
+- **Breaking.** hedge moves to mach 6 and the std 9 family (#350): `mach = "^6.2.1"`, mach-std v9.0.0, mach-crypto v0.24.0, mach-tls v0.13.0, mach-quic v0.21.0, mach-http v0.21.0, mach-acme v0.10.0 and laurel v0.19.0, each selected by an exact version in the root and `test/acme` and committed as gitlinks. Resolution is flat, so an application that depends on hedge moves with it. mach 6.2.1 is the floor because it fixes briar-systems/mach#4056, where a test run after a build rejected quic's `#[testing]` constant. CI seeds mach v6.2.1. Tests are named `<subject>__<case>` and pruned to the mach 6 test policy, so 629 run where 674 did (616 unit, 13 live ACME cases), and test-only helpers in production modules are `#[testing]`.
+- Runtime tests that waited on the wall clock run on a frozen one (#359). `clock.freeze` and `clock.skip_waits`, both `#[testing]`, stop hedge's monotonic clock and let the runtime's bounded waits pass on it without a real wait, since every monotonic read already goes through `hedge.clock` and `listener.poll` now waits through `clock.wait_ms`. The drain, stop, debug audit, request, handler, handshake, header and keep-alive timeout tests assert on that clock, the TLS ticket rotation test freezes the TLS policy's own clock in place of a two-second wait, and no test asserts on real elapsed time.
+- Bearer authentication, replay classification, `schema.set_text` and `schema.add_diagnostic` have a test for each branch that had none (#362).
+- hedge builds with no warnings on mach 6.2.1 (#371). The 16 unused imports it reported are gone, 13 in the library and 3 in the `tests` library. The `schema.add_diagnostic` test from #362 no longer uses `schema.WARNING`, which #360 deleted, and fills the cap with errors instead.
+
+### Removed
+
+- Declarations nothing referenced (#360), among them `store_worker.unwoken` with its counter. `schema.Severity` keeps only `ERROR`, and the diagnostic codes keep their numbers.
+- **Breaking.** `tls.replace`, `tls.replaceable`, `tls.retired_reclaimable` and `selection.select_quic`, which only tests reached (#361). A certificate is replaced live through `credentials.rotate`, which ACME's installs call, and a TLS reload through `plan.tls_reusable`. QUIC enforces its single `h3` ALPN entry in `quic.runtime`.
+
 ## [0.11.0] - 2026-09-26
 
 ### Added
