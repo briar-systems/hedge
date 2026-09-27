@@ -60,43 +60,31 @@ Secrets use dedicated types and explicit lifetimes. Copies are minimized and obs
 
 Certificate private keys support reload without exposing mutable key state to request handlers. Session ticket keys rotate through immutable key generations with controlled overlap.
 
-Automatically managed certificate and account keys are a stated exception to
-secret-typed storage, and it is a property of the toolchain rather than a
-choice. Mach forbids dropping the `^` secret qualifier — there is no
-declassification at all, in either direction — and it welds transitively: a
-record that contains secret storage, or a pointer to one, cannot be cast to the
-untyped `ptr` that every callback seam in the server uses. `mach-std` also
-exposes no secret-aware file interface, and `keys.encode_private_der` writes
-into a secret buffer, so a key that must survive a restart cannot reach a file
-at all while it stays secret-typed.
+Automatically managed certificate and account keys, and the ephemeral
+TLS-ALPN-01 key, are secret-typed for their whole life. Mach welds secret
+storage transitively: a record that holds it, or a pointer to one, cannot be
+cast to the untyped `ptr`. Every seam ACME keys must reach is such a `ptr`: the
+challenge provider's context, the certification-request signer's context, and
+the worker threads' start argument, from which the manager is reachable.
 
-ACME key material is therefore held as public bytes and classified into a
-secret stack buffer for the exact call that consumes it, which is zeroized
-immediately after. Every crossing is one `scratch` argument in
-`src/acme/keys.mach` and there are no others. The material is zeroized when the
-key is destroyed, is never rendered in diagnostics, and reaches disk only in
-files created owner-only.
+So the secret half of every key lives in one bounded ring of secret slots in
+`src/acme/keys.mach`, and a `keys.Key` is the public half (point and SPKI) plus
+a handle naming its slot and generation. A handle is not an address and
+unlocks only the operations that module defines. The scalar is drawn by the
+secret CSPRNG straight into its slot, signed with in place for JWS and for the
+certification request, and handed to `mach-tls` as secret bytes when a
+certificate is installed. A slot is wiped when its key is destroyed, and a
+stale handle reaches nothing. The ring holds `keys.MAX_KEYS` keys, and drawing
+or loading a key past that fails rather than falling back to public storage.
 
-**There is no key in this subsystem that could be held welded instead**, and
-the reason differs per key rather than being one blanket claim:
-
-- The account key and the certificate key must both survive a restart, and no
-  welded value can be written to a file by any route. Holding them welded and
-  declassifying only at the write is not a narrower option; it is not an
-  option.
-- Both are also reached through `ptr` callbacks — the serving plane for the
-  manager, and the certification-request signer for the certificate key — so
-  welded storage would make those seams unimplementable independently of
-  persistence.
-- The TLS-ALPN-01 key is never persisted, but it is held by the challenge
-  provider whose context is a `ptr`, and it must survive from presentation to
-  cleanup, so it cannot be confined to one call either.
-
-What is bounded is the window rather than the storage class. The public copy
-exists only inside the ACME subsystem: once a key is loaded into a `mach-tls`
-credential generation it lives in secret storage there and never returns to
-public bytes, and the per-call classification buffers are the only other place
-the material appears.
+Key material becomes public at exactly one site, a `:>` declassify in
+`keys.publish`, which produces the durable form. It is forced: `mach-acme`'s
+file store frames and digests public bytes. The published scalar and the
+document encoded around it are wiped as soon as the write returns, and the
+file is created owner-only. The only other crossing is inbound: a key file is
+read into public memory, because `mach-std` reads files there, lifted into its
+slot by `keys.adopt`, and the read buffer is wiped. The material is never
+rendered in diagnostics.
 
 ## Reporting
 
