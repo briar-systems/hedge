@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.13.0] - 2026-09-27
+
+### Added
+
+- `hedge.outbound`, an outbound HTTPS client for hosted code (#304). A `Client` keeps connections per host, routes and trust anchors, and an `Exchange` runs one request at a time in caller buffers (`begin`, `poll`, `response`, `finish`), with arbitrary request headers and a body. It resolves, connects, completes a mach-tls handshake verified against anchors from `tls.cert.bundle`, and reads content-length, chunked and close-delimited responses, skipping 1xx. A response over the size limit, a timeout and a chain that does not verify each fail with their own cause (`CAUSE_TOO_LARGE`, `CAUSE_TIMEOUT`, `CAUSE_UNTRUSTED`). Every step is a submission and a completion, so nothing blocks the driving thread. A self-delimited HTTP/1.1 response the peer did not close keeps its connection for reuse, and an exchange that finds its kept connection closed reconnects once when its request is replay safe. `hedge.outbound.names` resolves on std's resolver thread and caches briefly, and `outbound.Loop` runs a runtime, that resolution and a client on a thread of its own (`turn`, `fetch`, `close_loop`).
+- hedge drives a hosted application's lifecycle (#393). `service.Lifecycle` (`start`, `ready`, `drain(deadline)`, `stop`, each answering done, pending or failed) is recorded beside the handler by `service.register_hosted`, and `hedge.service.laurel.register` registers a laurel application's handler and lifecycle together. The supervisor starts every hosted application before any worker binds, and a failed start refuses the process's start. Each application gets a required readiness check named after it, polled every 10 ms until ready. Shutdown drains every started application toward the workers' drain deadline, and stop runs after the last worker is joined, bounded by `stop_ms`. A drain or stop past its bound is abandoned, logged, and counted in the new `StopReport.applications_abandoned`, and an abandoned drain makes the process exit 75. A reload never restarts an application.
+- `doc/HOSTING.md` states hedge's host contract, versioned apart from hedge (#397, #304). Version 1 lists the `pub` items that form the contract (the handler, lifecycle, registry and response helpers in `hedge.service`, the service-facing accessors of `hedge.dispatch.call`, `hedge.wake`, `hedge.clock` and the process-assembly items an embedding program needs), the handler and lifecycle rules, memory and cancellation rules and the stability promise, and says every other `pub` item is internal. Version 1.1 adds the `hedge.outbound` loop, exchange, request and response surface.
+- A fuzz lane over every untrusted-input entry point (#370). `test/fuzz` builds a `fuzz` binary with `replay`, `one` and `mutate` modes over 33 boundaries, each with a harness that checks what the entry point promises, and a corpus of 563 inputs. CI builds the lane on every pull request and replays it in debug and release on the heavy tier (a pull request into `main`, or a dispatch with `heavy: all` or `heavy: fuzz`). It found #357, #358 and #373. `doc/VALIDATION.md` describes it.
+- A load-lane cell, `test/load/keepalive.sh`, holds 10,000 QUIC connections on a one-second keep-alive and requires no dropped datagram over a 10 s window (#274). CI runs it at 2,000 a second.
+
+### Fixed
+
+- A request whose Host field is missing, repeated, too long or not a valid authority is answered 400, where an HTTP/1.0 request with two Host fields was answered 421 (#377). RFC 9112 §3.2 gives all of these 400. The `MISDIRECTED` dispatch outcome, which nothing else produced, is gone.
+- The static service weighs `Accept-Encoding` (#373). `br;q=0` selected the brotli variant the client refused. Each coding now takes its own member's qvalue, else that of `*`, else 0, names match case-insensitively, a repeated coding takes its lowest weight, and every `Accept-Encoding` line is read as one list. The heaviest accepted coding with a variant is served unless `identity` weighs more, brotli wins a tie with gzip and a coding wins a tie with identity. Identity stays the fallback when nothing else is acceptable.
+- A response that cannot be sent fails its own stream, never the connection, over HTTP/2 and HTTP/3 (#388). One oversized response header list cancelled every request on the connection. A response refused before any of it is sent is replaced by a bodyless 502, and one refused after it started resets the stream with `H3_INTERNAL_ERROR` or `INTERNAL_ERROR`, so the client learns it is incomplete. The connection fails only when the stream can no longer be reset.
+- An HTTP/3 response that fails on a stream the peer already reset settles the exchange rather than failing the connection (#390).
+- HTTP/3 refuses a session whose outbound field section limit exceeds the lowered-name scratch, so the two limits no longer agree by coincidence (#376). Lowering already refused an oversized list whole and never wrote past the scratch.
+- The live ACME tests take their large fixtures from the heap, so they run under the default 8 MiB stack (#392), and the renewal test compares certificates by their whole encoding without reading a closed manager's storage (#282).
+
+### Changed
+
+- **Breaking.** Dependencies: mach-http v0.23.0 (was v0.21.0), laurel v0.20.0 (was v0.19.0), mach-acme v0.11.0 (was v0.10.0), mach-tls v0.14.0 (was v0.13.0) and mach-quic v0.22.0 (was v0.21.0), each selected by an exact version in the root, `test/acme` and `test/fuzz` and committed as gitlinks (#304, #407). Resolution is flat, so an application that depends on hedge moves with it, and hedge and laurel 0.20 now resolve together. hedge does not use http's new server runner. In the h1 engine hedge drives, a closing engine no longer parses input, so an end of stream seen after the close was submitted cannot leave the connection open.
+- ACME runs on `hedge.outbound` and reads its trust anchors with `tls.cert.bundle` (#304). A malformed block in an ACME trust bundle is skipped rather than refusing the bundle. ACME closes its kept connections between runs and resolves its authority once at startup.
+- A settled QUIC send runs the transport's pass, not the connection's, unless the settle left connection, session or memory work, and route reconciliation reads each route once (#274). A keep-alive round runs 2 service passes, 2 HTTP/3 drives, 2 generates and 6 reconciles where it ran 3, 3, 4 and 10, about 15% fewer user instructions per received datagram.
+- HTTP/2 and HTTP/3 parse pseudo-headers through one module, `hedge.protocol.pseudo` (#379), and the QUIC runtime's arrival, held-datagram and stateless queues are their own modules under `hedge.protocol.quic` (#378). No behaviour changes.
+- The storage claim comments say a claim takes the lowest chunk with room and the slot freed most recently in it (#380).
+
+### Removed
+
+- **Breaking.** `hedge.acme.transport`, `hedge.acme.wire`, `hedge.acme.origination` and `hedge.acme.anchors` with `load_bundle`, replaced by `hedge.outbound` and `tls.cert.bundle` (#304).
+
 ## [0.12.0] - 2026-09-26
 
 ### Security
