@@ -441,6 +441,34 @@ handshake, so any loss is work the server dropped although it had room. This
 is what a slow ramp of 1100 QUIC dials failed before #164. The lane binds
 ports 19150 to 19153.
 
+## The keep-alive lane
+
+```sh
+./test/load/keepalive.sh
+```
+
+`keepalive.sh` is the keep-alive cell (#274). `LOAD_KEEPALIVE` QUIC
+connections (10000) each send a PING every `LOAD_KEEPALIVE_PERIOD` seconds
+(1), which is a datagram rate of count over period into the QUIC socket, and
+each PING costs the server a receive, an ACK and the ACK's send. The
+connections are dialled at `LOAD_KEEPALIVE_RATE` a second (250), because the
+PINGs of the connections already held arrive throughout the dial and a
+faster dial measures the handshake rate on top of them, which is burst.sh's
+subject. Once every one is held and a period has passed, the socket's drop
+counter is read over `LOAD_KEEPALIVE_SECONDS` (10). The lane passes when every
+dial is held, the socket dropped no datagram over that window, and every
+connection leaves hedge once its client closes it. It prints the server's CPU
+per PING round, the cores it used and the receive queue's peak. The lane binds
+ports 19180 to 19183.
+
+The rate is served by the one QUIC worker until #174 routes datagrams to their
+owning worker. Measured on a Ryzen 7 5800X3D over loopback, a round costs
+about 47 us of that worker's CPU, so 10,000 a second takes about half a core
+and the socket's queue peaks in the tens of kilobytes. Past the worker's core
+the queue fills and the kernel drops. About 40% of the round is the kernel's
+(a receive per datagram, and a send per ACK that on loopback carries the
+client's receive), and most of the rest is the transport's.
+
 ## The churn lane
 
 ```sh
