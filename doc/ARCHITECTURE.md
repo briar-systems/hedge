@@ -28,7 +28,7 @@ connection plane
   protocol selection, tls, quic, http engines
 
 service plane
-  static files, proxy pools, Laurel applications
+  static files, proxy pools, hosted applications
 
 telemetry plane
   logs, metrics, traces, health, readiness
@@ -198,7 +198,7 @@ A route resolves to one of:
 - reverse proxy service
 - load-balanced upstream service
 - redirect or fixed response
-- Laurel application
+- hosted application, of any framework, through its binding
 - native handler implementing the HTTP service contract
 
 Middleware wraps services through explicit before, after, and error paths. The core does not build a heap-allocated chain for every request. A compiled route graph references immutable middleware plans.

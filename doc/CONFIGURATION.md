@@ -62,21 +62,21 @@ kind = "static"
 root = "./public"
 
 [service.application]
-kind = "laurel"
+kind = "application"
 application = "site"
 ```
 
-A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application without starting it, binds it with `hedge.service.laurel.make`, registers it under that name with `hedge.service.laurel.register` in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `supervisor.stop` returns. The supervisor drives each registered application's lifecycle components (`start`, `ready`, `drain`, `stop`, bounded by the application's `max_background_services`): it starts every application before any worker binds a listener, polls each one's readiness into the process's readiness check named after it, drains it toward the `drain_ms` deadline once shutdown begins, and stops it after the last worker has stopped, within `stop_ms`. A start or readiness that fails stops the process. The registry lives for the whole process, so a reload never restarts an application. A configuration that names an unregistered application fails with `no application is registered under this name`. Register an application with the request memory it needs (see [Request memory](#request-memory)). A laurel application's per-request state alone is several kilobytes before its sessions, forms and response bodies. The contract a hosted application and its binding rely on is [Hosting applications](HOSTING.md).
+An `application` service names an application hosted in-process, which the embedding program registers before startup. Any framework's application is routed this way: its binding adapts it to hedge's handler and lifecycle contract, and the program registers it under that name in a `service.Applications` it owns and passes the registry as `composition.Options.applications`. [briar-systems/graft](https://github.com/briar-systems/graft) is the binding for laurel. Composition resolves every `application` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `supervisor.stop` returns. The supervisor drives each registered application's lifecycle: it starts every application before any worker binds a listener, polls each one's readiness into the process's readiness check named after it, drains it toward the `drain_ms` deadline once shutdown begins, and stops it after the last worker has stopped, within `stop_ms`. A start or readiness that fails stops the process. The registry lives for the whole process, so a reload never restarts an application. A configuration that names an unregistered application fails with `no application is registered under this name`. Register an application with the request memory it needs (see [Request memory](#request-memory)). The contract a hosted application and its binding rely on is [Hosting applications](HOSTING.md).
 
-Every worker is handed the same registry, so a registered application is entered by every worker at once. One `app.App` bound through `hedge.service.laurel`, like any other handler in `composition.Options.applications`, serves requests on several threads concurrently, with the same context pointer on each. hedge's side of that contract:
+Every worker is handed the same registry, so a registered application is entered by every worker at once. Its handler serves requests on several threads concurrently, with the same context pointer on each. hedge's side of that contract:
 
-- A request belongs to one worker. Its state lives in that worker's request arena, and only that worker enters, suspends, resumes or abandons it. For a laurel service that state is the adapter's context, recorder, execution cursor and outcome, and the route captures. Nothing per request is shared between workers.
-- After startup hedge only reads the registry and the handlers in it. A reload resolves every `laurel` service against the same registry again and writes nothing to it.
+- A request belongs to one worker. Its state lives in that worker's request arena, and only that worker enters, suspends, resumes or abandons it. Nothing per request is shared between workers.
+- After startup hedge only reads the registry and the handlers in it. A reload resolves every `application` service against the same registry again and writes nothing to it.
 - The supervisor calls the application's lifecycle, from its own thread and never from a handler. The embedding program registers the application assembled and does not start, drain or stop it itself. [Hosting applications](HOSTING.md#the-lifecycle-hooks) states when each step runs.
 
-What the application must synchronize is everything a request reaches that outlives it. That covers its handlers' and middleware's own state, `app_state`, and whatever its callbacks change (an observer, a session store, a cache). Each worker reaches all of it at the same time, so it must be atomic or locked. A value written before `composition.start_process` and never after needs nothing. laurel's own shared state is already atomic, locked, or read-only once assembled, and laurel states its side in [the threading contract](https://github.com/briar-systems/laurel/blob/dev/demo/README.md#the-threading-contract) of its demo README.
+What the application must synchronize is everything a request reaches that outlives it: its handlers' own state and whatever they change (an observer, a session store, a cache). Each worker reaches all of it at the same time, so it must be atomic or locked. A value written before `composition.start_process` and never after needs nothing.
 
-A laurel handler that waits on a request body suspends rather than blocking. The adapter reports the request as pending, the connection keeps reading, and when the body advances the adapter resumes laurel at the step that suspended: the handler is entered once however many reads its body takes. A suspended request holds its exchange, its request memory and one of the application's `max_active_requests` slots until it finishes, so a body that never arrives is bounded by the listener's request timeout rather than by the application. A connection that dies while a handler is suspended is abandoned through laurel, which runs every middleware exit half that is owed before the request's context is released.
+A handler that waits on a request body parks rather than blocking (see [The handler contract](HOSTING.md#the-handler-contract)). A parked request holds its exchange and its request memory until it finishes, so a body that never arrives is bounded by the listener's request timeout rather than by the application.
 
 The implemented schema accepts these top-level sections:
 
@@ -348,7 +348,7 @@ What bounds a request is how many bytes of chunk it may hold:
   is selected, and for any service that does not say otherwise. It defaults to
   32768 (32 KiB).
 - A registered application declares what it needs when it is registered, as the
-  last argument to `service.register_application`. A `laurel` service uses that
+  last argument to `service.register_application`. An `application` service uses that
   declaration instead of the server bound.
 - `service.<name>.memory_bytes` overrides both, for a service whose needs depend
   on how it is configured.
@@ -484,7 +484,7 @@ A host names itself with either `server_name` for a single name or `names` for s
 
 Precedence between names is by specificity and never by the order they are written: an exact name beats a wildcard suffix, a longer suffix beats a shorter one, and a pattern naming a port beats one that does not. Two hosts that claim the same name for the same path are refused at configuration time rather than one shadowing the other.
 
-Services support `static`, `proxy`, `laurel`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
+Services support `static`, `proxy`, `application`, `fixed`, `redirect`, and `native` kinds. Secret providers support `env`, `file`, `os`, and `application`. Availability is supplied as a target and build capability set, so unsupported providers and transports are rejected before construction.
 
 Two of those kinds answer without touching a filesystem or an upstream. `fixed` returns one body to every request, and `redirect` returns a location.
 

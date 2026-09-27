@@ -35,8 +35,11 @@ mach-acme
   <- hedge
 
 laurel
-  <- hedge
+  <- graft
   <- applications
+
+hedge
+  <- graft
 ```
 
 Arrows point from a provider to a consumer.
@@ -106,7 +109,7 @@ The framework owns application concerns:
 - application errors and observability
 - test clients and application harnesses
 
-It can run under Hedge or any server implementing the `mach-http` service contract.
+It runs under Hedge through [graft](https://github.com/briar-systems/graft), its binding to Hedge's host contract, or under any server implementing the `mach-http` service contract.
 
 ## `hedge`
 
