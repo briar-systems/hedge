@@ -216,6 +216,26 @@ A QUIC listener sizes its UDP socket's buffers with `receive_buffer_bytes` and `
 
 A QUIC listener remembers the nonce of every Retry token it accepts until the token's age passes, so that a replayed token is refused. `max_retry_replay` bounds how many it remembers, 65536 by default. Each remembered nonce costs roughly 120 to 150 bytes in the listener's replay store, so the default bounds the store near 10 MiB. A reload briefly holds two stores, one for the outgoing generation and one for the new. While the store is full, an Initial carrying a Retry token is dropped rather than refused, and the client's retransmission is admitted once older nonces expire. Each such drop counts in `hedge_quic_retry_replay_full_total`. The key is refused on TCP and local listeners, and so is zero. A reload applies a changed value to the connections that arrive afterwards.
 
+A QUIC listener draws its keys at random when the process starts: the key its connection IDs are encrypted under, the stateless reset key, and the Retry and NEW_TOKEN key. Every reload rotates them. So no other process can open what it minted, and a restart forgets them. To run several hosts behind one load balancer that routes QUIC by connection ID (QUIC-LB), or to keep connection IDs and tokens across a restart, give the listener a key file with `quic_keys = "<path>"`, plus a `quic_host_id` that differs per host.
+
+The key file is text, one record per line, keys in hex. hedge reads it at start and again on every reload, and never writes it:
+
+```
+current 2
+codepoint 1 host_id_length 1 cid <32 hex> reset <64 hex>
+codepoint 2 host_id_length 1 cid <32 hex> reset <64 hex>
+token <generation> <64 hex>
+token_previous <generation> <64 hex>
+```
+
+- A codepoint is 0 to 6 (QUIC-LB's config rotation bits, with 7 reserved as unroutable). Each has a CID key, a stateless reset key, and the length of the host ID its connection IDs carry, 0 to 2 octets. `current` names the codepoint new connection IDs are minted under.
+- `token` is the Retry and NEW_TOKEN key, and `token_previous` is the one before it, which still opens tokens. Each carries its generation, because the generation is sealed into every token. Generations are positive, and `token`'s is greater than `token_previous`'s. `token_previous` may be left out.
+- `quic_host_id` must fit the host ID length of every codepoint in the file, so it is 0 when every length is 0. The QUIC-LB server ID is the host ID followed by the worker.
+- To rotate, add a codepoint and make it `current`, then drop the old one on a later reload. A codepoint that leaves the file keeps decoding until no connection holds it and its Retries have expired, as a rotation without a file does. To rotate the token key, move `token` to `token_previous` and add a new `token` with a higher generation.
+- The file is refused if it is malformed, defines a codepoint twice, names a `current` it does not define, orders its token generations wrongly, or can be read by group or other. A reload also refuses a file that changes the keys of a codepoint still keyed, or the key of a token generation still held, because that would orphan every connection ID or token minted under it. To re-key, move to a retired codepoint or a new generation.
+- At start a refused file is a configuration error. On reload the listener keeps its keys, and hedge logs `hedge: reload kept the QUIC keys of listener <name>, <reason>`.
+- `quic_keys` and `quic_host_id` are refused on TCP and local listeners, and `quic_host_id` without `quic_keys`. Changing either needs a restart.
+
 `server.limits.max_connections` is optional and absent by default. For TCP and
 local listeners, connection storage grows with what is actually connected, so
 leaving it out does not mean an unbounded server: it means the ceiling is the
