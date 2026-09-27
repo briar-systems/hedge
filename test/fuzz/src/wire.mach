@@ -1,0 +1,277 @@
+# wire framing: the PROXY header, the prologue, cleartext protocol selection,
+# and ACME wire responses
+
+use ac: acme.client;
+use hedge.acme.wire;
+use hedge.config.schema;
+use hedge.protocol.prologue;
+use hedge.protocol.proxy_protocol;
+use hedge.protocol.selection;
+use http.core.field;
+use http.core.method;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.guard;
+use fuzz.verdict;
+
+val SCRATCH_BYTES: usize = 96;
+
+fun same_peer(a: proxy_protocol.Peer, b: proxy_protocol.Peer) bool {
+    ret a.family == b.family && a.port == b.port && verdict.same(a.address, b.address);
+}
+
+# a decoded peer is a family it names, with an address inside the input (v1)
+# or the scratch it was rendered into (v2)
+fun peer_sound(peer: proxy_protocol.Peer, data: *u8, len: usize, scratch: *u8) bool {
+    if (peer.family != proxy_protocol.FAMILY_INET && peer.family != proxy_protocol.FAMILY_INET6) {
+        ret false;
+    }
+    if (peer.address.len == 0 || peer.address.len > proxy_protocol.MAX_TEXT_BYTES) { ret false; }
+    ret verdict.view_inside(peer.address, data, len) ||
+        verdict.view_inside(peer.address, scratch, SCRATCH_BYTES);
+}
+
+fun decode_one(data: *u8, len: usize, trusted: bool, outcome: *u64) bool {
+    var scratch: [SCRATCH_BYTES]u8;
+    val decoded: proxy_protocol.Result = proxy_protocol.decode(data, len, trusted,
+        ?scratch[0], SCRATCH_BYTES);
+    @outcome = verdict.mix(@outcome, decoded.status::u64);
+    val status: proxy_protocol.Status = decoded.status;
+    if (status == proxy_protocol.ABSENT || status == proxy_protocol.INCOMPLETE ||
+        status == proxy_protocol.MALFORMED || status == proxy_protocol.UNTRUSTED) {
+        # a refusal or a wait consumes nothing, and an untrusted peer is never
+        # refused as anything a trusted one would be decoded as
+        ret decoded.consumed == 0 && (trusted || status != proxy_protocol.MALFORMED);
+    }
+    if (status != proxy_protocol.DECODED && status != proxy_protocol.LOCAL) { ret false; }
+    verdict.accept();
+    # a header is only believed from a trusted peer and lies inside the input
+    if (!trusted || decoded.consumed == 0 || decoded.consumed > len) { ret false; }
+    if (status == proxy_protocol.DECODED) {
+        if (!peer_sound(decoded.peer, data, len, ?scratch[0]) ||
+            !peer_sound(decoded.local, data, len, ?scratch[0]) ||
+            decoded.peer.family != decoded.local.family) { ret false; }
+        @outcome = verdict.mix(@outcome, decoded.peer.family::u64);
+    }
+    # the header decodes the same from exactly its own bytes, and every shorter
+    # prefix of it is still waiting for the rest
+    var again: [SCRATCH_BYTES]u8;
+    val exact: proxy_protocol.Result = proxy_protocol.decode(data, decoded.consumed, true,
+        ?again[0], SCRATCH_BYTES);
+    if (exact.status != status || exact.consumed != decoded.consumed) { ret false; }
+    if (status == proxy_protocol.DECODED &&
+        (!same_peer(exact.peer, decoded.peer) || !same_peer(exact.local, decoded.local))) {
+        ret false;
+    }
+    var prefix: usize = 0;
+    for (prefix < decoded.consumed) {
+        val partial: proxy_protocol.Result = proxy_protocol.decode(data, prefix, true,
+            ?again[0], SCRATCH_BYTES);
+        if (partial.status != proxy_protocol.INCOMPLETE) { ret false; }
+        prefix = prefix + 1;
+    }
+    ret true;
+}
+
+pub fun answer_proxy(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!decode_one(data, len, true, ?outcome) || !decode_one(data, len, false, ?outcome)) {
+        ret verdict.violated("proxy: a header was believed, consumed or framed inconsistently");
+    }
+    ret verdict.answered(outcome);
+}
+
+fun rules(index: usize) selection.Policy {
+    if (index == 0) { ret selection.policy(schema.PROTOCOL_HTTP1, false, false); }
+    if (index == 1) { ret selection.policy(schema.PROTOCOL_HTTP2, false, false); }
+    if (index == 2) {
+        ret selection.policy(schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2, false, false);
+    }
+    ret selection.policy(schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2, true, true);
+}
+
+val RULES: usize = 4;
+
+fun preface_exact(data: *u8, len: usize) bool {
+    if (len < selection.PREFACE_BYTES) { ret false; }
+    var i: usize = 0;
+    for (i < selection.PREFACE_BYTES) {
+        if (data[i] != selection.PREFACE[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun preface_prefix(data: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len && i < selection.PREFACE_BYTES) {
+        if (data[i] != selection.PREFACE[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun select_one(data: *u8, len: usize, value: selection.Policy, outcome: *u64) bool {
+    val chosen: selection.Decision = selection.select_cleartext(value, data, len);
+    @outcome = verdict.mix(@outcome, (chosen.outcome::u64 << 8) | chosen.protocol::u64);
+    if (value.require_tls) { ret chosen.outcome == selection.REFUSED; }
+    if (chosen.outcome == selection.SELECTED) {
+        verdict.accept();
+        # only a protocol the listener serves, and HTTP/2 only by the exact preface
+        if (!selection.offers(value, chosen.protocol)) { ret false; }
+        if (chosen.protocol == selection.HTTP2)        { ret preface_exact(data, len); }
+        ret chosen.protocol == selection.HTTP1 &&
+            !(preface_prefix(data, len) && selection.offers(value, selection.HTTP2));
+    }
+    if (chosen.outcome == selection.PENDING) {
+        # a wait is only ever for the rest of a possible preface
+        ret chosen.protocol == selection.NONE && len < selection.PREFACE_BYTES &&
+            preface_prefix(data, len) && selection.offers(value, selection.HTTP2);
+    }
+    ret (chosen.outcome == selection.REFUSED || chosen.outcome == selection.NO_PROTOCOL) &&
+        chosen.protocol == selection.NONE;
+}
+
+pub fun answer_selection(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64   = 0;
+    var i:       usize = 0;
+    for (i < RULES) {
+        if (!select_one(data, len, rules(i), ?outcome)) {
+            ret verdict.violated("cleartext: a protocol was chosen that the bytes or the policy do not support");
+        }
+        i = i + 1;
+    }
+    ret verdict.answered(outcome);
+}
+
+fun evaluate_one(data: *u8, len: usize, value: prologue.Policy, ended: bool,
+    outcome: *u64) bool {
+    var scratch: [SCRATCH_BYTES]u8;
+    val decided: prologue.Result = prologue.evaluate(value, data, len, ended, ?scratch[0],
+        SCRATCH_BYTES);
+    @outcome = verdict.mix(@outcome, (decided.outcome::u64 << 16) |
+        (decided.refusal::u64 << 8) | decided.protocol::u64);
+    if (decided.outcome == prologue.NEED_MORE) {
+        # a wait names no refusal, and never outlives the peer or the bound
+        ret !ended && decided.refusal == prologue.REFUSED_NONE && len < prologue.MAX_BYTES;
+    }
+    # PROXY off takes no header, and only a trusted peer names another. a
+    # refusal keeps a decoded peer, so the operator can see who was turned away
+    if (decided.consumed > len) { ret false; }
+    if (value.proxy == schema.PROXY_OFF && (decided.consumed != 0 || decided.has_peer)) {
+        ret false;
+    }
+    if (decided.has_peer && (!value.trusted ||
+        !peer_sound(decided.peer, data, len, ?scratch[0]))) { ret false; }
+    if (decided.outcome == prologue.REFUSE) {
+        ret decided.refusal != prologue.REFUSED_NONE &&
+            (decided.refusal != prologue.REFUSED_PROXY_UNTRUSTED || !value.trusted);
+    }
+    if (decided.outcome != prologue.READY || decided.refusal != prologue.REFUSED_NONE) {
+        ret false;
+    }
+    verdict.accept();
+    # a TLS listener leaves the protocol to ALPN, a cleartext one serves what it offers
+    if (value.secure) { ret decided.protocol == selection.NONE; }
+    ret selection.offers(value.selection, decided.protocol);
+}
+
+var PROXY_MODES: [3]u8 = [3]u8{schema.PROXY_OFF, schema.PROXY_OPTIONAL, schema.PROXY_REQUIRED};
+
+pub fun answer_prologue(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64   = 0;
+    var mode:    usize = 0;
+    for (mode < 3) {
+        var flags: usize = 0;
+        for (flags < 8) {
+            val trusted: bool  = (flags & 1) != 0;
+            val secure:  bool  = (flags & 2) != 0;
+            val ended:   bool  = (flags & 4) != 0;
+            var r:       usize = 0;
+            for (r < 3) {
+                val value: prologue.Policy = prologue.policy(PROXY_MODES[mode], trusted, secure,
+                    rules(r));
+                if (!evaluate_one(data, len, value, ended, ?outcome)) {
+                    ret verdict.violated("prologue: a decision waited past its bound or named a peer or protocol it may not");
+                }
+                r = r + 1;
+            }
+            flags = flags + 1;
+        }
+        mode = mode + 1;
+    }
+    ret verdict.answered(outcome);
+}
+
+val MAX_FIELDS: usize = 32;
+
+rec Parsed {
+    result: wire.Parse;
+    status: u16;
+    body:   usize;
+}
+
+fun parse_one(bytes: *u8, len: usize, eof: bool, request: method.Kind, parsed: *Parsed) bool {
+    # the parser decodes a chunked body in place, so each parse gets its own copy
+    val data: *u8 = guard.place(bytes, len);
+    if (data == nil) { ret false; }
+    var items:  [MAX_FIELDS]field.Field;
+    var fields: field.Fields = field.init(?items[0], MAX_FIELDS,
+        field.limits(MAX_FIELDS, 8192, 128, 4096));
+    var response: ac.Response;
+    val result:   wire.Parse = wire.parse_response(data, len, eof, request, ?fields,
+        ?response);
+    parsed.result = result;
+    parsed.status = 0;
+    parsed.body   = 0;
+    if (result == wire.PARSE_INCOMPLETE || result == wire.PARSE_INVALID ||
+        result == wire.PARSE_LIMIT) { ret true; }
+    if (result != wire.PARSE_OK) { ret false; }
+    verdict.accept();
+    # three digits, a body inside the bytes read, and only fields a peer may send
+    if (response.status > 999 || response.fields != ?fields ||
+        !verdict.view_inside(response.body, data, len)) { ret false; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        if (!verdict.view_inside(fields.items[i].name, data, len) ||
+            !verdict.view_inside(fields.items[i].value, data, len) ||
+            !field.valid_name(fields.items[i].name) || !field.valid_value(fields.items[i].value)) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    parsed.status = response.status::u16;
+    parsed.body   = response.body.len;
+    ret true;
+}
+
+pub fun answer_acme_response(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    var open:    Parsed;
+    var closed:  Parsed;
+    var head:    Parsed;
+    if (!parse_one(data, len, false, method.GET, ?open) ||
+        !parse_one(data, len, true, method.GET, ?closed) ||
+        !parse_one(data, len, true, method.HEAD, ?head)) {
+        ret verdict.violated("acme-response: an accepted response published a view outside its input or a field no peer may send");
+    }
+    # a response complete while the connection is open is the same response
+    # once the peer closes it
+    if (open.result == wire.PARSE_OK && (closed.result != wire.PARSE_OK ||
+        closed.status != open.status || closed.body != open.body)) {
+        ret verdict.violated("acme-response: a complete response changed when the peer closed");
+    }
+    if (head.result == wire.PARSE_OK && head.body != 0) {
+        ret verdict.violated("acme-response: a response to HEAD carried a body");
+    }
+    outcome = verdict.mix(outcome, open.result::u64);
+    outcome = verdict.mix(outcome, closed.result::u64);
+    outcome = verdict.mix(outcome, head.result::u64);
+    outcome = verdict.mix(outcome, (closed.status / 100)::u64);
+    outcome = verdict.mix(outcome, verdict.bucket(closed.body));
+    ret verdict.answered(outcome);
+}
