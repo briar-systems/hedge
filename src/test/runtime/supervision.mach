@@ -6,15 +6,18 @@
 
 use hedge.allowance;
 use http_cache: hedge.cache;
+use hedge.clock;
 use hedge.composition;
 use hedge.config.schema;
 use hedge.dispatch.call;
 use hedge.generation;
 use hedge.lifecycle;
 use hedge.listener;
+use hedge.outbound;
 use hedge.service;
 use hosting: hedge.service.laurel;
 use hedge.supervisor;
+use hedge.task;
 use telemetry_health: hedge.telemetry.health;
 use site_fixture:     hedge.test.laurel;
 use hedge.test.runtime.wire;
@@ -22,6 +25,7 @@ use hedge.worker;
 use http.core.exchange;
 use http.core.field;
 use http.core.message;
+use http.core.method;
 use http.core.status;
 use std.allocator;
 use std.allocator.page;
@@ -34,6 +38,7 @@ use local_socket: std.net.local;
 use local_types:  std.net.local.types;
 use std.net.tcp;
 use std.sync.atomic;
+use std.sync.cancel;
 use std.sync.thread;
 use std.system.os;
 use std.types.bool.bool;
@@ -45,6 +50,8 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.view;
+use tls.cert.bundle;
 
 val RESPONSE_BYTES: usize = 4096;
 # a read waits wire.READ_TIMEOUT_MS, so this bounds one exchange at ten seconds
@@ -84,14 +91,38 @@ rec Harness {
     adapter:  hosting.Adapter;
     slots:    [1]service.Application;
     registry: service.Applications;
+    # whether the process runs a background task facility, whose job fetches
+    # from the process's own TLS listener, verified against the fixture root
+    tasked:  bool;
+    tasks:   task.Tasks;
+    anchors: bundle.Loaded;
+    job:     Job;
 }
 
 val CACHED_BODY: str = "a response every worker reads back from the one disk cache\n";
 val CACHE_ROOT:  str = "out/cache-supervision";
 
+# the origin a background task fetches from: it answers with the credential
+# the request carried
+fun echo_authorization(active: *call.Call) exchange.ServiceStatus {
+    val carried: *field.Field = field.find_first(?call.request(active).fields,
+        service.text_view("authorization"));
+    if (carried == nil || message.set_status(call.response(active), status.OK)
+        != message.RESPONSE_OK) { ret exchange.SERVICE_FAILED; }
+    val copied: *u8 = service.arena_bytes(active, carried.value.len);
+    if (copied == nil) { ret exchange.SERVICE_FAILED; }
+    var i: usize = 0;
+    for (i < carried.value.len) {
+        copied[i] = carried.value.data[i];
+        i         = i + 1;
+    }
+    ret service.respond_with_bytes(active, copied, carried.value.len);
+}
+
 # the origin behind the cache, reached from every worker's thread
 fun origin_serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     val harness: *Harness = context::*Harness;
+    if (harness.tasked) { ret echo_authorization(active); }
     atomic.fetch_add(?harness.origin, 1);
     if (message.set_status(call.response(active), status.OK) != message.RESPONSE_OK
         || !service.add_field(active, field.CONTENT_TYPE, "text/plain")
@@ -173,10 +204,33 @@ fun configure(graph: *schema.Graph, body: str, cached: bool, local_address: str)
     schema.set_text(?graph.cache.disk_root, CACHE_ROOT);
 }
 
+# the one listener over TLS as api.example.com, whose one service is the
+# native origin
+fun secure_origin(graph: *schema.Graph) {
+    graph.budget_count = 0;
+    schema.clear_text(?graph.routes[0].budget);
+    graph.services[0].kind = schema.SERVICE_NATIVE;
+    schema.set_text(?graph.services[0].target, "origin");
+    schema.set_text(?graph.listeners[0].tls_policy, "public");
+    schema.set_text(?graph.hosts[0].server_names[0], "api.example.com");
+    graph.tls_policy_count = 1;
+    val policy: *schema.TlsPolicy = ?graph.tls_policies[0];
+    schema.set_text(?policy.name, "public");
+    policy.identity_count = 1;
+    schema.set_text(?policy.identities[0].server_name, "api.example.com");
+    schema.set_text(?policy.identities[0].certificate, "test/interop/fixtures/api.pem");
+    schema.set_text(?policy.identities[0].key, "test/interop/fixtures/api.key");
+    schema.set_text(?policy.default_name, "api.example.com");
+    policy.has_default = true;
+    policy.client_auth = false;
+    schema.clear_text(?policy.client_trust);
+}
+
 fun seal(candidate: *generation.Generation, id: u64, body: str, cached: bool,
-    local_address: str, hosted: bool, diagnostics: *schema.Diagnostics) bool {
+    local_address: str, hosted: bool, tasked: bool, diagnostics: *schema.Diagnostics) bool {
     if (!generation.make_candidate(candidate, id)) { ret false; }
     configure(?candidate.graph, body, cached, local_address);
+    if (tasked) { secure_origin(?candidate.graph); }
     if (hosted) {
         val site: *schema.Service = ?candidate.graph.services[0];
         site.kind = schema.SERVICE_LAUREL;
@@ -194,7 +248,7 @@ fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Gene
     val candidate: *generation.Generation = ?harness.generations[target];
     atomic.fetch_add(?harness.loads, 1);
     if (!seal(candidate, id, harness.next_body, harness.cached, local_address(harness),
-        harness.hosted, ?harness.diagnostics)) {
+        harness.hosted, harness.tasked, ?harness.diagnostics)) {
         ret nil;
     }
     if (harness.move_listener) {
@@ -263,7 +317,7 @@ fun boot(harness: *Harness, cached: bool) bool {
     if (cached && (!ensure_dir("out") || !ensure_dir(CACHE_ROOT))) { ret false; }
     val initial: *generation.Generation = ?harness.generations[0];
     if (!seal(initial, 1, "hello from one\n", cached, local_address(harness),
-        harness.hosted, ?harness.diagnostics)) { ret false; }
+        harness.hosted, harness.tasked, ?harness.diagnostics)) { ret false; }
     var options: composition.Options = composition.default_options();
     options.native = service.Factory{ctx: (harness)::ptr, build: origin_factory};
     if (harness.hosted) {
@@ -272,6 +326,14 @@ fun boot(harness: *Harness, cached: bool) bool {
             || !service.make_applications(?harness.registry, ?harness.slots[0], 1)
             || !hosting.register(?harness.registry, "site", ?harness.adapter, 0)) { ret false; }
         options.applications = ?harness.registry;
+    }
+    if (harness.tasked) {
+        # the facility runs its thread from the supervisor's start on
+        if (bundle.load(?harness.heap, "test/interop/fixtures/root.pem", ?harness.anchors)
+            != bundle.OK
+            || !task.make(?harness.tasks, task.Options{trust: ?harness.anchors.bundle.store,
+            secrets: task.Secrets{ctx: nil, resolve: resolve_secret}})) { ret false; }
+        options.tasks = ?harness.tasks;
     }
     # two workers, which on a platform whose reuseport balances share the port
     val started: composition.StartReport = composition.start_process(harness.composed,
@@ -400,6 +462,7 @@ test workers__serve_reload_and_stop {
     var harness: Harness;
     harness.local  = false;
     harness.hosted = false;
+    harness.tasked = false;
     if (!boot(?harness, false)) { ret 1; }
     if (!fetch(?harness, "hello from one")) {
         finish(?harness);
@@ -511,6 +574,7 @@ test disk_cache__shared_across_workers {
     var harness: Harness;
     harness.local  = false;
     harness.hosted = false;
+    harness.tasked = false;
     if (!boot(?harness, true)) { ret 1; }
     var path: usize = 0;
     for (path < PATHS) {
@@ -568,6 +632,7 @@ test local_listener__handed_off_and_served {
     }
     var harness: Harness;
     harness.hosted = false;
+    harness.tasked = false;
     if (!name_local(?harness))  { ret 1; }
     if (!boot(?harness, false)) { ret 2; }
     var answered: usize = 0;
@@ -602,6 +667,7 @@ test local_listener__handed_off_and_served {
 fun boot_hosted(harness: *Harness, stuck: bool) bool {
     harness.local  = false;
     harness.hosted = true;
+    harness.tasked = false;
     if (!site_fixture.assemble_site(?harness.site, opt[duration.Duration].none{})) {
         ret false;
     }
@@ -659,5 +725,177 @@ test hosted_application__drain_overrun_abandoned {
     if (stopped.applications_abandoned != 1 || stopped.reason != lifecycle.DEADLINE
         || stopped.cleanup_failures != 0) { ret 3; }
     if (phases.drains < 2 || phases.drained || phases.stops != 1) { ret 4; }
+    ret 0;
+}
+
+val JOB_TOKEN: str = "s3cr3t-token";
+# the job's own period, and the bound on each of its runs
+val JOB_PERIOD_NS:  u64 = 200000000;
+val JOB_TIMEOUT_NS: u64 = 10000000000;
+
+# the resolver the task facility owns: one secret, by name
+fun resolve_secret(context: ptr, name: view.View, output: *u8, capacity: usize) i64 {
+    if (!view.view_eq_str(name, "catalog-token")) { ret -1; }
+    val length: usize = str_len(JOB_TOKEN);
+    if (length >= capacity) { ret length::i64; }
+    var i: usize = 0;
+    for (i < length) {
+        output[i] = JOB_TOKEN[i];
+        i         = i + 1;
+    }
+    ret length::i64;
+}
+
+# a job's public state: the secret's name, never the secret, and an exchange
+# and snapshot slots it owns. the credential it sends lives in `header` only
+# while its exchange is in flight
+rec Job {
+    endpoint:   ip.Endpoint;
+    routed:     bool;
+    sequence:   u64;
+    waiting:    bool;
+    header:     [64]u8;
+    header_len: usize;
+    fields:     [1]field.Field;
+    request:    [2048]u8;
+    response:   [2048]u8;
+    items:      [16]field.Field;
+    exchange:   outbound.Exchange;
+    slots:      [2][64]u8;
+    published:  task.Status;
+}
+
+fun prepare_job(job: *Job) bool {
+    job.routed     = false;
+    job.sequence   = 0;
+    job.waiting    = false;
+    job.header_len = 0;
+    job.published  = 0;
+    ret outbound.make_exchange(?job.exchange, ?job.request[0], 2048, ?job.response[0], 2048,
+        ?job.items[0], 16, field.limits(16, 2048, 128, 1024));
+}
+
+fun take_token(context: ptr, secret: view.View) bool {
+    val job:    *Job = context::*Job;
+    val prefix: str  = "Bearer ";
+    if (secret.len + 7 > 64) { ret false; }
+    var i: usize = 0;
+    for (i < 7) {
+        job.header[i] = prefix[i];
+        i             = i + 1;
+    }
+    i = 0;
+    for (i < secret.len) {
+        job.header[7 + i] = secret.data[i];
+        i                 = i + 1;
+    }
+    job.header_len = 7 + secret.len;
+    ret true;
+}
+
+fun forget_token(job: *Job) {
+    var i: usize = 0;
+    for (i < 64) {
+        job.header[i] = 0;
+        i             = i + 1;
+    }
+    job.header_len = 0;
+}
+
+fun job_failed(job: *Job, detail: str) service.Step {
+    forget_token(job);
+    job.waiting = false;
+    ret service.Step{status: service.STEP_FAILED, detail: view.view(detail::*u8, str_len(detail))};
+}
+
+# fetch the catalog with the borrowed token and publish what came back. every
+# step returns at once: the first begins the exchange, and the rest poll it
+fun job_step(context: ptr, run: *task.Run) service.Step {
+    val job:     *Job         = context::*Job;
+    val pending: service.Step = service.Step{status: service.STEP_PENDING,
+        detail: view.view(nil, 0)};
+    if (job.sequence != run.sequence) {
+        job.sequence = run.sequence;
+        job.waiting  = false;
+    }
+    val reason: cancel.Reason = cancel.reason(run.scope);
+    if (!(sel reason.active)) { ret job_failed(job, "cancelled"); }
+    if (!job.waiting) {
+        if (!job.routed) {
+            if (!outbound.route(outbound.client(run.loop), view.view("api.example.com", 15),
+                outbound.secure_origin(job.endpoint))) { ret job_failed(job, "unroutable"); }
+            job.routed = true;
+        }
+        if (task.borrow(run, view.view("catalog-token", 13), take_token, context)
+            != task.BORROW_OK) { ret job_failed(job, "token unavailable"); }
+        job.fields[0] = field.Field{name: view.view("authorization", 13),
+            value: view.view(?job.header[0], job.header_len), sensitive: true};
+        var request: outbound.Request = outbound.request(method.GET,
+            view.view("https://api.example.com/catalog", 31));
+        request.headers      = ?job.fields[0];
+        request.header_count = 1;
+        request.timeout_ns   = JOB_TIMEOUT_NS;
+        val begun: outbound.Status = task.begin(run, ?job.exchange, request);
+        if (begun == outbound.FAILED || begun == outbound.INVALID) {
+            ret job_failed(job, "refused");
+        }
+        job.waiting = true;
+    }
+    val progress: outbound.Status = outbound.poll(?job.exchange, clock.instant());
+    if (progress == outbound.PENDING) { ret pending; }
+    if (progress != outbound.OK)      { ret job_failed(job, "fetch failed"); }
+    forget_token(job);
+    job.waiting = false;
+    val answer: outbound.Response = outbound.response(?job.exchange);
+    if (answer.status != 200) { ret job_failed(job, "unexpected status"); }
+    job.published = task.publish(run, answer.body);
+    outbound.finish(?job.exchange);
+    ret service.Step{status: service.STEP_DONE, detail: view.view(nil, 0)};
+}
+
+# the #305 hardest case over real sockets: a periodic job borrowing a token
+# fetches over HTTPS from the process's own listener on the task thread,
+# publishes what it read to readers that never wait on it, holds no secret
+# between runs, and drains when the process stops
+test tasks__periodic_https_job_publishes_and_drains {
+    var harness: Harness;
+    harness.local  = false;
+    harness.hosted = false;
+    harness.tasked = true;
+    if (!prepare_job(?harness.job) || !boot(?harness, false)) { ret 1; }
+    harness.job.endpoint = harness.endpoint;
+    var spec: task.Spec = task.Spec{name: view.view("catalog", 7),
+        state:      (?harness.job)::ptr, step: job_step, period_ns: JOB_PERIOD_NS,
+        timeout_ns: JOB_TIMEOUT_NS, slots: ?harness.job.slots[0][0], slot_bytes: 64,
+        slot_count: 2};
+    var handle: task.Handle;
+    if (task.register(?harness.tasks, ?spec, ?handle) != task.STATUS_OK
+        || task.trigger(?harness.tasks, handle) != task.STATUS_OK) {
+        finish(?harness);
+        ret 2;
+    }
+    # the triggered run, then one its period started
+    var report: task.Report;
+    var rounds: usize = 0;
+    for (rounds < PUBLISH_ROUNDS) {
+        if (task.report(?harness.tasks, handle, ?report) != task.STATUS_OK
+            || report.published >= 2 || report.failed != 0) { brk; }
+        os.sleep(PUBLISH_PAUSE);
+        rounds = rounds + 1;
+    }
+    var lease:   task.Lease;
+    val read:    task.Status = task.read(?harness.tasks, handle, ?lease);
+    val carried: bool        = read == task.STATUS_OK
+        && view.view_eq_str(task.lease_view(?lease), "Bearer s3cr3t-token");
+    val released: bool                   = task.release(?harness.tasks, ?lease) == task.STATUS_OK;
+    val stopped:  composition.StopReport = finish(?harness);
+    outbound.destroy_exchange(?harness.job.exchange);
+    bundle.release(?harness.heap, ?harness.anchors);
+    if (report.published < 2 || report.completed < 2 || report.failed != 0
+        || harness.job.published != task.STATUS_OK) { ret 3; }
+    if (!carried || !released || harness.job.header_len != 0) { ret 4; }
+    if (!stopped.stopped || stopped.reason == lifecycle.FAILED
+        || stopped.reason == lifecycle.DEADLINE || stopped.cleanup_failures != 0
+        || stopped.tasks_abandoned != 0) { ret 5; }
     ret 0;
 }
