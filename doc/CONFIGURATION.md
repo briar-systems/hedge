@@ -324,6 +324,9 @@ taken from another worker because their connection lives there, and
 `stopped`) those dropped on the way, for the client's retransmission to carry.
 `hedge_quic_unroutable_total` counts datagrams whose connection ID names no
 connection a worker holds, such as one for a connection already released.
+`hedge_quic_stateless_resets_total{outcome}` (`sent`, `limited`) counts the
+stateless resets a worker sent for such a datagram, and those its rate limit
+held back.
 `hedge_timers_claimed` and `hedge_timers_armed` are gauges of the worker's
 timing wheel: the entries a connection or plane has claimed, and those with a
 deadline armed, reported once per loop turn.
