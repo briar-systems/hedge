@@ -1,0 +1,306 @@
+# config and files from outside: the config loader, trusted PROXY peers, ACME
+# durable state and the urls the outbound client splits
+#
+# the file boundaries write their input under test/fuzz/out/work, so the lane
+# runs from the repository root and one replay runs at a time in a checkout
+
+use hedge.acme.durable;
+use hedge.acme.keys;
+use hedge.config.loader;
+use hedge.config.schema;
+use hedge.outbound.wire;
+use hedge.protocol.trust;
+use std.allocator.fixed;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use std.net.ip;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.path.Path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.view;
+
+use A: std.allocator;
+
+use fuzz.guard;
+use fuzz.verdict;
+
+val ARENA_BYTES: usize = 8388608;
+
+var arena_memory: [ARENA_BYTES]u8;
+var arena_state:  fixed.FixedState;
+var arena:        A.Allocator;
+
+var second_memory: [ARENA_BYTES]u8;
+var second_state:  fixed.FixedState;
+var second:        A.Allocator;
+
+# a fresh arena for one entry point, so nothing one input allocated outlives it
+fun fresh() *A.Allocator {
+    val made: err[A.Error] = fixed.make(?arena, ?arena_state, ?arena_memory[0], ARENA_BYTES);
+    if (sel made.err) { ret nil; }
+    ret ?arena;
+}
+
+# a second arena, for a build whose first result is still being read
+fun fresh_second() *A.Allocator {
+    val made: err[A.Error] = fixed.make(?second, ?second_state, ?second_memory[0], ARENA_BYTES);
+    if (sel made.err) { ret nil; }
+    ret ?second;
+}
+
+fun resolve_environment(context: ptr, name: str, output: *u8, capacity: usize) i64 {
+    if (!str_equals(name, "HOST")) { ret -1; }
+    val value: str = "example.com";
+    if (capacity > 11) {
+        var i: usize = 0;
+        for (i < 11) {
+            output[i] = value[i]::u8;
+            i         = i + 1;
+        }
+        output[11] = 0;
+    }
+    ret 11;
+}
+
+fun no_include(context: ptr, name: str, output: *u8, capacity: usize) i64 {
+    ret -1;
+}
+
+var graph:       schema.Graph;
+var diagnostics: schema.Diagnostics;
+var again_graph: schema.Graph;
+var again_diags: schema.Diagnostics;
+
+fun every() loader.Capabilities {
+    ret loader.Capabilities{quic: true, local_transport: true, environment_secrets: true,
+        file_secrets: true, os_secrets: true, application_secrets: true};
+}
+
+pub fun answer_config(data: *u8, len: usize) verdict.Verdict {
+    val source: *u8 = guard.text(data, len);
+    if (source == nil) { ret verdict.answered(0xc0); }
+    var resolver: loader.Resolver = loader.Resolver{context: nil, include: no_include,
+        environment: resolve_environment};
+    val a: *A.Allocator = fresh();
+    if (a == nil) { ret verdict.violated("config: the arena could not be made"); }
+    val built: bool = loader.build(?graph, ?diagnostics, a, "hedge.toml", source::str,
+        ?resolver, every());
+    # a refusal always names its reason, and an accepted graph has none
+    if (built != (diagnostics.error_count == 0) ||
+        diagnostics.count > schema.MAX_DIAGNOSTICS ||
+        (built && diagnostics.truncated)) {
+        ret verdict.violated("config: the answer and its diagnostics disagree");
+    }
+    # the same source builds the same graph again, and an accepted one validates
+    val b: *A.Allocator = fresh_second();
+    if (b == nil) { ret verdict.violated("config: the arena could not be made"); }
+    val rebuilt: bool = loader.build(?again_graph, ?again_diags, b, "hedge.toml", source::str,
+        ?resolver, every());
+    if (rebuilt != built || again_diags.error_count != diagnostics.error_count ||
+        again_graph.listener_count != graph.listener_count ||
+        again_graph.host_count != graph.host_count ||
+        again_graph.route_count != graph.route_count ||
+        again_graph.service_count != graph.service_count) {
+        ret verdict.violated("config: one source built two different graphs");
+    }
+    var outcome: u64 = verdict.mix(built::u64, verdict.bucket(diagnostics.error_count));
+    if (diagnostics.count != 0) {
+        outcome = verdict.mix(outcome, diagnostics.items[0].code::u64);
+    }
+    if (!built) { ret verdict.answered(outcome); }
+    verdict.accept();
+    var revalidated: schema.Diagnostics;
+    schema.reset_diagnostics(?revalidated);
+    if (!loader.validate(?graph, every(), ?revalidated)) {
+        ret verdict.violated("config: an accepted graph does not validate");
+    }
+    outcome = verdict.mix(outcome, (verdict.bucket(graph.listener_count) << 4) |
+        (verdict.bucket(graph.host_count) << 2) | verdict.bucket(graph.route_count));
+    ret verdict.answered(outcome);
+}
+
+fun width(addr: ip.Addr) usize {
+    if (addr.is_v6 != 0) { ret 128; }
+    ret 32;
+}
+
+fun mapped(addr: ip.Addr) ip.Addr {
+    var value: ip.Addr = addr;
+    value.is_v6 = 1;
+    var i: usize = 0;
+    for (i < 10) {
+        value.v6.octets[i] = 0;
+        i                  = i + 1;
+    }
+    value.v6.octets[10] = 0xff;
+    value.v6.octets[11] = 0xff;
+    i                   = 0;
+    for (i < 4) {
+        value.v6.octets[12 + i] = addr.v4.octets[i];
+        i                       = i + 1;
+    }
+    ret value;
+}
+
+pub fun answer_trusted_peer(data: *u8, len: usize) verdict.Verdict {
+    val text: *u8 = guard.text(data, len);
+    if (text == nil) { ret verdict.answered(0x70); }
+    var policy: trust.Policy;
+    trust.clear(?policy);
+    var prefix: trust.Prefix;
+    val parsed: bool = trust.parse(text::str, ?prefix);
+    val added:  bool = trust.add(?policy, text::str);
+    if (parsed != added || policy.count != added::usize) {
+        ret verdict.violated("trusted-peer: parsing and adding a prefix disagree");
+    }
+    if (!added) {
+        # a refused prefix trusts nobody
+        ret verdict.answered(1);
+    }
+    verdict.accept();
+    var slash: bool  = false;
+    var i:     usize = 0;
+    for (i < len) {
+        if (data[i] == '/') { slash = true; }
+        i = i + 1;
+    }
+    val stored: trust.Prefix = policy.prefixes[0];
+    # the prefix trusts its own address, and its IPv4 form trusts the address as
+    # a dual-stack socket reports it. a bare address is a host route
+    if (!stored.live || stored.bits > width(stored.addr) ||
+        (!slash && stored.bits != width(stored.addr)) || !trust.trusts(?policy, stored.addr) ||
+        (stored.addr.is_v6 == 0 && !trust.trusts(?policy, mapped(stored.addr)))) {
+        ret verdict.violated("trusted-peer: an accepted prefix does not trust the address it names");
+    }
+    ret verdict.answered(verdict.mix(stored.addr.is_v6::u64, verdict.bucket(stored.bits / 8)));
+}
+
+val WORK:        str = "test/fuzz/out/work";
+val DURABLE:     str = "test/fuzz/out/work/durable";
+val ACCOUNT_KEY: str = "test/fuzz/out/work/durable/account.key";
+val ACCOUNT_DOC: str = "test/fuzz/out/work/durable/account.acme";
+val CERT_DOC:    str = "test/fuzz/out/work/durable/certificate.acme";
+
+fun written(path: str, data: *u8, len: usize) bool {
+    val a: *A.Allocator = fresh();
+    if (a == nil) { ret false; }
+    fs.create_dir_all(a, WORK::Path, 448);
+    val put: err[fs.FsError] = fs.write_bytes(path::Path, data, len, 384);
+    ret sel put.ok;
+}
+
+# the file still holds exactly the input
+fun unchanged(path: str, data: *u8, len: usize) bool {
+    val a:    *A.Allocator                = fresh();
+    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path::Path);
+    if (sel read.err) { ret false; }
+    val bytes: Vector[u8] = read.ok;
+    ret verdict.same(view.view(bytes.data, bytes.len), view.view(data, len));
+}
+
+# the first byte names the document the rest of the input replaces: `k` the
+# account key, `a` the account record, anything else the certificate record
+pub fun answer_durable(data: *u8, len: usize) verdict.Verdict {
+    if (len == 0) { ret verdict.answered(0); }
+    val a: *A.Allocator = fresh();
+    fs.remove_all(a, DURABLE::Path);
+    fs.create_dir_all(a, DURABLE::Path, 448);
+    var path: str = CERT_DOC;
+    if (data[0] == 'k') { path = ACCOUNT_KEY; }
+    or (data[0] == 'a') { path = ACCOUNT_DOC; }
+    val body: *u8             = ?data[1];
+    val size: usize           = len - 1;
+    val put:  err[fs.FsError] = fs.write_bytes(path::Path, body, size, 384);
+    if (sel put.err) { ret verdict.violated("acme-durable: the input could not be written"); }
+    var store:  durable.Store;
+    val opened: durable.Status = durable.open(?store, fresh(), DURABLE);
+    # a document that is there is read or reported, never treated as absent
+    # and never rewritten
+    if (opened != durable.OK && opened != durable.CORRUPT) {
+        ret verdict.violated("acme-durable: a store over readable documents failed to open");
+    }
+    var selector: u64 = 2;
+    if (data[0] == 'k') { selector = 0; }
+    or (data[0] == 'a') { selector = 1; }
+    var outcome: u64 = verdict.mix(selector, opened::u64);
+    if (opened == durable.OK && data[0] == 'k') {
+        var key:    keys.Key;
+        val loaded: durable.Status = durable.open_account_key(?store, ?key);
+        outcome = verdict.mix(outcome, loaded::u64);
+        if (loaded != durable.OK && loaded != durable.CORRUPT) {
+            ret verdict.violated("acme-durable: a present account key was neither loaded nor reported");
+        }
+        if (loaded == durable.OK) {
+            verdict.accept();
+            # the key is the scalar the document carried, and nothing else
+            val material: view.View = keys.material(?key);
+            if (size < keys.SCALAR_BYTES || !verdict.same(material,
+                view.view(?body[size - keys.SCALAR_BYTES], keys.SCALAR_BYTES))) {
+                ret verdict.violated("acme-durable: the loaded key is not the one stored");
+            }
+            keys.destroy(?key);
+        }
+    }
+    or (opened == durable.OK) { verdict.accept(); }
+    if (!unchanged(path, body, size)) {
+        ret verdict.violated("acme-durable: a document was rewritten by reading it");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_outbound_url(data: *u8, len: usize) verdict.Verdict {
+    var target: wire.Target;
+    if (!wire.split_url(view.view(data, len), ?target)) { ret verdict.answered(0); }
+    verdict.accept();
+    # an absolute http(s) url with no userinfo splits into a host inside it, a
+    # port that is not zero, and an origin-form path with no fragment
+    var https:  bool  = len >= 8 && data[0] == 'h' && data[4] == 's' && data[5] == ':';
+    val scheme: usize = 7 + https::usize;
+    var i:      usize = 0;
+    for (i < len) {
+        if (data[i] == '#') { brk; }
+        if (data[i] == '@' && i >= scheme) {
+            var authority: bool  = true;
+            var j:         usize = scheme;
+            for (j < i) {
+                if (data[j] == '/' || data[j] == '?' || data[j] == '#') { authority = false; }
+                j = j + 1;
+            }
+            if (authority) {
+                ret verdict.violated("outbound-url: a url with userinfo was accepted");
+            }
+        }
+        i = i + 1;
+    }
+    if (target.secure != https || target.port == 0 || target.host.len == 0 ||
+        target.host.len > wire.MAX_HOST_BYTES ||
+        target.host.data::*u8 != ?data[scheme] ||
+        target.path.len == 0 || target.path.data[0] != '/') {
+        ret verdict.violated("outbound-url: the split is not the url's scheme, host, port and path");
+    }
+    # a url with no path is the root, and any other path lies inside the url
+    if (!verdict.view_inside(target.path, data, len)) {
+        if (target.path.len != 1) {
+            ret verdict.violated("outbound-url: the path lies outside the url");
+        }
+    }
+    or {
+        var k: usize = 0;
+        for (k < target.path.len) {
+            if (target.path.data[k] == '#') {
+                ret verdict.violated("outbound-url: the path carries the fragment");
+            }
+            k = k + 1;
+        }
+    }
+    ret verdict.answered(verdict.mix((target.secure::u64 << 1) |
+        ((target.port != 80 && target.port != 443)::u64), verdict.bucket(target.path.len)));
+}

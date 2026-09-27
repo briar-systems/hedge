@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # concurrent-connection fairness, HTTP/3 service, the shared connection cap,
-# idle memory and CPU per connection, a handshake burst, a ramp, churn,
-# request and handshake rates and QUIC migration, against the release
-# executable the standard phases built
+# idle memory and CPU per connection, a handshake burst, a ramp, a sustained
+# keep-alive rate, churn, request and handshake rates and QUIC migration,
+# against the release executable the standard phases built
 set -euo pipefail
 
 case "$MACH_CI_LEG" in
@@ -15,6 +15,9 @@ case "$MACH_CI_LEG" in
         # the scale harness's 1k cells (#176): a ramp, a minute of churn, the
         # request and handshake rates, and QUIC connections surviving a rebind
         LOAD_RAMP=1000 test/load/ramp.sh
+        # a sustained keep-alive rate with no datagram dropped (#274), at a
+        # rate the runner's two cores carry beside the client
+        LOAD_KEEPALIVE=2000 test/load/keepalive.sh
         # the client shares the runner's two cores with the server, which moves
         # CPU per connection more than a quiet box does over a minute
         LOAD_CHURN_SECONDS=60 LOAD_CHURN_SAMPLE=5 LOAD_CHURN_CPU_TOLERANCE=50 test/load/churn.sh

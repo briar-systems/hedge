@@ -1,0 +1,629 @@
+# HTTP semantics headers: Range, HTTP-date, Cache-Control, validators, and the
+# cache key and Vary selection
+
+use hedge.cache.key;
+use hedge.cache.policy;
+use directives: hedge.http.cache_control;
+use http_date:  hedge.http.date;
+use hedge.http.range;
+use hedge.http.validator;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use std.chrono.date;
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+use fuzz.input;
+use fuzz.verdict;
+
+val MODEL_INVALID: u8 = 0;
+val MODEL_SINGLE:  u8 = 1;
+val MODEL_SUFFIX:  u8 = 2;
+val MODEL_OTHER:   u8 = 3;
+
+rec Spec {
+    kind:     u8;
+    first:    u64;
+    last:     u64;
+    has_last: bool;
+}
+
+fun blank(c: u8) bool {
+    ret c == ' ' || c == '\t';
+}
+
+fun digit(c: u8) bool {
+    ret c >= '0' && c <= '9';
+}
+
+# a run of digits, or false when there is none or it does not fit in 64 bits
+fun number(data: *u8, len: usize, at: *usize, output: *u64) bool {
+    val start: usize = @at;
+    var total: u64   = 0;
+    for (@at < len && digit(data[@at])) {
+        val d: u64 = (data[@at] - '0')::u64;
+        if (total > (0xffffffffffffffff - d) / 10) { ret false; }
+        total = total * 10 + d;
+        @at   = @at + 1;
+    }
+    @output = total;
+    ret @at > start;
+}
+
+# RFC 9110 section 14.1: `bytes=` then a range-set. MODEL_OTHER is a well formed
+# field this model does not resolve: another unit, several ranges, or a number
+# past 64 bits, all of which a recipient may ignore
+fun model(data: *u8, len: usize) Spec {
+    var spec: Spec  = Spec{kind: MODEL_INVALID, first: 0, last: 0, has_last: false};
+    var at:   usize = 0;
+    for (at < len && blank(data[at])) { at = at + 1; }
+    if (at + 6 > len || data[at] != 'b' || data[at + 1] != 'y' || data[at + 2] != 't' ||
+        data[at + 3] != 'e' || data[at + 4] != 's' || data[at + 5] != '=') {
+        spec.kind = MODEL_OTHER;
+        ret spec;
+    }
+    at = at + 6;
+    for (at < len && blank(data[at])) { at = at + 1; }
+    if (at < len && data[at] == '-') {
+        at = at + 1;
+        if (!number(data, len, ?at, ?spec.last)) {
+            if (at < len && digit(data[at])) { spec.kind = MODEL_OTHER; }
+            ret spec;
+        }
+        spec.kind     = MODEL_SUFFIX;
+        spec.has_last = true;
+    }
+    or {
+        if (!number(data, len, ?at, ?spec.first)) {
+            if (at < len && digit(data[at])) { spec.kind = MODEL_OTHER; }
+            ret spec;
+        }
+        if (at >= len || data[at] != '-') { ret spec; }
+        at = at + 1;
+        if (at < len && digit(data[at])) {
+            if (!number(data, len, ?at, ?spec.last)) {
+                spec.kind = MODEL_OTHER;
+                ret spec;
+            }
+            spec.has_last = true;
+            # a last-pos below its first-pos makes the range-spec invalid
+            if (spec.last < spec.first) { ret spec; }
+        }
+        spec.kind = MODEL_SINGLE;
+    }
+    for (at < len && blank(data[at])) { at = at + 1; }
+    if (at != len) {
+        if (data[at] == ',') { spec.kind = MODEL_OTHER; }
+        or                   { spec.kind = MODEL_INVALID; }
+    }
+    ret spec;
+}
+
+var LENGTHS: [5]u64 = [5]u64{0, 1, 10, 1000, 0x8000000000000000};
+
+fun resolve_one(data: *u8, len: usize, spec: Spec, length: u64, outcome: *u64) bool {
+    val span: range.Span = range.resolve(view.view(data, len), length);
+    @outcome = verdict.mix(@outcome, span.outcome::u64);
+    if (len == 0) { ret span.outcome == range.NO_RANGE; }
+    # ignoring a Range field is always permitted
+    if (span.outcome == range.IGNORED)                                            { ret true; }
+    if (span.outcome != range.SATISFIABLE && span.outcome != range.UNSATISFIABLE) { ret false; }
+    if (spec.kind != MODEL_SINGLE && spec.kind != MODEL_SUFFIX)                   { ret false; }
+    var satisfiable: bool = false;
+    var first:       u64  = 0;
+    var last:        u64  = 0;
+    if (spec.kind == MODEL_SUFFIX) {
+        # a zero length representation has no byte a suffix could name
+        satisfiable = spec.last != 0 && length != 0;
+        if (satisfiable) {
+            last  = length - 1;
+            first = 0;
+            if (spec.last < length) { first = length - spec.last; }
+        }
+    }
+    or {
+        satisfiable = spec.first < length;
+        if (satisfiable) {
+            first = spec.first;
+            last  = length - 1;
+            if (spec.has_last && spec.last < last) { last = spec.last; }
+        }
+    }
+    if (span.outcome == range.UNSATISFIABLE) { ret !satisfiable; }
+    verdict.accept();
+    ret satisfiable && span.first == first && span.last == last &&
+        span.length == last - first + 1;
+}
+
+pub fun answer_range(data: *u8, len: usize) verdict.Verdict {
+    val spec:    Spec  = model(data, len);
+    var outcome: u64   = spec.kind::u64;
+    var i:       usize = 0;
+    for (i < 5) {
+        if (!resolve_one(data, len, spec, LENGTHS[i], ?outcome)) {
+            ret verdict.violated("range: a range was served or refused that the field does not describe");
+        }
+        i = i + 1;
+    }
+    ret verdict.answered(outcome);
+}
+
+val DAYS:   str = "SunMonTueWedThuFriSat";
+val MONTHS: str = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+fun two(output: *u8, at: usize, value: i64) {
+    output[at]     = '0' + (value / 10 % 10)::u8;
+    output[at + 1] = '0' + (value % 10)::u8;
+}
+
+fun four(output: *u8, at: usize, value: i64) {
+    two(output, at, value / 100);
+    two(output, at + 2, value % 100);
+}
+
+fun clock_at(output: *u8, at: usize, moment: date.Datetime) {
+    two(output, at, moment.hour);
+    output[at + 2] = ':';
+    two(output, at + 3, moment.minute);
+    output[at + 5] = ':';
+    two(output, at + 6, moment.second);
+}
+
+fun month_at(output: *u8, at: usize, moment: date.Datetime) {
+    output[at]     = MONTHS[(moment.month - 1)::usize * 3]::u8;
+    output[at + 1] = MONTHS[(moment.month - 1)::usize * 3 + 1]::u8;
+    output[at + 2] = MONTHS[(moment.month - 1)::usize * 3 + 2]::u8;
+}
+
+# the input equals a rendering from byte `from` on, where a leap second the
+# input names is the second before it in the rendering
+fun same_from(data: *u8, len: usize, rendered: *u8, from: usize, seconds_at: usize) bool {
+    var i: usize = from;
+    for (i < len) {
+        var expected: u8 = rendered[i];
+        if (i == seconds_at && data[i] == '6' && data[i + 1] == '0' && rendered[i] == '5' &&
+            rendered[i + 1] == '9') {
+            i = i + 2;
+            cnt;
+        }
+        if (data[i] != expected) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# `Sun, 06 Nov 1994 08:49:37 GMT`, `Sunday, 06-Nov-94 08:49:37 GMT` or
+# `Sun Nov  6 08:49:37 1994`: an accepted date is one of the three, naming the
+# instant it parsed to. only the day name is not checked, as the parser does not
+fun names_instant(data: *u8, len: usize, moment: date.Datetime) bool {
+    var rendered: [64]u8;
+    if (len == 29) {
+        rendered[3] = ',';
+        rendered[4] = ' ';
+        two(?rendered[0], 5, moment.day);
+        rendered[7] = ' ';
+        month_at(?rendered[0], 8, moment);
+        rendered[11] = ' ';
+        four(?rendered[0], 12, moment.year);
+        rendered[16] = ' ';
+        clock_at(?rendered[0], 17, moment);
+        rendered[25] = ' ';
+        rendered[26] = 'G';
+        rendered[27] = 'M';
+        rendered[28] = 'T';
+        if (same_from(data, len, ?rendered[0], 3, 23)) { ret true; }
+    }
+    if (len == 24) {
+        rendered[3] = ' ';
+        month_at(?rendered[0], 4, moment);
+        rendered[7] = ' ';
+        two(?rendered[0], 8, moment.day);
+        rendered[10] = ' ';
+        clock_at(?rendered[0], 11, moment);
+        rendered[19] = ' ';
+        four(?rendered[0], 20, moment.year);
+        if (moment.day < 10 && data[8] == ' ')         { rendered[8] = ' '; }
+        if (same_from(data, len, ?rendered[0], 3, 17)) { ret true; }
+    }
+    var comma: usize = 0;
+    for (comma < len && data[comma] != ',') { comma = comma + 1; }
+    if (comma + 24 == len) {
+        val at:      usize = comma;
+        var shifted: [64]u8;
+        shifted[0] = ',';
+        shifted[1] = ' ';
+        two(?shifted[0], 2, moment.day);
+        shifted[4] = '-';
+        month_at(?shifted[0], 5, moment);
+        shifted[8] = '-';
+        two(?shifted[0], 9, moment.year % 100);
+        shifted[11] = ' ';
+        clock_at(?shifted[0], 12, moment);
+        shifted[20] = ' ';
+        shifted[21] = 'G';
+        shifted[22] = 'M';
+        shifted[23] = 'T';
+        if (moment.year >= 1970 && moment.year <= 2069 &&
+            same_from(?data[at], 24, ?shifted[0], 0, 18)) { ret true; }
+    }
+    ret false;
+}
+
+pub fun answer_date(data: *u8, len: usize) verdict.Verdict {
+    var parsed: time.Time;
+    if (!http_date.parse(view.view(data, len), ?parsed)) { ret verdict.answered(1); }
+    verdict.accept();
+    val moment: date.Datetime = date.datetime_from_time(parsed);
+    if (!names_instant(data, len, moment)) {
+        ret verdict.violated("http-date: an accepted date is not one of the three forms naming its instant");
+    }
+    # the form it is written back in parses to the same instant
+    var formatted: [40]u8;
+    val written:   usize = http_date.format(parsed, ?formatted[0], 40);
+    if (moment.year >= 1000 && moment.year <= 9999) {
+        var again: time.Time;
+        if (written != http_date.IMF_LENGTH ||
+            !http_date.parse(view.view(?formatted[0], written), ?again) || again.sec != parsed.sec) {
+            ret verdict.violated("http-date: an accepted date does not round-trip through IMF-fixdate");
+        }
+    }
+    var outcome: u64 = verdict.mix(2, len::u64);
+    outcome = verdict.mix(outcome, (moment.day < 10)::u64);
+    ret verdict.answered(outcome);
+}
+
+fun same_view(a: view.View, b: view.View) bool {
+    ret verdict.same(a, b);
+}
+
+fun same_directives(a: directives.Directives, b: directives.Directives) bool {
+    ret a.present == b.present && a.no_store == b.no_store && a.no_cache == b.no_cache &&
+        a.no_cache_qualified == b.no_cache_qualified &&
+        a.private_response == b.private_response &&
+        a.private_qualified == b.private_qualified && a.public_response == b.public_response &&
+        a.must_revalidate == b.must_revalidate && a.proxy_revalidate == b.proxy_revalidate &&
+        a.must_understand == b.must_understand && a.immutable_response == b.immutable_response &&
+        a.only_if_cached == b.only_if_cached && a.no_transform == b.no_transform &&
+        a.max_age == b.max_age && a.s_maxage == b.s_maxage && a.max_stale == b.max_stale &&
+        a.max_stale_present == b.max_stale_present && a.min_fresh == b.min_fresh &&
+        a.stale_while_revalidate == b.stale_while_revalidate &&
+        a.stale_if_error == b.stale_if_error &&
+        same_view(a.no_cache_fields, b.no_cache_fields) &&
+        same_view(a.private_fields, b.private_fields);
+}
+
+fun parse_fields(first: view.View, second: view.View) directives.Directives {
+    var items:  [2]field.Field;
+    var fields: field.Fields = field.init(?items[0], 2, input.limits());
+    fields.items[0] = field.Field{name: view.view("Cache-Control", 13), value: first,
+        sensitive: false};
+    fields.len = 1;
+    if (second.len != 0) {
+        fields.items[1] = field.Field{name: view.view("cache-control", 13), value: second,
+            sensitive: false};
+        fields.len = 2;
+    }
+    ret directives.parse(?fields);
+}
+
+val SPLITS: usize = 8;
+
+# every quote opens an argument right after its `=` or closes one right before
+# a comma or the end, whitespace aside
+fun quotes_whole(data: *u8, len: usize) bool {
+    var quoted: bool  = false;
+    var i:      usize = 0;
+    for (i < len) {
+        if (data[i] == '"') {
+            if (!quoted) {
+                var before: usize = i;
+                for (before > 0 && blank(data[before - 1])) { before = before - 1; }
+                if (before == 0 || data[before - 1] != '=') { ret false; }
+            }
+            or {
+                var after: usize = i + 1;
+                for (after < len && blank(data[after])) { after = after + 1; }
+                if (after != len && data[after] != ',') { ret false; }
+            }
+            quoted = !quoted;
+        }
+        i = i + 1;
+    }
+    ret !quoted;
+}
+
+var unknown: [8]u8 = [8]u8{',', ' ', 'x', '-', 'e', '=', '1', ','};
+
+pub fun answer_cache_control(data: *u8, len: usize) verdict.Verdict {
+    val whole: directives.Directives = parse_fields(view.view(data, len), view.view(nil, 0));
+    if (whole.present != (len != 0)) {
+        ret verdict.violated("cache-control: presence does not follow the field");
+    }
+    if (!verdict.view_inside(whole.no_cache_fields, data, len) ||
+        !verdict.view_inside(whole.private_fields, data, len)) {
+        ret verdict.violated("cache-control: a listed-field view lies outside the field");
+    }
+    # the field is a list: split at a comma outside quotes into two fields, it
+    # says the same thing. a quote anywhere but around a whole argument leaves
+    # the list's members for a recipient to guess, so only a field that quotes
+    # whole arguments is held to it
+    var quoted: bool  = false;
+    var splits: usize = 0;
+    var i:      usize = 0;
+    if (!quotes_whole(data, len)) { splits = SPLITS; }
+    for (i < len && splits < SPLITS) {
+        if (data[i] == '"') { quoted = !quoted; }
+        or (data[i] == ',' && !quoted && i + 1 < len) {
+            val split: directives.Directives = parse_fields(view.view(data, i),
+                view.view(?data[i + 1], len - i - 1));
+            if (i != 0 && !same_directives(whole, split)) {
+                ret verdict.violated("cache-control: splitting the list across two fields changed it");
+            }
+            splits = splits + 1;
+        }
+        i = i + 1;
+    }
+    # a directive nobody knows changes nothing
+    if (quotes_whole(data, len) && len != 0) {
+        val extended: directives.Directives = parse_fields(view.view(data, len),
+            view.view(?unknown[0], 8));
+        if (!same_directives(whole, extended)) {
+            ret verdict.violated("cache-control: an unknown extension changed a known directive");
+        }
+    }
+    # as request directives against a response ten seconds into a hundred
+    # second lifetime
+    var stored: policy.Metadata = policy.blank();
+    stored.status       = 200;
+    stored.has_lifetime = true;
+    stored.lifetime_ns  = 100000000000;
+    stored.requested_at = time.unix(1000, 0);
+    stored.received_at  = time.unix(1000, 0);
+    val reused: policy.Reuse = policy.reuse(stored, whole, time.unix(1010, 0));
+    if (whole.no_store && reused != policy.UNUSABLE) {
+        ret verdict.violated("cache-control: a no-store request was answered from the cache");
+    }
+    if (!whole.no_store && whole.no_cache && reused != policy.REVALIDATE) {
+        ret verdict.violated("cache-control: a no-cache request was answered without validation");
+    }
+    if (reused == policy.FRESH && ((whole.min_fresh != directives.NO_DELTA &&
+        whole.min_fresh >= 90) || (whole.max_age != directives.NO_DELTA &&
+        whole.max_age <= 10))) {
+        ret verdict.violated("cache-control: a response was fresh for a request it is not fresh enough for");
+    }
+    if (whole.present) { verdict.accept(); }
+    var outcome: u64 = reused::u64;
+    outcome = verdict.mix(outcome, (whole.no_store::u64 << 3) | (whole.no_cache::u64 << 2) |
+        (whole.private_response::u64 << 1) | whole.public_response::u64);
+    outcome = verdict.mix(outcome, ((whole.max_age != directives.NO_DELTA)::u64 << 2) |
+        ((whole.min_fresh != directives.NO_DELTA)::u64 << 1) | whole.max_stale_present::u64);
+    outcome = verdict.mix(outcome, (whole.no_cache_qualified::u64 << 1) |
+        whole.private_qualified::u64);
+    ret verdict.answered(outcome);
+}
+
+fun weak_tag(value: view.View) bool {
+    ret value.len >= 2 && value.data[0] == 'W' && value.data[1] == '/';
+}
+
+fun request_with(request: *message.Request, items: *field.Field, kind: method.Kind,
+    name: str, name_len: usize, value: view.View) {
+    request.method = method.from_kind(kind);
+    request.fields = field.init(items, 2, input.limits());
+    if (value.len != 0) {
+        field.append(?request.fields, field.Field{name: view.view(name, name_len), value: value,
+            sensitive: false});
+    }
+}
+
+fun evaluate(kind: method.Kind, name: str, name_len: usize, value: view.View,
+    current: view.View) validator.Outcome {
+    var items:   [2]field.Field;
+    var request: message.Request;
+    request_with(?request, ?items[0], kind, name, name_len, value);
+    var validators: validator.Validators = validator.none();
+    validators.etag = current;
+    ret validator.evaluate(?request, validators);
+}
+
+fun plain_tag(value: view.View) bool {
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (c == ',' || c == ' ' || c == '\t') { ret false; }
+        i = i + 1;
+    }
+    ret value.len != 0 && field.valid_value(value);
+}
+
+pub fun answer_validator(data: *u8, len: usize) verdict.Verdict {
+    val first:     usize     = input.line_end(data, len, 0);
+    val a:         view.View = input.slice(data, 0, first);
+    val b:         view.View = input.slice(data, input.next_line(len, first), len);
+    val strong_ab: bool      = validator.strong_match(a, b);
+    val weak_ab:   bool      = validator.weak_match(a, b);
+    # strong comparison is the stricter one, both are symmetric, and a tag
+    # always weakly matches itself and strongly only when it is strong
+    if (strong_ab != validator.strong_match(b, a) || weak_ab != validator.weak_match(b, a) ||
+        (strong_ab && !weak_ab) || (strong_ab && (weak_tag(a) || weak_tag(b)))) {
+        ret verdict.violated("validator: strong and weak comparison disagree with their laws");
+    }
+    if ((a.len != 0 && !validator.weak_match(a, a)) ||
+        validator.strong_match(a, a) != (a.len != 0 && !weak_tag(a))) {
+        ret verdict.violated("validator: a tag does not match itself as its strength says");
+    }
+    # the list in the second line is a precondition on the tag in the first: a
+    # safe request answers 304 exactly where an unsafe one answers 412, and
+    # If-Match never answers 304
+    val safe:   validator.Outcome = evaluate(method.GET, "if-none-match", 13, b, a);
+    val unsafe: validator.Outcome = evaluate(method.POST, "if-none-match", 13, b, a);
+    val match:  validator.Outcome = evaluate(method.GET, "if-match", 8, b, a);
+    if ((safe == validator.NOT_MODIFIED) != (unsafe == validator.PRECONDITION_FAILED) ||
+        safe == validator.PRECONDITION_FAILED || unsafe == validator.NOT_MODIFIED ||
+        match == validator.NOT_MODIFIED) {
+        ret verdict.violated("validator: a precondition answered differently than its method allows");
+    }
+    # a plain tag named in its own list matches it
+    if (plain_tag(a)) {
+        if (evaluate(method.GET, "if-none-match", 13, a, a) != validator.NOT_MODIFIED ||
+            (evaluate(method.GET, "if-match", 8, a, a) == validator.PROCEED) == weak_tag(a)) {
+            ret verdict.violated("validator: a tag does not satisfy a precondition naming it");
+        }
+    }
+    if (weak_ab) { verdict.accept(); }
+    var outcome: u64 = (strong_ab::u64 << 1) | weak_ab::u64;
+    outcome = verdict.mix(outcome, (safe::u64 << 4) | match::u64);
+    outcome = verdict.mix(outcome, (weak_tag(a)::u64 << 1) | weak_tag(b)::u64);
+    ret verdict.answered(outcome);
+}
+
+val MAX_FIELDS: usize = 32;
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+rec Expected {
+    bytes:  [1024]u8;
+    length: usize;
+}
+
+fun push(expected: *Expected, c: u8) {
+    if (expected.length < 1024) { expected.bytes[expected.length] = c; }
+    expected.length = expected.length + 1;
+}
+
+fun push_text(expected: *Expected, text: str) {
+    var i: usize = 0;
+    for (text[i] != 0) {
+        push(expected, text[i]::u8);
+        i = i + 1;
+    }
+}
+
+fun push_view(expected: *Expected, value: view.View, lowered: bool) {
+    var i: usize = 0;
+    for (i < value.len) {
+        if (lowered) { push(expected, lower(value.data[i])); }
+        or           { push(expected, value.data[i]); }
+        i = i + 1;
+    }
+}
+
+# `<method> <scheme>://<authority><path>[?<query>]` with the authority lowercased
+fun key_one(request: *message.Request, secure: bool, kind: method.Kind, outcome: *u64) bool {
+    var made:      key.Key;
+    val valid:     bool      = key.make_with_method(request, secure, kind, ?made);
+    var authority: view.View = request.target.authority;
+    if (authority.len == 0) {
+        val host: *field.Field = field.find_first(?request.fields, view.view("host", 4));
+        if (host != nil) { authority = host.value; }
+    }
+    var expected: Expected;
+    expected.length = 0;
+    if (kind == method.HEAD) { push_text(?expected, "HEAD "); }
+    or                       { push_text(?expected, "GET "); }
+    if (secure)              { push_text(?expected, "https://"); }
+    or                       { push_text(?expected, "http://"); }
+    push_view(?expected, authority, true);
+    push_view(?expected, request.target.path, false);
+    if (request.target.query.len != 0) {
+        push(?expected, '?');
+        push_view(?expected, request.target.query, false);
+    }
+    val keyable: bool = authority.len != 0 && expected.length <= key.MAX_KEY_BYTES &&
+        (kind == method.GET || kind == method.HEAD);
+    @outcome = verdict.mix(@outcome, valid::u64);
+    if (valid != keyable) { ret false; }
+    if (!valid)           { ret true; }
+    verdict.accept();
+    if (made.length != expected.length) { ret false; }
+    var i: usize = 0;
+    for (i < made.length) {
+        if (made.bytes[i] != expected.bytes[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun answer_cache_key(data: *u8, len: usize) verdict.Verdict {
+    var items:   [MAX_FIELDS]field.Field;
+    var request: message.Request;
+    input.request(data, len, ?request, ?items[0], MAX_FIELDS);
+    var outcome: u64 = 0;
+    if (!key_one(?request, false, method.GET, ?outcome) ||
+        !key_one(?request, true, method.HEAD, ?outcome) ||
+        !key_one(?request, true, method.POST, ?outcome)) {
+        ret verdict.violated("cache-key: a key is not the method, scheme, authority, path and query it names");
+    }
+    var own:     key.Key;
+    var as_get:  key.Key;
+    val made:    bool = key.make(?request, true, ?own);
+    val made_as: bool = key.make_with_method(?request, true, request.method.kind, ?as_get);
+    if (made != made_as || (made && !key.equal(?own, ?as_get))) {
+        ret verdict.violated("cache-key: a request's own key is not the key for its method");
+    }
+    ret verdict.answered(verdict.mix(outcome, verdict.bucket(request.target.query.len)));
+}
+
+pub fun answer_vary(data: *u8, len: usize) verdict.Verdict {
+    var items:          [MAX_FIELDS]field.Field;
+    var request:        message.Request;
+    val at:             usize        = input.request(data, len, ?request, ?items[0], MAX_FIELDS);
+    var response_items: [MAX_FIELDS]field.Field;
+    var response:       field.Fields = field.init(?response_items[0], MAX_FIELDS,
+        input.limits());
+    input.fields(data, len, at, ?response);
+    var selected: key.Dimensions;
+    if (!key.select(?request, ?response, ?selected)) {
+        ret verdict.violated("vary: selection refused a request and response it was given");
+    }
+    var outcome: u64 = verdict.mix((selected.any::u64 << 1) | selected.valid::u64,
+        verdict.bucket(selected.len));
+    if (selected.any && selected.valid) {
+        ret verdict.violated("vary: `*` selected a representation");
+    }
+    if (!selected.valid) { ret verdict.answered(outcome); }
+    verdict.accept();
+    # each dimension is named once, in lowercase, and the request it was selected
+    # from negotiates to it
+    if (selected.len > key.MAX_DIMENSIONS) {
+        ret verdict.violated("vary: more dimensions than there is room for");
+    }
+    var i: usize = 0;
+    for (i < selected.len) {
+        val item: *key.Dimension = ?selected.items[i];
+        if (item.name_length == 0 || item.name_length > key.MAX_DIMENSION_NAME) {
+            ret verdict.violated("vary: a dimension name is empty or overlong");
+        }
+        var j: usize = 0;
+        for (j < item.name_length) {
+            if (item.name[j] != lower(item.name[j])) {
+                ret verdict.violated("vary: a dimension name is not lowercase");
+            }
+            j = j + 1;
+        }
+        j = 0;
+        for (j < i) {
+            val other: *key.Dimension = ?selected.items[j];
+            if (other.name_length == item.name_length &&
+                verdict.same(view.view(?other.name[0], other.name_length),
+                view.view(?item.name[0], item.name_length))) {
+                ret verdict.violated("vary: a dimension is selected twice");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if (!key.matches(?selected, ?request) || !key.dimensions_equal(?selected, ?selected)) {
+        ret verdict.violated("vary: a request does not negotiate to the representation selected for it");
+    }
+    ret verdict.answered(outcome);
+}

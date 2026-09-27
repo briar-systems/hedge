@@ -1,0 +1,731 @@
+# originating TLS connections for the outbound client
+#
+# hedge terminates TLS for the connections it serves. this is the other
+# direction: the connections the outbound client opens, ACME's among them.
+# every client on every thread draws its sessions from this one bounded table.
+#
+# a mach-tls client holds secret-welded storage, so a record containing one
+# cannot be erased to the untyped `ptr` that completion routing hands every
+# owner. sessions therefore live in a bounded typed table and are addressed
+# by an unwelded handle. callback contexts point only to the public channel next
+# to each session, so secret taint never crosses a `ptr`.
+#
+# the lower half is the same shape hedge's listener side uses: mach-tls submits
+# reads, writes and closes through a transport descriptor, and the completions
+# come back through whatever loop owns the driver.
+#
+# each session borrows its TLS buffers from a pool of its own, because the
+# clients that originate may run on different threads and a pool is
+# serialized-use. the pool's budget is twice the session's lane budget, so an
+# oversized exchange fails on its lane budget and never waits on a pool nobody
+# else can release into. a memory wake lands on the pool's ready list, and
+# `poll` resumes the stream from it.
+#
+# a slot is claimed and given back under `table`, since clients on different
+# threads share the table. a live slot belongs to the thread that claimed it.
+
+use crypto.contracts;
+use crypto.secret;
+use hedge.listener;
+use hedge.memory;
+use hedge.operation;
+use A: std.allocator;
+use std.allocator.page;
+use std.chrono.time;
+use io_error: std.io.error;
+use std.io.lifecycle;
+use io_runtime: std.io.runtime;
+use std.memory.buffers;
+use net_async: std.net.async;
+use std.net.tcp;
+use std.sync.cancel;
+use std.sync.mutex;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use tls_buffer: tls.buffer;
+use tls.cert;
+use tls_client: tls.client;
+use tls_clock:  tls.clock;
+use tls_config: tls.config;
+use tls_engine: tls.engine;
+use tls_error:  tls.error;
+use tls_record: tls.record;
+use tls_stream: tls.stream;
+use tls.tls13;
+use tls_transport: tls.transport;
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
+
+pub val WIRE_BYTES:            usize = tls_record.HEADER_SIZE + tls_record.MAX_CIPHERTEXT;
+pub val HANDSHAKE_INPUT_BYTES: usize = 16384;
+# what one session's TLS lane may hold: both record buffers, the handshake, and
+# a certificate chain on the oversize path, with room to spare
+pub val SESSION_BYTES:          usize = 262144;
+pub val HANDSHAKE_OUTPUT_BYTES: usize = 16384;
+pub val HELLO_BYTES:            usize = 8192;
+pub val PEER_PARAMETER_BYTES:   usize = 2048;
+pub val MAX_CHAIN_BYTES:        usize = 32768;
+pub val MAX_SERVER_NAME:        usize = 253;
+val     SIGNATURE_SCHEMES:      usize = 5;
+# shared by every client in the process
+pub val MAX_SESSIONS: usize = 16;
+pub val NO_SESSION:   usize = MAX_SESSIONS;
+
+# the owner is told each time the engine settles one of its socket operations,
+# so an exchange is stepped on the completion rather than at its next deadline
+pub def NotifyFun: fun(ptr);
+
+pub def Status: u8;
+pub val OK:      Status = 1;
+pub val PENDING: Status = 2;
+pub val FAILED:  Status = 3;
+pub val INVALID: Status = 4;
+
+pub def Kind: u8;
+pub val NONE:      Kind = 0;
+pub val HANDSHAKE: Kind = 1;
+pub val READ:      Kind = 2;
+pub val WRITE:     Kind = 3;
+pub val SHUTDOWN:  Kind = 4;
+
+# the half that is erased to `ptr` for mach-tls's transport descriptor. it
+# holds no secret, which is what makes the erasure legal.
+rec Channel {
+    driver:           *net_async.Driver;
+    socket:           *tcp.Stream;
+    operation:        operation.Operation;
+    context:          listener.ConnectionContext;
+    owner:            ptr;
+    notify:           NotifyFun;
+    index:            usize;
+    generation:       u32;
+    token_generation: u32;
+    current:          Kind;
+    token:            tls_transport.Token;
+    settled_bytes:    usize;
+    failure_value:    tls_error.Error;
+    established:      bool;
+    live:             bool;
+}
+
+pub rec Handle {
+    index:      usize;
+    generation: u32;
+}
+
+# the half that is never erased
+rec Session {
+    lower:           tls_transport.Transport;
+    configuration:   tls_config.ClientConfig;
+    engine:          tls_client.Handshake;
+    stream:          tls_stream.Stream;
+    entropy:         secret.Entropy;
+    clock:           tls_clock.Source;
+    memory:          memory.Memory;
+    borrower:        memory.Borrower;
+    account:         buffers.Account;
+    source:          buffers.Source;
+    secrets:         buffers.SecretSource;
+    versions:        [1]u16;
+    suites:          [3]tls13.CipherSuite;
+    groups:          [2]tls13.NamedGroup;
+    signatures:      [tls_config.MAX_SIGNATURE_SCHEMES]tls13.SignatureScheme;
+    alpn:            [1]tls_config.ProtocolName;
+    alpn_storage:    [8]u8;
+    server_name:     [MAX_SERVER_NAME]u8;
+    server_name_len: usize;
+    root:            cancel.Scope;
+    operation_scope: cancel.Scope;
+    root_live:       bool;
+    operation_live:  bool;
+    engine_started:  bool;
+    stream_started:  bool;
+    memory_live:     bool;
+    account_open:    bool;
+}
+
+var heap:       A.Allocator;
+var channels:   [MAX_SESSIONS]Channel;
+var sessions:   [MAX_SESSIONS]Session;
+var prepared:   bool;
+var live_count: usize;
+var table:      mutex.Mutex;
+
+pub fun no_handle() Handle {
+    ret Handle{index: NO_SESSION, generation: 0};
+}
+
+fun reset_channel(value: *Channel, index: usize) {
+    value.driver           = nil;
+    value.socket           = nil;
+    value.owner            = nil;
+    value.notify           = (0::usize)::NotifyFun;
+    value.index            = index;
+    value.token_generation = 0;
+    value.current          = NONE;
+    value.token            = tls_transport.Token{index: 0, generation: 0};
+    value.settled_bytes    = 0;
+    value.failure_value    = tls_error.OK;
+    value.established      = false;
+    value.live             = false;
+}
+
+fun clear_session(index: usize) {
+    sessions[index].root_live      = false;
+    sessions[index].operation_live = false;
+    sessions[index].engine_started = false;
+    sessions[index].stream_started = false;
+    sessions[index].memory_live    = false;
+    sessions[index].account_open   = false;
+}
+
+fun prepare_locked() {
+    if (prepared) { ret; }
+    page.make(?heap);
+    var i: usize = 0;
+    for (i < MAX_SESSIONS) {
+        channels[i].generation = 0;
+        reset_channel(?channels[i], i);
+        clear_session(i);
+        i = i + 1;
+    }
+    live_count = 0;
+    prepared   = true;
+}
+
+# a slot the table was never prepared for is zeroed, so it is not live
+fun entry(handle: Handle) *Channel {
+    if (handle.index >= MAX_SESSIONS || handle.generation == 0) { ret nil; }
+    val value: *Channel = ?channels[handle.index];
+    if (!value.live || value.generation != handle.generation) { ret nil; }
+    ret value;
+}
+
+fun acquire() Handle {
+    mutex.lock(?table);
+    prepare_locked();
+    var i: usize = 0;
+    for (i < MAX_SESSIONS) {
+        if (!channels[i].live) {
+            var generation: u32 = channels[i].generation + 1;
+            if (generation == 0) { generation = 1; }
+            reset_channel(?channels[i], i);
+            channels[i].generation = generation;
+            channels[i].live       = true;
+            live_count             = live_count + 1;
+            mutex.unlock(?table);
+            ret Handle{index: i, generation: generation};
+        }
+        i = i + 1;
+    }
+    mutex.unlock(?table);
+    ret no_handle();
+}
+
+pub fun capacity() usize {
+    ret MAX_SESSIONS;
+}
+
+pub fun live() usize {
+    mutex.lock(?table);
+    prepare_locked();
+    val count: usize = live_count;
+    mutex.unlock(?table);
+    ret count;
+}
+
+fun lower_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val value: *Channel = context::*Channel;
+    if (value == nil || !value.live || value.driver == nil
+        || value.socket == nil) {
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)};
+    }
+    ret net_async.submit_read(value.driver, scope, value.socket, buffer,
+        length, (?value.context)::usize);
+}
+
+fun lower_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val value: *Channel = context::*Channel;
+    if (value == nil || !value.live || value.driver == nil
+        || value.socket == nil) {
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WRITE)};
+    }
+    ret net_async.submit_write(value.driver, scope, value.socket, buffer,
+        length, (?value.context)::usize);
+}
+
+fun lower_shutdown(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val value: *Channel = context::*Channel;
+    if (value == nil || !value.live || value.driver == nil
+        || value.socket == nil) {
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_SHUTDOWN)};
+    }
+    ret net_async.submit_shutdown_write(value.driver, scope, value.socket,
+        (?value.context)::usize);
+}
+
+fun lower_close(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val value: *Channel = context::*Channel;
+    if (value == nil || !value.live || value.driver == nil
+        || value.socket == nil) {
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)};
+    }
+    ret net_async.submit_stream_close(value.driver, scope, value.socket,
+        lifecycle.EXPLICIT, (?value.context)::usize);
+}
+
+fun overlaps(base: usize, size: usize, data: *u8, len: usize) bool {
+    if (base == 0 || size == 0) { ret false; }
+    val start: usize = (data)::usize;
+    ret start < base + size && base < start + len;
+}
+
+# an application buffer that aliased this transport's own state would be
+# mutated under the engine, so mach-tls asks and this answers honestly
+fun lower_aliases(context: ptr, data: *u8, len: usize) bool {
+    val value: *Channel = context::*Channel;
+    if (value == nil || data == nil || len == 0)                { ret false; }
+    if (overlaps((value)::usize, $size_of(Channel), data, len)) { ret true; }
+    if (value.socket != nil
+        && overlaps((value.socket)::usize, $size_of(tcp.Stream), data, len)) {
+        ret true;
+    }
+    ret value.driver != nil
+        && io_runtime.aliases(value.driver.runtime, data, len);
+}
+
+fun descriptor(index: usize) tls_transport.Transport {
+    var value: tls_transport.Transport;
+    value.runtime         = channels[index].driver.runtime;
+    value.context         = (?channels[index])::ptr;
+    value.context_size    = $size_of(Channel);
+    value.aliases_state   = lower_aliases;
+    value.submit_read     = lower_read;
+    value.submit_write    = lower_write;
+    value.submit_shutdown = lower_shutdown;
+    value.submit_close    = lower_close;
+    value.submit_abort    = lower_close;
+    ret value;
+}
+
+fun lease(index: usize) tls_buffer.Lease {
+    ret tls_buffer.Lease{source: ?sessions[index].source,
+        account: ?sessions[index].account, lane: memory.LANE_TLS};
+}
+
+fun secret_lease(index: usize) tls_buffer.SecretLease {
+    ret tls_buffer.SecretLease{source: ?sessions[index].secrets,
+        account: ?sessions[index].account, lane: memory.LANE_TLS};
+}
+
+# the session's pool and its one account
+fun open_memory(index: usize, owner: u64) bool {
+    if (!memory.make(?sessions[index].memory, SESSION_BYTES * 2, ?heap)) { ret false; }
+    sessions[index].memory_live = true;
+    var budgets: memory.Budgets = memory.no_budgets();
+    budgets.lanes[memory.LANE_TLS::usize] = SESSION_BYTES;
+    memory.borrower(?sessions[index].borrower, ?sessions[index].memory, owner, 0, budgets);
+    sessions[index].source  = memory.borrowed_source(?sessions[index].borrower);
+    sessions[index].secrets = memory.borrowed_secret_source(?sessions[index].borrower);
+    if (!memory.open(?sessions[index].borrower, ?sessions[index].account)) { ret false; }
+    sessions[index].account_open = true;
+    ret true;
+}
+
+fun close_memory(index: usize) bool {
+    if (sessions[index].account_open) {
+        if (!memory.close(?sessions[index].memory, ?sessions[index].account)) { ret false; }
+        sessions[index].account_open = false;
+    }
+    if (sessions[index].memory_live) {
+        if (!memory.destroy(?sessions[index].memory)) { ret false; }
+        sessions[index].memory_live = false;
+    }
+    ret true;
+}
+
+# a woken account resumes whatever the stream parked for memory. the retry
+# arrives as a completion on the channel's bound operation
+fun resume_woken(index: usize) {
+    if (!sessions[index].memory_live || !memory.has_woken(?sessions[index].memory)) { ret; }
+    var woken: [4]u64;
+    for (memory.woken(?sessions[index].memory, ?woken[0], 4) != 0) {}
+    if (sessions[index].stream_started) { tls_stream.resume(?sessions[index].stream); }
+}
+
+fun limits() tls_config.Limits {
+    var value: tls_config.Limits = tls_config.production_limits();
+    value.max_peer_handshake_bytes = HANDSHAKE_INPUT_BYTES;
+    value.max_client_hello_bytes   = HELLO_BYTES;
+    value.max_client_flight_bytes  = HANDSHAKE_OUTPUT_BYTES;
+    value.max_server_flight_bytes  = HANDSHAKE_INPUT_BYTES;
+    value.max_chain_bytes          = MAX_CHAIN_BYTES;
+    value.max_ticket_bytes         = 4096;
+    ret value;
+}
+
+fun offer_http11(index: usize) {
+    val name: str   = "http/1.1";
+    var i:    usize = 0;
+    for (i < 8) {
+        sessions[index].alpn_storage[i] = name[i];
+        i                               = i + 1;
+    }
+    sessions[index].alpn[0] = tls_config.ProtocolName{
+        data: ?sessions[index].alpn_storage[0], len: 8
+    };
+}
+
+fun configure(index: usize, trust: *cert.TrustStore) {
+    sessions[index].versions[0]   = tls13.VERSION;
+    sessions[index].suites[0]     = tls13.AES_128_GCM_SHA256;
+    sessions[index].suites[1]     = tls13.AES_256_GCM_SHA384;
+    sessions[index].suites[2]     = tls13.CHACHA20_POLY1305_SHA256;
+    sessions[index].groups[0]     = tls13.X25519;
+    sessions[index].groups[1]     = tls13.SECP256R1;
+    sessions[index].signatures[0] = tls13.ED25519;
+    sessions[index].signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
+    sessions[index].signatures[2] = tls13.ECDSA_SECP384R1_SHA384;
+    sessions[index].signatures[3] = tls13.RSA_PSS_RSAE_SHA256;
+    sessions[index].signatures[4] = tls13.RSA_PSS_RSAE_SHA384;
+    sessions[index].entropy       = secret.system_entropy();
+    sessions[index].clock         = tls_clock.system();
+    offer_http11(index);
+    var value: tls_config.ClientConfig;
+    value.server_name = contracts.Bytes{data: ?sessions[index].server_name[0],
+        len: sessions[index].server_name_len};
+    value.alpn                    = ?sessions[index].alpn[0];
+    value.alpn_len                = 1;
+    value.trust                   = trust;
+    value.versions                = ?sessions[index].versions[0];
+    value.version_len             = 1;
+    value.suites                  = ?sessions[index].suites[0];
+    value.suite_len               = 3;
+    value.groups                  = ?sessions[index].groups[0];
+    value.group_len               = 2;
+    value.signatures              = ?sessions[index].signatures[0];
+    value.signature_len           = SIGNATURE_SCHEMES;
+    value.client_identity         = nil;
+    value.entropy                 = ?sessions[index].entropy;
+    value.entropy_context_size    = 0;
+    value.clock                   = ?sessions[index].clock;
+    value.sessions                = nil;
+    value.limits                  = limits();
+    sessions[index].configuration = value;
+}
+
+fun next_token(value: *Channel) tls_transport.Token {
+    var generation: u32 = value.token_generation + 1;
+    if (generation == 0) { generation = 1; }
+    value.token_generation = generation;
+    ret tls_transport.Token{index: 1, generation: generation};
+}
+
+fun renew_operation_scope(index: usize) bool {
+    if (sessions[index].operation_live) {
+        cancel.destroy(?sessions[index].operation_scope);
+        sessions[index].operation_live = false;
+    }
+    if (!operation_ok(cancel.make_child(?sessions[index].operation_scope,
+        ?sessions[index].root, opt[time.Instant].none{}))) { ret false; }
+    sessions[index].operation_live = true;
+    ret true;
+}
+
+pub fun active(handle: Handle) bool {
+    ret entry(handle) != nil;
+}
+
+pub fun established(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    ret value != nil && value.established;
+}
+
+# no live channel means the tls layer was never reached or was already
+# released, so there is no tls failure to report. surfacing INTERNAL_ERROR here
+# invents a failure the tls stack never raised; the caller reads the transport
+# stage for where the exchange actually stopped
+pub fun failure(handle: Handle) tls_error.Error {
+    val value: *Channel = entry(handle);
+    if (value == nil) { ret tls_error.OK; }
+    ret value.failure_value;
+}
+
+pub fun transferred(handle: Handle) usize {
+    val value: *Channel = entry(handle);
+    if (value == nil) { ret 0; }
+    ret value.settled_bytes;
+}
+
+pub fun negotiated(handle: Handle) tls_engine.Snapshot {
+    val value: *Channel = entry(handle);
+    if (value == nil || !sessions[handle.index].stream_started) {
+        ret tls_engine.empty_snapshot();
+    }
+    ret tls_stream.negotiated(?sessions[handle.index].stream);
+}
+
+pub fun cancel_operation(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    if (value == nil || value.current == NONE
+        || !sessions[handle.index].operation_live) { ret false; }
+    ret transition_ok(cancel.cancel(?sessions[handle.index].operation_scope));
+}
+
+# releases the engine and every scope it borrowed. the socket belongs to the
+# caller and is closed by whoever opened it.
+pub fun release(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    if (value == nil) { ret false; }
+    val index: usize = handle.index;
+    if (value.current != NONE) {
+        val settled: Status = poll(handle);
+        if (settled == PENDING || settled == INVALID) { ret false; }
+    }
+    if (sessions[index].stream_started) {
+        if (!tls_stream.destroy(?sessions[index].stream)) { ret false; }
+        sessions[index].stream_started = false;
+    }
+    if (sessions[index].engine_started) {
+        if (!tls_client.destroy(?sessions[index].engine)) { ret false; }
+        sessions[index].engine_started = false;
+    }
+    if (sessions[index].operation_live) {
+        if (!operation_ok(cancel.destroy(?sessions[index].operation_scope))) { ret false; }
+        sessions[index].operation_live = false;
+    }
+    if (sessions[index].root_live) {
+        if (!operation_ok(cancel.destroy(?sessions[index].root))) { ret false; }
+        sessions[index].root_live = false;
+    }
+    if (!close_memory(index)) { ret false; }
+    mutex.lock(?table);
+    reset_channel(value, index);
+    if (live_count > 0) { live_count = live_count - 1; }
+    mutex.unlock(?table);
+    ret true;
+}
+
+# begins one TLS connection over a socket the caller has already connected.
+# `trust` is the anchor set the peer is verified against; without one
+# there is nothing to verify against and the connection is refused.
+pub fun begin(output: *Handle, driver: *net_async.Driver, socket: *tcp.Stream,
+    server_name: view.View, trust: *cert.TrustStore, owner: ptr,
+    notify: NotifyFun) Status {
+    if (output == nil || driver == nil || socket == nil || trust == nil
+        || trust.len == 0 || server_name.data == nil || server_name.len == 0
+        || server_name.len > MAX_SERVER_NAME || owner == nil
+        || notify::usize == 0) { ret INVALID; }
+    @output = no_handle();
+    val handle: Handle = acquire();
+    if (handle.index == NO_SESSION) { ret FAILED; }
+    val index: usize    = handle.index;
+    val value: *Channel = ?channels[index];
+    value.driver = driver;
+    value.socket = socket;
+    value.owner  = owner;
+    value.notify = notify;
+    if (!operation.bind_operation(?value.operation, ?value.context,
+        (value)::ptr, settle, index)) {
+        release(handle);
+        ret FAILED;
+    }
+    clear_session(index);
+    var i: usize = 0;
+    for (i < server_name.len) {
+        sessions[index].server_name[i] = server_name.data[i];
+        i                              = i + 1;
+    }
+    sessions[index].server_name_len = server_name.len;
+    configure(index, trust);
+    if (!open_memory(index, (index::u64 << 32) | handle.generation::u64)) {
+        release(handle);
+        ret FAILED;
+    }
+    var extra: tls_client.ExtraExtension;
+    extra.kind = 0;
+    extra.data = contracts.Bytes{data: nil, len: 0};
+    if (!tls_client.init(?sessions[index].engine,
+        ?sessions[index].configuration, lease(index), extra, 0)) {
+        release(handle);
+        ret FAILED;
+    }
+    sessions[index].engine_started = true;
+    if (!operation_ok(cancel.make_root(?sessions[index].root,
+        opt[time.Instant].none{}))) {
+        release(handle);
+        ret FAILED;
+    }
+    sessions[index].root_live = true;
+    if (!renew_operation_scope(index)) {
+        release(handle);
+        ret FAILED;
+    }
+    sessions[index].lower = descriptor(index);
+    value.token           = next_token(value);
+    if (!tls_stream.connect(?sessions[index].stream,
+        ?sessions[index].engine, lease(index), secret_lease(index),
+        ?sessions[index].lower, ?sessions[index].operation_scope,
+        value.token, index)) {
+        value.failure_value = tls_error.INTERNAL_ERROR;
+        release(handle);
+        ret FAILED;
+    }
+    sessions[index].stream_started = true;
+    value.current                  = HANDSHAKE;
+    @output                        = handle;
+    ret PENDING;
+}
+
+# every socket completion the engine submitted lands here, routed by the
+# listener plane, and the owner is told once the engine has taken it
+fun settle(context: ptr, index: usize, completion: io_runtime.Completion) {
+    val value: *Channel = context::*Channel;
+    if (value == nil || index >= MAX_SESSIONS || !value.live
+        || !sessions[index].stream_started) { ret; }
+    var settled: io_runtime.Completion = completion;
+    tls_stream.accept(?sessions[index].stream, ?settled);
+    if (value.notify::usize != 0) { value.notify(value.owner); }
+}
+
+# resolves the operation in flight, if it has finished
+pub fun poll(handle: Handle) Status {
+    val value: *Channel = entry(handle);
+    if (value == nil)          { ret INVALID; }
+    if (value.current == NONE) { ret OK; }
+    val index: usize = handle.index;
+    resume_woken(index);
+    val lanes: tls_stream.Snapshot = tls_stream.snapshot(?sessions[index].stream);
+    # the handshake, writes and the half close all run on the write lane
+    var snapshot: tls_transport.Snapshot = lanes.write;
+    if (value.current == READ)                              { snapshot = lanes.read; }
+    if (snapshot.state != tls_transport.OPERATION_TERMINAL) { ret PENDING; }
+    val kind: Kind = value.current;
+    if (!tls_stream.destroy_operation(?sessions[index].stream, value.token)) {
+        ret PENDING;
+    }
+    value.current       = NONE;
+    value.settled_bytes = snapshot.application_bytes;
+    value.failure_value = snapshot.terminal_error;
+    if (snapshot.terminal_error != tls_error.OK) { ret FAILED; }
+    if (kind == HANDSHAKE)                       { value.established = true; }
+    ret OK;
+}
+
+fun start(handle: Handle, kind: Kind, buffer: *u8, length: usize) Status {
+    val value: *Channel = entry(handle);
+    if (value == nil || value.current != NONE)  { ret INVALID; }
+    if (kind != SHUTDOWN && !value.established) { ret INVALID; }
+    val index: usize = handle.index;
+    if (!renew_operation_scope(index)) { ret FAILED; }
+    val token:   tls_transport.Token = next_token(value);
+    var started: bool                = false;
+    value.token = token;
+    if (kind == READ) {
+        started = tls_stream.read(?sessions[index].stream,
+            ?sessions[index].operation_scope, token, buffer, length,
+            index);
+    }
+    or (kind == WRITE) {
+        started = tls_stream.write(?sessions[index].stream,
+            ?sessions[index].operation_scope, token, buffer, length,
+            index);
+    }
+    or {
+        started = tls_stream.half_close(?sessions[index].stream,
+            ?sessions[index].operation_scope, token, index);
+    }
+    if (!started) {
+        value.failure_value = tls_error.INTERNAL_ERROR;
+        ret FAILED;
+    }
+    value.current       = kind;
+    value.settled_bytes = 0;
+    ret PENDING;
+}
+
+pub fun start_read(handle: Handle, buffer: *u8, length: usize) Status {
+    ret start(handle, READ, buffer, length);
+}
+
+pub fun start_write(handle: Handle, buffer: *u8, length: usize) Status {
+    ret start(handle, WRITE, buffer, length);
+}
+
+pub fun peer_closed(handle: Handle) bool {
+    if (entry(handle) == nil || !sessions[handle.index].stream_started) {
+        ret false;
+    }
+    val value: tls_stream.Snapshot = tls_stream.snapshot(
+        ?sessions[handle.index].stream);
+    ret value.peer_closed || value.state == tls_stream.CLOSED;
+}
+
+pub fun operating(handle: Handle) bool {
+    val value: *Channel = entry(handle);
+    ret value != nil && value.current != NONE;
+}
+
+test acquire__bounded_reusable_stale_safe {
+    val before:  usize = live();
+    var handles: [MAX_SESSIONS]Handle;
+    var i:       usize = 0;
+    for (i < MAX_SESSIONS) {
+        handles[i] = acquire();
+        if (handles[i].index == NO_SESSION || !active(handles[i])) { ret 1; }
+        i = i + 1;
+    }
+    if (live() != before + MAX_SESSIONS) { ret 2; }
+    val exhausted: Handle = acquire();
+    if (exhausted.index != NO_SESSION || active(exhausted)) { ret 3; }
+    val stale: Handle = handles[0];
+    if (!release(stale) || active(stale)) { ret 4; }
+    val reused: Handle = acquire();
+    if (reused.index != stale.index || reused.generation == stale.generation
+        || !active(reused)) { ret 5; }
+    if (release(stale)) { ret 6; }
+    handles[0] = reused;
+    i          = 0;
+    for (i < MAX_SESSIONS) {
+        if (!release(handles[i])) { ret 7; }
+        i = i + 1;
+    }
+    if (live() != before) { ret 8; }
+    ret 0;
+}
+
+test configure__signature_schemes {
+    configure(0, nil);
+    val value: tls_config.ClientConfig = sessions[0].configuration;
+    if (value.signatures != ?sessions[0].signatures[0]
+        || value.signature_len != SIGNATURE_SCHEMES
+        || SIGNATURE_SCHEMES > tls_config.MAX_SIGNATURE_SCHEMES) {
+        ret 1;
+    }
+    if (value.signatures[0] != tls13.ED25519
+        || value.signatures[1] != tls13.ECDSA_SECP256R1_SHA256
+        || value.signatures[2] != tls13.ECDSA_SECP384R1_SHA384
+        || value.signatures[3] != tls13.RSA_PSS_RSAE_SHA256
+        || value.signatures[4] != tls13.RSA_PSS_RSAE_SHA384) { ret 2; }
+    if (value.group_len != 2 || value.groups[0] != tls13.X25519
+        || value.groups[1] != tls13.SECP256R1) { ret 3; }
+    if (value.client_identity != nil) { ret 4; }
+    ret 0;
+}

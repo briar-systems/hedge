@@ -1,0 +1,436 @@
+# the fuzz lane: replay the retained corpus, answer one input, or mutate
+#
+#   fuzz replay [corpus]
+#   fuzz one <boundary> <file>
+#   fuzz mutate <boundary|all> <runs> <seed> [--retain] [corpus]
+#
+# the corpus defaults to test/fuzz/corpus, so the lane runs from the repository
+# root. exit 0 is every input answered, 1 a harness or usage error, 2 a finding
+
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use io_error: std.io.error;
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A:  std.allocator;
+use fs: std.filesystem;
+
+use fuzz.boundaries;
+use fuzz.guard;
+use fuzz.mutate;
+use fuzz.verdict;
+
+val HARNESS: i64 = 1;
+val FINDING: i64 = 2;
+
+# the largest input the lane reads or a mutation grows to
+val MAX_INPUT: usize = 16384;
+# how many retained inputs of one boundary a mutation run draws from
+val MAX_POOL: usize = 256;
+
+var backing: A.Allocator;
+var table:   [boundaries.CAPACITY]boundaries.Boundary;
+var count:   usize;
+
+# answer one input from a copy that ends on the last byte before an unreadable
+# page, so a parser that reads one byte past its input faults on the spot
+fun answer(index: usize, bytes: *u8, len: usize) verdict.Verdict {
+    val data: *u8 = guard.place(bytes, len);
+    if (data == nil) { ret verdict.violated("fuzz: the guarded allocator refused an input"); }
+    verdict.reset();
+    val result: verdict.Verdict = table[index].answer(data, len);
+    guard.release();
+    ret result;
+}
+
+fun join(a: *A.Allocator, dir: str, name: str) str {
+    val dl: usize             = str_len(dir);
+    val nl: usize             = str_len(name);
+    val rb: res[*u8, A.Error] = A.allocate[u8](a, dl + nl + 2);
+    if (sel rb.err) { ret nil; }
+    val out: *u8   = rb.ok;
+    var i:   usize = 0;
+    for (i < dl) {
+        out[i] = dir[i]::u8;
+        i      = i + 1;
+    }
+    out[dl] = '/';
+    i       = 0;
+    for (i < nl) {
+        out[dl + 1 + i] = name[i]::u8;
+        i               = i + 1;
+    }
+    out[dl + 1 + nl] = 0;
+    ret out::usize::str;
+}
+
+fun is_dir(path: str) bool {
+    val r: res[bool, io_error.Error] = fs.is_dir(path);
+    ret sel r.ok && r.ok;
+}
+
+fun is_file(path: str) bool {
+    val r: res[bool, io_error.Error] = fs.is_file(path);
+    ret sel r.ok && r.ok;
+}
+
+fun hidden(name: str) bool {
+    ret str_len(name) == 0 || name[0]::u8 == '.';
+}
+
+# the files of one boundary's directory, or none when it cannot be listed
+fun files(dir: str, out: *Vector[str]) bool {
+    val listed: res[Vector[str], fs.FsError] = fs.read_dir(?backing, dir);
+    if (sel listed.err) { ret false; }
+    var names: Vector[str] = listed.ok;
+    @out = vector.init[str](?backing);
+    var i: usize = 0;
+    for (i < names.len) {
+        val name: str = names.data[i];
+        i = i + 1;
+        if (hidden(name)) { cnt; }
+        val path: str = join(?backing, dir, name);
+        if (path == nil || !is_file(path)) { cnt; }
+        vector.push[str](out, path);
+    }
+    ret true;
+}
+
+fun report(boundary: str, path: str, result: verdict.Verdict) {
+    print.eprintlnf("fuzz: FINDING {} {}: {}", boundary, path, result.detail);
+}
+
+fun replay(root: str) i64 {
+    if (!is_dir(root)) {
+        print.eprintlnf("fuzz: no corpus at {}", root);
+        ret HARNESS;
+    }
+    var findings: usize = 0;
+    var inputs:   usize = 0;
+    var b:        usize = 0;
+    for (b < count) {
+        val dir:   str = join(?backing, root, table[b].name);
+        var paths: Vector[str];
+        if (dir == nil || !files(dir, ?paths)) {
+            print.eprintlnf("fuzz: cannot list the corpus for {}", table[b].name);
+            ret HARNESS;
+        }
+        if (paths.len == 0) {
+            print.eprintlnf("fuzz: the corpus for {} is empty, so it checked nothing", table[b].name);
+            ret HARNESS;
+        }
+        var i: usize = 0;
+        for (i < paths.len) {
+            val read: res[Vector[u8], fs.FsError] = fs.read_bytes(?backing, paths.data[i]);
+            if (sel read.err) {
+                print.eprintlnf("fuzz: cannot read {}", paths.data[i]);
+                ret HARNESS;
+            }
+            var bytes:  Vector[u8]      = read.ok;
+            val result: verdict.Verdict = answer(b, bytes.data, bytes.len);
+            if (result.finding) {
+                report(table[b].name, paths.data[i], result);
+                findings = findings + 1;
+            }
+            vector.dnit[u8](?bytes);
+            i = i + 1;
+        }
+        inputs = inputs + paths.len;
+        print.printlnf("fuzz: {}: {} answered", table[b].name, paths.len);
+        b = b + 1;
+    }
+    # a directory no boundary answers would be skipped without a sound
+    val listed: res[Vector[str], fs.FsError] = fs.read_dir(?backing, root);
+    if (sel listed.err) { ret HARNESS; }
+    var names: Vector[str] = listed.ok;
+    var i:     usize       = 0;
+    for (i < names.len) {
+        val name: str = names.data[i];
+        i = i + 1;
+        if (hidden(name) || !is_dir(join(?backing, root, name))) { cnt; }
+        val known: opt[usize] = boundaries.lookup(?table[0], count, name);
+        if (sel known.none) {
+            print.eprintlnf("fuzz: corpus directory {} names no boundary", name);
+            ret HARNESS;
+        }
+    }
+    print.printlnf("fuzz: {} inputs over {} boundaries, {} findings", inputs, count, findings);
+    if (findings != 0) { ret FINDING; }
+    ret 0;
+}
+
+fun find(name: str) opt[usize] {
+    val found: opt[usize] = boundaries.lookup(?table[0], count, name);
+    if (sel found.none) { print.eprintlnf("fuzz: no boundary named {}", name); }
+    ret found;
+}
+
+fun one(name: str, path: str) i64 {
+    val found: opt[usize] = find(name);
+    if (sel found.none) { ret HARNESS; }
+    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(?backing, path);
+    if (sel read.err) {
+        print.eprintlnf("fuzz: cannot read {}", path);
+        ret HARNESS;
+    }
+    var bytes:  Vector[u8]      = read.ok;
+    val result: verdict.Verdict = answer(found.some, bytes.data, bytes.len);
+    vector.dnit[u8](?bytes);
+    if (result.finding) {
+        report(name, path, result);
+        ret FINDING;
+    }
+    print.printlnf("fuzz: {} answered, accepted by {} parses, outcome {}", path,
+        verdict.accepted(), result.outcome);
+    ret 0;
+}
+
+fun parse_number(text: str) opt[u64] {
+    val n: usize = str_len(text);
+    if (n == 0) { ret opt[u64].none{}; }
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (i < n) {
+        val c: u8 = text[i]::u8;
+        if (c < '0' || c > '9') { ret opt[u64].none{}; }
+        value = value * 10 + (c - '0')::u64;
+        i     = i + 1;
+    }
+    ret opt[u64].some{value};
+}
+
+fun hex_name(prefix: str, value: u64) str {
+    val pl: usize             = str_len(prefix);
+    val rb: res[*u8, A.Error] = A.allocate[u8](?backing, pl + 21);
+    if (sel rb.err) { ret nil; }
+    val out: *u8   = rb.ok;
+    var i:   usize = 0;
+    for (i < pl) {
+        out[i] = prefix[i]::u8;
+        i      = i + 1;
+    }
+    var digit: usize = 0;
+    for (digit < 16) {
+        val nibble: u8 = ((value >> ((15 - digit) * 4)::u64) & 0xf)::u8;
+        if (nibble < 10) { out[pl + digit] = '0' + nibble; }
+        or               { out[pl + digit] = 'a' + nibble - 10; }
+        digit = digit + 1;
+    }
+    out[pl + 16] = '.';
+    out[pl + 17] = 'b';
+    out[pl + 18] = 'i';
+    out[pl + 19] = 'n';
+    out[pl + 20] = 0;
+    ret out::usize::str;
+}
+
+fun write(path: str, data: *u8, len: usize) bool {
+    val written: err[fs.FsError] = fs.write_bytes(path, data, len, 420);
+    ret sel written.ok;
+}
+
+var pool_data:  [MAX_POOL][MAX_INPUT]u8;
+var pool_len:   [MAX_POOL]usize;
+var pool_count: usize;
+var seen:       [MAX_POOL * 4]u64;
+var seen_count: usize;
+var scratch:    [MAX_INPUT]u8;
+
+fun known(outcome: u64) bool {
+    var i: usize = 0;
+    for (i < seen_count) {
+        if (seen[i] == outcome) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun remember(outcome: u64) {
+    if (seen_count < MAX_POOL * 4 && !known(outcome)) {
+        seen[seen_count] = outcome;
+        seen_count       = seen_count + 1;
+    }
+}
+
+fun keep(bytes: *u8, len: usize) {
+    if (pool_count >= MAX_POOL || len > MAX_INPUT) { ret; }
+    var i: usize = 0;
+    for (i < len) {
+        pool_data[pool_count][i] = bytes[i];
+        i                        = i + 1;
+    }
+    pool_len[pool_count] = len;
+    pool_count           = pool_count + 1;
+}
+
+# the shortest input that keeps the outcome, by cutting ever smaller chunks
+fun minimize(index: usize, length: usize, outcome: u64) usize {
+    var len:   usize = length;
+    var chunk: usize = len / 2;
+    if (chunk == 0) { chunk = 1; }
+    for (chunk > 0) {
+        var start: usize = 0;
+        for (start + chunk <= len) {
+            var trial: [MAX_INPUT]u8;
+            var i:     usize = 0;
+            for (i < len) {
+                trial[i] = scratch[i];
+                i        = i + 1;
+            }
+            val shorter: usize           = mutate.cut(?trial[0], len, start, chunk);
+            val result:  verdict.Verdict = answer(index, ?trial[0], shorter);
+            if (!result.finding && result.outcome == outcome) {
+                mutate.cut(?scratch[0], len, start, chunk);
+                len = shorter;
+            }
+            or { start = start + chunk; }
+        }
+        chunk = chunk / 2;
+    }
+    ret len;
+}
+
+fun mutate_one(root: str, findings_dir: str, index: usize, runs: u64, seed: u64,
+    retain: bool, findings: *usize, retained: *usize) i64 {
+    val name:  str = table[index].name;
+    val dir:   str = join(?backing, root, name);
+    var paths: Vector[str];
+    if (dir == nil || !files(dir, ?paths) || paths.len == 0) {
+        print.eprintlnf("fuzz: no corpus to mutate for {}", name);
+        ret HARNESS;
+    }
+    pool_count = 0;
+    seen_count = 0;
+    var i: usize = 0;
+    for (i < paths.len) {
+        val read: res[Vector[u8], fs.FsError] = fs.read_bytes(?backing, paths.data[i]);
+        if (sel read.err) { ret HARNESS; }
+        var bytes: Vector[u8] = read.ok;
+        remember(answer(index, bytes.data, bytes.len).outcome);
+        keep(bytes.data, bytes.len);
+        vector.dnit[u8](?bytes);
+        i = i + 1;
+    }
+    var state: u64 = seed ^ 0x5eed;
+    var run:   u64 = 0;
+    for (run < runs) {
+        val source: usize = mutate.draw(?state, pool_count);
+        var len:    usize = pool_len[source];
+        i = 0;
+        for (i < len) {
+            scratch[i] = pool_data[source][i];
+            i          = i + 1;
+        }
+        val rounds: usize = mutate.draw(?state, 3) + 1;
+        var round:  usize = 0;
+        for (round < rounds) {
+            len   = mutate.mutate(?state, ?scratch[0], len, MAX_INPUT);
+            round = round + 1;
+        }
+        val result: verdict.Verdict = answer(index, ?scratch[0], len);
+        if (result.finding) {
+            val found_dir: str = join(?backing, findings_dir, name);
+            fs.create_dir_all(?backing, found_dir, 493);
+            val path: str = join(?backing, found_dir, hex_name("", (seed << 32) + run));
+            write(path, ?scratch[0], len);
+            report(name, path, result);
+            @findings = @findings + 1;
+        }
+        or (retain && !known(result.outcome) && seen_count < MAX_POOL * 4) {
+            len = minimize(index, len, result.outcome);
+            val path: str = join(?backing, dir, hex_name("m-", result.outcome));
+            if (!write(path, ?scratch[0], len)) {
+                print.eprintlnf("fuzz: cannot write {}", path);
+                ret HARNESS;
+            }
+            remember(result.outcome);
+            keep(?scratch[0], len);
+            @retained = @retained + 1;
+        }
+        run = run + 1;
+    }
+    ret 0;
+}
+
+fun mutate_all(root: str, target: str, runs: u64, seed: u64, retain: bool) i64 {
+    val findings_dir: str   = "test/fuzz/out/findings";
+    var findings:     usize = 0;
+    var retained:     usize = 0;
+    var b:            usize = 0;
+    for (b < count) {
+        if (str_equals(target, "all") || str_equals(target, table[b].name)) {
+            val code: i64 = mutate_one(root, findings_dir, b, runs, seed, retain,
+                ?findings, ?retained);
+            if (code != 0) { ret code; }
+        }
+        b = b + 1;
+    }
+    if (!str_equals(target, "all")) {
+        val found: opt[usize] = find(target);
+        if (sel found.none) { ret HARNESS; }
+    }
+    print.printlnf("fuzz: {} findings, {} inputs retained", findings, retained);
+    if (findings != 0) { ret FINDING; }
+    ret 0;
+}
+
+fun usage() i64 {
+    print.eprintln("usage: fuzz replay [corpus]");
+    print.eprintln("       fuzz one <boundary> <file>");
+    print.eprintln("       fuzz mutate <boundary|all> <runs> <seed> [--retain] [corpus]");
+    ret HARNESS;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val made: err[A.Error] = page.make(?backing);
+    if (sel made.err || !guard.make()) { ret HARNESS; }
+    count = boundaries.all(?table[0]);
+    if (count >= boundaries.CAPACITY) {
+        print.eprintln("fuzz: the boundary table is full, so a boundary was dropped");
+        ret HARNESS;
+    }
+    if (argc < 2) { ret usage(); }
+    val mode: str = argv[1]::usize::str;
+    var root: str = "test/fuzz/corpus";
+    if (str_equals(mode, "replay")) {
+        if (argc > 3)  { ret usage(); }
+        if (argc == 3) { root = argv[2]::usize::str; }
+        ret replay(root);
+    }
+    if (str_equals(mode, "one")) {
+        if (argc != 4) { ret usage(); }
+        ret one(argv[2]::usize::str, argv[3]::usize::str);
+    }
+    if (str_equals(mode, "mutate")) {
+        if (argc < 5 || argc > 7) { ret usage(); }
+        val runs:     opt[u64] = parse_number(argv[3]::usize::str);
+        val seed:     opt[u64] = parse_number(argv[4]::usize::str);
+        var retain:   bool     = false;
+        var argument: i64      = 5;
+        for (argument < argc) {
+            val text: str = argv[argument]::usize::str;
+            if (str_equals(text, "--retain")) { retain = true; }
+            or                                { root = text; }
+            argument = argument + 1;
+        }
+        if (sel runs.some) {
+            if (sel seed.some) {
+                ret mutate_all(root, argv[2]::usize::str, runs.some, seed.some, retain);
+            }
+        }
+    }
+    ret usage();
+}

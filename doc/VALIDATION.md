@@ -20,7 +20,13 @@ Wire parsers, serializers, cryptographic algorithms, TLS handshakes, and compres
 
 ### Fuzz tests
 
-Coverage-guided harnesses target parsers, state machines, configuration, certificates, compression, routing, and cross-layer protocol transitions. Seed corpora include standards examples, historical vulnerabilities, and minimized failures.
+`test/fuzz` answers every untrusted-input entry point: the PROXY header, the prologue and cleartext protocol selection, the responses and urls of the outbound client, destination CID routing and the QUIC runtime's arrival, stateless and held-datagram queues, HTTP/2 and HTTP/3 request headers, dispatch, forwarding, trace context, administration auth, the HTTP semantics headers, static paths and media types, the ACME challenge path, and the config loader, trusted peers and ACME durable state. Trust bundles are read by mach-tls's `tls.cert.bundle`, which mach-tls fuzzes. Each boundary has a harness and a directory of retained inputs in `test/fuzz/corpus`. The property is that no byte sequence a peer, an upstream or a file can send crashes an entry point, reads past its input, loops, or is accepted or refused against what it promises:
+
+- every input is parsed or refused as its entry point says it will, and every view a parse publishes lies inside the input or the storage it was copied into
+- each input ends on the last byte before an unreadable page, so a read one byte past it faults
+- each harness checks its entry point's promise: a round trip, a comparison law, a model of the RFC or of the state the runtime must hold
+
+The replay is deterministic and runs in both profiles on the heavy tier (a pull request into `main`, or a dispatch with `heavy: fuzz` or `heavy: all`). The lane is built on every pull request so it cannot rot. `fuzz mutate` is the on-demand search: a seeded structural mutator over a boundary's corpus that writes findings and, with `--retain`, adds a minimized input for each outcome the corpus does not hold yet. It is not coverage-guided: no coverage instrumentation exists for Mach, so the search will not find a path that needs a specific constant to reach. [`test/fuzz/README.md`](../test/fuzz/README.md) has the commands.
 
 ### Fault injection
 

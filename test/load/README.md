@@ -18,7 +18,7 @@ assertions that HTTP/3 transfers were served, leaving admission and refusal
 checked. `LOAD_CONNECTIONS` and `LOAD_TARGET` change the shape of the TCP load, `LOAD_QUIC_CONNECTIONS` and `LOAD_QUIC_RATE`
 the QUIC load. `LOAD_CACHE=memory` puts the cache in front of the content, and
 `LOAD_CACHE=disk` also keeps the large body on disk, so any lane can be run with the
-cache on. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
+cache on. The runner binds 127.0.0.1 ports 19100 to 19106, TCP and UDP,
 and releases every server and client on every exit path. The QUIC cells use the
 system `curl` when it is built with HTTP/3, and otherwise fetch a pinned static
 build into `.tools/`.
@@ -62,6 +62,14 @@ belongs in a CI lane against a release build instead.
 Five small bodies are fetched over HTTP/3 one connection at a time. That cell
 always runs, and it is what fails when a change stops HTTP/3 being served at
 all.
+
+One connection then carries two transfers at once: the body, rate limited so
+its stream stays open, and a proxied response whose field section is past what
+HTTP/3 can encode (#388). The refused one must be answered 502 and the body must
+complete, with curl reporting a single connection for both. This is the only
+test that drives a live HTTP/3 session, since no QUIC client links into
+`mach test`. The HTTP/2 counterpart is a `mach test` case in
+`src/test/runtime/protocol.mach`.
 
 A server with no configured `max_connections` must serve 1100 concurrent QUIC
 connections, past the 1024 its QUIC pools were once preallocated to. Each
@@ -432,6 +440,34 @@ counter must not move. The offered rate is below what the server can
 handshake, so any loss is work the server dropped although it had room. This
 is what a slow ramp of 1100 QUIC dials failed before #164. The lane binds
 ports 19150 to 19153.
+
+## The keep-alive lane
+
+```sh
+./test/load/keepalive.sh
+```
+
+`keepalive.sh` is the keep-alive cell (#274). `LOAD_KEEPALIVE` QUIC
+connections (10000) each send a PING every `LOAD_KEEPALIVE_PERIOD` seconds
+(1), which is a datagram rate of count over period into the QUIC socket, and
+each PING costs the server a receive, an ACK and the ACK's send. The
+connections are dialled at `LOAD_KEEPALIVE_RATE` a second (250), because the
+PINGs of the connections already held arrive throughout the dial and a
+faster dial measures the handshake rate on top of them, which is burst.sh's
+subject. Once every one is held and a period has passed, the socket's drop
+counter is read over `LOAD_KEEPALIVE_SECONDS` (10). The lane passes when every
+dial is held, the socket dropped no datagram over that window, and every
+connection leaves hedge once its client closes it. It prints the server's CPU
+per PING round, the cores it used and the receive queue's peak. The lane binds
+ports 19180 to 19183.
+
+The rate is served by the one QUIC worker until #174 routes datagrams to their
+owning worker. Measured on a Ryzen 7 5800X3D over loopback, a round costs
+about 47 us of that worker's CPU, so 10,000 a second takes about half a core
+and the socket's queue peaks in the tens of kilobytes. Past the worker's core
+the queue fills and the kernel drops. About 40% of the round is the kernel's
+(a receive per datagram, and a send per ACK that on loopback carries the
+client's receive), and most of the rest is the transport's.
 
 ## The churn lane
 

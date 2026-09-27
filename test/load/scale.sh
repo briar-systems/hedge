@@ -220,9 +220,13 @@ start_http_holder() {
 }
 
 # starts one holder of `count` HTTP/3 connections idle after their handshakes,
-# over test/load/h3load. handshakes are bounded to DIALING in flight: a burst
-# past a few thousand loses some to their handshake timeout (#232), and this
-# lane measures what an idle connection holds, not what a burst admits.
+# over test/load/h3load. handshakes are bounded to DIALING in flight, since
+# this lane measures what an idle connection holds, not what a burst admits.
+# unbounded, 10,000 dials arrive faster than one QUIC worker completes their
+# handshakes and hedge's deferred admission refuses the rest: 988 of them with
+# the 15 s keep-alive and the socket dropping nothing, and 2,691 with a 1 s
+# keep-alive, whose PINGs from the connections already held compete with the
+# handshakes and overflow the socket (#274).
 DIALING=64
 start_quic_holder() {
     local name="$1" count="$2" source="127.0.0.$next_source"

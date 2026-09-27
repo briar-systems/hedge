@@ -15,17 +15,14 @@ use ac:   acme.client;
 use acme.identifier;
 use acme.problem;
 use acme.storage;
-use hedge.acme.anchors;
 use hedge.acme.challenge;
 use hedge.acme.durable;
 use hedge.acme.handler;
 use hedge.acme.issue;
 use hedge.acme.keys;
 use acme: hedge.acme.manager;
-use hedge.acme.origination;
 use hedge.acme.session;
 use hedge.acme.tlsalpn;
-use hedge.acme.transport;
 use hedge.composition;
 use hedge.config.schema;
 use hedge.connection;
@@ -33,6 +30,8 @@ use hedge.dispatch.middleware;
 use hedge.dispatch.plan;
 use hedge.listener;
 use hedge.operation;
+use hedge.outbound;
+use hedge.outbound.origination;
 use protocol:     hedge.protocol.credentials;
 use quic_runtime: hedge.protocol.quic.runtime;
 use hedge_tls:    hedge.protocol.tls;
@@ -41,6 +40,7 @@ use hedge.service;
 use hedge.supervisor;
 use hedge.wake;
 use http.core.field;
+use http.core.method;
 use http.router.router;
 use std.allocator;
 use std.allocator.fixed;
@@ -49,6 +49,7 @@ use T:          std.chrono.time;
 use fs:         std.filesystem;
 use io_error:   std.io.error;
 use io_runtime: std.io.runtime;
+use bytes:      std.memory;
 use net_async:  std.net.async;
 use std.net.ip;
 use std.net.tcp;
@@ -64,6 +65,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
+use tls.cert.bundle;
 
 fun page_ok(outcome: err[allocator.Error]) bool {
     ret sel outcome.ok;
@@ -83,6 +85,18 @@ fun monotonic_now() T.Instant {
 
 fun fixed_ok(outcome: err[allocator.Error]) bool {
     ret sel outcome.ok;
+}
+
+# the arena a live test's fixed allocator draws from
+val ARENA: usize = 262144;
+
+# the fixtures below run to megabytes each, and a test that holds several on
+# its stack passes the default 8 MiB limit (#392), so tests take them from the
+# heap. the process ends with the test, which returns them.
+fun placed[T](heap: *allocator.Allocator, count: usize) *T {
+    val got: res[*T, allocator.Error] = allocator.zallocate[T](heap, count);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
 }
 
 val MAX_ROUTES:   usize = 8;
@@ -150,8 +164,16 @@ fun wire_make(wire: *Wire) bool {
     ret true;
 }
 
-fun wire_attach(wire: *Wire, engine: *transport.Transport) bool {
-    ret transport.attach(engine, ?wire.driver, wake.waker(?wire.wakes, wake.PLANE_OWNER));
+# the client and exchange a test's acme conversation sends on, attached to the
+# test's own driver
+fun wire_link(wire: *Wire, http: *outbound.Client, exchange: *outbound.Exchange,
+    link: *session.Link, request: *u8, response: *u8, items: *field.Field) bool {
+    if (!outbound.make(http, outbound.literal_addresses())
+        || !outbound.attach(http, ?wire.driver, wake.waker(?wire.wakes, wake.PLANE_OWNER))
+        || !outbound.make_exchange(exchange, request, 8192, response, 65536, items,
+        64, session.limits().response_fields)) { ret false; }
+    @link = session.Link{client: http, exchange: exchange};
+    ret true;
 }
 
 # one dispatch round: completions land and are routed, plane wakes are taken
@@ -162,17 +184,18 @@ fun wire_turn(wire: *Wire, timeout_ms: i32) {
     for (taken != 0) { taken = wake.take(?wire.wakes, ?wakes[0], 4); }
 }
 
-# the transport's socket is released on its close completion, so the release
-# is dispatched to its end before the transport is destroyed
-fun wire_release(wire: *Wire, engine: *transport.Transport) {
-    transport.finish(engine);
+# the client's sockets are released on their close completions, so the
+# release is dispatched to its end before the client is shut down
+fun wire_release(wire: *Wire, link: *session.Link) {
+    outbound.finish(link.exchange);
     var i: usize = 0;
-    for (i < 256 && !transport.idle(engine)) {
+    for (i < 256 && (!outbound.idle(link.exchange) || !outbound.settled(link.client))) {
+        outbound.close_kept(link.client);
         wire_turn(wire, 10);
-        transport.poll(engine, monotonic_now());
         i = i + 1;
     }
-    transport.destroy(engine);
+    outbound.destroy_exchange(link.exchange);
+    outbound.shutdown(link.client);
     wake.destroy(?wire.wakes);
     net_async.destroy(?wire.driver);
     io_runtime.destroy(?wire.runtime);
@@ -183,7 +206,9 @@ rec Client {
     response:    [65536]u8;
     items:       [64]field.Field;
     wire:        Wire;
-    engine:      transport.Transport;
+    http:        outbound.Client;
+    exchange:    outbound.Exchange;
+    link:        session.Link;
     session:     session.Session;
     run:         issue.Issue;
     table:       challenge.Http01;
@@ -327,16 +352,14 @@ fun prepare(client: *Client, prefix: str) bool {
         ret false;
     }
     if (!wire_make(?client.wire)) { ret false; }
-    if (!transport.make(?client.engine, ?client.request[0], 8192,
-        ?client.response[0], 65536, ?client.items[0], 64,
-        session.limits().response_fields, transport.literal_addresses())
-        || !wire_attach(?client.wire, ?client.engine)) {
+    if (!wire_link(?client.wire, ?client.http, ?client.exchange, ?client.link,
+        ?client.request[0], ?client.response[0], ?client.items[0])) {
         ret false;
     }
     # the authority's urls are https, as rfc 8555 requires. the harness
     # terminates tls in front of pebble, so the configured origin says where
     # that authority is actually reached.
-    if (!transport.set_origin(?client.engine, transport.cleartext_origin(
+    if (!outbound.route(?client.http, text_view("127.0.0.1"), outbound.cleartext_origin(
         ip.endpoint(127, 0, 0, 1, AUTHORITY_PORT)))) { ret false; }
     if (session.make(?client.session, view.view(DIRECTORY_URL, 27))
         != session.OK) { ret false; }
@@ -351,7 +374,7 @@ fun prepare(client: *Client, prefix: str) bool {
 fun context(client: *Client) issue.Context {
     var value: issue.Context;
     value.session         = ?client.session;
-    value.engine          = ?client.engine;
+    value.link            = ?client.link;
     value.account_key     = ?client.account;
     value.certificate_key = ?client.certificate;
     value.provider        = challenge.http01_provider(?client.table);
@@ -386,12 +409,12 @@ fun discover(server: *Server, client: *Client) bool {
     for (status == session.PENDING) {
         serve.poll(?quic_controls, ?server.runtime, 1);
         wire_turn(?client.wire, 0);
-        status = session.poll(?client.session, ?client.engine,
+        status = session.poll(?client.session, ?client.link,
             ?client.account, monotonic_now());
         if (monotonic_ns() > deadline) { brk; }
     }
     if (status != session.OK) { ret false; }
-    session.complete(?client.session, ?client.engine);
+    session.complete(?client.session, ?client.link);
     ret true;
 }
 
@@ -417,7 +440,7 @@ fun shutdown(server: *Server, client: *Client) {
     var quic_controls: quic_runtime.ControlView;
     serve.stop(?quic_controls, ?server.runtime);
     session.release(?client.session);
-    wire_release(?client.wire, ?client.engine);
+    wire_release(?client.wire, ?client.link);
     keys.destroy(?client.account);
     keys.destroy(?client.certificate);
 }
@@ -427,7 +450,7 @@ test http01__issues_a_certificate {
     var client: Client;
     if (!prepare(?client, "issued")) { ret 1; }
     if (!boot(?server, ?client.table)) {
-        wire_release(?client.wire, ?client.engine);
+        wire_release(?client.wire, ?client.link);
         ret 2;
     }
     if (!discover(?server, ?client)) {
@@ -569,7 +592,7 @@ test http01__serves_challenge_on_own_listener {
     var client: Client;
     if (!prepare(?client, "route")) { ret 1; }
     if (!boot_at(?server, ?client.table, "127.0.0.1:0", 0)) {
-        wire_release(?client.wire, ?client.engine);
+        wire_release(?client.wire, ?client.link);
         ret 2;
     }
     var value: ch.Challenge;
@@ -673,6 +696,13 @@ fun same_point(key: *keys.Key, point: *u8) bool {
     ret true;
 }
 
+# whether held is the certificate saved in saved: the whole encoding, since two
+# certificates for one name share their length and most of their bytes (#282)
+fun same_certificate(held: view.View, saved: *u8, saved_len: usize) bool {
+    ret held.len == saved_len
+        && bytes.raw_equal(held.data::ptr, saved::ptr, saved_len);
+}
+
 fun drive_manager(server: *Server, deployment: *Deployment,
     wanted: acme.State) bool {
     var quic_controls: quic_runtime.ControlView;
@@ -703,28 +733,33 @@ fun drive_manager(server: *Server, deployment: *Deployment,
 
 test manager__obtains_stores_and_recovers {
     var quic_controls: quic_runtime.ControlView;
-    var memory:        [262144]u8;
-    var state:         fixed.FixedState;
-    var a:             allocator.Allocator;
-    if (!fixed_ok(fixed.make(?a, ?state, ?memory[0], 262144))) { ret 1; }
+    var heap:          allocator.Allocator;
+    if (!page_ok(page.make(?heap))) { ret 1; }
+    val memory:     *u8         = placed[u8](?heap, ARENA);
+    val deployment: *Deployment = placed[Deployment](?heap, 1);
+    val restarted:  *Deployment = placed[Deployment](?heap, 1);
+    val expiring:   *Deployment = placed[Deployment](?heap, 1);
+    val client:     *Client     = placed[Client](?heap, 1);
+    val server:     *Server     = placed[Server](?heap, 1);
+    if (memory == nil || deployment == nil || restarted == nil
+        || expiring == nil || client == nil || server == nil) { ret 1; }
+    var state: fixed.FixedState;
+    var a:     allocator.Allocator;
+    if (!fixed_ok(fixed.make(?a, ?state, memory, ARENA))) { ret 1; }
     val directory: str = "out/acme-managed";
     fs.remove_all(?a, directory::Path);
-
-    var deployment: Deployment;
-    var client:     Client;
-    val name_len:   usize = unique_name(?client, "managed");
-    var i:          usize = 0;
+    val name_len: usize = unique_name(client, "managed");
+    var i:        usize = 0;
     for (i < name_len) {
         deployment.name[i] = client.name[i];
         i                  = i + 1;
     }
     deployment.name_len = name_len;
-    configure_acme(?deployment, directory, name_len);
+    configure_acme(deployment, directory, name_len);
     if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.OK) {
         ret 2;
     }
-    var server: Server;
-    if (!boot(?server, acme.challenge_table(?deployment.manager))) {
+    if (!boot(server, acme.challenge_table(?deployment.manager))) {
         acme.close(?deployment.manager);
         ret 3;
     }
@@ -734,7 +769,7 @@ test manager__obtains_stores_and_recovers {
         serve.stop(?quic_controls, ?server.runtime);
         ret 4;
     }
-    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+    if (!drive_manager(server, deployment, acme.INSTALLING)) {
         acme.close(?deployment.manager);
         serve.stop(?quic_controls, ?server.runtime);
         ret 5;
@@ -757,6 +792,11 @@ test manager__obtains_stores_and_recovers {
         serve.stop(?quic_controls, ?server.runtime);
         ret 8;
     }
+    # leaf reads the manager's own storage, so the certificate is copied out
+    # for the comparisons made after that manager has closed
+    var original:     [acme.MAX_CHAIN_BYTES]u8;
+    val original_len: usize = leaf.len;
+    bytes.raw_copy((?original[0])::ptr, leaf.data::ptr, original_len);
     var issuer: view.View;
     if (!acme.chain_entry(?deployment.manager, count - 1, ?issuer)
         || issuer.len < 64) {
@@ -782,13 +822,12 @@ test manager__obtains_stores_and_recovers {
 
     # a restart recovers the certificate and its key from disk and does not
     # order a second one
-    var restarted: Deployment;
     i = 0;
     for (i < name_len) {
         restarted.name[i] = deployment.name[i];
         i                 = i + 1;
     }
-    configure_acme(?restarted, directory, name_len);
+    configure_acme(restarted, directory, name_len);
     # the renewal lead is stated by this test rather than inherited from the
     # authority: pebble picks between a ninety-day and a six-day profile when
     # an order names none, so a lead compared against its choice would be a
@@ -811,7 +850,7 @@ test manager__obtains_stores_and_recovers {
     }
     var recovered: view.View;
     if (!acme.chain_entry(?restarted.manager, 0, ?recovered)
-        || recovered.len != leaf.len) {
+        || !same_certificate(recovered, ?original[0], original_len)) {
         acme.close(?restarted.manager);
         serve.stop(?quic_controls, ?server.runtime);
         ret 15;
@@ -832,13 +871,12 @@ test manager__obtains_stores_and_recovers {
 
     # and with a lead longer than the certificate has left, the same recovered
     # state is due, so the schedule fires rather than sitting idle forever
-    var expiring: Deployment;
     i = 0;
     for (i < name_len) {
         expiring.name[i] = deployment.name[i];
         i                = i + 1;
     }
-    configure_acme(?expiring, directory, name_len);
+    configure_acme(expiring, directory, name_len);
     expiring.graph.acme.renew_before_seconds = 31536000;
     if (acme.open(?expiring.manager, ?a, ?expiring.graph) != acme.OK) {
         serve.stop(?quic_controls, ?server.runtime);
@@ -868,7 +906,7 @@ test manager__obtains_stores_and_recovers {
     # and it renews for real: the same account key registers again, a second
     # certificate is issued and stored, and the superseded generation's key
     # is discarded
-    if (!drive_manager(?server, ?expiring, acme.INSTALLING)) {
+    if (!drive_manager(server, expiring, acme.INSTALLING)) {
         acme.close(?expiring.manager);
         serve.stop(?quic_controls, ?server.runtime);
         ret 19;
@@ -886,9 +924,7 @@ test manager__obtains_stores_and_recovers {
         ret 21;
     }
     # a renewal is a new certificate, not the same bytes served again
-    if (renewed.len == leaf.len
-        && renewed.data[renewed.len - 1] == leaf.data[leaf.len - 1]
-        && renewed.data[16] == leaf.data[16]) {
+    if (same_certificate(renewed, ?original[0], original_len)) {
         acme.close(?expiring.manager);
         serve.stop(?quic_controls, ?server.runtime);
         ret 22;
@@ -1271,36 +1307,41 @@ test tls_alpn01__composition_issues {
 
 test rotation__keeps_live_connection {
     var quic_controls: quic_runtime.ControlView;
-    var memory:        [262144]u8;
-    var arena:         fixed.FixedState;
-    var a:             allocator.Allocator;
-    if (!fixed_ok(fixed.make(?a, ?arena, ?memory[0], 262144))) { ret 1; }
+    var heap:          allocator.Allocator;
+    if (!page_ok(page.make(?heap))) { ret 1; }
+    val memory:     *u8           = placed[u8](?heap, ARENA);
+    val deployment: *Deployment   = placed[Deployment](?heap, 1);
+    val renewing:   *Deployment   = placed[Deployment](?heap, 1);
+    val client:     *Client       = placed[Client](?heap, 1);
+    val server:     *Server       = placed[Server](?heap, 1);
+    val tls_graph:  *schema.Graph = placed[schema.Graph](?heap, 1);
+    if (memory == nil || deployment == nil || renewing == nil
+        || client == nil || server == nil || tls_graph == nil) { ret 1; }
+    var arena: fixed.FixedState;
+    var a:     allocator.Allocator;
+    if (!fixed_ok(fixed.make(?a, ?arena, memory, ARENA))) { ret 1; }
     val directory: str = "out/acme-rotation";
     fs.remove_all(?a, directory::Path);
-    var client:     Client;
-    val name_len:   usize = unique_name(?client, "rotate");
-    var deployment: Deployment;
-    var i:          usize = 0;
+    val name_len: usize = unique_name(client, "rotate");
+    var i:        usize = 0;
     for (i < name_len) {
         deployment.name[i] = client.name[i];
         i                  = i + 1;
     }
-    configure_acme(?deployment, directory, name_len);
+    configure_acme(deployment, directory, name_len);
     if (acme.open(?deployment.manager, ?a, ?deployment.graph) != acme.OK) {
         ret 2;
     }
-    var server: Server;
-    if (!boot(?server, acme.challenge_table(?deployment.manager))) {
+    if (!boot(server, acme.challenge_table(?deployment.manager))) {
         acme.close(?deployment.manager);
         ret 3;
     }
-    if (!drive_manager(?server, ?deployment, acme.INSTALLING)) {
+    if (!drive_manager(server, deployment, acme.INSTALLING)) {
         acme.close(?deployment.manager);
         serve.stop(?quic_controls, ?server.runtime);
         ret 4;
     }
-    var tls_graph: schema.Graph;
-    schema.reset_graph(?tls_graph);
+    schema.reset_graph(tls_graph);
     tls_graph.tls_policy_count = 1;
     val configured: *schema.TlsPolicy = ?tls_graph.tls_policies[0];
     schema.set_text(?configured.name, "managed");
@@ -1336,13 +1377,12 @@ test rotation__keeps_live_connection {
 
     # the certificate is renewed while that connection is still open
     acme.close(?deployment.manager);
-    var renewing: Deployment;
     i = 0;
     for (i < name_len) {
         renewing.name[i] = deployment.name[i];
         i                = i + 1;
     }
-    configure_acme(?renewing, directory, name_len);
+    configure_acme(renewing, directory, name_len);
     renewing.graph.acme.renew_before_seconds = 31536000;
     if (acme.open(?renewing.manager, ?a, ?renewing.graph) != acme.OK) {
         serve.stop(?quic_controls, ?server.runtime);
@@ -1354,7 +1394,7 @@ test rotation__keeps_live_connection {
         serve.stop(?quic_controls, ?server.runtime);
         ret 9;
     }
-    if (!drive_manager(?server, ?renewing, acme.INSTALLING)) {
+    if (!drive_manager(server, renewing, acme.INSTALLING)) {
         acme.close(?renewing.manager);
         serve.stop(?quic_controls, ?server.runtime);
         ret 10;
@@ -1418,30 +1458,41 @@ rec SecureFixture {
     response: [65536]u8;
     items:    [64]field.Field;
     wire:     Wire;
-    engine:   transport.Transport;
+    http:     outbound.Client;
+    exchange: outbound.Exchange;
+    link:     session.Link;
     session:  session.Session;
     account:  keys.Key;
-    anchors:  anchors.Anchors;
+    anchors:  bundle.Loaded;
+}
+
+# the host of an https directory url, copied into `output`
+fun directory_host(directory: str, output: *u8) view.View {
+    var at:  usize = 8;
+    var len: usize = 0;
+    for (directory[at] != 0 && directory[at] != ':' && directory[at] != '/') {
+        output[len] = directory[at];
+        len         = len + 1;
+        at          = at + 1;
+    }
+    ret view.view(output, len);
 }
 
 fun secure_fixture(fixture: *SecureFixture, a: *allocator.Allocator,
-    bundle: str, directory: str) bool {
-    if (anchors.load_bundle(?fixture.anchors, a, bundle) != anchors.OK) {
+    anchors: str, directory: str) bool {
+    if (bundle.load(a, anchors, ?fixture.anchors) != bundle.OK) { ret false; }
+    if (!keys.generate(?fixture.account))                       { ret false; }
+    if (!wire_make(?fixture.wire))                              { ret false; }
+    if (!wire_link(?fixture.wire, ?fixture.http, ?fixture.exchange, ?fixture.link,
+        ?fixture.request[0], ?fixture.response[0], ?fixture.items[0])) {
         ret false;
     }
-    if (!keys.generate(?fixture.account)) { ret false; }
-    if (!wire_make(?fixture.wire))        { ret false; }
-    if (!transport.make(?fixture.engine, ?fixture.request[0], 8192,
-        ?fixture.response[0], 65536, ?fixture.items[0], 64,
-        session.limits().response_fields, transport.literal_addresses())
-        || !wire_attach(?fixture.wire, ?fixture.engine)) {
-        ret false;
-    }
-    if (!transport.set_trust(?fixture.engine,
-        anchors.store(?fixture.anchors))) { ret false; }
-    # the address comes from the origin; the name that is verified comes from
+    if (!outbound.set_trust(?fixture.http, ?fixture.anchors.bundle.store)) { ret false; }
+    # the address comes from the route; the name that is verified comes from
     # the url, and they are deliberately not the same thing
-    if (!transport.set_origin(?fixture.engine, transport.secure_origin(
+    var target: [64]u8;
+    val host:   view.View = directory_host(directory, ?target[0]);
+    if (!outbound.route(?fixture.http, host, outbound.secure_origin(
         ip.endpoint(127, 0, 0, 1, SECURE_PORT)))) { ret false; }
     ret session.make(?fixture.session, text_view(directory)) == session.OK;
 }
@@ -1456,7 +1507,7 @@ fun secure_discover(fixture: *SecureFixture) session.Status {
     val deadline: i64            = monotonic_ns() + 30000000000;
     for {
         wire_turn(?fixture.wire, 10);
-        status = session.poll(?fixture.session, ?fixture.engine,
+        status = session.poll(?fixture.session, ?fixture.link,
             ?fixture.account, monotonic_now());
         if (status != session.PENDING) { brk; }
         if (monotonic_ns() > deadline) { brk; }
@@ -1466,7 +1517,7 @@ fun secure_discover(fixture: *SecureFixture) session.Status {
 
 fun secure_release(fixture: *SecureFixture) {
     session.release(?fixture.session);
-    wire_release(?fixture.wire, ?fixture.engine);
+    wire_release(?fixture.wire, ?fixture.link);
     keys.destroy(?fixture.account);
 }
 
@@ -1479,7 +1530,7 @@ test authority_tls__verified_against_ca {
     if (!secure_fixture(?fixture, ?a, AUTHORITY_CA, SECURE_DIRECTORY)) {
         ret 2;
     }
-    if (anchors.count(?fixture.anchors) == 0) {
+    if (fixture.anchors.bundle.store.len == 0) {
         secure_release(?fixture);
         ret 3;
     }
@@ -1498,7 +1549,7 @@ test authority_tls__verified_against_ca {
         secure_release(?fixture);
         ret 6;
     }
-    session.complete(?fixture.session, ?fixture.engine);
+    session.complete(?fixture.session, ?fixture.link);
     secure_release(?fixture);
     ret 0;
 }
@@ -1533,12 +1584,12 @@ test authority_tls__sessions_coexist {
         wire_turn(?active.wire, 1);
         wire_turn(?superseded.wire, 1);
         if (active_status == session.PENDING) {
-            active_status = session.poll(?active.session, ?active.engine,
+            active_status = session.poll(?active.session, ?active.link,
                 ?active.account, monotonic_now());
         }
         if (superseded_status == session.PENDING) {
             superseded_status = session.poll(?superseded.session,
-                ?superseded.engine, ?superseded.account, monotonic_now());
+                ?superseded.link, ?superseded.account, monotonic_now());
         }
         val current: usize = origination.live();
         if (current > peak)            { peak = current; }
@@ -1551,8 +1602,8 @@ test authority_tls__sessions_coexist {
         secure_release(?superseded);
         ret 4;
     }
-    session.complete(?active.session, ?active.engine);
-    session.complete(?superseded.session, ?superseded.engine);
+    session.complete(?active.session, ?active.link);
+    session.complete(?superseded.session, ?superseded.link);
     secure_release(?active);
     secure_release(?superseded);
     if (origination.live() != before) { ret 5; }
@@ -1573,7 +1624,7 @@ test authority_tls__untrusted_anchor_refused {
         ret 3;
     }
     # it failed in the handshake and never fell back to cleartext
-    if (transport.cause(?fixture.engine) != transport.CAUSE_HANDSHAKE) {
+    if (outbound.cause(?fixture.exchange) != outbound.CAUSE_UNTRUSTED) {
         secure_release(?fixture);
         ret 4;
     }
@@ -1600,7 +1651,7 @@ test authority_tls__name_mismatch_refused {
         secure_release(?fixture);
         ret 3;
     }
-    if (transport.cause(?fixture.engine) != transport.CAUSE_HANDSHAKE) {
+    if (outbound.cause(?fixture.exchange) != outbound.CAUSE_UNTRUSTED) {
         secure_release(?fixture);
         ret 4;
     }
@@ -1625,29 +1676,25 @@ test authority_tls__public_authority_verified {
     var a:      allocator.Allocator;
     if (!fixed_ok(fixed.make(?a, ?arena, ?memory[0], 1048576))) { ret 1; }
     var fixture: SecureFixture;
-    val loaded:  anchors.Status = anchors.load_bundle(?fixture.anchors, ?a,
-        SYSTEM_ANCHORS);
-    if (loaded != anchors.OK) {
+    val loaded:  bundle.Status = bundle.load(?a, SYSTEM_ANCHORS, ?fixture.anchors);
+    if (loaded != bundle.OK) {
         print.eprintlnf("anchors: {} loading {}", loaded::i64, SYSTEM_ANCHORS);
         ret 2;
     }
     if (!keys.generate(?fixture.account)) { ret 4; }
     if (!wire_make(?fixture.wire))        { ret 3; }
-    if (!transport.make(?fixture.engine, ?fixture.request[0], 8192,
-        ?fixture.response[0], 65536, ?fixture.items[0], 64,
-        session.limits().response_fields, transport.literal_addresses())
-        || !wire_attach(?fixture.wire, ?fixture.engine)) {
+    if (!wire_link(?fixture.wire, ?fixture.http, ?fixture.exchange, ?fixture.link,
+        ?fixture.request[0], ?fixture.response[0], ?fixture.items[0])) {
         ret 5;
     }
-    if (!transport.set_trust(?fixture.engine,
-        anchors.store(?fixture.anchors))) { ret 6; }
+    if (!outbound.set_trust(?fixture.http, ?fixture.anchors.bundle.store)) { ret 6; }
     var endpoint: ip.Endpoint;
-    if (!transport.resolve_endpoint(text_view(STAGING_HOST), 443, ?endpoint)) {
+    if (!outbound.resolve_now(text_view(STAGING_HOST), 443, ?endpoint)) {
         secure_release(?fixture);
         ret 7;
     }
-    if (!transport.set_origin(?fixture.engine,
-        transport.secure_origin(endpoint))) {
+    if (!outbound.route(?fixture.http, text_view(STAGING_HOST),
+        outbound.secure_origin(endpoint))) {
         secure_release(?fixture);
         ret 8;
     }
@@ -1662,9 +1709,9 @@ test authority_tls__public_authority_verified {
         var detail: str           = cause.detail;
         if (detail == nil) { detail = ""; }
         print.eprintlnf("staging: outcome {} stage {} cause {} tls {} kind {} code {} {}",
-            outcome::i64, transport.stage(?fixture.engine)::i64,
-            transport.cause(?fixture.engine)::i64,
-            origination.failure(fixture.engine.tls)::i64,
+            outcome::i64, outbound.stage(?fixture.exchange)::i64,
+            outbound.cause(?fixture.exchange)::i64,
+            outbound.tls_failure(?fixture.exchange)::i64,
             cause.kind::i64, cause.code::i64, detail);
         secure_release(?fixture);
         ret 10;
@@ -1682,7 +1729,67 @@ test authority_tls__public_authority_verified {
         secure_release(?fixture);
         ret 12;
     }
-    session.complete(?fixture.session, ?fixture.engine);
+    session.complete(?fixture.session, ?fixture.link);
     secure_release(?fixture);
+    ret 0;
+}
+
+# the facility hosted code gets, end to end against the authority's own https
+# interface: the name resolved by the system on the loop's resolver thread, the
+# chain verified against the anchors, a response read in full
+fun loop_fetch(a: *allocator.Allocator, anchors: str, status: *u16,
+    cause: *outbound.Cause) outbound.Status {
+    var loaded: bundle.Loaded;
+    if (bundle.load(a, anchors, ?loaded) != bundle.OK) { ret outbound.INVALID; }
+    val loop: *outbound.Loop = placed[outbound.Loop](a, 1);
+    if (loop == nil || !outbound.open_loop(loop, ?loaded.bundle.store)) {
+        ret outbound.INVALID;
+    }
+    var request:  [4096]u8;
+    var response: [16384]u8;
+    var items:    [32]field.Field;
+    var exchange: outbound.Exchange;
+    if (!outbound.make_exchange(?exchange, ?request[0], 4096, ?response[0], 16384,
+        ?items[0], 32, field.limits(32, 8192, 128, 4096))) { ret outbound.INVALID; }
+    var value: outbound.Request = outbound.request(method.GET,
+        text_view(SECURE_DIRECTORY));
+    value.timeout_ns = 10000000000;
+    val fetched: outbound.Status = outbound.fetch(loop, ?exchange, value);
+    @cause  = outbound.cause(?exchange);
+    @status = 0;
+    if (fetched == outbound.OK) { @status = outbound.response(?exchange).status::u16; }
+    outbound.finish(?exchange);
+    var closed: outbound.Status = outbound.PENDING;
+    val limit:  i64             = monotonic_ns() + 10000000000;
+    for (closed == outbound.PENDING && !outbound.idle(?exchange)) {
+        outbound.turn(loop, 10);
+        if (monotonic_ns() > limit) { brk; }
+    }
+    outbound.destroy_exchange(?exchange);
+    for (closed == outbound.PENDING) {
+        closed = outbound.close_loop(loop);
+        if (monotonic_ns() > limit) { brk; }
+    }
+    if (closed != outbound.OK) { ret outbound.INVALID; }
+    ret fetched;
+}
+
+test outbound__verified_fetch_and_untrusted_refusal {
+    var pages: allocator.Allocator;
+    page.make(?pages);
+    var status: u16            = 0;
+    var cause:  outbound.Cause = outbound.CAUSE_NONE;
+    if (loop_fetch(?pages, AUTHORITY_CA, ?status, ?cause) != outbound.OK
+        || status != 200) {
+        print.eprintlnf("trusted: status {} cause {}", status::i64, cause::i64);
+        ret 1;
+    }
+    # a real certificate that is not the authority's issuer: the chain is
+    # refused, and nothing is read from the peer
+    if (loop_fetch(?pages, UNRELATED_CERTIFICATE, ?status, ?cause) != outbound.FAILED
+        || cause != outbound.CAUSE_UNTRUSTED) {
+        print.eprintlnf("untrusted: status {} cause {}", status::i64, cause::i64);
+        ret 2;
+    }
     ret 0;
 }

@@ -70,6 +70,7 @@ See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md
 ## Documentation
 
 - [Architecture](doc/ARCHITECTURE.md)
+- [Hosting applications](doc/HOSTING.md)
 - [Project boundaries](doc/PROJECTS.md)
 - [Roadmap](doc/ROADMAP.md)
 - [Production requirements](doc/PRODUCTION.md)
