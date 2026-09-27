@@ -248,9 +248,9 @@ worker or timer.
 
 ## Web applications
 
-Laurel applications receive only the common HTTP service exchange and framework services declared during composition. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities through typed providers.
+Hosted applications receive only the common HTTP service exchange, through the handler contract, and a lifecycle the supervisor drives. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities to them through the same contract.
 
-Applications cannot reach listener or connection internals. Server reload can replace an application generation without invalidating exchanges already executing in the old generation.
+Applications cannot reach listener or connection internals. A reload rebuilds the services that reach an application without restarting the application, and without invalidating exchanges already executing in the old generation. [Hosting applications](HOSTING.md) is the host contract.
 
 ## Configuration and reload
 
