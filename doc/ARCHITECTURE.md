@@ -55,7 +55,13 @@ its listener's keys, which are process-wide and rotated by every reload, so any
 worker decodes any ID and nothing but the key holder learns what it names. A
 listener given an operator's key file (#405) takes its keys from the file
 instead, so hosts sharing it and a restarted process decode one another's IDs,
-and each ID carries its host's ID ahead of the worker.
+and each ID carries its host's ID ahead of the worker. A connection also
+offers its client spare IDs minted the same way, up to the client's
+`active_connection_id_limit`, so a client that migrates has an unlinkable ID
+to move to (#404). After a rotation, a connection raises `retire_prior_to` and
+mints its next IDs under the new codepoint. The old codepoint is freed once
+the client retires the IDs minted under it, without waiting for the
+connection to close.
 Every worker binds every QUIC listener's address, and a datagram the kernel
 delivers to a worker other than its connection's is handed over a bounded
 single-producer ring to the one that owns it; a full ring drops it and counts
