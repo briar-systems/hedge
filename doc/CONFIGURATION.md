@@ -85,7 +85,7 @@ The implemented schema accepts these top-level sections:
   protocol sets. A `quic` listener binds a UDP endpoint, becomes ready, and
   serves HTTP/3 to clients that select `h3` through ALPN inside QUIC
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
-- named `application` tables, one for each hosted application that has a section of its own
+- named `application` tables, one for each hosted application that has a section of its own: the secrets it is granted and its settings
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
 - `cache` policy and `acme` certificate management
@@ -778,6 +778,22 @@ database = "db-password"
 
 Every generation resolves the secrets it grants before it is published, into secret-welded memory, and a secret that cannot be resolved refuses the generation. A `file` secret is the file's bytes, read straight into that memory and handed over as they are, a trailing newline included. An `env` secret is the variable's value, and `os` and `application` secrets come from the provider the embedding program registers (see [Secrets](HOSTING.md#secrets)). A value is at most 4096 bytes. A reload resolves every grant again, so a secret rotated at its source reaches hosted code with the next reload, and grants and declarations may change at a reload. The administration credential is the exception: it is resolved once at startup, so a reload that changes its declaration is refused.
 
+### Application settings
+
+A hosted application's section may carry a `settings` table, which hedge hands to the application as it is (see [Settings](HOSTING.md#settings)):
+
+```toml
+[application.site.settings]
+greeting = "hello"
+ratio = 0.5
+peers = ["a", "b"]
+
+[application.site.settings.database]
+pool = 8
+password = "${SECRET:database}"
+```
+
+hedge does not interpret the table. It checks that every key can be addressed, as one of up to 128 bytes of dotted segments that are each printable and hold no space or dot, and flattens it: an array's elements sit under their indices (`peers.0`), a table's members under its key (`database.pool`), and a value may be a string, an integer, a float, a boolean, an array or a table. `${ENV:...}` is not expanded inside it. A string that is exactly `${SECRET:name}` refers to the grant `name` in the same application's `secrets` table, and one that names no grant of that application refuses the configuration. The settings of every section together hold at most 1024 values and 65536 bytes of keys and values. A reload hands the application its new settings with its new generation.
 ## Lightweight behavior
 
 Disabled sections create no worker, timer, cache, or background task. Default configuration does not enable proxying, caching, ACME, admin networking, templates, or application sessions.
