@@ -14,20 +14,26 @@ use hedge.allowance;
 use http_cache:  hedge.cache;
 use cache_store: hedge.cache.store;
 use hedge.cache.store_worker;
+use hedge.clock;
 use hedge.config.schema;
 use hedge.dispatch.plan;
 use hedge.handoff;
 use hedge.lifecycle;
 use hedge.listener;
+use hedge.protocol.quic.keyfile;
+use quic_keys:    hedge.protocol.quic.keys;
 use quic_runtime: hedge.protocol.quic.runtime;
-use hedge_tls:    hedge.protocol.tls;
+use hedge.protocol.quic.steering;
+use hedge_tls: hedge.protocol.tls;
 use hedge.serve;
 use hedge.service;
+use hedge.task;
 use hedge.telemetry;
 use telemetry_production: hedge.telemetry.production;
 use hedge.worker;
 use std.allocator;
 use std.chrono.time;
+use std.crypto.hash.siphash;
 use std.net.ip;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -55,6 +61,9 @@ fwd worker.quic_required;
 
 pub val CACHE_ENTRIES: usize = 128;
 
+pub val ENTROPY_UNAVAILABLE: str =
+    "the operating system entropy source is unavailable, so peer-keyed tables cannot be keyed";
+
 pub def Event: u8;
 pub val CACHE_BINDINGS_READY: Event = 1;
 pub val CACHE_WRAPPER_READY:  Event = 2;
@@ -72,13 +81,18 @@ pub val TELEMETRY_CLOSED:     Event = 10;
 pub rec Options {
     native:       service.Factory;
     applications: *service.Applications;
-    pseudonym:    str;
-    telemetry:    telemetry_production.Options;
+    # the background task facility the supervisor runs, or nil for none
+    tasks:     *task.Tasks;
+    pseudonym: str;
+    telemetry: telemetry_production.Options;
+    # where the process key comes from: the operating system entropy source
+    entropy: fun() opt[siphash.Key];
 }
 
 pub fun default_options() Options {
-    ret Options{native: service.no_factory(), applications: nil,
-        pseudonym: "hedge", telemetry: telemetry_production.default_options()};
+    ret Options{native: service.no_factory(), applications: nil, tasks: nil,
+        pseudonym: "hedge", telemetry: telemetry_production.default_options(),
+        entropy:   siphash.random_key};
 }
 
 pub rec Runtime {
@@ -93,9 +107,19 @@ pub rec Runtime {
     certificate_policy: usize;
     observability:      telemetry_production.Production;
     options:            Options;
+    # the secret the process's peer-keyed tables are placed by, drawn once at
+    # start. a peer who could guess it could aim collisions at one bucket
+    key: siphash.Key;
     # the caps every worker shares, and where a worker waiting for one is woken
-    wakers:          allowance.Wakers;
-    board:           handoff.Board;
+    wakers: allowance.Wakers;
+    board:  handoff.Board;
+    # the board datagrams cross workers on, and whether the process keyed its
+    # QUIC listeners (hedge.protocol.quic.keys), made only when one is configured
+    steering:   steering.Board;
+    quic_keyed: bool;
+    # why the last reload kept each filed QUIC listener's keys, nil where it
+    # took its key file
+    quic_keys_kept:  [schema.MAX_LISTENERS]str;
     connections:     process_admission.Shared;
     handshakes:      process_admission.Shared;
     handshake_slots: allowance.Pool;
@@ -161,13 +185,13 @@ fun make_caps(runtime: *Runtime, configured: *schema.Graph, generation_id: u64,
     val limits: *schema.Limits = ?configured.limits;
     if (!allowance.make_wakers(?runtime.wakers, workers)
         || !handoff.make_board(?runtime.board, runtime.heap, ?runtime.wakers, workers)) { ret false; }
-    if (!process_admission.make_shared(?runtime.connections, runtime.heap,
+    if (!process_admission.make_shared(?runtime.connections, runtime.heap, runtime.key,
         limits.max_connections, limits.max_connections_per_peer, workers,
         ?runtime.wakers)) {
         handoff.destroy_board(?runtime.board);
         ret false;
     }
-    if (!process_admission.make_shared(?runtime.handshakes, runtime.heap,
+    if (!process_admission.make_shared(?runtime.handshakes, runtime.heap, runtime.key,
         opt[usize].none{}, limits.max_handshakes_per_peer, workers, ?runtime.wakers)) {
         process_admission.destroy_shared(?runtime.connections);
         handoff.destroy_board(?runtime.board);
@@ -186,15 +210,76 @@ fun make_caps(runtime: *Runtime, configured: *schema.Graph, generation_id: u64,
     }
     runtime.budget_pools[1].generation = 0;
     runtime.budget_pools[1].count      = 0;
-    runtime.caps_live                  = true;
+    if (!make_quic_caps(runtime, configured, workers)) {
+        process_admission.destroy_shared(?runtime.connections);
+        process_admission.destroy_shared(?runtime.handshakes);
+        handoff.destroy_board(?runtime.board);
+        ret false;
+    }
+    runtime.caps_live = true;
     ret true;
+}
+
+# a board for `workers` workers that forwards nothing when there is one, and
+# keys for every listener index, which only QUIC listeners use
+fun make_quic_caps(runtime: *Runtime, configured: *schema.Graph, workers: usize) bool {
+    runtime.quic_keyed = false;
+    if (!steering.make_board(?runtime.steering, nil, nil, 1)) { ret false; }
+    if (!worker.quic_required(configured))                    { ret true; }
+    if (!quic_keys.make(configured.listener_count))           { ret false; }
+    if (!steering.make_board(?runtime.steering, runtime.heap, ?runtime.wakers, workers)) {
+        quic_keys.destroy();
+        ret false;
+    }
+    runtime.quic_keyed = true;
+    ret true;
+}
+
+# every QUIC listener that names a key file takes its keys from it. a refusal
+# is diagnosed against the listener
+fun file_quic_keys(runtime: *Runtime, configured: *schema.Graph,
+    diagnostics: *schema.Diagnostics) bool {
+    var i: usize = 0;
+    for (i < schema.MAX_LISTENERS) {
+        runtime.quic_keys_kept[i] = nil;
+        i                         = i + 1;
+    }
+    if (!runtime.quic_keyed) { ret true; }
+    val now_ns: u64  = clock.monotonic_ns();
+    var ok:     bool = true;
+    i = 0;
+    for (i < configured.listener_count) {
+        val listener: *schema.Listener = ?configured.listeners[i];
+        if (listener.transport == schema.TRANSPORT_QUIC && listener.quic_keys.len > 0) {
+            var file:   quic_keys.File;
+            var reason: str            = nil;
+            val read:   keyfile.Status = keyfile.read(schema.text(?listener.quic_keys), ?file);
+            if (read != keyfile.OK) { reason = keyfile.message(read); }
+            or {
+                var host: u32 = 0;
+                if (sel listener.quic_host_id.some) { host = listener.quic_host_id.some::u32; }
+                val filed: quic_keys.Status = quic_keys.start_filed(
+                    quic_keys.listener_at(i), host, ?file, now_ns);
+                if (filed != quic_keys.KEYED) { reason = quic_keys.message(filed); }
+            }
+            quic_keys.wipe_file(?file);
+            if (reason != nil) {
+                schema.add_diagnostic(diagnostics, schema.ERROR, schema.INVALID_VALUE,
+                    "quic_keys", schema.text(?listener.name), reason);
+                ok = false;
+            }
+        }
+        i = i + 1;
+    }
+    ret ok;
 }
 
 # what worker `index` shares with the others
 fun caps(runtime: *Runtime) serve.Caps {
     ret serve.Caps{connections: ?runtime.connections, handshakes: ?runtime.handshakes,
         handshake_slots: ?runtime.handshake_slots, budgets: ?runtime.budget_pools[0],
-        wakers:          ?runtime.wakers, board: ?runtime.board};
+        wakers:          ?runtime.wakers, board: ?runtime.board,
+        steering:        ?runtime.steering};
 }
 
 fun built_events(runtime: *Runtime, given: *worker.Inputs) {
@@ -208,7 +293,7 @@ fun built_events(runtime: *Runtime, given: *worker.Inputs) {
 fun clean(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
     var report: worker.StopReport = worker.StopReport{stopped: true,
         reason:           lifecycle.IMMEDIATE, abandoned: 0, applications_abandoned: 0,
-        serve_failures:   0,
+        tasks_abandoned:  0, serve_failures: 0,
         cleanup_failures: 0};
     var i: usize = 0;
     for (i < runtime.worker_count) {
@@ -287,6 +372,11 @@ fun close_process(runtime: *Runtime, report: *worker.StopReport) {
             report.cleanup_failures = report.cleanup_failures + 1;
         }
         handoff.destroy_board(?runtime.board);
+        steering.destroy_board(?runtime.steering);
+        if (runtime.quic_keyed) {
+            quic_keys.destroy();
+            runtime.quic_keyed = false;
+        }
         runtime.caps_live = false;
     }
 }
@@ -336,6 +426,12 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
     runtime.certificate_policy  = hedge_tls.NO_POLICY;
     runtime.workers             = nil;
     runtime.worker_count        = 0;
+    # no fallback: a table placed by a guessable key is one a peer can flood
+    val key: opt[siphash.Key] = options.entropy();
+    if (!(sel key.some)) {
+        ret worker.failed(worker.START_RUNTIME, ENTROPY_UNAVAILABLE);
+    }
+    runtime.key = key.some;
 
     val worker_memory: res[*worker.Worker, allocator.Error] =
         allocator.allocate[worker.Worker](heap, workers);
@@ -346,6 +442,9 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
     runtime.caps_live = false;
     if (!make_caps(runtime, configured, generation_id, workers)) {
         ret worker.failed(worker.START_CONFIG, "admission caps could not be constructed");
+    }
+    if (!file_quic_keys(runtime, configured, diagnostics)) {
+        ret fail(runtime, nil, worker.START_CONFIG, "a QUIC listener's key file was refused");
     }
     var i: usize = 0;
     for (i < workers) {
@@ -370,7 +469,7 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
         runtime.caching = layer_memory.ok;
         if (!http_cache.from_config(runtime.caching, ?configured.cache,
             entry_memory.ok, CACHE_ENTRIES,
-            body_memory.ok, configured.cache.memory_bytes, workers, heap)) {
+            body_memory.ok, configured.cache.memory_bytes, workers, runtime.key, heap)) {
             ret fail(runtime, nil, worker.START_CONFIG, "cache could not be constructed");
         }
         runtime.cache_live = true;
@@ -536,7 +635,8 @@ pub fun close(runtime: *Runtime, report: *worker.StopReport) {
 pub fun stop(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
     if (runtime == nil) {
         ret worker.StopReport{stopped: false, reason: lifecycle.FAILED, abandoned: 0,
-            applications_abandoned: 0, serve_failures: 0, cleanup_failures: 0};
+            applications_abandoned: 0, tasks_abandoned: 0, serve_failures: 0,
+            cleanup_failures:       0};
     }
     ret clean(runtime, controls);
 }
@@ -603,8 +703,53 @@ pub fun stage_reload(runtime: *Runtime, configured: *schema.Graph,
     if (runtime == nil || configured == nil || !runtime.caps_live) { ret false; }
     var slot: usize = 0;
     if (runtime.budget_pools[0].generation == runtime.generation_id) { slot = 1; }
-    ret allowance.make_budget_pools(?runtime.budget_pools[slot], configured,
-        generation_id, runtime.worker_count, ?runtime.wakers);
+    if (!allowance.make_budget_pools(?runtime.budget_pools[slot], configured,
+        generation_id, runtime.worker_count, ?runtime.wakers)) { ret false; }
+    rotate_quic_keys(runtime, configured);
+    ret true;
+}
+
+# every reload moves each QUIC listener's connection IDs and tokens onto fresh
+# keys, or onto what its key file now holds. the old codepoint decodes on until
+# nothing can carry it: no live connection holds it, and a Retry minted under it
+# has outlived its token and the handshake that could follow. a rotation that
+# finds no free codepoint leaves the current keys and is counted, and a key file
+# that is refused leaves them too, and says why in `quic_keys_kept`
+fun rotate_quic_keys(runtime: *Runtime, configured: *schema.Graph) {
+    if (!runtime.quic_keyed) { ret; }
+    val grace_ns: u64 = serve.QUIC_RETRY_MAX_AGE_NS
+        + configured.timeouts.handshake_ms * 1000000;
+    val now_ns: u64   = clock.monotonic_ns();
+    var i:      usize = 0;
+    for (i < configured.listener_count) {
+        val listener: *schema.Listener    = ?configured.listeners[i];
+        val keys:     *quic_keys.Listener = quic_keys.listener_at(i);
+        runtime.quic_keys_kept[i] = nil;
+        if (listener.transport == schema.TRANSPORT_QUIC && keys.filed) {
+            var file: quic_keys.File;
+            val read: keyfile.Status = keyfile.read(schema.text(?listener.quic_keys), ?file);
+            if (read != keyfile.OK) { runtime.quic_keys_kept[i] = keyfile.message(read); }
+            or {
+                val adopted: quic_keys.Status = quic_keys.adopt(keys, ?file, now_ns,
+                    grace_ns, runtime.worker_count);
+                if (adopted != quic_keys.KEYED) {
+                    runtime.quic_keys_kept[i] = quic_keys.message(adopted);
+                }
+            }
+            quic_keys.wipe_file(?file);
+        }
+        or (listener.transport == schema.TRANSPORT_QUIC) {
+            quic_keys.rotate(keys, now_ns, grace_ns, runtime.worker_count);
+        }
+        i = i + 1;
+    }
+}
+
+# why the last reload kept listener `index`'s key file keys rather than take its
+# file, or nil when it took it or has none
+pub fun quic_keys_kept(runtime: *Runtime, index: usize) str {
+    if (runtime == nil || index >= schema.MAX_LISTENERS) { ret nil; }
+    ret runtime.quic_keys_kept[index];
 }
 
 # the first step of a reload, on worker `index`'s thread: build the candidate's

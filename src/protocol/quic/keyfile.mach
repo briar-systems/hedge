@@ -1,0 +1,338 @@
+# an operator's QUIC listener key file
+#
+# the file is text, one record per line, keys in hex:
+#
+#   current <codepoint>
+#   codepoint <n> host_id_length <h> cid <32 hex> reset <64 hex>
+#   token <generation> <64 hex>
+#   token_previous <generation> <64 hex>
+#
+# codepoints are 0 to 6 and a host ID length is 0 to 2 octets. `current` must
+# name a codepoint the file defines, `token` is required, and `token_previous`,
+# when present, has a lower generation than `token`. blank lines are allowed.
+#
+# this is the one way QUIC listener keys enter from outside. the file is read
+# straight into secret storage, and each key is decoded from there into its
+# own secret storage (hedge.protocol.quic.keys), so no key byte is ever public.
+# the parser sees only the file's layout: which bytes separate words and lines,
+# whether a word is a keyword, the numbers, and whether a key is well-formed
+# hex. the read storage is wiped when the read returns. hedge never writes the
+# file, and one that group or other can read is refused.
+
+use hedge.protocol.quic.keys;
+use std.crypto.ct;
+use std.filesystem;
+use io_error:      std.io.error;
+use secret_memory: std.memory.secret;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val MAX_FILE_BYTES: usize = 4096;
+
+pub def Status: u8;
+pub val OK:         Status = 0;
+pub val UNREADABLE: Status = 1;
+# group or other may read it
+pub val EXPOSED:   Status = 2;
+pub val MALFORMED: Status = 3;
+pub val DUPLICATE: Status = 4;
+# `current` is missing or names a codepoint the file does not define
+pub val NO_CURRENT: Status = 5;
+# `token` is missing, a generation is zero, or `token_previous`'s is not lower
+pub val TOKEN_ORDER: Status = 6;
+
+pub fun message(status: Status) str {
+    if (status == OK)         { ret "the key file was read"; }
+    if (status == UNREADABLE) { ret "the key file cannot be read"; }
+    if (status == EXPOSED)    { ret "the key file can be read by group or other"; }
+    if (status == DUPLICATE)  { ret "the key file defines a codepoint twice"; }
+    if (status == NO_CURRENT) { ret "the key file's current codepoint is missing or undefined"; }
+    if (status == TOKEN_ORDER) {
+        ret "the key file needs a token, and token_previous's generation below token's";
+    }
+    ret "the key file is malformed";
+}
+
+# a cursor over one line's space-separated words
+rec Line {
+    text:   *^u8;
+    length: usize;
+    at:     usize;
+}
+
+rec Word {
+    text:   *^u8;
+    length: usize;
+}
+
+val OTHER:   u8 = 0;
+val BLANK:   u8 = 1;
+val NEWLINE: u8 = 2;
+val NUL:     u8 = 3;
+
+# whether a byte separates words or lines, or is a nul the file may not hold
+#[oblivious]
+fun class_of(c: ^u8) u8 {
+    val blank:   ^u8 = (c == ' ') | (c == '\t') | (c == '\r');
+    val newline: ^u8 = c == '\n';
+    val nul:     ^u8 = c == 0;
+    val class:   ^u8 = blank | (newline << 1) | nul | (nul << 1);
+    # declassify: the separators are the file's public layout, and every hex
+    # digit of a key is OTHER, so the scan learns nothing of a key
+    ret class:>u8;
+}
+
+fun next_word(line: *Line) Word {
+    for (line.at < line.length && class_of(line.text[line.at]) == BLANK) { line.at = line.at + 1; }
+    val start: usize = line.at;
+    for (line.at < line.length && class_of(line.text[line.at]) != BLANK) { line.at = line.at + 1; }
+    ret Word{text: ?line.text[start], length: line.at - start};
+}
+
+#[oblivious]
+fun is(word: Word, expected: str) bool {
+    var n: usize = 0;
+    for (expected[n] != 0) { n = n + 1; }
+    if (word.length != n) { ret false; }
+    var differ: ^u8   = 0;
+    var i:      usize = 0;
+    for (i < n) {
+        differ = differ | (word.text[i] ^ expected[i]);
+        i      = i + 1;
+    }
+    val same: ^u8 = differ == 0;
+    # declassify: whether a word is one keyword, the file's public layout
+    ret (same:>u8) == 1;
+}
+
+# a decimal number up to `limit`, or false
+fun number(word: Word, limit: u64, output: *u64) bool {
+    if (word.length == 0 || word.length > 19) { ret false; }
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (i < word.length) {
+        # declassify: a number is a codepoint, a length or a generation, the
+        # file's public layout
+        val c: u8 = word.text[i]:>u8;
+        if (c < '0' || c > '9') { ret false; }
+        value = value * 10 + (c - '0')::u64;
+        i     = i + 1;
+    }
+    if (value > limit) { ret false; }
+    @output = value;
+    ret true;
+}
+
+# one hex digit's value without a branch on it. `valid` is cleared when `c`
+# is no hex digit
+#[oblivious]
+fun nibble(c: ^u8, valid: *^u8) ^u8 {
+    val digit: ^u8 = (c >= '0') & (c <= '9');
+    val lower: ^u8 = (c >= 'a') & (c <= 'f');
+    val upper: ^u8 = (c >= 'A') & (c <= 'F');
+    @valid = @valid & (digit | lower | upper);
+    ret ct.select_u8(digit, c - '0', ct.select_u8(lower, c - 'a' + 10, c - 'A' + 10));
+}
+
+# `length` bytes of hex from `word`, decoded straight into secret storage
+#[oblivious]
+fun hex(word: Word, output: *^u8, length: usize) bool {
+    if (word.length != length * 2) { ret false; }
+    var valid: ^u8   = 1;
+    var i:     usize = 0;
+    for (i < length) {
+        val high: ^u8 = nibble(word.text[i * 2], ?valid);
+        val low:  ^u8 = nibble(word.text[i * 2 + 1], ?valid);
+        output[i] = (high << 4) | low;
+        i         = i + 1;
+    }
+    # declassify: one verdict on whether the whole key is well-formed hex
+    ret (valid:>u8) == 1;
+}
+
+rec Seen {
+    current:        bool;
+    token:          bool;
+    token_previous: bool;
+}
+
+fun parse_codepoint(line: *Line, file: *keys.File) Status {
+    var index:  u64 = 0;
+    var length: u64 = 0;
+    if (!number(next_word(line), (keys.CODEPOINTS - 1)::u64, ?index)
+        || !is(next_word(line), "host_id_length")
+        || !number(next_word(line), keys.MAX_HOST_ID_LENGTH::u64, ?length)) {
+        ret MALFORMED;
+    }
+    val defined: *keys.FileCodepoint = ?file.codepoints[index::usize];
+    if (defined.defined) { ret DUPLICATE; }
+    if (!is(next_word(line), "cid")
+        || !hex(next_word(line), ?defined.cid_key[0], keys.CID_KEY_BYTES)
+        || !is(next_word(line), "reset")
+        || !hex(next_word(line), ?defined.reset_key[0], keys.RESET_KEY_BYTES)) {
+        ret MALFORMED;
+    }
+    defined.defined        = true;
+    defined.host_id_length = length::u8;
+    ret OK;
+}
+
+fun parse_line(line: *Line, file: *keys.File, seen: *Seen) Status {
+    val first: Word = next_word(line);
+    if (first.length == 0) { ret OK; }
+    var status: Status = MALFORMED;
+    if (is(first, "codepoint")) { status = parse_codepoint(line, file); }
+    or (is(first, "current") && !seen.current) {
+        var index: u64 = 0;
+        if (number(next_word(line), (keys.CODEPOINTS - 1)::u64, ?index)) {
+            file.current = index::usize;
+            seen.current = true;
+            status       = OK;
+        }
+    }
+    or (is(first, "token") && !seen.token) {
+        if (number(next_word(line), 0xffffffffffffffff, ?file.token_generation)
+            && hex(next_word(line), ?file.token_key[0], keys.TOKEN_KEY_BYTES)) {
+            seen.token = true;
+            status     = OK;
+        }
+    }
+    or (is(first, "token_previous") && !seen.token_previous) {
+        if (number(next_word(line), 0xffffffffffffffff, ?file.token_previous_generation)
+            && hex(next_word(line), ?file.token_previous[0], keys.TOKEN_KEY_BYTES)) {
+            seen.token_previous = true;
+            status              = OK;
+        }
+    }
+    if (status == OK && next_word(line).length != 0) { ret MALFORMED; }
+    ret status;
+}
+
+# the keys `length` bytes of key file `text` hold, into `file`. anything but OK
+# leaves `file` wiped
+pub fun parse(text: *^u8, length: usize, file: *keys.File) Status {
+    keys.wipe_file(file);
+    var seen:   Seen   = Seen{current: false, token: false, token_previous: false};
+    var status: Status = OK;
+    var start:  usize  = 0;
+    for (start < length && status == OK) {
+        var end: usize = start;
+        for (end < length) {
+            val class: u8 = class_of(text[end]);
+            if (class == NEWLINE) { brk; }
+            if (class == NUL)     { status = MALFORMED; }
+            end = end + 1;
+        }
+        var line: Line = Line{text: ?text[start], length: end - start, at: 0};
+        if (status == OK) { status = parse_line(?line, file, ?seen); }
+        start = end + 1;
+    }
+    if (status == OK && (!seen.current || !file.codepoints[file.current].defined)) {
+        status = NO_CURRENT;
+    }
+    if (status == OK && (!seen.token || file.token_generation == 0
+        || (seen.token_previous && (file.token_previous_generation == 0
+        || file.token_previous_generation >= file.token_generation)))) {
+        status = TOKEN_ORDER;
+    }
+    if (status != OK) { keys.wipe_file(file); }
+    ret status;
+}
+
+fun exposed(handle: filesystem.File) bool {
+    val metadata: res[filesystem.Metadata, io_error.Error] = filesystem.stat_of(handle);
+    if (sel metadata.err) { ret true; }
+    # windows synthesizes the mode from attributes, so it says nothing about
+    # who may read the file
+    $if ($mach.build.os == $mach.os.windows) { ret false; }
+    $or                                      { ret (metadata.ok.mode & 0o077) != 0; }
+}
+
+# read and parse the key file at `path` into `file`. anything but OK leaves
+# `file` wiped
+pub fun read(path: str, file: *keys.File) Status {
+    keys.wipe_file(file);
+    if (path == nil || path[0] == 0) { ret UNREADABLE; }
+    val opened: res[filesystem.File, io_error.Error] = filesystem.open(path);
+    if (sel opened.err) { ret UNREADABLE; }
+    var handle:   filesystem.File                          = opened.ok;
+    val refused:  bool                                     = exposed(handle);
+    val metadata: res[filesystem.Metadata, io_error.Error] = filesystem.stat_of(handle);
+    filesystem.close(?handle);
+    if (refused)          { ret EXPOSED; }
+    if (sel metadata.err) { ret UNREADABLE; }
+    # a file as large as the bound may hold more, and is no key file
+    if (metadata.ok.size >= MAX_FILE_BYTES) { ret MALFORMED; }
+    val read: res[filesystem.SecretBytes, filesystem.FsError] = filesystem.read_secret(path);
+    if (sel read.err) { ret UNREADABLE; }
+    val bytes:  filesystem.SecretBytes = read.ok;
+    var status: Status                 = MALFORMED;
+    if (bytes.size < MAX_FILE_BYTES) { status = parse(bytes.data, bytes.size, file); }
+    if (bytes.data != nil)           { secret_memory.deallocate(bytes.data, bytes.size); }
+    ret status;
+}
+
+#[testing]
+pub fun parsed(text: str, file: *keys.File) Status {
+    var lifted: [MAX_FILE_BYTES]^u8;
+    var i:      usize = 0;
+    for (text[i] != 0) {
+        lifted[i] = text[i];
+        i         = i + 1;
+    }
+    val status: Status = parse(?lifted[0], i, file);
+    ct.zeroize(?lifted[0], MAX_FILE_BYTES);
+    ret status;
+}
+
+test parse__refuses_what_no_host_could_share {
+    var file: keys.File;
+    if (parsed("current 1\ncodepoint 1 host_id_length 2 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 3 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken_previous 2 00112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff\n",
+        ?file) != OK || file.current != 1 || !file.codepoints[1].defined
+        || file.codepoints[1].host_id_length != 2 || file.codepoints[0].defined
+        || file.token_generation != 3 || file.token_previous_generation != 2) { ret 1; }
+    if (parsed("current 1\ncodepoint 1 host_id_length 0 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ncodepoint 1 host_id_length 0 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 1 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+        ?file) != DUPLICATE || file.codepoints[1].defined) { ret 2; }
+    if (parsed("current 2\ncodepoint 1 host_id_length 0 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 1 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+        ?file) != NO_CURRENT) { ret 3; }
+    if (parsed("current 1\ncodepoint 1 host_id_length 0 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 2 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken_previous 2 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+        ?file) != TOKEN_ORDER) { ret 4; }
+    # codepoint 7 is reserved, a host ID is at most two octets, and a key is
+    # exactly its length
+    if (parsed("current 7\ncodepoint 7 host_id_length 0 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 1 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+        ?file) != MALFORMED) { ret 5; }
+    if (parsed("current 1\ncodepoint 1 host_id_length 3 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 1 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+        ?file) != MALFORMED) { ret 6; }
+    if (parsed("current 1\ncodepoint 1 host_id_length 0 cid 00112233445566778899aabbccddee reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 1 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+        ?file) != MALFORMED) { ret 7; }
+    ret 0;
+}
+
+# the file is read from disk into secret storage, and one others can read is
+# refused before a byte of it is read
+test read__keys_from_disk_and_refuses_an_exposed_file {
+    val path:   str   = "hedge_keyfile_read_test";
+    val text:   str   = "current 1\ncodepoint 1 host_id_length 0 cid 00112233445566778899aabbccddeeff reset 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\ntoken 1 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+    var length: usize = 0;
+    for (text[length] != 0) { length = length + 1; }
+    var file:    keys.File;
+    val written: err[filesystem.FsError] = filesystem.write_bytes(path, text, length, 0o600);
+    if (sel written.err) { ret 1; }
+    val status: Status = read(path, ?file);
+    filesystem.remove_file(path);
+    if (status != OK || file.current != 1 || !file.codepoints[1].defined) { ret 2; }
+    keys.wipe_file(?file);
+    $if ($mach.build.os != $mach.os.windows) {
+        val shared: err[filesystem.FsError] = filesystem.write_bytes(path, text, length, 0o644);
+        if (sel shared.err) { ret 3; }
+        val exposed_status: Status = read(path, ?file);
+        filesystem.remove_file(path);
+        if (exposed_status != EXPOSED || file.codepoints[1].defined) { ret 4; }
+    }
+    ret 0;
+}

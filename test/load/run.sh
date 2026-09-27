@@ -24,9 +24,8 @@ target="${LOAD_TARGET:-40}"
 quic_connections="${LOAD_QUIC_CONNECTIONS:-1100}"
 # every transfer has to outlast the dial burst, or the cell cannot show that all
 # of them were held open at once. the burst is bounded by the handshake rate,
-# and until #174 one worker completes every QUIC handshake, so under load it can
-# run past 20 s. a 64 KiB body at 1 KiB/s takes 64 s, which outlasts any burst
-# the connect timeout allows (#301)
+# which a slow runner's workers can carry past 20 s. a 64 KiB body at 1 KiB/s
+# takes 64 s, which outlasts any burst the connect timeout allows (#301)
 quic_connect_timeout=60
 quic_rate="${LOAD_QUIC_RATE:-1k}"
 # 0 skips every assertion that HTTP/3 transfers were served, for a box whose

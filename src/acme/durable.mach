@@ -24,8 +24,12 @@ use acme.storage;
 use hedge.acme.keys;
 use std.allocator;
 use std.allocator.fixed;
+use std.crypto.ct;
+use std.crypto.hash.sha256;
 use fs:       std.filesystem;
 use io_error: std.io.error;
+use std.memory;
+use secret_memory: std.memory.secret;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -82,7 +86,6 @@ pub rec Store {
     account_key:          PathBuffer;
     certificate_key:      PathBuffer;
     scratch:              [1024]u8;
-    buffer:               [1024]u8;
     live:                 bool;
 }
 
@@ -184,21 +187,72 @@ pub fun secret_owner(store: *Store) ptr {
     ret file_store.secret_owner(?store.backing);
 }
 
-fun read_key(store: *Store, target: *PathBuffer, key: *keys.Key) Status {
+val FRAME_BYTES: usize = 24;
+
+# checks a key document read into secret storage exactly as mach-acme's file
+# store checks any document: magic, schema version, kind, declared length and
+# payload digest. the frame before the digest says what the document is and
+# never what it holds, so it is read in the clear. the digest is taken over the
+# secret payload and compared without a branch on either.
+fun key_document(data: *^u8, size: usize) bool {
+    if (data == nil || size != file_store.HEADER_BYTES + keys.SCALAR_BYTES) {
+        ret false;
+    }
+    var frame: [FRAME_BYTES]u8;
+    var i:     usize = 0;
+    for (i < FRAME_BYTES) {
+        # declassify: the frame is the document's public layout
+        frame[i] = data[i]:>u8;
+        i        = i + 1;
+    }
+    val magic: str = "MACHACME";
+    i = 0;
+    for (i < file_store.MAGIC_BYTES) {
+        if (frame[i] != magic[i]) { ret false; }
+        i = i + 1;
+    }
+    val version: u32 = (frame[8]::u32 << 24) | (frame[9]::u32 << 16)
+        | (frame[10]::u32 << 8) | frame[11]::u32;
+    val kind: u16 = (frame[12]::u16 << 8) | frame[13]::u16;
+    if (version == 0 || version > file_store.SCHEMA_VERSION
+        || kind != file_store.DOC_KEY_GENERATION || frame[14] != 0 || frame[15] != 0
+        || file_store.get_u64(?frame[0], 16) != keys.SCALAR_BYTES::u64) {
+        ret false;
+    }
+    var digest: [32]^u8;
+    var state:  sha256.SecretState = sha256.init_secret();
+    sha256.update_secret(?state, ?data[file_store.HEADER_BYTES], keys.SCALAR_BYTES);
+    sha256.final_secret(?state, ?digest[0]);
+    sha256.destroy_secret(?state);
+    val same: ^u8 = ct.eq_bytes(?digest[0], ?data[FRAME_BYTES], 32);
+    ct.zeroize(?digest[0], 32);
+    # declassify: one verdict on whether the payload matches its digest
+    ret (same:>u8) == 1;
+}
+
+# the file is read straight into secret storage and the scalar adopted from
+# there, so no key byte is ever public
+fun read_key(target: *PathBuffer, key: *keys.Key) Status {
     if (!present(fs.is_file(path_text(target)::Path))) { ret MISSING; }
-    var document: file_store.Document;
-    val read:     problem.Error = file_store.read_document(path_text(target),
-        file_store.DOC_KEY_GENERATION, ?store.buffer[0], 1024, ?document);
-    if (problem.failed(read))                      { ret CORRUPT; }
-    if (document.payload.len != keys.SCALAR_BYTES) { ret CORRUPT; }
-    if (!keys.adopt(key, document.payload.data))   { ret CORRUPT; }
+    val read: res[fs.SecretBytes, fs.FsError] = fs.read_secret(path_text(target)::Path);
+    if (sel read.err) { ret CORRUPT; }
+    val bytes:   fs.SecretBytes = read.ok;
+    val adopted: bool           = key_document(bytes.data, bytes.size)
+        && keys.adopt(key, ?bytes.data[file_store.HEADER_BYTES]);
+    if (bytes.data != nil) { secret_memory.deallocate(bytes.data, bytes.size); }
+    if (!adopted)          { ret CORRUPT; }
     ret OK;
 }
 
 fun write_key(store: *Store, target: *PathBuffer, key: *keys.Key) Status {
+    var published: [keys.SCALAR_BYTES]u8;
+    if (!keys.publish(key, ?published[0])) { ret INVALID; }
     val written: problem.Error = file_store.write_document(path_text(target),
-        file_store.DOC_KEY_GENERATION, keys.material(key), ?store.scratch[0],
-        1024);
+        file_store.DOC_KEY_GENERATION,
+        view.view(?published[0], keys.SCALAR_BYTES), ?store.scratch[0], 1024);
+    # the published scalar and the document encoded around it are wiped
+    memory.raw_zero((?published[0])::ptr, keys.SCALAR_BYTES);
+    memory.raw_zero((?store.scratch[0])::ptr, 1024);
     if (problem.failed(written)) { ret FAILED; }
     ret OK;
 }
@@ -208,7 +262,7 @@ fun write_key(store: *Store, target: *PathBuffer, key: *keys.Key) Status {
 # document whose loss changes identity.
 pub fun open_account_key(store: *Store, key: *keys.Key) Status {
     if (store == nil || !store.live || key == nil) { ret INVALID; }
-    val read: Status = read_key(store, ?store.account_key, key);
+    val read: Status = read_key(?store.account_key, key);
     if (read != MISSING)     { ret read; }
     if (!keys.generate(key)) { ret FAILED; }
     val written: Status = write_key(store, ?store.account_key, key);
@@ -226,7 +280,7 @@ pub fun open_certificate_key(store: *Store, generation: u64,
         ret INVALID;
     }
     if (!certificate_key_path(store, generation)) { ret INVALID; }
-    ret read_key(store, ?store.certificate_key, key);
+    ret read_key(?store.certificate_key, key);
 }
 
 # makes the key for the next certificate generation durable. it is written

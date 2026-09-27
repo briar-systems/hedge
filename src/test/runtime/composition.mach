@@ -5,6 +5,7 @@ use hedge.clock;
 use hedge.composition;
 use hedge.config.lanes;
 use hedge.config.schema;
+use hedge.dispatch.call;
 use hedge.listener;
 use hedge_memory: hedge.memory;
 use h3_session:   hedge.protocol.h3.session;
@@ -12,15 +13,15 @@ use quic_runtime: hedge.protocol.quic.runtime;
 use hedge_tls:    hedge.protocol.tls;
 use hedge.serve;
 use hedge.service;
-use hosting: hedge.service.laurel;
 use hedge.storage;
-use site_fixture: hedge.test.laurel;
 use hedge.test.runtime.tlswire;
 use hedge.test.runtime.wire;
-use laurel.app;
+use http_exchange: http.core.exchange;
+use http.core.status;
 use std.allocator;
 use std.allocator.page;
 use std.chrono.time;
+use std.crypto.hash.siphash;
 use std.memory.buffers;
 use std.net.ip;
 use std.net.tcp;
@@ -44,8 +45,6 @@ fun page_ok(outcome: err[allocator.Error]) bool {
 }
 
 val RESPONSE_BYTES: usize = 4096;
-
-val FORM_HEAD: str = "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 10\r\nConnection: close\r\n\r\n";
 
 rec Counted {
     inner: *allocator.Allocator;
@@ -465,6 +464,26 @@ test start__failure_unwinds_resources {
     ret 0;
 }
 
+#[testing]
+fun no_entropy() opt[siphash.Key] {
+    ret opt[siphash.Key].none{};
+}
+
+# without entropy the peer-keyed tables cannot be keyed, so the process refuses
+# to start and builds nothing, rather than keying them with a guessable value
+test start__refused_without_entropy {
+    var controls: composition.Controls;
+    var harness:  Harness;
+    if (!prepare(?harness, true)) { ret 1; }
+    var options: composition.Options = composition.default_options();
+    options.entropy = no_entropy;
+    val started: composition.StartReport = start_with(?harness, ?controls, options);
+    if (started.status != composition.START_RUNTIME
+        || !str_equals(started.detail, composition.ENTROPY_UNAVAILABLE)) { ret 2; }
+    if (harness.runtime.workers != nil || composition.cache(harness.runtime) != nil) { ret 3; }
+    ret 0;
+}
+
 test reload__pins_old_registry_and_reclaims {
     var quic_controls: quic_runtime.ControlView;
     var controls:      composition.Controls;
@@ -678,30 +697,33 @@ fun exchange_status(harness: *Harness, request: str, status_line: str) bool {
     ret length != 0 && wire.starts_with(?response[0], length, status_line);
 }
 
-fun laurel_graph(harness: *Harness) {
+fun application_graph(harness: *Harness) {
     graph(harness, false);
     val site: *schema.Service = ?harness.graph.services[0];
     schema.set_text(?site.name, "application");
-    site.kind = schema.SERVICE_LAUREL;
+    site.kind = schema.SERVICE_APPLICATION;
     schema.set_text(?site.target, "site");
     schema.clear_text(?site.content_type);
     schema.set_text(?harness.graph.routes[0].service, "application");
 }
 
-test laurel__resolves_at_start_and_reload {
+# a registered application that answers 202 and counts the requests it served
+fun serve_registered(context: ptr, active: *call.Call) http_exchange.ServiceStatus {
+    atomic.fetch_add(context::*i64, 1);
+    ret service.respond(active, status.ACCEPTED);
+}
+
+test application__resolves_at_start_and_reload {
     var controls: composition.Controls;
     var harness:  Harness;
     if (!prepare(?harness, false)) { ret 1; }
-    laurel_graph(?harness);
-    var site: site_fixture.Site;
-    if (!site_fixture.make_site(?site)) { ret 2; }
-    var adapter:  hosting.Adapter;
+    application_graph(?harness);
+    var served:   i64 = 0;
     var slots:    [1]service.Application;
     var registry: service.Applications;
-    if (!hosting.make(?adapter, ?site.application)
-        || !service.make_applications(?registry, ?slots[0], 1)
+    if (!service.make_applications(?registry, ?slots[0], 1)
         || !service.register_application(?registry, "site",
-        hosting.bound_handler(?adapter), 0)) { ret 3; }
+        service.Handler{ctx: (?served)::ptr, serve: serve_registered}, 0)) { ret 3; }
     var options: composition.Options = composition.default_options();
     options.applications = ?registry;
     val started: composition.StartReport = start_with(?harness, ?controls,
@@ -709,15 +731,9 @@ test laurel__resolves_at_start_and_reload {
     if (started.status != composition.START_OK) { ret 4; }
     if (!exchange_status(?harness,
         "GET /orders/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        "HTTP/1.1 200 OK\r\n") || site.probe.order != 42) {
+        "HTTP/1.1 202 Accepted\r\n") || atomic.load(?served) != 1) {
         composition.stop(harness.runtime, ?controls);
         ret 5;
-    }
-    if (!exchange_status(?harness,
-        "GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        "HTTP/1.1 202 Accepted\r\n") || site.probe.calls != 1) {
-        composition.stop(harness.runtime, ?controls);
-        ret 6;
     }
 
     # the reloaded plan resolves the same registration
@@ -731,102 +747,22 @@ test laurel__resolves_at_start_and_reload {
         || !composition.reclaim_superseded(harness.runtime, ?controls)
         || !exchange_status(?harness,
         "GET /orders/7 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        "HTTP/1.1 200 OK\r\n") || site.probe.order != 7) {
-        composition.stop(harness.runtime, ?controls);
-        ret 7;
-    }
-    val stopped: composition.StopReport = composition.stop(harness.runtime, ?controls);
-    if (!stopped.stopped || stopped.serve_failures != 0 || stopped.cleanup_failures != 0
-        || app.active_request_count(?site.application) != 0) {
-        ret 8;
-    }
-    ret 0;
-}
-
-test laurel__fragmented_body_enters_once {
-    var controls: composition.Controls;
-    var harness:  Harness;
-    if (!prepare(?harness, false)) { ret 1; }
-    laurel_graph(?harness);
-    var site: site_fixture.Site;
-    if (!site_fixture.make_site(?site)) { ret 2; }
-    var adapter:  hosting.Adapter;
-    var slots:    [1]service.Application;
-    var registry: service.Applications;
-    if (!hosting.make(?adapter, ?site.application)
-        || !service.make_applications(?registry, ?slots[0], 1)
-        || !service.register_application(?registry, "site",
-        hosting.bound_handler(?adapter), 0)) { ret 3; }
-    var options: composition.Options = composition.default_options();
-    options.applications = ?registry;
-    if (start_with(?harness, ?controls, options).status != composition.START_OK) {
-        ret 4;
-    }
-
-    var client: tcp.Stream;
-    if (!wire.connect(harness.endpoint, ?client)) {
-        composition.stop(harness.runtime, ?controls);
-        ret 5;
-    }
-    # the head alone: the handler is entered, finds no body, and suspends
-    if (!wire.send(?client, FORM_HEAD)) {
-        tcp.stream_close(?client);
+        "HTTP/1.1 202 Accepted\r\n") || atomic.load(?served) != 2) {
         composition.stop(harness.runtime, ?controls);
         ret 6;
     }
-    wire.pump(?harness.runtime.workers[0].serving, 16);
-    if (site.probe.entries != 1 || site.probe.work != 0) {
-        tcp.stream_close(?client);
-        composition.stop(harness.runtime, ?controls);
+    val stopped: composition.StopReport = composition.stop(harness.runtime, ?controls);
+    if (!stopped.stopped || stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
         ret 7;
     }
-    # the body arrives in two writes, and neither one starts the handler again
-    if (!wire.send(?client, "name=")) {
-        tcp.stream_close(?client);
-        composition.stop(harness.runtime, ?controls);
-        ret 8;
-    }
-    wire.pump(?harness.runtime.workers[0].serving, 16);
-    if (site.probe.entries != 1 || site.probe.work != 0) {
-        tcp.stream_close(?client);
-        composition.stop(harness.runtime, ?controls);
-        ret 9;
-    }
-    if (!wire.send(?client, "alice")) {
-        tcp.stream_close(?client);
-        composition.stop(harness.runtime, ?controls);
-        ret 10;
-    }
-    var response: [RESPONSE_BYTES]u8;
-    val length:   usize = wire.collect(?harness.runtime.workers[0].serving, ?client,
-        ?response[0], RESPONSE_BYTES, "alice");
-    tcp.stream_close(?client);
-    if (length == 0
-        || !wire.starts_with(?response[0], length, "HTTP/1.1 200 OK\r\n")
-        || !wire.contains(?response[0], length, "alice")) {
-        composition.stop(harness.runtime, ?controls);
-        ret 11;
-    }
-    # entered once, resumed for what arrived after, and the work done exactly once
-    if (site.probe.entries != 1 || site.probe.work != 1
-        || site.probe.resumes == 0 || site.probe.exits != site.probe.layers
-        || site.probe.abandons != 0) {
-        composition.stop(harness.runtime, ?controls);
-        ret 12;
-    }
-    val stopped: composition.StopReport = composition.stop(harness.runtime,
-        ?controls);
-    if (!stopped.stopped || stopped.serve_failures != 0
-        || stopped.cleanup_failures != 0
-        || app.active_request_count(?site.application) != 0) { ret 13; }
     ret 0;
 }
 
-test laurel__unregistered_is_config_error {
+test application__unregistered_is_config_error {
     var controls: composition.Controls;
     var harness:  Harness;
     if (!prepare(?harness, false)) { ret 1; }
-    laurel_graph(?harness);
+    application_graph(?harness);
     val started: composition.StartReport = boot(?harness, ?controls, false);
     if (started.status != composition.START_CONFIG
         || !str_equals(started.detail, "no application is registered under this name")) {

@@ -28,7 +28,7 @@ connection plane
   protocol selection, tls, quic, http engines
 
 service plane
-  static files, proxy pools, Laurel applications
+  static files, proxy pools, hosted applications
 
 telemetry plane
   logs, metrics, traces, health, readiness
@@ -39,16 +39,27 @@ The control plane publishes immutable runtime generations. A listener and every 
 The executable and runtime tests enter those planes through one production
 composition module. Its runtime record owns every binding array and compiled
 plan for the process lifetime. The QUIC runtime inside it owns the public QUIC
-state, all of which grows with what is connected: the connection-ID routes, the
-timers, the pending initials, and the connection and session storage claimed
-per connection. The welded control records for the pump, the connection, its
+state, all of which grows with what is connected: the routes for the
+connection IDs clients carry until their handshakes finish, the timers, the
+pending initials, and the connection and session storage claimed per
+connection. The welded control records for the pump, the connection, its
 deep-secret assembly storage, and the HTTP/3 session are owned separately by a
 typed secret owner the executable holds for the process lifetime. Its tables
 start empty and the runtime grows them, and a record never moves once it
 exists. No public record retains one; code that needs them borrows a
 stack-local view for the duration of a call. Startup
 constructs cache bindings before the resolver and compiles only after both are
-stable. Teardown cancels and releases QUIC operations before closing their UDP
+stable. A QUIC connection is reached by its own connection ID, minted at accept for
+the worker and slot that hold it (#174). The ID is encrypted QUIC-LB style under
+its listener's keys, which are process-wide and rotated by every reload, so any
+worker decodes any ID and nothing but the key holder learns what it names. A
+listener given an operator's key file (#405) takes its keys from the file
+instead, so hosts sharing it and a restarted process decode one another's IDs,
+and each ID carries its host's ID ahead of the worker.
+Every worker binds every QUIC listener's address, and a datagram the kernel
+delivers to a worker other than its connection's is handed over a bounded
+single-producer ring to the one that owns it; a full ring drops it and counts
+it. Teardown cancels and releases QUIC operations before closing their UDP
 sockets, then closes certificate management, TLS credentials, proxy state,
 cache storage, and static storage. Partial startup follows the same ordering for
 every resource it acquired.
@@ -187,7 +198,7 @@ A route resolves to one of:
 - reverse proxy service
 - load-balanced upstream service
 - redirect or fixed response
-- Laurel application
+- hosted application, of any framework, through its binding
 - native handler implementing the HTTP service contract
 
 Middleware wraps services through explicit before, after, and error paths. The core does not build a heap-allocated chain for every request. A compiled route graph references immutable middleware plans.
@@ -248,7 +259,7 @@ worker or timer.
 
 ## Web applications
 
-Hosted applications receive only the common HTTP service exchange, through the handler contract, and a lifecycle the supervisor drives. Hedge may supply configuration, secrets, storage, telemetry, and background-task facilities to them through the same contract.
+Hosted applications receive only the common HTTP service exchange, through the handler contract, and a lifecycle the supervisor drives. Hedge supplies background tasks to them through the same contract (see [HOSTING.md](HOSTING.md#background-tasks)), and may supply configuration, secrets, storage and telemetry the same way.
 
 Applications cannot reach listener or connection internals. A reload rebuilds the services that reach an application without restarting the application, and without invalidating exchanges already executing in the old generation. [Hosting applications](HOSTING.md) is the host contract.
 

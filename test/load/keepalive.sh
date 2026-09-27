@@ -18,6 +18,14 @@
 # dial is held, the socket dropped nothing over the window, and every
 # connection has left hedge once the holder closes them. It prints the
 # server's CPU per PING round, the cores it used and the receive queue's peak.
+#
+# LOAD_KEEPALIVE_WORKERS fixes the worker count, one per CPU otherwise. Since
+# #174 every worker binds the QUIC port and the kernel spreads the connections
+# across them, so a rate past what one worker's core carries (#401 measured
+# about 15k a second) is held without a drop once enough workers serve it. The
+# connections are held by one client process per HOLDER_CONNECTIONS (10000),
+# each bound to its own loopback address, since one address runs out of
+# ephemeral ports and one client process out of CPU first.
 
 set -u
 
@@ -26,6 +34,8 @@ count="${LOAD_KEEPALIVE:-10000}"
 period="${LOAD_KEEPALIVE_PERIOD:-1}"
 window="${LOAD_KEEPALIVE_SECONDS:-10}"
 rate="${LOAD_KEEPALIVE_RATE:-250}"
+workers="${LOAD_KEEPALIVE_WORKERS:-}"
+HOLDER_CONNECTIONS=10000
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 trap cleanup_load EXIT
@@ -45,7 +55,7 @@ cpu_ns() {
 
 echo "binary $binary"
 stat -c '  mtime %y  size %s' "$binary"
-echo "count=$count period=${period}s rate=$((count / period))/s window=${window}s dials=$rate/s"
+echo "count=$count period=${period}s rate=$((count / period))/s window=${window}s dials=$rate/s workers=${workers:-per CPU}"
 echo
 
 export HEDGE_ADMIN_TOKEN=keepalive-secret
@@ -54,18 +64,28 @@ write_config "$work/keepalive.toml" \
 memory_bytes = $((count * 4 * 1048576))" \
     "$CLEARTEXT_PORT" "$SECURE_PORT" "$QUIC_PORT" \
     "keep_alive_ms = 900000" \
-    "$(admin_config)"
+    "$(admin_config)" "$workers"
 start_hedge "$work/keepalive.toml"
 start_socket_sampler "$QUIC_PORT"
 
 mark="$(socket_mark "$QUIC_PORT")"
-start_holder keepalive "$h3load" -address "127.0.0.1:$QUIC_PORT" \
-    -connections "$count" -serve=false -rate "$rate" -dialing 64 \
-    -connect-timeout 60s -idle-timeout 900s -keep-alive "${period}s" \
-    -source 127.0.0.2 -label keepalive -hold
-held="$(held_by keepalive "${holders[0]}")"
-echo "dial: held ${held:-none}, socket $(socket_phase "$QUIC_PORT" "$mark")"
-test "${held:-0}" = "$count"
+parts=$(((count + HOLDER_CONNECTIONS - 1) / HOLDER_CONNECTIONS))
+left="$count"
+for part in $(seq 0 $((parts - 1))); do
+    share=$((left / (parts - part)))
+    left=$((left - share))
+    start_holder "keepalive-$part" "$h3load" -address "127.0.0.1:$QUIC_PORT" \
+        -connections "$share" -serve=false -rate "$(awk -v r="$rate" -v p="$parts" 'BEGIN { print r / p }')" \
+        -dialing 64 -connect-timeout 60s -idle-timeout 900s -keep-alive "${period}s" \
+        -source "127.0.0.$((2 + part))" -label "keepalive-$part" -hold
+done
+held=0
+for part in $(seq 0 $((parts - 1))); do
+    part_held="$(held_by "keepalive-$part" "${holders[$part]}")"
+    held=$((held + ${part_held:-0}))
+done
+echo "dial: held $held, socket $(socket_phase "$QUIC_PORT" "$mark")"
+test "$held" = "$count"
 report $? "every one of $count dials is held"
 
 sleep "$period"
@@ -77,7 +97,7 @@ phase="$(socket_phase "$QUIC_PORT" "$mark")"
 awk -v n="$count" -v p="$period" -v w="$window" -v c="$((after - before))" 'BEGIN {
     printf "hold: %d/s for %ds, %.3f cores, %.1f us per round\n", n / p, w, c / (w * 1e9), c / (n * w / p) / 1000
 }'
-echo "hold: socket $phase"
+echo "hold: socket $phase, $(metric 'hedge_quic_forwarded_total{direction="in"}') of $(metric hedge_quic_datagrams_received_total) datagrams handed to another worker since start"
 drops="${phase#drops=}"
 drops="${drops%% *}"
 test "$drops" = 0

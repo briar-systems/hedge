@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.14.0] - 2026-09-27
+
+### Migration
+
+- **Configuration.** The `laurel` service kind is now `application`, the kind every hosted application is routed under whatever its framework (#398). Replace `kind = "laurel"` with `kind = "application"`. The old name is refused like any unknown kind, with no alias.
+- **Composing laurel.** hedge no longer depends on laurel and no longer ships `hedge.service.laurel` (#398). A laurel application is composed through [graft](https://github.com/briar-systems/graft), which binds it to hedge's host contract. Register it through graft where `hedge.service.laurel.register` was called.
+- **Dependencies.** hedge's dependencies are caret ranges, and std moves to 9.2 and mach-http to 0.24 (#430). An application that depends on hedge resolves with it, so it moves to ranges these satisfy.
+
+### Security
+
+- Peer-keyed tables are placed by SipHash under a secret key from the operating system's entropy source, and hedge refuses to start when it cannot draw that key (#403). The admission table seeded FNV with a fixed fallback when the random draw failed, and the cache store and the QUIC arrival index hashed with unkeyed FNV, so a peer could choose inputs that collide. The process draws one key before it builds anything and fails `START_RUNTIME` with `ENTROPY_UNAVAILABLE` without it. A standalone admission manager and each QUIC arrival queue draw their own. A datagram with no valid destination connection ID is no longer indexed, where each one added an entry that was never removed.
+- ACME key material is secret-typed for its whole life (#413, #430). Keys live in a bounded ring of 64 secret slots, drawn with `std.memory.secret.random_fill`, signed from in place and wiped on destroy, and a `Key` holds only its public half and a generational handle to its slot. The one declassify is `keys.publish`, which writes the durable key document. Key documents and QUIC key files are read with `std.filesystem.read_secret` and checked in secret storage. `doc/SECURITY.md` states the property and its one crossing.
+
+### Added
+
+- Background tasks, `hedge.task`, in host contract 1.2 (#305). A `Tasks` facility runs registered periodic or triggered tasks as non-blocking steps on one supervisor-owned thread with its own io runtime and `outbound.Loop`. Triggers are single-flight and coalesce, each run has a cancel scope and a deadline, and snapshots are published through caller-owned slots and read by counted leases without waiting on a run. A registered `task.Resolver` fills a secret into scratch the facility owns and zeroizes, `task.borrow` hands it to the task as `contracts.SecretBytes`, and `outbound.secret_header` is the one place such a secret becomes a public header value. `composition.Options.tasks` hands the facility to the supervisor, which starts the thread before hosted applications, drains tasks toward the workers' drain deadline, and counts runs abandoned at drain in the new `StopReport.tasks_abandoned`. The API mirrors `laurel.task` so graft can adapt it.
+- QUIC datagrams reach the worker that owns their connection (#174). Every worker binds every QUIC listener with `SO_REUSEPORT` on Linux and darwin, and Windows stays on one worker until #149. Connection IDs are 20 bytes encrypted with the four-pass AES-128 construction of draft-ietf-quic-load-balancers-21, under per-listener keys drawn per process and rotated on every reload, and a datagram whose ID names another worker is forwarded to it over per-pair rings. Retry and NEW_TOKEN keys belong to the listener and every worker shares them. New series count datagrams received, forwarded by direction, dropped by reason and unroutable. On one host over loopback, 4 workers served about 3.6 times one worker's HTTP/3 requests a second and 3.9 times its QUIC handshakes, and 8 workers held 40,000 keep-alives a second with no drop.
+- QUIC listener keys from an operator's key file (#405). A listener's `quic_keys` names a file of connection ID, stateless reset and token keys by codepoint and generation, and `quic_host_id` places a host ID in the connection IDs it mints, so hosts that share a key file mint distinct IDs. The file is refused when group or other can read it or when it is malformed. A reload re-reads it, keeps unchanged keys, adds new ones, retires dropped ones, and keeps the old keys with a logged reason when the new file would re-key a codepoint or token generation still in use. Without a file, keys stay random per process. `doc/CONFIGURATION.md` describes the settings and the file format.
+
+### Fixed
+
+- A listener's `max_retry_replay` is accepted (#405). The listener parser checked one field fewer than it lists, so the setting was refused as an unknown field in every configuration.
+
+### Changed
+
+- **Breaking.** The `laurel` service kind is renamed `application` (#398). See Migration.
+- **Breaking.** Dependencies are caret ranges at the current family releases (#430): mach-std `^9.2` (v9.2.0, was v9.0.0), mach-crypto `^0.24` (v0.24.1, was v0.24.0), mach-http `^0.24` (v0.24.0, was v0.23.0), mach-tls `^0.14` (v0.14.0), mach-quic `^0.23` (v0.23.0, was v0.22.0) and mach-acme `^0.12` (v0.12.0, was v0.11.0), in the root, `test/acme` and `test/fuzz`, with gitlinks at those releases. ACME's challenge providers and CSR signer use mach-acme 0.12's typed contexts, through one `challenge.Responder` that forwards to the selected kind, and `Manager.provider` is `Manager.responder`.
+- A QUIC teardown step that cannot finish waits on the timer wheel for a 10 ms retry, and a closing connection whose HTTP/3 session is winding down is woken by its own events rather than polled (#418, #265). Every such connection was serviced on every turn, so a drain cost work in proportion to the connections closing. With 1,000 clients abandoning in-flight requests, hedge's CPU fell about 8%.
+
+### Removed
+
+- **Breaking.** `hedge.service.laurel` and the laurel dependency (#398). See Migration.
+- `hedge.VERSION`, `implementation_ready` and the `hedge.hedge` module that held them (#400). The constant read 0.6.0 and nothing read it.
+- `hedge.server`, `src/config.mach` and `src/lib.mach`, which nothing that ships reached (#267). The host contract names full module paths, so none of them was part of it.
+
 ## [0.13.0] - 2026-09-27
 
 ### Added
