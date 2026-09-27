@@ -63,7 +63,8 @@ Certificate private keys support reload without exposing mutable key state to re
 Every secret hedge holds, and where it becomes public:
 
 - the administration credential: welded storage in `hedge.secret`, compared in
-  constant time, never declassified beyond the comparison's verdict
+  constant time, never declassified beyond two one-bit verdicts: whether it
+  holds a NUL, CR or LF byte, and whether a presented token matches it
 - secrets granted to hosted applications: welded storage in `hedge.secret`,
   never declassified by hedge
 - automatically managed certificate and account keys: a ring of secret slots,
@@ -90,8 +91,17 @@ effect at the next start. hedge holds it in a bounded table of
 welded slots, and the admin handler refers to it by a public handle, a slot
 and generation that is not an address. The handler checks the public `Bearer `
 scheme, then compares the presented token against every byte of the credential
-in constant time. The one `:>` on that path is the comparison's verdict in
-`secret.matches`. The credential is wiped and its slot freed when telemetry
+in constant time. That path has two `:>` sites, each declassifying one bit
+computed over every byte without a branch on the value:
+
+- `secret.presentable`: whether the credential holds a NUL, CR or LF byte. No
+  request can present such a credential, so hedge refuses to start with it
+  rather than hold one that nothing could match. The refusal is diagnosed
+  against the secret's declaration (source `secret`, path its name), never by
+  its value. This is the same kind of structural verdict the QUIC key file
+  parser declassifies.
+- `secret.matches`: whether a presented token equals the credential.
+ The credential is wiped and its slot freed when telemetry
 closes, and a stale handle authenticates nothing.
 
 A hosted application's secrets are resolved again for every generation, into a
