@@ -18,8 +18,8 @@ use hedge.storage;
 use A: std.allocator;
 use std.allocator.page;
 use std.collections.map;
-use std.crypto.rand;
-use io_error: std.io.error;
+use std.collections.natural;
+use std.crypto.hash.siphash;
 use std.net.ip;
 use std.sync.atomic;
 use std.sync.mutex;
@@ -40,25 +40,33 @@ val SLOT_FREE:      u8 = 0;
 val SLOT_RESERVED:  u8 = 1;
 val SLOT_COMMITTED: u8 = 2;
 
-# the peer key is what a remote chooses, so each table hashes it under a seed
-# of its own and a flood of crafted addresses cannot be made to collide. the
-# map's hash sees only the key, so the key carries its table's seed
-pub rec PeerKey {
-    address: ip.Addr;
-    seed:    u64;
+# the peer address is what a remote chooses, so the shard and the count table
+# are both placed by SipHash under a secret key, and a flood of crafted
+# addresses cannot be aimed at one bucket. the address is held as plain words
+# so the keyed map hashes and compares it by value
+rec PeerKey {
+    family: u64;
+    high:   u64;
+    low:    u64;
 }
+
+# what the shard and the count maps are keyed for. every entry in a shard
+# shares the low bits of its shard hash, so a map keyed alike would pile a
+# shard's entries into one probe run
+val SHARD_PURPOSE: u64 = 1;
+val COUNT_PURPOSE: u64 = 2;
 
 rec Shard {
     lock:   mutex.Mutex;
-    counts: map.MapBy[PeerKey, usize];
+    counts: map.MapKeyed[PeerKey, usize];
 }
 
 # how many admissions each address holds, across every worker
 pub rec Peers {
-    cap:    i64;
-    seed:   u64;
-    shards: [SHARDS]Shard;
-    live:   bool;
+    cap:       i64;
+    shard_key: siphash.Key;
+    shards:    [SHARDS]Shard;
+    live:      bool;
 }
 
 # the caps one kind of admission shares across workers
@@ -126,55 +134,35 @@ fun normalize(value: ip.Addr) ip.Addr {
     ret result;
 }
 
-fun address_equal(left: ip.Addr, right: ip.Addr) bool {
-    if (left.is_v6 != right.is_v6) { ret false; }
-    var count: usize = 4;
-    var a:     *u8   = ?left.v4.octets[0];
-    var b:     *u8   = ?right.v4.octets[0];
-    if (left.is_v6 != 0) {
-        count = 16;
-        a     = ?left.v6.octets[0];
-        b     = ?right.v6.octets[0];
-    }
-    var i: usize = 0;
+# a key for one purpose, from the table's key. SipHash is a pseudorandom
+# function, so keys for distinct purposes are independent to anyone without it
+fun derive(key: siphash.Key, purpose: u64) siphash.Key {
+    var low:  siphash.State = siphash.init(key);
+    var high: siphash.State = siphash.init(key);
+    siphash.update_u64(?low, purpose);
+    siphash.update_u64(?low, 0);
+    siphash.update_u64(?high, purpose);
+    siphash.update_u64(?high, 1);
+    ret siphash.Key{k0: siphash.final(?low), k1: siphash.final(?high)};
+}
+
+fun big_endian(octets: *u8, count: usize) u64 {
+    var value: u64   = 0;
+    var i:     usize = 0;
     for (i < count) {
-        if (a[i] != b[i]) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun draw_seed() u64 {
-    var value:  u64                 = 0;
-    val filled: err[io_error.Error] = rand.fill((?value)::*u8, 8);
-    if (sel filled.err) { ret 0x9e3779b97f4a7c15; }
-    ret value;
-}
-
-fun peer_key(peers: *Peers, address: ip.Addr) PeerKey {
-    ret PeerKey{address: address, seed: peers.seed};
-}
-
-fun hash_key(key: *PeerKey) u64 {
-    val address: *ip.Addr = ?key.address;
-    var value:   u64      = key.seed ^ 0xcbf29ce484222325;
-    var count:   usize    = 4;
-    var octets:  *u8      = ?address.v4.octets[0];
-    if (address.is_v6 != 0) {
-        count  = 16;
-        octets = ?address.v6.octets[0];
-    }
-    value = (value ^ (address.is_v6::u64)) * 0x100000001b3;
-    var i: usize = 0;
-    for (i < count) {
-        value = (value ^ (octets[i]::u64)) * 0x100000001b3;
+        value = (value << 8) | octets[i]::u64;
         i     = i + 1;
     }
     ret value;
 }
 
-fun equal_key(left: *PeerKey, right: *PeerKey) bool {
-    ret address_equal(left.address, right.address);
+# the key of a normalized address
+fun peer_key(address: ip.Addr) PeerKey {
+    if (address.is_v6 != 0) {
+        ret PeerKey{family: 6, high: big_endian(?address.v6.octets[0], 8),
+            low: big_endian(?address.v6.octets[8], 8)};
+    }
+    ret PeerKey{family: 4, high: 0, low: big_endian(?address.v4.octets[0], 4)};
 }
 
 fun limit_valid(limit: opt[usize]) bool {
@@ -197,13 +185,14 @@ fun cap_word(limit: opt[usize]) i64 {
     ret NO_CAP;
 }
 
-fun make_peers(peers: *Peers, a: *A.Allocator, cap: opt[usize]) {
-    peers.seed = draw_seed();
+fun make_peers(peers: *Peers, a: *A.Allocator, key: siphash.Key, cap: opt[usize]) {
+    peers.shard_key = derive(key, SHARD_PURPOSE);
+    val counts: siphash.Key = derive(key, COUNT_PURPOSE);
     atomic.store(?peers.cap, cap_word(cap));
     var i: usize = 0;
     for (i < SHARDS) {
         peers.shards[i].lock   = mutex.make();
-        peers.shards[i].counts = map.init_by[PeerKey, usize](a, hash_key, equal_key);
+        peers.shards[i].counts = map.init_keyed[PeerKey, usize](a, counts);
         i                      = i + 1;
     }
     peers.live = true;
@@ -214,7 +203,7 @@ fun destroy_peers(peers: *Peers) bool {
     var ok: bool  = true;
     var i:  usize = 0;
     for (i < SHARDS) {
-        val dropped: err[A.Error] = map.dnit_by[PeerKey, usize](?peers.shards[i].counts);
+        val dropped: err[A.Error] = map.dnit_keyed[PeerKey, usize](?peers.shards[i].counts);
         if (sel dropped.err) { ok = false; }
         i = i + 1;
     }
@@ -223,17 +212,18 @@ fun destroy_peers(peers: *Peers) bool {
 }
 
 fun shard_of(peers: *Peers, key: *PeerKey) *Shard {
-    ret ?peers.shards[(hash_key(key) % SHARDS::u64)::usize];
+    val hash: u64 = natural.hash_keyed[PeerKey](peers.shard_key, key);
+    ret ?peers.shards[(hash % SHARDS::u64)::usize];
 }
 
 # one more admission for `address`, or false at its cap or when the count
 # cannot be stored
 fun count_peer(peers: *Peers, address: ip.Addr) bool {
-    var key:   PeerKey = peer_key(peers, address);
+    var key:   PeerKey = peer_key(address);
     val shard: *Shard  = shard_of(peers, ?key);
     val cap:   i64     = atomic.load(?peers.cap);
     mutex.lock(?shard.lock);
-    val found:    opt[*usize] = map.get_by[PeerKey, usize](?shard.counts, ?key);
+    val found:    opt[*usize] = map.get_keyed[PeerKey, usize](?shard.counts, ?key);
     var admitted: bool        = true;
     if (sel found.some) {
         if (cap != NO_CAP && (@found.some)::i64 >= cap) { admitted = false; }
@@ -241,7 +231,7 @@ fun count_peer(peers: *Peers, address: ip.Addr) bool {
     }
     or (cap != NO_CAP && cap < 1) { admitted = false; }
     or {
-        val inserted: res[bool, A.Error] = map.insert_by[PeerKey, usize](?shard.counts, key, 1);
+        val inserted: res[bool, A.Error] = map.insert_keyed[PeerKey, usize](?shard.counts, key, 1);
         if (sel inserted.err) { admitted = false; }
     }
     mutex.unlock(?shard.lock);
@@ -249,14 +239,14 @@ fun count_peer(peers: *Peers, address: ip.Addr) bool {
 }
 
 fun uncount_peer(peers: *Peers, address: ip.Addr) bool {
-    var key:   PeerKey = peer_key(peers, address);
+    var key:   PeerKey = peer_key(address);
     val shard: *Shard  = shard_of(peers, ?key);
     mutex.lock(?shard.lock);
-    val found:    opt[*usize] = map.get_by[PeerKey, usize](?shard.counts, ?key);
+    val found:    opt[*usize] = map.get_keyed[PeerKey, usize](?shard.counts, ?key);
     var released: bool        = false;
     if (sel found.some) {
         if (@found.some > 1) { @found.some = @found.some - 1; }
-        or                   { map.remove_by[PeerKey, usize](?shard.counts, ?key); }
+        or                   { map.remove_keyed[PeerKey, usize](?shard.counts, ?key); }
         released = true;
     }
     mutex.unlock(?shard.lock);
@@ -271,7 +261,7 @@ pub fun peers_tracked(shared: *Shared) usize {
     for (i < SHARDS) {
         val shard: *Shard = ?shared.peers.shards[i];
         mutex.lock(?shard.lock);
-        count = count + map.length_by[PeerKey, usize](shard.counts);
+        count = count + map.length_keyed[PeerKey, usize](shard.counts);
         mutex.unlock(?shard.lock);
         i = i + 1;
     }
@@ -279,9 +269,11 @@ pub fun peers_tracked(shared: *Shared) usize {
 }
 
 # the caps `workers` workers share. `wakers` wakes a worker that waits for the
-# global cap, or is nil when one worker admits alone
-pub fun make_shared(shared: *Shared, a: *A.Allocator, max_connections: opt[usize],
-    max_connections_per_peer: opt[usize], workers: usize, wakers: *allowance.Wakers) bool {
+# global cap, or is nil when one worker admits alone. `key` is the secret the
+# per-peer table is placed by, which the owner of the caps draws
+pub fun make_shared(shared: *Shared, a: *A.Allocator, key: siphash.Key,
+    max_connections: opt[usize], max_connections_per_peer: opt[usize], workers: usize,
+    wakers: *allowance.Wakers) bool {
     if (shared == nil || a == nil || !limit_valid(max_connections)
         || !limit_valid(max_connections_per_peer)
         || !limits_ordered(max_connections, max_connections_per_peer)) { ret false; }
@@ -290,7 +282,7 @@ pub fun make_shared(shared: *Shared, a: *A.Allocator, max_connections: opt[usize
         batch = allowance.batch_for(max_connections.some, workers, allowance.MAX_BATCH);
     }
     if (!allowance.make_pool(?shared.pool, max_connections, batch, wakers)) { ret false; }
-    make_peers(?shared.peers, a, max_connections_per_peer);
+    make_peers(?shared.peers, a, key, max_connections_per_peer);
     shared.owned = false;
     ret true;
 }
@@ -317,13 +309,17 @@ pub fun destroy_shared(shared: *Shared) bool {
     ret destroy_peers(?shared.peers);
 }
 
-# a manager admitting against caps it alone holds
+# a manager admitting against caps it alone holds. it owns those caps, so it
+# draws their key, and refuses when the entropy source gives none
 pub fun make(manager: *Manager, a: *A.Allocator, max_connections: opt[usize],
     max_connections_per_peer: opt[usize]) bool {
     if (manager == nil || manager.initialized || a == nil) { ret false; }
+    val key: opt[siphash.Key] = siphash.random_key();
+    if (!(sel key.some)) { ret false; }
     val made: res[*Shared, A.Error] = A.allocate[Shared](a, 1);
     if (sel made.err) { ret false; }
-    if (!make_shared(made.ok, a, max_connections, max_connections_per_peer, 1, nil)) {
+    if (!make_shared(made.ok, a, key.some, max_connections, max_connections_per_peer, 1,
+        nil)) {
         A.deallocate[Shared](a, made.ok, 1);
         ret false;
     }
@@ -455,6 +451,9 @@ pub fun in_use(manager: *Manager) usize {
     if (manager == nil || !manager.initialized) { ret 0; }
     ret manager.live;
 }
+
+#[testing]
+val TEST_KEY: siphash.Key = siphash.Key{k0: 0x0706050403020100, k1: 0x0f0e0d0c0b0a0908};
 
 #[testing]
 fun capped(value: usize) opt[usize] {
@@ -613,15 +612,15 @@ test lease__stale_after_regrow_refused {
 }
 
 # the caps are the process's: two workers' managers joined to one Shared
-# admit against one global cap and one per-peer count, and each table draws a
-# seed of its own
+# admit against one global cap and one per-peer count, and each table places
+# peers by the key it was given
 test join__workers_share_caps {
     var a: A.Allocator;
     page.make(?a);
     var wakers: allowance.Wakers;
     var shared: Shared;
     if (!allowance.make_wakers(?wakers, 2)
-        || !make_shared(?shared, ?a, capped(3), capped(2), 2, ?wakers)) { ret 1; }
+        || !make_shared(?shared, ?a, TEST_KEY, capped(3), capped(2), 2, ?wakers)) { ret 1; }
     var first:  Manager;
     var second: Manager;
     if (!join(?first, ?a, ?shared, 0) || !join(?second, ?a, ?shared, 1)) { ret 2; }
@@ -643,12 +642,12 @@ test join__workers_share_caps {
     if (!acquire(?first, ?peer, ?refused)) { ret 6; }
     if (!release(?first, leases[0]) || !release(?first, refused)
         || !release(?second, leases[2]) || peers_tracked(?shared) != 0) { ret 10; }
-    var mine: Shared;
-    if (!make_shared(?mine, ?a, uncapped(), capped(1), 1, nil)) { ret 7; }
-    var left:  PeerKey = peer_key(?shared.peers, peer.addr);
-    var right: PeerKey = peer_key(?mine.peers, peer.addr);
-    if (shared.peers.seed == mine.peers.seed || hash_key(?left) == hash_key(?right)
-        || !equal_key(?left, ?right)) { ret 8; }
+    var mine:      Shared;
+    val other_key: siphash.Key = siphash.Key{k0: TEST_KEY.k1, k1: TEST_KEY.k0};
+    if (!make_shared(?mine, ?a, other_key, uncapped(), capped(1), 1, nil)) { ret 7; }
+    var key: PeerKey = peer_key(normalize(peer.addr));
+    if (natural.hash_keyed[PeerKey](shared.peers.shard_key, ?key)
+        == natural.hash_keyed[PeerKey](mine.peers.shard_key, ?key)) { ret 8; }
     if (!destroy(?first) || !destroy(?second) || !destroy_shared(?shared)
         || !destroy_shared(?mine)) { ret 9; }
     ret 0;
