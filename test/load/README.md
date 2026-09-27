@@ -18,7 +18,7 @@ assertions that HTTP/3 transfers were served, leaving admission and refusal
 checked. `LOAD_CONNECTIONS` and `LOAD_TARGET` change the shape of the TCP load, `LOAD_QUIC_CONNECTIONS` and `LOAD_QUIC_RATE`
 the QUIC load. `LOAD_CACHE=memory` puts the cache in front of the content, and
 `LOAD_CACHE=disk` also keeps the large body on disk, so any lane can be run with the
-cache on. The runner binds 127.0.0.1 ports 19100 to 19105, TCP and UDP,
+cache on. The runner binds 127.0.0.1 ports 19100 to 19106, TCP and UDP,
 and releases every server and client on every exit path. The QUIC cells use the
 system `curl` when it is built with HTTP/3, and otherwise fetch a pinned static
 build into `.tools/`.
@@ -62,6 +62,14 @@ belongs in a CI lane against a release build instead.
 Five small bodies are fetched over HTTP/3 one connection at a time. That cell
 always runs, and it is what fails when a change stops HTTP/3 being served at
 all.
+
+One connection then carries two transfers at once: the body, rate limited so
+its stream stays open, and a proxied response whose field section is past what
+HTTP/3 can encode (#388). The refused one must be answered 502 and the body must
+complete, with curl reporting a single connection for both. This is the only
+test that drives a live HTTP/3 session, since no QUIC client links into
+`mach test`. The HTTP/2 counterpart is a `mach test` case in
+`src/test/runtime/protocol.mach`.
 
 A server with no configured `max_connections` must serve 1100 concurrent QUIC
 connections, past the 1024 its QUIC pools were once preallocated to. Each
