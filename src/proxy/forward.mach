@@ -5,6 +5,7 @@
 # turns two disagreeing parsers into request smuggling, so the filter here is a
 # deny list applied to every field rather than a fix applied to known names.
 
+use http.core.body;
 use http.core.field;
 use http.core.message;
 use http.core.method;
@@ -106,15 +107,31 @@ pub fun copy_fields(source: *field.Fields, destination: *field.Fields) bool {
     ret true;
 }
 
-pub fun copy_request_fields(source: *field.Fields,
-    destination: *field.Fields) bool {
+fun prefix_is(name: view.View, expected: str) bool {
+    val length: usize = str_len(expected);
+    if (name.len < length || name.data == nil) { ret false; }
+    ret name_is(view.view(name.data, length), expected);
+}
+
+# a field that states who the client is or how it reached this proxy
+pub fun forwarding_field(name: view.View) bool {
+    ret name_is(name, "forwarded")
+        || prefix_is(name, "x-forwarded-")
+        || name_is(name, "x-real-ip");
+}
+
+# `vouched` is whether the peer that wrote this request is trusted to speak for
+# another. only then do its forwarding fields reach the upstream
+pub fun copy_request_fields(source: *field.Fields, destination: *field.Fields,
+    vouched: bool) bool {
     if (source == nil || destination == nil) { ret false; }
     var i: usize = 0;
     for (i < source.len) {
         val item: *field.Field = ?source.items[i];
         if (forwardable(source, item.name)
             && !name_is(item.name, "traceparent")
-            && !name_is(item.name, "tracestate")) {
+            && !name_is(item.name, "tracestate")
+            && (vouched || !forwarding_field(item.name))) {
             if (field.append(destination, @item) != field.ADD_OK) { ret false; }
         }
         i = i + 1;
@@ -170,9 +187,10 @@ fun quotable(value: view.View) bool {
 
 # `Forwarded: for="<peer>";proto=<scheme>;host="<host>"`
 #
-# the peer identity this proxy states is its own observation. an inbound
-# Forwarded or X-Forwarded-For is not extended, because a value from an
-# untrusted peer would let a client choose the identity the upstream sees.
+# the peer identity this proxy states is its own observation. inbound
+# forwarding fields reach the upstream only from a vouched peer, ahead of this
+# element, because a value from an untrusted peer would let a client choose the
+# identity the upstream sees.
 pub fun format_forwarded(peer: Peer, output: *u8, capacity: usize) usize {
     if (output == nil || capacity == 0 || peer.address.len == 0
         || !quotable(peer.address) || !quotable(peer.host)) { ret 0; }
@@ -233,7 +251,26 @@ pub fun classify_replay(request: *message.Request) Replay {
     ret REPLAY_SAFE;
 }
 
-test "forward: the fixed hop-by-hop set never crosses the hop" {
+test classify_replay__idempotent_bodyless_only {
+    var reader: body.Reader;
+    reader.has_length      = true;
+    reader.declared_length = 0;
+    var request: message.Request;
+    request.method.kind = method.GET;
+    request.body        = ?reader;
+    if (classify_replay(?request) != REPLAY_SAFE) { ret 1; }
+    request.method.kind = method.POST;
+    if (classify_replay(?request) != REPLAY_FORBIDDEN) { ret 2; }
+    request.method.kind    = method.GET;
+    reader.declared_length = 5;
+    if (classify_replay(?request) != REPLAY_FORBIDDEN) { ret 3; }
+    reader.declared_length = 0;
+    reader.has_length      = false;
+    if (classify_replay(?request) != REPLAY_FORBIDDEN) { ret 4; }
+    ret 0;
+}
+
+test forwardable__fixed_hop_by_hop {
     if (forwardable(nil, view.view("connection", 10)))          { ret 1; }
     if (forwardable(nil, view.view("Transfer-Encoding", 17)))   { ret 2; }
     if (forwardable(nil, view.view("keep-alive", 10)))          { ret 3; }
@@ -246,7 +283,7 @@ test "forward: the fixed hop-by-hop set never crosses the hop" {
     ret 0;
 }
 
-test "forward: a field named by Connection is hop-by-hop for this connection" {
+test named_by_connection__listed_members {
     var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 256, 64, 128));
     field.append(?fields, field.Field{
@@ -266,7 +303,7 @@ test "forward: a field named by Connection is hop-by-hop for this connection" {
     ret 0;
 }
 
-test "forward: copying keeps end-to-end fields and drops the rest" {
+test copy_fields__drops_hop_by_hop {
     var items:  [4]field.Field;
     var fields: field.Fields = field.init(?items[0], 4, field.limits(4, 512, 64, 128));
     field.append(?fields, field.Field{name: view.view("connection", 10),
@@ -285,25 +322,43 @@ test "forward: copying keeps end-to-end fields and drops the rest" {
     ret 0;
 }
 
-test "forward: proxy-managed trace fields are replaced, never duplicated" {
-    var items:  [3]field.Field;
-    var fields: field.Fields = field.init(?items[0], 3,
-        field.limits(3, 512, 64, 128));
+test copy_request_fields__drops_inbound_trace_and_forwarding {
+    var items:  [8]field.Field;
+    var fields: field.Fields = field.init(?items[0], 8,
+        field.limits(8, 512, 64, 128));
     field.append(?fields, field.Field{name: view.view("traceparent", 11),
         value: view.view("untrusted", 9), sensitive: false});
     field.append(?fields, field.Field{name: view.view("tracestate", 10),
         value: view.view("vendor=value", 12), sensitive: false});
     field.append(?fields, field.Field{name: view.view("accept", 6),
         value: view.view("*/*", 3), sensitive: false});
-    var out_items: [3]field.Field;
-    var outbound:  field.Fields = field.init(?out_items[0], 3,
-        field.limits(3, 512, 64, 128));
-    if (!copy_request_fields(?fields, ?outbound) || outbound.len != 1
-        || !name_is(out_items[0].name, "accept")) { ret 1; }
+    field.append(?fields, field.Field{name: view.view("Forwarded", 9),
+        value: view.view("for=\"203.0.113.7\"", 17), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("X-Forwarded-For", 15),
+        value: view.view("203.0.113.7", 11), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("x-forwarded-proto", 17),
+        value: view.view("https", 5), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("x-real-ip", 9),
+        value: view.view("203.0.113.7", 11), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("x-forwarded", 11),
+        value: view.view("1", 1), sensitive: false});
+    var out_items: [8]field.Field;
+    var outbound:  field.Fields = field.init(?out_items[0], 8,
+        field.limits(8, 512, 64, 128));
+    # x-forwarded without the family's dash names no forwarding field
+    if (!copy_request_fields(?fields, ?outbound, false) || outbound.len != 2
+        || !name_is(out_items[0].name, "accept")
+        || !name_is(out_items[1].name, "x-forwarded")) { ret 1; }
+    var vouched_items: [8]field.Field;
+    var vouched:       field.Fields = field.init(?vouched_items[0], 8,
+        field.limits(8, 512, 64, 128));
+    if (!copy_request_fields(?fields, ?vouched, true) || vouched.len != 6
+        || !name_is(vouched_items[1].name, "forwarded")
+        || !name_is(vouched_items[4].name, "x-real-ip")) { ret 2; }
     ret 0;
 }
 
-test "forward: forwarded metadata states this proxy's own observation" {
+test format_forwarded__own_observation {
     var output: [MAX_FORWARDED_BYTES]u8;
     val peer:   Peer = Peer{
         address: view.view("192.0.2.7:51000", 15),
@@ -322,7 +377,7 @@ test "forward: forwarded metadata states this proxy's own observation" {
     ret 0;
 }
 
-test "forward: a peer identity that could break out of the quoting is refused" {
+test format_forwarded__refuses_quote_breakout {
     var output:  [MAX_FORWARDED_BYTES]u8;
     val hostile: Peer = Peer{
         address: view.view("1.2.3.4\";proto=https;for=\"9.9.9.9", 33),
@@ -336,7 +391,7 @@ test "forward: a peer identity that could break out of the quoting is refused" {
     ret 0;
 }
 
-test "forward: via names the protocol this hop received" {
+test format_via__names_protocol {
     var output: [64]u8;
     val length: usize = format_via(message.version_h1(1, 1), "hedge", ?output[0], 64);
     if (length == 0 || !view.view_eq_str(view.view(?output[0], length), "1.1 hedge")) { ret 1; }

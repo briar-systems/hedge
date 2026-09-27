@@ -29,7 +29,6 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -59,10 +58,20 @@ pub rec Options {
     index:         str;
     symlinks:      SymlinkPolicy;
     precompressed: bool;
+    # the configured Cache-Control, borrowed from the generation's graph
+    cache_control:    str;
+    cache_rules:      *schema.CacheRule;
+    cache_rule_count: usize;
+    # the configured 404 page and media types, borrowed the same way
+    not_found:        str;
+    media_types:      *schema.MediaType;
+    media_type_count: usize;
 }
 
 pub fun default_options() Options {
-    ret Options{index: DEFAULT_INDEX, symlinks: SYMLINK_DENY, precompressed: false};
+    ret Options{index: DEFAULT_INDEX, symlinks: SYMLINK_DENY, precompressed: false,
+        cache_control: nil, cache_rules: nil, cache_rule_count: 0,
+        not_found:     nil, media_types: nil, media_type_count: 0};
 }
 
 pub rec Site {
@@ -220,6 +229,113 @@ pub fun resolve(target: view.View, output: *u8, capacity: usize) Path {
     result.status   = PATH_OK;
     result.length   = written;
     ret result;
+}
+
+val NO_POSITION: usize = 0xffffffffffffffff;
+
+# where a `**` retries next: one byte on, or the next segment for a `**/`
+fun retry_from(name: *u8, length: usize, from: usize, segments: bool) usize {
+    if (!segments) { ret from + 1; }
+    var at: usize = from;
+    for (at < length) {
+        if (name[at] == '/') { ret at + 1; }
+        at = at + 1;
+    }
+    ret NO_POSITION;
+}
+
+# match a configured path pattern against a served file's path
+#
+# `*` matches within one segment, `**` matches across segments, and a `**/` that
+# opens a segment also matches no segment at all. only the latest `*` and `**`
+# are retried on a mismatch, which is enough for a glob and bounds the work by
+# the path length times the pattern length, so a request path cannot make it
+# explode.
+fun glob(pattern: *u8, pattern_length: usize, name: *u8, length: usize) bool {
+    var px:       usize = 0;
+    var nx:       usize = 0;
+    var star_px:  usize = NO_POSITION;
+    var star_nx:  usize = 0;
+    var deep_px:  usize = NO_POSITION;
+    var deep_nx:  usize = 0;
+    var segments: bool  = false;
+    for (px < pattern_length || nx < length) {
+        if (px < pattern_length) {
+            val c: u8 = pattern[px];
+            if (c == '*' && px + 1 < pattern_length && pattern[px + 1] == '*') {
+                segments = px + 2 < pattern_length && pattern[px + 2] == '/'
+                    && (px == 0 || pattern[px - 1] == '/');
+                px = px + 2;
+                if (segments) { px = px + 1; }
+                deep_px = px;
+                deep_nx = nx;
+                star_px = NO_POSITION;
+                cnt;
+            }
+            if (c == '*') {
+                px      = px + 1;
+                star_px = px;
+                star_nx = nx;
+                cnt;
+            }
+            if (nx < length && name[nx] == c) {
+                px = px + 1;
+                nx = nx + 1;
+                cnt;
+            }
+        }
+        if (star_px != NO_POSITION && star_nx < length && name[star_nx] != '/') {
+            star_nx = star_nx + 1;
+            px      = star_px;
+            nx      = star_nx;
+            cnt;
+        }
+        if (deep_px == NO_POSITION || deep_nx >= length) { ret false; }
+        deep_nx = retry_from(name, length, deep_nx, segments);
+        if (deep_nx == NO_POSITION) { ret false; }
+        px      = deep_px;
+        nx      = deep_nx;
+        star_px = NO_POSITION;
+    }
+    ret true;
+}
+
+# does a rule path, which begins with `/`, name this path relative to the root
+pub fun path_matches(pattern: str, relative: str, length: usize) bool {
+    if (pattern == nil || pattern[0] != '/') { ret false; }
+    ret glob((?pattern[1])::*u8, str_len(pattern) - 1, relative::*u8, length);
+}
+
+# the first matching rule wins, then the service's default, then no field at all
+fun cache_control_for(options: *Options, relative: str, length: usize) str {
+    var i: usize = 0;
+    for (i < options.cache_rule_count) {
+        val rule: *schema.CacheRule = ?options.cache_rules[i];
+        if (path_matches(schema.text(?rule.path), relative, length)) {
+            ret schema.text(?rule.value);
+        }
+        i = i + 1;
+    }
+    ret options.cache_control;
+}
+
+# a configured media type wins over the built-in table
+fun media_type_for(options: *Options, relative: str, length: usize) str {
+    val path: view.View = view.view(relative, length);
+    var i:    usize     = 0;
+    for (i < options.media_type_count) {
+        val entry: *schema.MediaType = ?options.media_types[i];
+        if (media.has_extension(path, schema.text(?entry.extension))) {
+            ret schema.text(?entry.value);
+        }
+        i = i + 1;
+    }
+    ret media.for_path(path);
+}
+
+fun emit_cache_control(active: *call.Call, value: str) bool {
+    if (value == nil) { ret true; }
+    ret service.add_field(active, field.CACHE_CONTROL, value);
 }
 
 # --- the served representation ---
@@ -498,6 +614,32 @@ fun serve_body(active: *call.Call, opened: *Opened, first: u64, length: u64,
     ret exchange.SERVICE_COMPLETE;
 }
 
+# a miss serves the configured 404 page with status 404, or an empty 404 when
+# none is configured or it cannot be opened. the page stands in for a
+# representation that does not exist, so it carries no validators and answers no
+# condition or range
+fun not_found(active: *call.Call, site: *Site, head_only: bool) exchange.ServiceStatus {
+    val page: str = site.options.not_found;
+    if (page == nil) { ret fail_with(active, status.NOT_FOUND); }
+    var path_bytes: [MAX_PATH_BYTES]u8;
+    val resolved:   Path = resolve(view.view(page, str_len(page)), ?path_bytes[0], MAX_PATH_BYTES);
+    if (resolved.status != PATH_OK || resolved.length == 0) { ret fail_with(active, status.NOT_FOUND); }
+    val relative: str    = (?path_bytes[0])::str;
+    var opened:   Opened = open_at(site, relative);
+    if (!opened.open) { ret fail_with(active, status.NOT_FOUND); }
+    if (opened.metadata.kind != filesystem.KIND_FILE) {
+        close_file(?opened);
+        ret fail_with(active, status.NOT_FOUND);
+    }
+    if (message.set_status(call.response(active), status.NOT_FOUND) != message.RESPONSE_OK
+        || !service.add_field(active, field.CONTENT_TYPE,
+        media_type_for(?site.options, relative, resolved.length))) {
+        close_file(?opened);
+        ret exchange.SERVICE_FAILED;
+    }
+    ret serve_body(active, ?opened, 0, opened.metadata.size::u64, head_only);
+}
+
 pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     val site: *Site = context::*Site;
     if (site == nil || !site.open) { ret fail_with(active, status.INTERNAL_SERVER_ERROR); }
@@ -512,7 +654,7 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     var path_bytes: [MAX_PATH_BYTES]u8;
     val resolved:   Path = resolve(request.target.path, ?path_bytes[0], MAX_PATH_BYTES);
     if (resolved.status == PATH_TOO_LONG) { ret fail_with(active, status.URI_TOO_LONG); }
-    if (resolved.status != PATH_OK)       { ret fail_with(active, status.NOT_FOUND); }
+    if (resolved.status != PATH_OK)       { ret not_found(active, site, head_only); }
 
     var relative: str   = (?path_bytes[0])::str;
     var length:   usize = resolved.length;
@@ -526,26 +668,27 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
     }
 
     var opened: Opened = open_at(site, relative);
-    if (!opened.open) { ret fail_with(active, status.NOT_FOUND); }
+    if (!opened.open) { ret not_found(active, site, head_only); }
     if (opened.metadata.kind == filesystem.KIND_DIR) {
         close_file(?opened);
         if (!resolved.directory) { ret redirect_to_directory(active); }
         if (indexed || !join_index(?path_bytes[0], length, MAX_PATH_BYTES, site.options.index)) {
-            ret fail_with(active, status.NOT_FOUND);
+            ret not_found(active, site, head_only);
         }
         length = str_len(relative);
         opened = open_at(site, relative);
-        if (!opened.open) { ret fail_with(active, status.NOT_FOUND); }
+        if (!opened.open) { ret not_found(active, site, head_only); }
     }
     if (opened.metadata.kind != filesystem.KIND_FILE) {
         close_file(?opened);
-        ret fail_with(active, status.NOT_FOUND);
+        ret not_found(active, site, head_only);
     }
 
     # a precompressed variant is a distinct representation, so it carries its own
     # validators and the response varies on the negotiation input
-    val media_type: str = media.for_path(view.view(relative, length));
-    var encoding:   str = nil;
+    val media_type:    str = media_type_for(?site.options, relative, length);
+    val cache_control: str = cache_control_for(?site.options, relative, length);
+    var encoding:      str = nil;
     if (site.options.precompressed) {
         val accepted: view.View = header(active, field.ACCEPT_ENCODING, 15);
         var variant:  Opened    = no_file();
@@ -586,7 +729,9 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
         if (message.set_status(call.response(active), status.NOT_MODIFIED) != message.RESPONSE_OK) {
             ret exchange.SERVICE_FAILED;
         }
-        if (!emit_validators(active, current)) { ret exchange.SERVICE_FAILED; }
+        if (!emit_validators(active, current) || !emit_cache_control(active, cache_control)) {
+            ret exchange.SERVICE_FAILED;
+        }
         if (site.options.precompressed && !service.add_field(active, field.VARY, field.ACCEPT_ENCODING)) {
             ret exchange.SERVICE_FAILED;
         }
@@ -622,7 +767,8 @@ pub fun serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
         close_file(?opened);
         ret exchange.SERVICE_FAILED;
     }
-    if (!service.add_field(active, field.CONTENT_TYPE, media_type)) {
+    if (!service.add_field(active, field.CONTENT_TYPE, media_type)
+        || !emit_cache_control(active, cache_control)) {
         close_file(?opened);
         ret exchange.SERVICE_FAILED;
     }
@@ -678,12 +824,19 @@ pub fun factory(context: ptr, configured: *schema.Service, handler: *service.Han
     site.options = registry.options;
     if (configured.index.len != 0) { site.options.index = schema.text(?configured.index); }
     site.options.precompressed = configured.precompressed;
-    site.open                  = true;
-    registry.len               = registry.len + 1;
-    @handler                   = service.Handler{ctx: (site)::ptr, serve: serve};
+    if (configured.cache_control.len != 0) { site.options.cache_control = schema.text(?configured.cache_control); }
+    site.options.cache_rules      = ?configured.cache_rules[0];
+    site.options.cache_rule_count = configured.cache_rule_count;
+    if (configured.not_found.len != 0) { site.options.not_found = schema.text(?configured.not_found); }
+    site.options.media_types      = ?configured.media_types[0];
+    site.options.media_type_count = configured.media_type_count;
+    site.open                     = true;
+    registry.len                  = registry.len + 1;
+    @handler                      = service.Handler{ctx: (site)::ptr, serve: serve};
     ret true;
 }
 
+#[testing]
 fun resolved_is(target: str, expected: str, directory: bool) bool {
     var output: [MAX_PATH_BYTES]u8;
     val result: Path = resolve(view.view(target, str_len(target)), ?output[0], MAX_PATH_BYTES);
@@ -696,12 +849,13 @@ fun resolved_is(target: str, expected: str, directory: bool) bool {
     ret output[i] == 0 && result.length == i;
 }
 
+#[testing]
 fun rejected(target: str) bool {
     var output: [MAX_PATH_BYTES]u8;
     ret resolve(view.view(target, str_len(target)), ?output[0], MAX_PATH_BYTES).status != PATH_OK;
 }
 
-test "static path: a normal target becomes a relative path with no leading separator" {
+test resolve__normal_target {
     if (!resolved_is("/a/b.txt", "a/b.txt", false))   { ret 1; }
     if (!resolved_is("/a/b/", "a/b", true))           { ret 2; }
     if (!resolved_is("/a//b", "a/b", false))          { ret 3; }
@@ -710,7 +864,7 @@ test "static path: a normal target becomes a relative path with no leading separ
     ret 0;
 }
 
-test "static path: traversal is refused in every encoding rather than collapsed" {
+test resolve__refuses_traversal {
     if (!rejected("/../etc/passwd"))      { ret 1; }
     if (!rejected("/a/../../etc/passwd")) { ret 2; }
     if (!rejected("/a/./b"))              { ret 3; }
@@ -725,7 +879,7 @@ test "static path: traversal is refused in every encoding rather than collapsed"
     ret 0;
 }
 
-test "static path: a NUL, a control byte, and a bad escape are all refused" {
+test resolve__refuses_nul_control_bad_escape {
     if (!rejected("/a%00b"))   { ret 1; }
     if (!rejected("/a%01b"))   { ret 2; }
     if (!rejected("/a%zzb"))   { ret 3; }
@@ -734,14 +888,37 @@ test "static path: a NUL, a control byte, and a bad escape are all refused" {
     ret 0;
 }
 
-test "static path: an overlong target is refused rather than truncated" {
+test resolve__refuses_overlong {
     var output: [16]u8;
     val result: Path = resolve(view.view("/aaaaaaaaaaaaaaaaaaaaaaaa", 25), ?output[0], 16);
     if (result.status != PATH_TOO_LONG) { ret 1; }
     ret 0;
 }
 
-test "static: an accept-encoding token matches only on a whole member" {
+#[testing]
+fun matches(pattern: str, path: str) bool {
+    ret path_matches(pattern, path, str_len(path));
+}
+
+test path_matches__segment_aware_glob {
+    if (!matches("/assets/**", "assets/a.css"))         { ret 1; }
+    if (!matches("/assets/**", "assets/x/y/a.css"))     { ret 2; }
+    if (matches("/assets/**", "other/a.css"))           { ret 3; }
+    if (!matches("/*.html", "index.html"))              { ret 4; }
+    if (matches("/*.html", "docs/index.html"))          { ret 5; }
+    if (!matches("/**.html", "docs/index.html"))        { ret 6; }
+    if (!matches("/**/*.html", "index.html"))           { ret 7; }
+    if (!matches("/**/*.html", "a/b/index.html"))       { ret 8; }
+    if (matches("/**/*.html", "a/b/index.htm"))         { ret 9; }
+    if (!matches("/robots.txt", "robots.txt"))          { ret 10; }
+    if (matches("/robots.txt", "robots.txt.gz"))        { ret 11; }
+    if (!matches("/a*b*c", "aXbYc"))                    { ret 12; }
+    if (matches("/a*c", "ab/c"))                        { ret 13; }
+    if (!matches("/**/fonts/*", "assets/fonts/x.woff")) { ret 14; }
+    ret 0;
+}
+
+test accepts__whole_member_only {
     if (!accepts(view.view("gzip, br", 8), "br")) { ret 1; }
     if (!accepts(view.view("br;q=1.0", 8), "br")) { ret 2; }
     if (accepts(view.view("brotli", 6), "br"))    { ret 3; }

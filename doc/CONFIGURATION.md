@@ -192,6 +192,20 @@ routing, and forwarded headers all name the same client. Both the v1 text and v2
 binary forms are accepted, and a malformed header closes the connection rather
 than being read as the start of a request.
 
+`trusted_peers` also decides which clients may speak for another through
+request fields. A `proxy` service passes a request's `Forwarded`, `X-Real-IP`
+and every `X-Forwarded-*` field to its upstream only when the peer that wrote
+the request is trusted: its socket address is in `trusted_peers` and no PROXY
+header replaced it. A decoded PROXY peer is never trusted this way, because the
+header vouches for the client's address and not for the fields the client
+writes. From any other peer those fields are dropped, and the upstream sees
+only hedge's own `Forwarded` element, `for="<peer>";proto=<scheme>;host="<host>"`.
+From a trusted peer they pass unchanged and hedge's element follows them,
+extending the chain. hedge writes no `X-Forwarded-*` field of its own. A QUIC
+listener trusts no peer, so HTTP/3 requests always have their forwarding fields
+dropped. A listener that only fronts an HTTP proxy can name it in
+`trusted_peers` with `proxy_protocol` left `off`.
+
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and are reloadable.
 
 A QUIC listener sizes its UDP socket's buffers with `receive_buffer_bytes` and `send_buffer_bytes`. When they are absent it asks for 4 MiB to receive and 1 MiB to send, because the kernel default (212 KiB on Linux, about 166 full-size datagrams) overflows under a burst of handshakes, and every dropped Initial costs a client a retransmission timeout. The kernel decides what it grants: Linux doubles the request and caps it at `net.core.rmem_max` and `net.core.wmem_max`. So hedge reads the size back and logs both at startup, as `hedge: socket buffers <listener> receive <granted> (asked <requested>) send <granted> (asked <requested>)`. If the granted size is well below the request, raise those sysctls. Either key on a TCP or local listener is a configuration error, as are zero and sizes past the native signed 32-bit range. Changing either needs a restart, like `backlog`, because the size is applied when the socket is bound.
@@ -610,6 +624,33 @@ Trace propagation accepts strict W3C `traceparent` version 00 and bounded `trace
 The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. The `env` and `file` secret providers resolve in the binary. Embedded deployments may supply `os` and `application` providers through the typed resolver contract. Resolved administration credentials are limited to 512 bytes, reject line breaks, remain in one production owner, and are cleared at shutdown.
 
 The administration service exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
+
+## Static files
+
+```toml
+[service.site]
+kind = "static"
+root = "./public"
+index = "index.html"
+precompressed = true
+cache_control = "max-age=600"
+cache_control_rules = [
+  { path = "/assets/**", value = "public, max-age=31536000, immutable" },
+  { path = "/**/*.html", value = "no-cache" },
+]
+not_found = "/404.html"
+media_types = { ps1 = "text/plain; charset=utf-8", webmanifest = "application/manifest+json" }
+```
+
+A `static` service serves the files under `root`. `index` names the file a directory request serves, `index.html` by default. With `precompressed` set, a request that accepts `br` or `gzip` is served a `.br` or `.gz` sibling of the file when one exists.
+
+`cache_control` is the `Cache-Control` field the service sends, and `cache_control_rules` overrides it for the files whose path matches. The rules are tried in order and the first match wins. A file no rule matches carries `cache_control`, and with neither set the field is not sent. The field goes out on `200`, `206` and `304` responses, for GET and HEAD alike, and never on an error or a redirect.
+
+A rule's `path` begins with `/` and is matched against the path of the file served, relative to `root`. That is the index file for a directory request, so `/` is matched as `/index.html`, and it is the file itself for a precompressed variant. `*` matches within one path segment, `**` matches across segments, and `**/` at the start of a segment also matches no segment, so `/**/*.html` covers `/index.html` as well as `/docs/index.html`. Every other byte matches itself. A service holds at most 8 rules. Each value must be a valid HTTP field value, and both options are refused on any service that is not `static`.
+
+`not_found` names a file under `root`, written as a path that begins with `/`, that is served with status `404` whenever a request finds no file: a missing path, a directory with no index, anything that is not a regular file, a symlink, or a target the path checks refuse. It goes out with its own `Content-Type` and `Content-Length`, and HEAD gets the length with no body. It stands in for a representation that does not exist, so it carries no validators or `Cache-Control` and ignores conditions and ranges. Without `not_found`, or when the file cannot be opened at the time of the request, the `404` has an empty body.
+
+A file's `Content-Type` comes from its extension. The built-in table covers `html`/`htm`, `css`, `js`/`mjs`, `json`, `txt`, `md`, `mach`, `sh` (`application/x-sh`), `xml`, `svg`, `png`, `jpg`/`jpeg`, `gif`, `webp`, `ico`, `woff2`, `woff`, `ttf`, `wasm`, `pdf`, `zip` and `gz`, and anything else goes out as `application/octet-stream` rather than a guess. `media_types` adds or overrides types for this service. Each key is an extension without its dot, matched regardless of case, and each value is the field value sent. A configured type is used before the built-in table, a service holds at most 8, an extension may appear once whatever its case, and `media_types` is refused on any service that is not `static`.
 
 ## Caching
 
