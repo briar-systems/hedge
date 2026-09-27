@@ -85,6 +85,7 @@ The implemented schema accepts these top-level sections:
   protocol sets. A `quic` listener binds a UDP endpoint, becomes ready, and
   serves HTTP/3 to clients that select `h3` through ALPN inside QUIC
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
+- named `application` tables, one for each hosted application that has a section of its own
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
 - `cache` policy and `acme` certificate management
@@ -759,6 +760,23 @@ The generation store publishes only sealed candidates. Parsing, resolution, vali
 TOML can reference a secret by provider and key. Secret values are not interpolated into the general configuration tree and never appear in rendered diagnostics.
 
 Providers may include restricted files, environment delivery, operating-system stores, and application-defined services. Provider support is explicit per target.
+
+### Secrets for hosted applications
+
+A hosted application borrows only the secrets its own section grants it:
+
+```toml
+[secret.db-password]
+provider = "file"
+key = "/run/secrets/db"
+
+[application.site.secrets]
+database = "db-password"
+```
+
+`[application.<name>]` is the section of the application registered as `<name>`, and a section for a name the registry does not hold refuses the configuration, at startup or at a reload. Each key of its `secrets` table is the name the application borrows by, from 1 to 64 printable characters without spaces, and each value names a `[secret]` declaration. An application holds at most 16 grants, and a configuration at most 32 sections. Two applications may borrow different secrets under the same name, and neither can borrow the other's.
+
+Every generation resolves the secrets it grants before it is published, into secret-welded memory, and a secret that cannot be resolved refuses the generation. A `file` secret is the file's bytes, read straight into that memory and handed over as they are, a trailing newline included. An `env` secret is the variable's value, and `os` and `application` secrets come from the provider the embedding program registers (see [Secrets](HOSTING.md#secrets)). A value is at most 4096 bytes. A reload resolves every grant again, so a secret rotated at its source reaches hosted code with the next reload, and grants and declarations may change at a reload. The administration credential is the exception: it is resolved once at startup, so a reload that changes its declaration is refused.
 
 ## Lightweight behavior
 
