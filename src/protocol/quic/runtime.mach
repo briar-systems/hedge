@@ -213,8 +213,10 @@ pub rec RuntimeConfig {
 val TIMER_TAG:   u64 = 0x5155000000000000;
 val TIMER_MASK:  u64 = 0xffff000000000000;
 val PENDING_TAG: u64 = 0x5149000000000000;
-# how long a forced release that is still waiting sleeps before it looks again
-val BROKEN_RETRY_NS: u64 = 10000000;
+# how long a release step that cannot finish yet sleeps before it is tried
+# again: a forced release, a cleanup, a finalize, an abandoned or retiring
+# session, and a pending initial's release all wait this on the wheel
+val RELEASE_RETRY_NS: u64 = 10000000;
 
 pub rec PumpConfig {
     admission_generation: u64;
@@ -494,16 +496,14 @@ pub rec Connection {
     # next deadline and the drain deadline once closing
     timer:           wheel.Handle;
     transport_timer: qt.Timer;
-    # the connections with work, in arrival order, and those whose teardown
-    # waits on nothing that wakes it (needs_polling), which are tried every turn
-    ready_next:   usize;
-    ready_prev:   usize;
-    waiting_next: usize;
-    waiting_prev: usize;
-    ready:        bool;
+    # when a release step that could not finish is tried again, zero when none
+    retry_ns: u64;
+    # the connections with work, in arrival order
+    ready_next: usize;
+    ready_prev: usize;
+    ready:      bool;
     # which ready list holds it: the handshake list while it holds a record
     ready_handshake:    bool;
-    waiting:            bool;
     generation:         u64;
     source:             u64;
     next_live:          usize;
@@ -521,8 +521,11 @@ pub rec Connection {
     h3_cancelled:       bool;
     # the session is finished and queued for release. the connection holds it,
     # and so is not released itself, until the queue has released it
-    h3_retiring:        bool;
-    retire_next:        usize;
+    h3_retiring: bool;
+    retire_next: usize;
+    # a finished session whose release is pending waits off the teardown queue
+    # for its retry, which queues it again
+    retire_parked:      bool;
     close_started:      bool;
     close_deadline_ns:  u64;
     transport_finished: bool;
@@ -633,7 +636,6 @@ pub rec Runtime {
     live_head:        usize;
     ready_head:       usize;
     ready_tail:       usize;
-    waiting_head:     usize;
     completions_head: *CompletionContext;
     completions_tail: *CompletionContext;
     admission:        *process_admission.Manager;
@@ -877,17 +879,16 @@ fun reset_connection(value: *Connection) {
     value.h3_cancelled         = false;
     value.h3_retiring          = false;
     value.retire_next          = NO_CONNECTION;
+    value.retire_parked        = false;
+    value.retry_ns             = 0;
     value.close_started        = false;
     value.close_deadline_ns    = 0;
     value.transport_finished   = false;
     value.timer_disarmed       = false;
     value.timer                = wheel.no_handle();
     value.ready                = false;
-    value.waiting              = false;
     value.ready_next           = NO_CONNECTION;
     value.ready_prev           = NO_CONNECTION;
-    value.waiting_next         = NO_CONNECTION;
-    value.waiting_prev         = NO_CONNECTION;
     value.routes_removed       = false;
     value.minted               = false;
     value.tls_live             = false;
@@ -1365,7 +1366,6 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.wakes             = config.wakes;
     runtime.ready_head        = NO_CONNECTION;
     runtime.ready_tail        = NO_CONNECTION;
-    runtime.waiting_head      = NO_CONNECTION;
     runtime.completions_head  = nil;
     runtime.completions_tail  = nil;
     runtime.admission         = nil;
@@ -2271,7 +2271,6 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     value.peer                     = ip.endpoint(0, 0, 0, 0, 0);
     value.local                    = ip.endpoint(0, 0, 0, 0, 0);
     unmark_ready(controls, runtime, index);
-    set_waiting(controls, runtime, index, false);
     holding.release(?runtime.held, ?value.held);
     wheel.release(runtime.timers, value.timer);
     value.timer = wheel.no_handle();
@@ -2404,12 +2403,12 @@ pub fun owns(owner: u64) bool {
 
 # the wheel entry follows the earliest thing this connection is waiting for in
 # time: the transport's deadline, the drain deadline once closing, the earliest
-# h3 deadline, the memory-wait deadline, and a short retry while a forced
-# release is still blocked
+# h3 deadline, the memory-wait deadline, the retry of a release step that could
+# not finish, and a short retry while a forced release is still blocked
 fun arm_timer(runtime: *Runtime, value: *Connection, now_ns: u64) bool {
     if (value.state == CONNECTION_BROKEN) {
         ret wheel.arm(runtime.timers, value.timer,
-            saturated_add(now_ns, BROKEN_RETRY_NS)) == wheel.OK;
+            saturated_add(now_ns, RELEASE_RETRY_NS)) == wheel.OK;
     }
     var armed:    bool = false;
     var deadline: u64  = 0;
@@ -2431,8 +2430,19 @@ fun arm_timer(runtime: *Runtime, value: *Connection, now_ns: u64) bool {
         armed    = true;
         deadline = value.memory_deadline_ns;
     }
+    if (value.retry_ns != 0 && (!armed || value.retry_ns < deadline)) {
+        armed    = true;
+        deadline = value.retry_ns;
+    }
     if (!armed) { ret wheel.disarm(runtime.timers, value.timer) == wheel.OK; }
     ret wheel.arm(runtime.timers, value.timer, deadline) == wheel.OK;
+}
+
+# a release step that cannot finish now is tried again RELEASE_RETRY_NS later,
+# when the connection's wheel entry fires, rather than on every turn
+fun retry_later(runtime: *Runtime, value: *Connection, now_ns: u64) bool {
+    value.retry_ns = saturated_add(now_ns, RELEASE_RETRY_NS);
+    ret arm_timer(runtime, value, now_ns);
 }
 
 # the transport's deadline is read once per service pass, at the end of
@@ -2535,31 +2545,6 @@ fun deliver_held(controls: *ControlView, runtime: *Runtime, index: usize,
     }
 }
 
-fun set_waiting(controls: *ControlView, runtime: *Runtime, index: usize, waiting: bool) {
-    val value: *Connection = connection_at(controls, index);
-    if (value.waiting == waiting) { ret; }
-    if (waiting) {
-        value.waiting      = true;
-        value.waiting_prev = NO_CONNECTION;
-        value.waiting_next = runtime.waiting_head;
-        if (runtime.waiting_head != NO_CONNECTION) {
-            connection_at(controls, runtime.waiting_head).waiting_prev = index;
-        }
-        runtime.waiting_head = index;
-        ret;
-    }
-    if (value.waiting_prev != NO_CONNECTION) {
-        connection_at(controls, value.waiting_prev).waiting_next = value.waiting_next;
-    }
-    or { runtime.waiting_head = value.waiting_next; }
-    if (value.waiting_next != NO_CONNECTION) {
-        connection_at(controls, value.waiting_next).waiting_prev = value.waiting_prev;
-    }
-    value.waiting      = false;
-    value.waiting_next = NO_CONNECTION;
-    value.waiting_prev = NO_CONNECTION;
-}
-
 pub fun has_ready(runtime: *Runtime) bool {
     ret runtime != nil && runtime.initialized
         && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil
@@ -2605,13 +2590,14 @@ fun initialize_tls(value: *Connection, engine: *server.Handshake,
         server.QUIC_TRANSPORT_PARAMETERS);
 }
 
-fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize) bool {
+fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize,
+    now_ns: u64) bool {
     val value: *Connection          = connection_at(controls, index);
     val pump:  *Pump                = ?controls.pumps[value.pump];
     val bank:  *AdmissionGeneration = ?pump.admissions[value.admission_bank];
     if (value.state != CONNECTION_CLEANUP) { ret false; }
     if (value.assembly_attempted && !assembly.reusable(?value.assembly)) {
-        set_waiting(controls, runtime, index, true);
+        retry_later(runtime, value, now_ns);
         ret false;
     }
     if (value.tls_live && server.destroy(handshake_at(controls, value.handshake))) {
@@ -2634,11 +2620,11 @@ fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize) b
     if (value.scope_live) {
         if (operation_ok(cancel.destroy(?value.storage.scope))) { value.scope_live = false; }
     }
-    # a cleanup that cannot finish now is tried again every turn
+    # a cleanup that cannot finish now is tried again on its retry
     if (value.tls_live || value.handshake != NO_HANDSHAKE || value.charge_live
         || value.budget_charge_live || value.scope_live
         || !return_connection(controls, runtime, index)) {
-        set_waiting(controls, runtime, index, true);
+        retry_later(runtime, value, now_ns);
         ret false;
     }
     ret true;
@@ -2692,7 +2678,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
         || !operation_ok(cancel.make_child(?value.storage.scope, ?pump.storage.scope,
         opt[time.Instant].none{}))) {
         value.state = CONNECTION_CLEANUP;
-        cleanup_accepting(controls, runtime, index);
+        cleanup_accepting(controls, runtime, index, now_ns);
         ret false;
     }
     value.scope_live = true;
@@ -2724,7 +2710,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     config.enable_early_data           = false;
     if (!assembly.apply_server_acceptance(?config, accepted)) {
         value.state = CONNECTION_CLEANUP;
-        cleanup_accepting(controls, runtime, index);
+        cleanup_accepting(controls, runtime, index, now_ns);
         ret false;
     }
     val encoded: transport_parameters.EncodeResult =
@@ -2733,7 +2719,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     val engine: *server.Handshake = handshake_at(controls, value.handshake);
     if (!encoded.ok || !initialize_tls(value, engine, encoded.count)) {
         value.state = CONNECTION_CLEANUP;
-        cleanup_accepting(controls, runtime, index);
+        cleanup_accepting(controls, runtime, index, now_ns);
         ret false;
     }
     value.tls_live           = true;
@@ -2750,7 +2736,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
         # assembly to release and the cleanup finishes in one pass
         if (!initialized.cleanup_retained) { value.assembly_attempted = false; }
         value.state = CONNECTION_CLEANUP;
-        cleanup_accepting(controls, runtime, index);
+        cleanup_accepting(controls, runtime, index, now_ns);
         ret false;
     }
     value.tls_live = false;
@@ -3518,7 +3504,7 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
     }
     if (!release_handshake(controls, runtime, index, false, 0)) { ret FAILED; }
     value.state = CONNECTION_FINALIZING;
-    ret finalize_connection(controls, runtime, index);
+    ret finalize_connection(controls, runtime, index, now_ns);
 }
 
 fun endpoint_metadata(endpoint: ip.Endpoint, storage: *u8,
@@ -3565,6 +3551,7 @@ fun start_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
             value.h3_session    = index;
             value.h3_started    = true;
             value.h3_abandoning = true;
+            retry_later(runtime, value, now_ns);
         }
         ret false;
     }
@@ -3592,7 +3579,10 @@ fun drive_h3(controls: *ControlView, runtime: *Runtime, value: *Connection,
     if (value.h3_retiring) { ret true; }
     if (value.h3_abandoning) {
         if (!h3_session.abandon(?runtime.sessions,
-            controls.sessions, value.h3_session)) { ret false; }
+            controls.sessions, value.h3_session)) {
+            retry_later(runtime, value, now_ns);
+            ret false;
+        }
         value.h3_session    = h3_session.NO_SESSION;
         value.h3_abandoning = false;
         ret true;
@@ -3650,16 +3640,19 @@ fun unqueue_retiring(controls: *ControlView, runtime: *Runtime) usize {
 }
 
 # release a queued session and let its connection close. one still waiting on
-# its engine or scope goes to the back of the queue, and its connection is
-# serviced meanwhile, since the transport is what settles what it waits on
+# its engine or scope leaves the queue until its retry queues it again. the
+# transport settles what it waits on, and the transport's own events service
+# the connection meanwhile
 fun release_retiring(controls: *ControlView, runtime: *Runtime, index: usize,
     now_ns: u64) {
     val value:    *Connection              = connection_at(controls, index);
     val released: h3_session.ReleaseStatus = h3_session.release_status(
         ?runtime.sessions, controls.sessions, value.h3_session);
     if (released == h3_session.RELEASE_PENDING) {
-        queue_retiring(controls, runtime, index);
-        mark_ready(controls, runtime, index);
+        value.retire_parked = true;
+        if (!retry_later(runtime, value, now_ns)) {
+            fail_connection(controls, runtime, index, now_ns);
+        }
         ret;
     }
     value.h3_retiring = false;
@@ -4119,12 +4112,16 @@ fun observe_transport_close(value: *Connection, now_ns: u64) {
     }
 }
 
-fun finalize_connection(controls: *ControlView, runtime: *Runtime, index: usize) Status {
+fun finalize_connection(controls: *ControlView, runtime: *Runtime, index: usize,
+    now_ns: u64) Status {
     val value: *Connection = connection_at(controls, index);
     if (!value.live || value.state != CONNECTION_FINALIZING) { ret INVALID; }
     val pump:       *Pump = ?controls.pumps[value.pump];
     val bank_index: usize = value.admission_bank;
-    if (!release_process_lease(runtime, value)) { ret FAILED; }
+    if (!release_process_lease(runtime, value)) {
+        retry_later(runtime, value, now_ns);
+        ret FAILED;
+    }
     free_connection(controls, runtime, index);
     if (pump.admissions[bank_index].retiring
         && pump.admissions[bank_index].active_connections == 0
@@ -4138,7 +4135,7 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     now: time.Instant, now_ns: u64) Status {
     val value: *Connection = connection_at(controls, index);
     if (value.live && value.state == CONNECTION_FINALIZING) {
-        ret finalize_connection(controls, runtime, index);
+        ret finalize_connection(controls, runtime, index, now_ns);
     }
     if (!value.live || value.state == CONNECTION_CLEANUP) { ret BLOCKED; }
     if (value.state == CONNECTION_BROKEN) {
@@ -4204,7 +4201,7 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     }
     if (!release_handshake(controls, runtime, index, false, 0)) { ret FAILED; }
     value.state = CONNECTION_FINALIZING;
-    ret finalize_connection(controls, runtime, index);
+    ret finalize_connection(controls, runtime, index, now_ns);
 }
 
 # a budget-admitted initial takes its place in the deferred queue. its wheel
@@ -4254,7 +4251,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         if (pending.pump >= MAX_PUMPS
             || pending.admission_bank >= ADMISSION_BANKS) {
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4265,7 +4262,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             ?pump.admissions[pending.admission_bank];
         if (pending.cleanup_only) {
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4274,7 +4271,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         if (!pump.live || pump.generation != pending.pump_generation
             || pump.draining || pump.cancelling || !bank.live) {
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4292,7 +4289,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
                     pending.budget_charge_live = false;
                 }
                 if (!release_pending_initial(controls, runtime, i)) {
-                    retry_release(runtime, i);
+                    retry_release(runtime, i, now_ns);
                     status = FAILED;
                 }
                 i = next;
@@ -4300,7 +4297,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             }
             if (!defer_admitted(controls, runtime, i, now_ns)) {
                 if (!release_pending_initial(controls, runtime, i)) {
-                    retry_release(runtime, i);
+                    retry_release(runtime, i, now_ns);
                     status = FAILED;
                 }
                 i = next;
@@ -4312,7 +4309,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         if (now_ns >= deadline_ns) {
             refuse_pending(controls, runtime, pending, now_ns);
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4330,7 +4327,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             pending.config.handshake_timeout_ns, now_ns, 0)) {
             refuse_pending(controls, runtime, pending, now_ns);
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4351,7 +4348,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             ?config_snapshot)) {
             allowance.give(?runtime.handshake_slots, 1);
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4365,7 +4362,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         if (connection_index == NO_CONNECTION) {
             allowance.give(?runtime.handshake_slots, 1);
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4380,7 +4377,7 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             connection_failed(runtime);
             free_connection(controls, runtime, connection_index);
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4394,9 +4391,9 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             value.lease_live = false;
             value.lease      = process_admission.no_lease();
             value.state      = CONNECTION_CLEANUP;
-            cleanup_accepting(controls, runtime, connection_index);
+            cleanup_accepting(controls, runtime, connection_index, now_ns);
             if (!release_pending_initial(controls, runtime, i)) {
-                retry_release(runtime, i);
+                retry_release(runtime, i, now_ns);
                 status = FAILED;
             }
             i = next;
@@ -4430,14 +4427,30 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
     ret status;
 }
 
-# an initial whose release waits on nothing that wakes it is tried every turn
-# until #418 gives teardown a wake of its own
-fun retry_release(runtime: *Runtime, index: usize) {
-    mark_pending_ready(runtime, index);
+# an initial whose release could not finish is only released from here on, and
+# is tried again when its wheel entry fires RELEASE_RETRY_NS later. a wheel that
+# cannot hold the entry leaves it to the next turn
+fun retry_release(runtime: *Runtime, index: usize, now_ns: u64) {
+    val pending: *PendingInitial = pending_at(runtime, index);
+    if (pending == nil || !pending.live) { ret; }
+    pending.cleanup_only = true;
+    if (!pending.timer_live) {
+        val handle: wheel.Handle = wheel.claim(runtime.timers, pending_owner(index));
+        if (handle.index == wheel.NONE) {
+            mark_pending_ready(runtime, index);
+            ret;
+        }
+        pending.timer      = handle;
+        pending.timer_live = true;
+    }
+    if (wheel.arm(runtime.timers, pending.timer,
+        saturated_add(now_ns, RELEASE_RETRY_NS)) != wheel.OK) {
+        mark_pending_ready(runtime, index);
+    }
 }
 
 fun cancel_pending_bank(controls: *ControlView, runtime: *Runtime, pump_index: usize,
-    bank_index: usize) bool {
+    bank_index: usize, now_ns: u64) bool {
     var success: bool  = true;
     var i:       usize = runtime.pending_live_head;
     for (i != NO_CONNECTION) {
@@ -4446,7 +4459,7 @@ fun cancel_pending_bank(controls: *ControlView, runtime: *Runtime, pump_index: u
         if (pending.pump == pump_index
             && pending.admission_bank == bank_index
             && !release_pending_initial(controls, runtime, i)) {
-            retry_release(runtime, i);
+            retry_release(runtime, i, now_ns);
             success = false;
         }
         i = next;
@@ -4458,19 +4471,18 @@ fun connection_failed(runtime: *Runtime) {
     runtime.connection_failures = runtime.connection_failures + 1;
 }
 
-# a connection whose teardown waits on nothing that wakes it is tried every
-# turn until #418 gives teardown a wake of its own. a service it holds wakes it
-fun needs_polling(controls: *ControlView, runtime: *Runtime, value: *Connection) bool {
-    if (value.state == CONNECTION_CLEANUP || value.state == CONNECTION_FINALIZING
-        || value.h3_abandoning) { ret true; }
-    # the teardown queue wakes a connection once its session is released
-    if (value.h3_session == h3_session.NO_SESSION || value.h3_retiring) { ret false; }
-    ret value.close_started;
+# a teardown step that could not finish waits on its retry. the rest of a
+# teardown is woken by what it waits on: the transport's datagrams, sends and
+# deadlines, the calls a closing session holds, and the teardown queue once its
+# session is released
+fun release_waits(value: *Connection) bool {
+    ret value.state == CONNECTION_CLEANUP || value.state == CONNECTION_FINALIZING
+        || value.h3_abandoning || value.retire_parked;
 }
 
 # whether servicing the connection now would do work nothing else will start:
-# datagrams held for its handshake turn, a pool wake nobody routed, a teardown
-# that finishes only by being serviced (#182), what the transport says it holds
+# datagrams held for its handshake turn, a pool wake nobody routed, a blocked
+# teardown step with no retry armed (#418), what the transport says it holds
 # (#261) unless `output` is false for a caller that generates it anyway, or an
 # HTTP/3 session that ran out of steps still moving (#275). the transport
 # answers false for a send the pool refused, whose wake drives it.
@@ -4480,7 +4492,7 @@ fun pending_work(controls: *ControlView, runtime: *Runtime, value: *Connection,
     now: time.Instant, output: bool) bool {
     if (value.held.count != 0)                                          { ret true; }
     if (value.assembly.account.open && value.assembly.account.is_ready) { ret true; }
-    if (needs_polling(controls, runtime, value))                        { ret true; }
+    if (release_waits(value) && value.retry_ns == 0)                    { ret true; }
     if (!value.assembly.initialized)                                    { ret false; }
     if (output && qt.pending_output[binding.Binding](?value.assembly.driver, now)) {
         ret true;
@@ -4497,7 +4509,7 @@ fun pending_work(controls: *ControlView, runtime: *Runtime, value: *Connection,
 }
 
 # the worker's debug audit over this runtime's records: every live connection
-# on neither the ready lists nor the waiting list, and with no timer firing by
+# on neither ready list, and with no timer firing by
 # `now`, must hold no work at `now`. a timer due is a wake in flight: the wheel
 # fires it on the next advance and the connection is serviced, which is what
 # time-driven transport work waits for. returns how many do (#182)
@@ -4507,7 +4519,7 @@ pub fun audit(controls: *ControlView, runtime: *Runtime, now: time.Instant) usiz
     var i:     usize = runtime.live_head;
     for (i != NO_CONNECTION) {
         val value: *Connection = connection_at(controls, i);
-        if (value.live && !value.ready && !value.waiting
+        if (value.live && !value.ready
             && !wheel.fires_by(runtime.timers, value.timer, clock.to_ns(now))
             && pending_work(controls, runtime, value, now, true)) { found = found + 1; }
         i = value.next_live;
@@ -4520,10 +4532,12 @@ fun service_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     val value: *Connection = connection_at(controls, index);
     if (!value.live) { ret; }
     if (value.state == CONNECTION_CLEANUP) {
-        if (!cleanup_accepting(controls, runtime, index)) { connection_failed(runtime); }
+        if (!cleanup_accepting(controls, runtime, index, now_ns)) { connection_failed(runtime); }
     }
     or (value.state == CONNECTION_FINALIZING) {
-        if (finalize_connection(controls, runtime, index) == FAILED) { connection_failed(runtime); }
+        if (finalize_connection(controls, runtime, index, now_ns) == FAILED) {
+            connection_failed(runtime);
+        }
     }
     or (value.state == CONNECTION_BROKEN) {
         if (release_connection(controls, runtime, index, now, now_ns) == FAILED) {
@@ -4548,7 +4562,6 @@ fun service_connection(controls: *ControlView, runtime: *Runtime, index: usize,
         connection_failed(runtime);
         fail_connection(controls, runtime, index, now_ns);
     }
-    set_waiting(controls, runtime, index, needs_polling(controls, runtime, current));
 }
 
 # a wheel entry of this runtime came due. the transport's own deadline is
@@ -4585,6 +4598,13 @@ pub fun fire(controls: *ControlView, runtime: *Runtime, owner: u64, now_ns: u64)
         if (memory.waiting(?value.assembly.account)) {
             memory.timed_out(?value.storage.borrower);
             fail_connection(controls, runtime, index, now_ns);
+        }
+    }
+    if (value.retry_ns != 0 && value.retry_ns <= now_ns) {
+        value.retry_ns = 0;
+        if (value.retire_parked) {
+            value.retire_parked = false;
+            queue_retiring(controls, runtime, index);
         }
     }
     mark_ready(controls, runtime, index);
@@ -4641,11 +4661,6 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
     val now:    time.Instant = clock.from_ns(now_ns);
     val status: Status       = drain_completions(controls, runtime, now, now_ns);
     take_forwarded(controls, runtime, now, now_ns);
-    var i: usize = runtime.waiting_head;
-    for (i != NO_CONNECTION) {
-        mark_ready(controls, runtime, i);
-        i = connection_at(controls, i).waiting_next;
-    }
     # a connection marked while these are serviced waits for the next turn
     val last: usize = runtime.ready_tail;
     for (last != NO_CONNECTION && runtime.ready_head != NO_CONNECTION) {
@@ -4740,7 +4755,9 @@ pub fun graceful_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHan
     val active: usize = pump.active_admission;
     if (pump.admissions[active].live
         && (!begin_retire(?pump.admissions[active])
-        || !cancel_pending_bank(controls, runtime, handle.index, active))) { ret FAILED; }
+        || !cancel_pending_bank(controls, runtime, handle.index, active, now_ns))) {
+        ret FAILED;
+    }
     var i: usize = runtime.live_head;
     for (i != NO_CONNECTION) {
         val value: *Connection = connection_at(controls, i);
@@ -4791,10 +4808,10 @@ pub fun cancel_all(controls: *ControlView, runtime: *Runtime) Status {
         val value: *Connection = connection_at(controls, i);
         val next:  usize       = value.next_live;
         if (value.state == CONNECTION_CLEANUP) {
-            if (!cleanup_accepting(controls, runtime, i)) { status = FAILED; }
+            if (!cleanup_accepting(controls, runtime, i, now_ns)) { status = FAILED; }
         }
         or (value.state == CONNECTION_FINALIZING) {
-            if (finalize_connection(controls, runtime, i) == FAILED) { status = FAILED; }
+            if (finalize_connection(controls, runtime, i, now_ns) == FAILED) { status = FAILED; }
         }
         or (value.state != CONNECTION_BROKEN) {
             fail_connection(controls, runtime, i, now_ns);
@@ -4811,7 +4828,7 @@ pub fun cancel_all(controls: *ControlView, runtime: *Runtime) Status {
             for (bank < ADMISSION_BANKS) {
                 if (pump.admissions[bank].live
                     && (!begin_retire(?pump.admissions[bank])
-                    || !cancel_pending_bank(controls, runtime, i, bank))) {
+                    || !cancel_pending_bank(controls, runtime, i, bank, now_ns))) {
                     status = FAILED;
                 }
                 bank = bank + 1;
@@ -5492,7 +5509,7 @@ test assembly_init__failure_returns_capacity {
     value.state              = CONNECTION_CLEANUP;
     value.tls_live           = true;
     value.assembly_attempted = true;
-    if (!cleanup_accepting(controls, ?runtime, index)) { ret 8; }
+    if (!cleanup_accepting(controls, ?runtime, index, 1)) { ret 8; }
     # freeing the only connection compacts its chunk and its handshake away, so
     # the record pointer is gone rather than merely cleared
     if (runtime.live_connections != 0 || connection_at(controls, index) != nil
@@ -5748,13 +5765,17 @@ test cleanup_accepting__retries_lease {
     val connection: *Connection = connection_at(controls, index);
     connection.state  = CONNECTION_CLEANUP;
     runtime.admission = nil;
-    if (cleanup_accepting(controls, ?runtime, index) || !connection.live
-        || !connection.lease_live || process_admission.in_use(?manager) != 1) {
+    # the cleanup that cannot finish waits on its wheel entry, not the ready list
+    if (cleanup_accepting(controls, ?runtime, index, 1) || !connection.live
+        || !connection.lease_live || process_admission.in_use(?manager) != 1
+        || connection.retry_ns != 1 + RELEASE_RETRY_NS || has_ready(?runtime)
+        || !wheel.fires_by(?fixture.timers, connection.timer, connection.retry_ns)
+        || wheel.fires_by(?fixture.timers, connection.timer, RELEASE_RETRY_NS)) {
         ret 3;
     }
     runtime.admission = ?manager;
     # the retry frees the only connection, compacting its chunk away
-    if (!cleanup_accepting(controls, ?runtime, index)
+    if (!cleanup_accepting(controls, ?runtime, index, connection.retry_ns)
         || connection_at(controls, index) != nil
         || process_admission.in_use(?manager) != 0) { ret 4; }
     ret 0;
@@ -5798,12 +5819,19 @@ test release_pending__retries_lease_once {
     pending.budget_charge_live = true;
     pending.lease              = lease;
     pending.lease_live         = true;
-    if (release_pending_initial(controls, ?runtime, 0) || !pending.live
+    # the release that cannot finish waits on its wheel entry, not the ready list
+    if (cancel_pending_bank(controls, ?runtime, 0, 0, 1) || !pending.live
         || pending.budget_charge_live || !pending.lease_live
-        || items[0].waiting != 0
+        || items[0].waiting != 0 || has_ready(?runtime) || !pending.cleanup_only
+        || !wheel.fires_by(?fixture.timers, pending.timer, 1 + RELEASE_RETRY_NS)
+        || wheel.fires_by(?fixture.timers, pending.timer, RELEASE_RETRY_NS)
         || process_admission.in_use(?manager) != 1) { ret 3; }
     runtime.admission = ?manager;
-    if (!release_pending_initial(controls, ?runtime, 0) || pending.live
+    fire(controls, ?runtime, pending_owner(0), 1 + RELEASE_RETRY_NS);
+    if (!pending.ready
+        || advance_pending_initials(controls, ?runtime,
+        clock.from_ns(1 + RELEASE_RETRY_NS), 1 + RELEASE_RETRY_NS) != OK
+        || pending.live
         || runtime.pending_initial_count != 0 || runtime.live_total != 0
         || items[0].waiting != 0
         || process_admission.in_use(?manager) != 0) { ret 4; }
@@ -6256,15 +6284,19 @@ test cleanup__stall_costs_only_the_connection {
     if (index == NO_CONNECTION) { ret 91; }
     val connection: *Connection = connection_at(controls, index);
     connection.state = CONNECTION_CLEANUP;
-    # the lease cannot be returned, so the cleanup cannot finish this pass
+    # the lease cannot be returned, so the cleanup cannot finish this pass, and
+    # no turn tries it again before its retry is due
     runtime.admission = nil;
-    if (cleanup_accepting(controls, ?runtime, index) || !connection.waiting) { ret 5; }
-    if (advance(controls, ?runtime, 1) != OK
-        || !connection.live
+    if (cleanup_accepting(controls, ?runtime, index, 1) || connection.retry_ns == 0
+        || has_ready(?runtime)) { ret 5; }
+    fire(controls, ?runtime, timer_owner(index), connection.retry_ns);
+    if (advance(controls, ?runtime, 1 + RELEASE_RETRY_NS) != OK
+        || !connection.live || connection.retry_ns != 1 + 2 * RELEASE_RETRY_NS
         || snapshot(controls, ?runtime).connection_failures != 1) { ret 3; }
     runtime.admission = ?manager;
     # the retry finishes cleanup and frees the connection, compacting it away
-    if (advance(controls, ?runtime, 2) != OK
+    fire(controls, ?runtime, timer_owner(index), connection.retry_ns);
+    if (advance(controls, ?runtime, 1 + 2 * RELEASE_RETRY_NS) != OK
         || connection_at(controls, index) != nil
         || process_admission.in_use(?manager) != 0) { ret 4; }
     ret 0;
@@ -6723,12 +6755,12 @@ test audit__finds_unlisted_work {
     if (audit(controls, ?runtime, clock.instant()) != 1) { ret 5; }
     value.assembly.account.is_ready = false;
     value.assembly.account.open     = false;
-    # a teardown that finishes only by being serviced, unless the waiting list holds it
+    # a blocked teardown step with no retry armed
     value.state = CONNECTION_CLEANUP;
     if (audit(controls, ?runtime, clock.instant()) != 1) { ret 6; }
-    set_waiting(controls, ?runtime, index, true);
-    if (audit(controls, ?runtime, clock.instant()) != 0) { ret 7; }
-    set_waiting(controls, ?runtime, index, false);
+    if (!retry_later(?runtime, value, clock.monotonic_ns())
+        || audit(controls, ?runtime, clock.instant()) != 0) { ret 7; }
+    value.retry_ns   = 0;
     value.state      = CONNECTION_ACCEPTING;
     value.lease_live = false;
     free_connection(controls, ?runtime, index);
@@ -7638,8 +7670,8 @@ test teardown__bounded_per_turn {
     }
     if (runtime.retiring != burst || runtime.sessions.live != burst
         || !has_ready(?runtime)) { ret 4; }
-    # the queue wakes a retiring connection, so it is not polled every turn
-    if (needs_polling(controls, ?runtime, connection_at(controls, held[0]))) { ret 5; }
+    # the queue wakes a retiring connection, so nothing is left unqueued
+    if (audit(controls, ?runtime, now) != 0) { ret 5; }
     # one turn's teardown releases TEARDOWN_BUDGET, oldest first, and reads the
     # sockets before each: every read saw the sessions the releases before it left
     advance_teardown(controls, ?runtime, now, now_ns);
