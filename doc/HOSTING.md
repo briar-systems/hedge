@@ -4,7 +4,7 @@ hedge hosts applications in-process. A hosted application is Mach code linked in
 
 This document is the **host contract**: the part of hedge's public surface a hosted application, or a binding that adapts a framework to hedge, may depend on. It says which items the contract is made of, what hedge promises about each, and what it asks of the code it hosts. Anything it does not name is internal to hedge, even when it is declared `pub`.
 
-This is **host contract version 1.2**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), and version 1.2 adds background tasks ([Background tasks](#background-tasks)).
+This is **host contract version 1.3**. Version 1.1 added the outbound HTTPS client ([Outbound HTTPS](#outbound-https)), version 1.2 added background tasks ([Background tasks](#background-tasks)), and version 1.3 reports where the listeners bound ([Where the listeners bound](#where-the-listeners-bound)).
 
 ## Roles
 
@@ -63,16 +63,16 @@ Of these records, a program writes the fields of `Spec`, `Options` and `Resolver
 
 **Process assembly.** hedge has no single entry point that runs a process around a registry yet, so an embedding program assembles one from these items (see [Running a process](#running-a-process)):
 
-- `hedge.composition`: `Options` (its `applications` and `tasks`), `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`
+- `hedge.composition`: `Options` (its `applications` and `tasks`), `default_options`, `Runtime`, `start_process`, `close`, `StartReport`, `StartStatus`, `START_OK`, `START_CONFIG`, `START_RUNTIME`, `StopReport`, `Bound`, `bound_count`, `bound`
 - `hedge.supervisor`: `Supervisor`, `Loader`, `make`, `attach_reloads`, `start`, `run`, `stop`, `request_stop`, `request_reload`
 - `hedge.config.loader`: `Resolver`, `ResolveFun`, `Capabilities`, `build`
-- `hedge.config.schema`: `Graph`, `Diagnostics`, `Diagnostic`, `reset_diagnostics`, `text`
+- `hedge.config.schema`: `Graph`, `Diagnostics`, `Diagnostic`, `reset_diagnostics`, `text`, `TRANSPORT_TCP`, `TRANSPORT_QUIC`, `TRANSPORT_LOCAL`, `PROTOCOL_HTTP1`, `PROTOCOL_HTTP2`, `PROTOCOL_HTTP3`
 - `hedge.generation`: `Generation`, `make_candidate`, `seal`, `ConstructFun`
 - `hedge.spread`: `count`
 - `hedge.connection`: `config_from`, `message_limits`
 - `hedge.lifecycle`: `Reason`, `DRAINED`, `DEADLINE`, `IMMEDIATE`, `FAILED`
 
-Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
+Of the records here, a program reads `StartReport.status` and `.detail`, the `StopReport` fields, the `Bound` fields, `Generation.graph` and `.id`, and `Diagnostics.items`, `.count` and `.truncated`. The rest of each record is hedge's.
 
 Everything else is internal, and that includes the rest of `hedge.dispatch.call` (`bind`, `enter`, `stir`, `due`, `unpark`, the recorder, interceptor and observer hooks), `service.Resolver`, `service.Factory` and the `native` service factory, `service.ListenerService`, `hedge.serve`, `hedge.worker`, `hedge.telemetry`, the rest of `hedge.outbound`, the rest of `hedge.task` (`drain`, `stop`, `poll`, `next_due`, `spawn`, `close`, `thread_state` are the supervisor's), and every module under `hedge.acme`, `hedge.outbound`, `hedge.protocol`, `hedge.proxy` and `hedge.cache`.
 
@@ -172,6 +172,18 @@ The program then assembles the process around the registry. This is the sequence
 3. `supervisor.make`, then `supervisor.attach_reloads` with a `Loader` that seals each reload's candidate into the generation slot the active one is not using.
 4. `supervisor.start`, which starts the hosted applications and then the workers. On `START_OK`, `supervisor.run`, which returns once the process has been asked to stop and every worker and every hosted drain has settled.
 5. `supervisor.stop`, which joins the workers, stops the hosted applications and returns the `StopReport` the exit status is chosen from.
+
+### Where the listeners bound
+
+Once `supervisor.start` answers `START_OK`, the program can read every listener the configuration declares, in the order it declares them, as the process bound it. `composition.bound_count(runtime)` is how many there are, and none before the first worker serves. `composition.bound(runtime, i)` is the `i`th, or nil past the last:
+
+- `name`: the listener's configured name, read with `schema.text(?bound.name)`.
+- `transport`: `schema.TRANSPORT_TCP`, `TRANSPORT_QUIC` or `TRANSPORT_LOCAL`.
+- `protocols`: the protocols it serves, as `schema.PROTOCOL_HTTP1`, `PROTOCOL_HTTP2` and `PROTOCOL_HTTP3` bits, and `secure`, whether it serves them over TLS.
+- `address`: for a TCP or QUIC listener, the address its socket is bound to. A configured port of 0 reads as the port the system chose, which every worker shares.
+- `local`: for a local listener, its configured endpoint, a filesystem path or an abstract name.
+
+This is how a binding's `run` announces where it serves, and how a test binds `127.0.0.1:0` and connects to the port it got. hedge's own `main` prints its `hedge: listening` lines from it. A listener that bound but cannot say where fails the start with `START_RUNTIME`. Listeners change only with a restart, since a reload that changes one is refused, so what `bound` reports holds until `supervisor.stop` returns. It is written before `supervisor.start` returns and read-only after, so any thread may read it.
 
 `connection.message_limits(graph, connection.config_from(graph))` gives the limits hedge commits every response under, for a framework that assembles its application against them before registering it.
 
