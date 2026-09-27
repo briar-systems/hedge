@@ -2244,14 +2244,9 @@ fun unpublish_route(runtime: *Runtime,
     ret true;
 }
 
-fun route_matches(value: *Connection, published: *PublishedRoute,
-    route: assembly.Route, binding_value: routing.Binding) bool {
-    ret published.live && same_route_binding(published.binding, binding_value)
-        && route.active && route.id.length == published.key.length
-        && assembly.route_valid(?value.assembly, ?route);
-}
-
-# the copied table is reconciled after every operation that can mutate core state
+# the copied table is reconciled after every operation that can mutate core
+# state. each route is read once: the table is this connection's and only its
+# own operations move it, so a second read in the same pass reads the same
 fun reconcile_routes(controls: *ControlView, runtime: *Runtime, index: usize) bool {
     val value: *Connection = connection_at(controls, index);
     if (!value.live || !value.assembly.initialized) { ret false; }
@@ -2259,45 +2254,37 @@ fun reconcile_routes(controls: *ControlView, runtime: *Runtime, index: usize) bo
         assembly.routing_snapshot(?value.assembly);
     if (!snapshot.initialized
         || snapshot.capacity > assembly.CONNECTION_ID_CAPACITY) { ret false; }
-    var i: usize = 0;
+    var routes: [assembly.CONNECTION_ID_CAPACITY]assembly.Route;
+    var i:      usize = 0;
     for (i < assembly.CONNECTION_ID_CAPACITY) {
+        var route: assembly.Route;
+        if (i < snapshot.capacity) { route = assembly.route_at(?value.assembly, i); }
+        if (route.active && (route.id.length == 0
+            || route.id.length > routing.MAX_CID_BYTES)) { ret false; }
+        routes[i] = route;
+        # every stale route leaves before any is published, so a CID that
+        # moved between slots is never published twice
         val published: *PublishedRoute = ?value.storage.published[i];
-        if (published.live) {
-            if (i >= snapshot.capacity) {
-                if (!unpublish_route(runtime, published)) { ret false; }
-            }
-            or {
-                val current: assembly.Route =
-                    assembly.route_at(?value.assembly, i);
-                val current_binding: routing.Binding =
-                    route_binding(value, index, current);
-                if (!route_matches(value, published, current,
-                    current_binding)) {
-                    if (!unpublish_route(runtime, published)) { ret false; }
-                }
-            }
+        if (published.live && !(route.active
+            && route.id.length == published.key.length
+            && same_route_binding(published.binding,
+            route_binding(value, index, route)))) {
+            if (!unpublish_route(runtime, published)) { ret false; }
         }
         i = i + 1;
     }
     i = 0;
-    for (i < snapshot.capacity) {
-        val route: assembly.Route = assembly.route_at(?value.assembly, i);
-        if (route.active) {
-            if (!assembly.route_valid(?value.assembly, ?route)
-                || route.id.length == 0
-                || route.id.length > routing.MAX_CID_BYTES) { ret false; }
-            val key: routing.Key = routing.key(?route.id.data[0],
-                route.id.length);
-            val binding_value: routing.Binding =
-                route_binding(value, index, route);
-            val published: *PublishedRoute = ?value.storage.published[i];
-            if (!published.live) {
-                if (routing.publish(?runtime.routes, key,
-                    binding_value) != routing.ROUTE_OK) { ret false; }
-                published.key     = key;
-                published.binding = binding_value;
-                published.live    = true;
-            }
+    for (i < assembly.CONNECTION_ID_CAPACITY) {
+        val route:     *assembly.Route = ?routes[i];
+        val published: *PublishedRoute = ?value.storage.published[i];
+        if (route.active && !published.live) {
+            val key:           routing.Key     = routing.key(?route.id.data[0], route.id.length);
+            val binding_value: routing.Binding = route_binding(value, index, @route);
+            if (routing.publish(?runtime.routes, key,
+                binding_value) != routing.ROUTE_OK) { ret false; }
+            published.key     = key;
+            published.binding = binding_value;
+            published.live    = true;
         }
         i = i + 1;
     }
@@ -2368,8 +2355,9 @@ fun arm_timer(runtime: *Runtime, value: *Connection, now_ns: u64) bool {
 }
 
 # the transport's deadline is read once per service pass, at the end of
-# progress_connection. a step that changes it and queues the record for that
-# pass leaves the timer to it, so a datagram costs one read and not one per step
+# progress_connection, or by settle_transport when no pass follows. a step that
+# changes it and queues the record for that pass leaves the timer to it, so a
+# datagram costs one read and not one per step
 fun refresh_timer(controls: *ControlView, runtime: *Runtime, index: usize) bool {
     val value: *Connection = connection_at(controls, index);
     if (!value.live || !value.assembly.initialized) { ret false; }
@@ -2424,6 +2412,30 @@ fun unmark_ready(controls: *ControlView, runtime: *Runtime, index: usize) {
     value.ready_handshake = false;
     value.ready_next      = NO_CONNECTION;
     value.ready_prev      = NO_CONNECTION;
+}
+
+# a settled send wakes the service pass only when it left work beyond the
+# transport's own: a connection or transport state to act on, an HTTP/3 session
+# to start or with work named by pending_work, or memory to wait on. otherwise
+# the transport generates what the settle freed and its deadline is read, which
+# is the pass without the session: a send settles on every datagram out, and
+# driving HTTP/3 there made a keep-alive round three passes rather than two
+fun settle_transport(controls: *ControlView, runtime: *Runtime, index: usize,
+    now: time.Instant, now_ns: u64) {
+    val value: *Connection = connection_at(controls, index);
+    if (value == nil || !value.live || value.ready) { ret; }
+    if (value.state != CONNECTION_LIVE || !value.h3_started
+        || value.handshake != NO_HANDSHAKE || !value.assembly.initialized
+        || memory.waiting(?value.assembly.account)
+        || qt.snapshot[binding.Binding](?value.assembly.driver).state != qt.ACTIVE
+        || pending_work(controls, runtime, value, now, false)) {
+        mark_ready(controls, runtime, index);
+        ret;
+    }
+    if (!generate_sends(controls, runtime, index, now_ns)
+        || !refresh_timer(controls, runtime, index)) {
+        fail_connection(controls, runtime, index, now_ns);
+    }
 }
 
 # deliver what was held, in order. this is where a handshake's crypto runs
@@ -3661,12 +3673,14 @@ fun generate_sends(controls: *ControlView, runtime: *Runtime, index: usize,
         val generated: qt.Generated = qt.generate[binding.Binding](
             ?value.assembly.driver, ?value.storage.scope, ?operation.buffer[0],
             assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns), operation.generation::usize);
-        if (!reconcile_routes(controls, runtime, index)) { ret false; }
+        # a datagram's routes are published before it goes out. with nothing
+        # to send, the reconcile that ends the service pass covers the table
         if (generated.status == qt.STATUS_EMPTY
             || generated.status == qt.STATUS_BLOCKED
             || generated.status == qt.STATUS_CLOSED
             || generated.status == qt.STATUS_CANCELLED) { ret true; }
-        if (generated.status != qt.STATUS_OK) { ret false; }
+        if (generated.status != qt.STATUS_OK
+            || !reconcile_routes(controls, runtime, index)) { ret false; }
         operation.token = generated.token;
         fill_send_packet(operation, generated);
         if (!make_context(?operation.context, runtime, COMPLETION_SEND,
@@ -3881,7 +3895,7 @@ fun settle_send(controls: *ControlView, runtime: *Runtime, context: *CompletionC
         || !reconcile_routes(controls, runtime, context.connection)) {
         fail_connection(controls, runtime, context.connection, now_ns);
     }
-    mark_ready(controls, runtime, context.connection);
+    settle_transport(controls, runtime, context.connection, now, now_ns);
     ret OK;
 }
 
@@ -4315,17 +4329,20 @@ fun needs_polling(controls: *ControlView, runtime: *Runtime, value: *Connection)
 # whether servicing the connection now would do work nothing else will start:
 # datagrams held for its handshake turn, a pool wake nobody routed, a teardown
 # that finishes only by being serviced (#182), what the transport says it holds
-# (#261), or an HTTP/3 session that ran out of steps still moving (#275). the
-# transport answers false for a send the pool refused, whose wake drives it.
+# (#261) unless `output` is false for a caller that generates it anyway, or an
+# HTTP/3 session that ran out of steps still moving (#275). the transport
+# answers false for a send the pool refused, whose wake drives it.
 # stream news waits for an HTTP/3 session that takes it, and not on an account
 # waiting for the pool, whose wake services the connection
 fun pending_work(controls: *ControlView, runtime: *Runtime, value: *Connection,
-    now: time.Instant) bool {
-    if (value.held.count != 0)                                           { ret true; }
-    if (value.assembly.account.open && value.assembly.account.is_ready)  { ret true; }
-    if (needs_polling(controls, runtime, value))                         { ret true; }
-    if (!value.assembly.initialized)                                     { ret false; }
-    if (qt.pending_output[binding.Binding](?value.assembly.driver, now)) { ret true; }
+    now: time.Instant, output: bool) bool {
+    if (value.held.count != 0)                                          { ret true; }
+    if (value.assembly.account.open && value.assembly.account.is_ready) { ret true; }
+    if (needs_polling(controls, runtime, value))                        { ret true; }
+    if (!value.assembly.initialized)                                    { ret false; }
+    if (output && qt.pending_output[binding.Binding](?value.assembly.driver, now)) {
+        ret true;
+    }
     if (value.h3_session == h3_session.NO_SESSION
         || memory.waiting(?value.assembly.account)) { ret false; }
     val session: *h3_session.Session = h3_session.session_at(
@@ -4350,7 +4367,7 @@ pub fun audit(controls: *ControlView, runtime: *Runtime, now: time.Instant) usiz
         val value: *Connection = connection_at(controls, i);
         if (value.live && !value.ready && !value.waiting
             && !wheel.fires_by(runtime.timers, value.timer, clock.to_ns(now))
-            && pending_work(controls, runtime, value, now)) { found = found + 1; }
+            && pending_work(controls, runtime, value, now, true)) { found = found + 1; }
         i = value.next_live;
     }
     ret found;
