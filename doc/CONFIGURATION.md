@@ -192,6 +192,20 @@ routing, and forwarded headers all name the same client. Both the v1 text and v2
 binary forms are accepted, and a malformed header closes the connection rather
 than being read as the start of a request.
 
+`trusted_peers` also decides which clients may speak for another through
+request fields. A `proxy` service passes a request's `Forwarded`, `X-Real-IP`
+and every `X-Forwarded-*` field to its upstream only when the peer that wrote
+the request is trusted: its socket address is in `trusted_peers` and no PROXY
+header replaced it. A decoded PROXY peer is never trusted this way, because the
+header vouches for the client's address and not for the fields the client
+writes. From any other peer those fields are dropped, and the upstream sees
+only hedge's own `Forwarded` element, `for="<peer>";proto=<scheme>;host="<host>"`.
+From a trusted peer they pass unchanged and hedge's element follows them,
+extending the chain. hedge writes no `X-Forwarded-*` field of its own. A QUIC
+listener trusts no peer, so HTTP/3 requests always have their forwarding fields
+dropped. A listener that only fronts an HTTP proxy can name it in
+`trusted_peers` with `proxy_protocol` left `off`.
+
 Each listener configures a native `backlog` and a pre-submitted `accept_depth`. Defaults are 256 and 8. Backlog is limited to the native signed 32-bit range. Accept depth is limited to 64 per listener. Process-wide connection and per-peer limits come from `server.limits` and are reloadable.
 
 A QUIC listener sizes its UDP socket's buffers with `receive_buffer_bytes` and `send_buffer_bytes`. When they are absent it asks for 4 MiB to receive and 1 MiB to send, because the kernel default (212 KiB on Linux, about 166 full-size datagrams) overflows under a burst of handshakes, and every dropped Initial costs a client a retransmission timeout. The kernel decides what it grants: Linux doubles the request and caps it at `net.core.rmem_max` and `net.core.wmem_max`. So hedge reads the size back and logs both at startup, as `hedge: socket buffers <listener> receive <granted> (asked <requested>) send <granted> (asked <requested>)`. If the granted size is well below the request, raise those sysctls. Either key on a TCP or local listener is a configuration error, as are zero and sizes past the native signed 32-bit range. Changing either needs a restart, like `backlog`, because the size is applied when the socket is bound.
