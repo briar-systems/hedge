@@ -66,7 +66,7 @@ kind = "laurel"
 application = "site"
 ```
 
-A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application, binds it with `hedge.service.laurel.make`, registers `bound_handler` under that name in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `composition.stop` returns. The program also owns the application's lifecycle, so it starts the application before `composition.start` and drains and stops it after `composition.stop`. A configuration that names an unregistered application fails with `no application is registered under this name`. Register an application with the request memory it needs (see [Request memory](#request-memory)). A laurel application's per-request state alone is several kilobytes before its sessions, forms and response bodies.
+A `laurel` service names an application that the embedding program registers before startup. The program assembles the laurel application without starting it, binds it with `hedge.service.laurel.make`, registers it under that name with `hedge.service.laurel.register` in a `service.Applications` it owns, and passes the registry as `composition.Options.applications`. Composition resolves every `laurel` service against that registry at startup and again at each reload, so the registry and every application in it must stay live and unchanged until `supervisor.stop` returns. The supervisor drives each registered application's lifecycle components (`start`, `ready`, `drain`, `stop`, bounded by the application's `max_background_services`): it starts every application before any worker binds a listener, polls each one's readiness into the process's readiness check named after it, drains it toward the `drain_ms` deadline once shutdown begins, and stops it after the last worker has stopped, within `stop_ms`. A start or readiness that fails stops the process. The registry lives for the whole process, so a reload never restarts an application. A configuration that names an unregistered application fails with `no application is registered under this name`. Register an application with the request memory it needs (see [Request memory](#request-memory)). A laurel application's per-request state alone is several kilobytes before its sessions, forms and response bodies.
 
 Every worker is handed the same registry, so a registered application is entered by every worker at once. One `app.App` bound through `hedge.service.laurel`, like any other handler in `composition.Options.applications`, serves requests on several threads concurrently, with the same context pointer on each. hedge's side of that contract:
 
@@ -411,10 +411,13 @@ GOAWAY, HTTP/1 marks its responses for close and stops reading — exchanges
 already in flight are given until the `drain_ms` deadline to finish, whatever
 remains is cancelled, telemetry is flushed, and the resources are released last.
 
+Every hosted application drains alongside the workers, toward the same
+deadline, and is stopped once the last worker has.
+
 The exit status reports which of those happened. A clean drain exits 0. A drain
-whose deadline passed with exchanges still running exits 75 and names how many
-were abandoned, because that is not a clean shutdown even though it is a
-complete one. A step of the sequence failing exits 70 and names the step.
+whose deadline passed with exchanges or a hosted application's drain still
+running exits 75 and names how many were abandoned, because that is not a clean
+shutdown even though it is a complete one. A step of the sequence failing exits 70 and names the step.
 
 Cancelling closes each remaining connection, and the stop waits for those closes
 under `server.timeouts.stop_ms` (default 10000, 10 seconds). The deadline
