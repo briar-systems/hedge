@@ -13,6 +13,10 @@
 # pressure a new arrival takes the slot of the oldest held arrival of a lower
 # class, and a duplicate takes nothing. the queue reports what it dropped, and
 # its owner counts it
+#
+# a destination CID is the client's choice, so the index of held CIDs is a
+# keyed map under a key the queue draws, and a flood of chosen CIDs cannot be
+# aimed at one probe run
 
 use hedge.protocol.quic.routing;
 use hedge_storage: hedge.storage;
@@ -21,6 +25,7 @@ use quic.connection.assembly;
 use quic_listener: quic.connection.listener;
 use A:             std.allocator;
 use std.collections.map;
+use std.crypto.hash.siphash;
 use std_memory: std.memory;
 use net_types:  std.net.async.types;
 use std.net.ip;
@@ -59,9 +64,35 @@ pub rec Queue {
     tails:    [CLASSES]usize;
     held:     [CLASSES]usize;
     # held destination CIDs, each with the count of arrivals that carry it
-    index:    map.MapBy[routing.Key, usize];
+    index:    map.MapKeyed[Held, usize];
     live:     usize;
     capacity: usize;
+}
+
+# a held destination CID as plain words, which the keyed map hashes and
+# compares by value: its length, then its bytes eight to a word, zero past the end
+rec Held {
+    length: u64;
+    first:  u64;
+    second: u64;
+    third:  u64;
+}
+
+$if (routing.MAX_CID_BYTES > 24) {
+    $error("hedge.protocol.quic.arrivals: a held CID packs into three words");
+}
+
+fun held_key(key: routing.Key) Held {
+    var words: [3]u64;
+    words[0] = 0;
+    words[1] = 0;
+    words[2] = 0;
+    var i: usize = 0;
+    for (i < key.length) {
+        words[i / 8] = words[i / 8] | (key.bytes[i]::u64 << (8 * (i % 8))::u64);
+        i            = i + 1;
+    }
+    ret Held{length: key.length::u64, first: words[0], second: words[1], third: words[2]};
 }
 
 pub def Outcome: u8;
@@ -90,11 +121,14 @@ fun clear(queue: *Queue) {
     queue.live = 0;
 }
 
-# an empty queue, which holds nothing until it is given a capacity
+# an empty queue, which holds nothing until it is given a capacity. the queue
+# draws its index's key, and refuses when the entropy source gives none
 pub fun make(queue: *Queue, backing: *A.Allocator) bool {
-    if (queue == nil || backing == nil)                               { ret false; }
+    if (queue == nil || backing == nil) { ret false; }
+    val key: opt[siphash.Key] = siphash.random_key();
+    if (!(sel key.some))                                              { ret false; }
     if (!hedge_storage.make_table[Arrival](?queue.arrivals, backing)) { ret false; }
-    queue.index    = map.init_by[routing.Key, usize](backing, routing.key_hash, routing.key_equal);
+    queue.index    = map.init_keyed[Held, usize](backing, key.some);
     queue.capacity = 0;
     clear(queue);
     ret true;
@@ -110,7 +144,7 @@ pub fun resize(queue: *Queue, capacity: usize) {
 pub fun destroy(queue: *Queue) bool {
     var success: bool = true;
     if (!hedge_storage.destroy_table[Arrival](?queue.arrivals)) { success = false; }
-    val dropped: err[A.Error] = map.dnit_by[routing.Key, usize](?queue.index);
+    val dropped: err[A.Error] = map.dnit_keyed[Held, usize](?queue.index);
     if (sel dropped.err) { success = false; }
     clear(queue);
     ret success;
@@ -132,32 +166,49 @@ pub fun at(queue: *Queue, index: usize) *Arrival {
 # destination CID already held makes it a duplicate whatever it carries
 pub fun class_of(queue: *Queue, classified: *quic_listener.ClassifiedDatagram,
     key: routing.Key) usize {
-    val held_key: opt[*usize] = map.get_by[routing.Key, usize](?queue.index, ?key);
-    if (sel held_key.some)                                  { ret DUPLICATE; }
-    if (classified.class != quic_listener.DATAGRAM_INITIAL) { ret OTHER; }
-    if (classified.token_length != 0)                       { ret TOKEN; }
+    var held: Held = held_key(key);
+    if (key.valid && map.contains_keyed[Held, usize](?queue.index, ?held)) { ret DUPLICATE; }
+    if (classified.class != quic_listener.DATAGRAM_INITIAL)                { ret OTHER; }
+    if (classified.token_length != 0)                                      { ret TOKEN; }
     ret UNTOKEN;
 }
 
+# how many distinct CIDs the index holds
+#[testing]
+pub fun indexed(queue: *Queue) usize {
+    ret map.length_keyed[Held, usize](queue.index);
+}
+
+# whether an arrival carrying `key` is held
+#[testing]
+pub fun holds_key(queue: *Queue, key: routing.Key) bool {
+    var held: Held = held_key(key);
+    ret key.valid && map.contains_keyed[Held, usize](?queue.index, ?held);
+}
+
+# an arrival with no valid CID matches nothing, so it is not indexed
 fun index_key(queue: *Queue, key: routing.Key) bool {
-    val held_key: opt[*usize] = map.get_by[routing.Key, usize](?queue.index, ?key);
-    if (sel held_key.some) {
-        @held_key.some = @held_key.some + 1;
+    if (!key.valid) { ret true; }
+    var held:  Held        = held_key(key);
+    val count: opt[*usize] = map.get_keyed[Held, usize](?queue.index, ?held);
+    if (sel count.some) {
+        @count.some = @count.some + 1;
         ret true;
     }
-    val inserted: res[bool, A.Error] =
-        map.insert_by[routing.Key, usize](?queue.index, key, 1);
+    val inserted: res[bool, A.Error] = map.insert_keyed[Held, usize](?queue.index, held, 1);
     ret !(sel inserted.err);
 }
 
 fun unindex_key(queue: *Queue, key: routing.Key) {
-    val held_key: opt[*usize] = map.get_by[routing.Key, usize](?queue.index, ?key);
-    if (!(sel held_key.some)) { ret; }
-    if (@held_key.some > 1) {
-        @held_key.some = @held_key.some - 1;
+    if (!key.valid) { ret; }
+    var held:  Held        = held_key(key);
+    val count: opt[*usize] = map.get_keyed[Held, usize](?queue.index, ?held);
+    if (!(sel count.some)) { ret; }
+    if (@count.some > 1) {
+        @count.some = @count.some - 1;
         ret;
     }
-    map.remove_by[routing.Key, usize](?queue.index, ?key);
+    map.remove_keyed[Held, usize](?queue.index, ?held);
 }
 
 # unlinks the oldest arrival of a class and releases its record
