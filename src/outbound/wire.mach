@@ -1,12 +1,11 @@
-# http/1.1 codec for the acme transport
+# http/1.1 codec for the outbound client
 #
-# mach-acme produces typed wire requests and consumes typed responses; it never
-# owns a socket. this module is the exact translation between those types and
-# http/1.1 bytes, so the transport only moves bytes and the acme state machine
-# above it never sees framing.
+# the exact translation between a request the client was handed and the bytes
+# on the wire, and between the bytes that came back and a response, so the
+# client only moves bytes and never sees framing. the client owns framing:
+# the host, content-length, transfer-encoding and connection fields are its to
+# write, and a caller that supplies one is refused rather than overridden.
 
-use ac: acme.client;
-use acme.problem;
 use http_date: hedge.http.date;
 use http.core.field;
 use http.core.method;
@@ -38,6 +37,17 @@ pub rec Target {
     secure: bool;
 }
 
+# one parsed response. `consumed` is where the message ended in what was read,
+# and `reusable` says the connection may carry another exchange after it: the
+# message delimited itself, the peer speaks http/1.1 and did not ask to close.
+pub rec Parsed {
+    status:   status.Status;
+    fields:   *field.Fields;
+    body:     view.View;
+    consumed: usize;
+    reusable: bool;
+}
+
 fun empty_view() view.View {
     var value: view.View;
     value.data = nil;
@@ -60,8 +70,8 @@ fun digit(c: u8) bool {
 }
 
 # splits an absolute http or https url into host, port, and origin-form path.
-# userinfo is refused rather than ignored, because an authority hedge did not
-# expect must never be reached with credentials the caller did not intend.
+# userinfo is refused rather than ignored, because an authority the caller did
+# not expect must never be reached with credentials the caller did not intend.
 pub fun split_url(url: view.View, output: *Target) bool {
     if (output == nil) { ret false; }
     output.host   = empty_view();
@@ -197,18 +207,81 @@ fun method_name(value: method.Kind, output: **u8, length: *usize) bool {
         @length = 4;
         ret true;
     }
+    if (value == method.PUT) {
+        @output = "PUT"::*u8;
+        @length = 3;
+        ret true;
+    }
+    if (value == method.PATCH) {
+        @output = "PATCH"::*u8;
+        @length = 5;
+        ret true;
+    }
+    if (value == method.DELETE) {
+        @output = "DELETE"::*u8;
+        @length = 6;
+        ret true;
+    }
+    if (value == method.OPTIONS) {
+        @output = "OPTIONS"::*u8;
+        @length = 7;
+        ret true;
+    }
     ret false;
 }
 
-# writes one complete request. the connection is not reused across acme
-# requests, so every request announces close and carries its own framing.
-pub fun encode_request(request: ac.WireRequest, target: Target,
-    user_agent: str, user_agent_len: usize, output: *u8,
-    capacity: usize) usize {
+# a method whose request carries content, so its length is always stated
+fun carries_content(value: method.Kind) bool {
+    ret value == method.POST || value == method.PUT || value == method.PATCH;
+}
+
+fun named(item: *field.Field, name: str, length: usize) bool {
+    ret field.name_equal(item.name, view.view(name, length));
+}
+
+# the fields framing depends on belong to the client
+fun reserved(item: *field.Field) bool {
+    ret named(item, field.HOST, 4) || named(item, field.CONTENT_LENGTH, 14)
+        || named(item, field.TRANSFER_ENCODING, 17)
+        || named(item, field.CONNECTION, 10) || named(item, field.TE, 2)
+        || named(item, field.UPGRADE, 7) || named(item, field.TRAILER, 7)
+        || named(item, "keep-alive", 10) || named(item, "proxy-connection", 16);
+}
+
+# every caller field is a valid name and value and none is one the client
+# writes itself, so nothing a caller supplies can split or reframe the request
+pub fun valid_headers(headers: *field.Field, count: usize) bool {
+    if (count != 0 && headers == nil) { ret false; }
+    var i: usize = 0;
+    for (i < count) {
+        if (!field.valid_name(headers[i].name) || !field.valid_value(headers[i].value)
+            || reserved(?headers[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun supplies(headers: *field.Field, count: usize, name: str, length: usize) bool {
+    var i: usize = 0;
+    for (i < count) {
+        if (named(?headers[i], name, length)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# writes one complete request. a caller's user-agent replaces `user_agent`.
+# the connection stays open for the next request unless the peer closes it.
+pub fun encode_request(kind: method.Kind, target: Target,
+    headers: *field.Field, header_count: usize, body: view.View,
+    user_agent: view.View, output: *u8, capacity: usize) usize {
     var name:     *u8   = nil;
     var name_len: usize = 0;
-    if (!method_name(request.method.kind, ?name, ?name_len)) { ret 0; }
-    if (target.host.len == 0 || target.path.len == 0)        { ret 0; }
+    if (!method_name(kind, ?name, ?name_len))                         { ret 0; }
+    if (target.host.len == 0 || target.path.len == 0)                 { ret 0; }
+    if (!valid_headers(headers, header_count))                        { ret 0; }
+    if (body.len != 0 && body.data == nil)                            { ret 0; }
+    if (body.len != 0 && (kind == method.GET || kind == method.HEAD)) { ret 0; }
     var out: Writer = writer(output, capacity);
     put(?out, name, name_len);
     put_str(?out, " ", 1);
@@ -220,30 +293,34 @@ pub fun encode_request(request: ac.WireRequest, target: Target,
         put_str(?out, ":", 1);
         put_number(?out, target.port::usize);
     }
-    put_str(?out, "\r\nuser-agent: ", 14);
-    put_str(?out, user_agent, user_agent_len);
-    put_str(?out, "\r\nconnection: close\r\n", 21);
-    if (request.content_type.len != 0) {
-        put_str(?out, "content-type: ", 14);
-        put_view(?out, request.content_type);
+    put_str(?out, "\r\n", 2);
+    if (user_agent.len != 0 && !supplies(headers, header_count, field.USER_AGENT, 10)) {
+        put_str(?out, "user-agent: ", 12);
+        put_view(?out, user_agent);
         put_str(?out, "\r\n", 2);
     }
-    if (request.method.kind == method.POST) {
+    var i: usize = 0;
+    for (i < header_count) {
+        put_view(?out, headers[i].name);
+        put_str(?out, ": ", 2);
+        put_view(?out, headers[i].value);
+        put_str(?out, "\r\n", 2);
+        i = i + 1;
+    }
+    if (carries_content(kind) || body.len != 0) {
         put_str(?out, "content-length: ", 16);
-        put_number(?out, request.body.len);
+        put_number(?out, body.len);
         put_str(?out, "\r\n", 2);
     }
     put_str(?out, "\r\n", 2);
-    if (request.method.kind == method.POST) {
-        put_view(?out, request.body);
-    }
+    put_view(?out, body);
     if (!out.ok) { ret 0; }
     ret out.len;
 }
 
-fun head_end(data: *u8, len: usize) usize {
-    if (len < 4) { ret 0; }
-    var i: usize = 0;
+fun head_end(data: *u8, from: usize, len: usize) usize {
+    if (len < from + 4) { ret 0; }
+    var i: usize = from;
     for (i + 3 < len) {
         if (data[i] == 13 && data[i + 1] == 10 && data[i + 2] == 13
             && data[i + 3] == 10) { ret i + 4; }
@@ -261,22 +338,26 @@ fun line_end(data: *u8, at: usize, limit: usize) usize {
     ret limit;
 }
 
-fun parse_status_line(data: *u8, len: usize, output: *status.Status) usize {
-    val finish: usize = line_end(data, 0, len);
-    if (finish < 12 || finish >= len) { ret 0; }
+# the status line at `at`, its code and whether the peer speaks http/1.1
+fun parse_status_line(data: *u8, at: usize, len: usize, output: *status.Status,
+    modern: *bool) usize {
+    val finish: usize = line_end(data, at, len);
+    if (finish < at + 12 || finish >= len) { ret 0; }
     var i:        usize = 0;
     val expected: str   = "HTTP/1.";
     for (i < 7) {
-        if (data[i] != expected[i]) { ret 0; }
+        if (data[at + i] != expected[i]) { ret 0; }
         i = i + 1;
     }
-    if (data[7] != '0' && data[7] != '1')                        { ret 0; }
-    if (data[8] != ' ')                                          { ret 0; }
-    if (!digit(data[9]) || !digit(data[10]) || !digit(data[11])) { ret 0; }
-    if (finish > 12 && data[12] != ' ')                          { ret 0; }
-    val code: usize = (data[9] - '0')::usize * 100
-        + (data[10] - '0')::usize * 10 + (data[11] - '0')::usize;
+    if (data[at + 7] != '0' && data[at + 7] != '1') { ret 0; }
+    if (data[at + 8] != ' ')                        { ret 0; }
+    if (!digit(data[at + 9]) || !digit(data[at + 10])
+        || !digit(data[at + 11])) { ret 0; }
+    if (finish > at + 12 && data[at + 12] != ' ') { ret 0; }
+    val code: usize = (data[at + 9] - '0')::usize * 100
+        + (data[at + 10] - '0')::usize * 10 + (data[at + 11] - '0')::usize;
     @output = code::status.Status;
+    @modern = data[at + 7] == '1';
     ret finish + 2;
 }
 
@@ -331,6 +412,24 @@ pub fun find_field(fields: *field.Fields, name: str, name_len: usize,
     ret false;
 }
 
+# whether a comma-separated field value lists `token`, ignoring case
+fun lists_token(value: view.View, token: str, length: usize) bool {
+    var at: usize = 0;
+    for (at < value.len) {
+        for (at < value.len && (value.data[at] == ' ' || value.data[at] == 9
+            || value.data[at] == ',')) { at = at + 1; }
+        val start: usize = at;
+        for (at < value.len && value.data[at] != ',') { at = at + 1; }
+        var end: usize = at;
+        for (end > start && (value.data[end - 1] == ' ' || value.data[end - 1] == 9)) {
+            end = end - 1;
+        }
+        if (field.name_equal(view.view(?value.data[start], end - start),
+            view.view(token, length))) { ret true; }
+    }
+    ret false;
+}
+
 fun decimal(value: view.View, output: *usize) bool {
     if (value.len == 0 || value.len > 19) { ret false; }
     var total: usize = 0;
@@ -361,9 +460,10 @@ fun hex_value(c: u8, output: *usize) bool {
 }
 
 # scans chunked framing without writing anything. a parse over an incomplete
-# message must leave the buffer exactly as it was, because the transport calls
-# it again on every read; compaction happens only once the message is whole.
-fun scan_chunked(data: *u8, at: usize, len: usize, decoded: *usize) Parse {
+# message must leave the buffer exactly as it was, because the client calls it
+# again on every read; compaction happens only once the message is whole.
+fun scan_chunked(data: *u8, at: usize, len: usize, decoded: *usize,
+    finish: *usize) Parse {
     var read:  usize = at;
     var total: usize = 0;
     for (true) {
@@ -391,15 +491,16 @@ fun scan_chunked(data: *u8, at: usize, len: usize, decoded: *usize) Parse {
         if (data[read] != 13 || data[read + 1] != 10) { ret PARSE_INVALID; }
         read = read + 2;
     }
-    # the trailer section ends the message; acme carries nothing in it
+    # the trailer section ends the message; its fields are not kept
     for (read + 1 < len) {
         if (data[read] == 13 && data[read + 1] == 10) {
             @decoded = total;
+            @finish  = read + 2;
             ret PARSE_OK;
         }
-        val finish: usize = line_end(data, read, len);
-        if (finish >= len) { ret PARSE_INCOMPLETE; }
-        read = finish + 2;
+        val end: usize = line_end(data, read, len);
+        if (end >= len) { ret PARSE_INCOMPLETE; }
+        read = end + 2;
     }
     ret PARSE_INCOMPLETE;
 }
@@ -451,37 +552,53 @@ pub fun retry_after(fields: *field.Fields) u64 {
 
 # parses one complete response out of `data`. `eof` reports that the peer has
 # closed, which is the only framing a response without content-length or
-# chunked encoding has.
+# chunked encoding has. interim 1xx responses are stepped over, since the
+# request is answered by the final one.
 pub fun parse_response(data: *u8, len: usize, eof: bool, request: method.Kind,
-    fields: *field.Fields, output: *ac.Response) Parse {
+    fields: *field.Fields, output: *Parsed) Parse {
     if (data == nil || fields == nil || output == nil) { ret PARSE_INVALID; }
-    val body_at: usize = head_end(data, len);
-    if (body_at == 0) {
-        if (len > MAX_HEAD_BYTES) { ret PARSE_LIMIT; }
-        if (eof)                  { ret PARSE_INVALID; }
-        ret PARSE_INCOMPLETE;
-    }
-    if (body_at > MAX_HEAD_BYTES) { ret PARSE_LIMIT; }
+    var head_at:   usize         = 0;
+    var body_at:   usize         = 0;
     var code:      status.Status = 0;
-    val fields_at: usize         = parse_status_line(data, body_at, ?code);
-    if (fields_at == 0) { ret PARSE_INVALID; }
+    var modern:    bool          = false;
+    var fields_at: usize         = 0;
+    for (true) {
+        body_at = head_end(data, head_at, len);
+        if (body_at == 0) {
+            if (len - head_at > MAX_HEAD_BYTES) { ret PARSE_LIMIT; }
+            if (eof)                            { ret PARSE_INVALID; }
+            ret PARSE_INCOMPLETE;
+        }
+        if (body_at - head_at > MAX_HEAD_BYTES) { ret PARSE_LIMIT; }
+        fields_at = parse_status_line(data, head_at, body_at, ?code, ?modern);
+        if (fields_at == 0)                           { ret PARSE_INVALID; }
+        if (code < 100 || code >= 200 || code == 101) { brk; }
+        head_at = body_at;
+    }
+    if (!field.reset(fields)) { ret PARSE_INVALID; }
     val parsed: Parse = parse_fields(data, fields_at, body_at, fields);
     if (parsed != PARSE_OK) { ret parsed; }
-    output.status              = code;
-    output.fields              = fields;
-    output.body                = empty_view();
-    output.retry_after_seconds = retry_after(fields);
+    output.status   = code;
+    output.fields   = fields;
+    output.body     = empty_view();
+    output.consumed = body_at;
+    var connection: view.View;
+    val closing:    bool = find_field(fields, field.CONNECTION, 10, ?connection)
+        && lists_token(connection, "close", 5);
+    output.reusable = modern && !closing;
     val bodyless: bool = request == method.HEAD || code == 204 || code == 304
-        || (code >= 100 && code < 200);
+        || code < 200;
     if (bodyless) { ret PARSE_OK; }
     var encoding: view.View;
     if (find_field(fields, field.TRANSFER_ENCODING, 17, ?encoding)) {
         if (!view.view_eq_str(encoding, "chunked")) { ret PARSE_INVALID; }
         var decoded: usize = 0;
-        val framed:  Parse = scan_chunked(data, body_at, len, ?decoded);
-        if (framed != PARSE_OK)                             { ret framed; }
-        if (compact_chunked(data, body_at, len) != decoded) { ret PARSE_INVALID; }
-        if (decoded != 0)                                   { output.body = view.view(?data[body_at], decoded); }
+        var finish:  usize = 0;
+        val framed:  Parse = scan_chunked(data, body_at, len, ?decoded, ?finish);
+        if (framed != PARSE_OK)                                { ret framed; }
+        if (compact_chunked(data, body_at, finish) != decoded) { ret PARSE_INVALID; }
+        if (decoded != 0)                                      { output.body = view.view(?data[body_at], decoded); }
+        output.consumed = finish;
         ret PARSE_OK;
     }
     var declared: view.View;
@@ -493,12 +610,16 @@ pub fun parse_response(data: *u8, len: usize, eof: bool, request: method.Kind,
             ret PARSE_INCOMPLETE;
         }
         if (length != 0) { output.body = view.view(?data[body_at], length); }
+        output.consumed = body_at + length;
         ret PARSE_OK;
     }
+    # a body delimited by the close leaves nothing to reuse
+    output.reusable = false;
     if (!eof) { ret PARSE_INCOMPLETE; }
     if (len > body_at) {
         output.body = view.view(?data[body_at], len - body_at);
     }
+    output.consumed = len;
     ret PARSE_OK;
 }
 
@@ -539,28 +660,53 @@ test split_url__refuses_userinfo_scheme_and_port {
     ret 0;
 }
 
-test encode_request__post_framing {
+test encode_request__headers_and_post_framing {
     var target: Target;
     if (!split_url(view.view("http://127.0.0.1:14001/order", 28), ?target)) { ret 1; }
-    var request: ac.WireRequest;
-    request.method             = method.from_kind(method.POST);
-    request.url                = view.view("http://127.0.0.1:14001/order", 28);
-    request.content_type       = view.view("application/jose+json", 21);
-    request.body               = view.view("{\"a\":1}", 7);
-    request.error              = problem.none();
-    request.timeout_ns         = 5000000000;
-    request.max_response_bytes = 4096;
-    request.response_fields    = field.limits(32, 8192, 128, 4096);
-    request.replay_safe        = false;
+    var headers: [2]field.Field;
+    headers[0] = field.Field{name: view.view("content-type", 12),
+        value: view.view("application/jose+json", 21), sensitive: false};
+    headers[1] = field.Field{name: view.view("authorization", 13),
+        value: view.view("Bearer t", 8), sensitive: true};
     var output:  [512]u8;
-    val written: usize = encode_request(request, target, "hedge", 5,
-        ?output[0], 512);
+    val written: usize = encode_request(method.POST, target, ?headers[0], 2,
+        view.view("{\"a\":1}", 7), view.view("hedge", 5), ?output[0], 512);
     if (written == 0) { ret 2; }
-    val encoded: view.View = view.view(?output[0], written);
-    if (!view.view_eq_str(encoded,
-        "POST /order HTTP/1.1\r\nhost: 127.0.0.1:14001\r\nuser-agent: hedge\r\nconnection: close\r\ncontent-type: application/jose+json\r\ncontent-length: 7\r\n\r\n{\"a\":1}")) {
+    if (!view.view_eq_str(view.view(?output[0], written),
+        "POST /order HTTP/1.1\r\nhost: 127.0.0.1:14001\r\nuser-agent: hedge\r\ncontent-type: application/jose+json\r\nauthorization: Bearer t\r\ncontent-length: 7\r\n\r\n{\"a\":1}")) {
         ret 3;
     }
+    # a caller's user-agent replaces the client's
+    headers[0] = field.Field{name: view.view("User-Agent", 10),
+        value: view.view("site/1", 6), sensitive: false};
+    val plain: usize = encode_request(method.GET, target, ?headers[0], 1,
+        view.view(nil, 0), view.view("hedge", 5), ?output[0], 512);
+    if (!view.view_eq_str(view.view(?output[0], plain),
+        "GET /order HTTP/1.1\r\nhost: 127.0.0.1:14001\r\nUser-Agent: site/1\r\n\r\n")) {
+        ret 4;
+    }
+    ret 0;
+}
+
+test encode_request__refuses_framing_and_injected_fields {
+    var target: Target;
+    if (!split_url(view.view("https://api.example/x", 21), ?target)) { ret 1; }
+    var output: [256]u8;
+    var header: [1]field.Field;
+    header[0] = field.Field{name: view.view("Content-Length", 14),
+        value: view.view("1", 1), sensitive: false};
+    if (encode_request(method.POST, target, ?header[0], 1, view.view("ab", 2),
+        view.view(nil, 0), ?output[0], 256) != 0) { ret 2; }
+    header[0] = field.Field{name: view.view("x-a", 3),
+        value: view.view("1\r\nhost: evil", 13), sensitive: false};
+    if (encode_request(method.GET, target, ?header[0], 1, view.view(nil, 0),
+        view.view(nil, 0), ?output[0], 256) != 0) { ret 3; }
+    # a get carries no content
+    if (encode_request(method.GET, target, nil, 0, view.view("ab", 2),
+        view.view(nil, 0), ?output[0], 256) != 0) { ret 4; }
+    # and a request that does not fit is refused, never truncated
+    if (encode_request(method.GET, target, nil, 0, view.view(nil, 0),
+        view.view(nil, 0), ?output[0], 16) != 0) { ret 5; }
     ret 0;
 }
 
@@ -570,16 +716,15 @@ test parse_response__content_length_incomplete {
     var data:   [128]u8;
     val len:    usize        = load(?data[0],
         "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello");
-    var response: ac.Response;
+    var response: Parsed;
     if (parse_response(?data[0], 20, false, method.GET, ?fields, ?response)
         != PARSE_INCOMPLETE) { ret 1; }
-    fields = test_fields(?items[0], 16);
     if (parse_response(?data[0], len - 2, false, method.GET, ?fields, ?response)
         != PARSE_INCOMPLETE) { ret 2; }
-    fields = test_fields(?items[0], 16);
     if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
         != PARSE_OK) { ret 3; }
-    if (response.status != 200 || !view.view_eq_str(response.body, "hello")) { ret 4; }
+    if (response.status != 200 || !view.view_eq_str(response.body, "hello")
+        || response.consumed != len || !response.reusable) { ret 4; }
     ret 0;
 }
 
@@ -589,7 +734,7 @@ test parse_response__truncated_body_at_eof {
     var data:   [128]u8;
     val len:    usize        = load(?data[0],
         "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhel");
-    var response: ac.Response;
+    var response: Parsed;
     if (parse_response(?data[0], len, true, method.GET, ?fields, ?response)
         != PARSE_INVALID) { ret 1; }
     ret 0;
@@ -601,26 +746,62 @@ test parse_response__head_ignores_framing {
     var data:   [128]u8;
     val len:    usize        = load(?data[0],
         "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n");
-    var response: ac.Response;
+    var response: Parsed;
     if (parse_response(?data[0], len, false, method.HEAD, ?fields, ?response)
         != PARSE_OK) { ret 1; }
-    if (response.body.len != 0) { ret 2; }
+    if (response.body.len != 0 || response.consumed != len) { ret 2; }
     ret 0;
 }
 
 test parse_response__chunked_in_place {
     var items:  [16]field.Field;
     var fields: field.Fields = test_fields(?items[0], 16);
-    var data:   [128]u8;
+    var data:   [160]u8;
     val len:    usize        = load(?data[0],
-        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\n123\r\n0\r\n\r\n");
-    var response: ac.Response;
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n3;x=y\r\n123\r\n0\r\nx-trailer: 1\r\n\r\n");
+    var response: Parsed;
     if (parse_response(?data[0], len - 8, false, method.GET, ?fields, ?response)
         != PARSE_INCOMPLETE) { ret 1; }
-    fields = test_fields(?items[0], 16);
     if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
         != PARSE_OK) { ret 2; }
     if (!view.view_eq_str(response.body, "hello123")) { ret 3; }
+    # the message ends at the encoded end, not at the decoded one
+    if (response.consumed != len || !response.reusable) { ret 4; }
+    ret 0;
+}
+
+test parse_response__reuse_follows_framing_and_version {
+    var items:    [16]field.Field;
+    var fields:   field.Fields = test_fields(?items[0], 16);
+    var data:     [128]u8;
+    var response: Parsed;
+    var len:      usize        = load(?data[0],
+        "HTTP/1.1 200 OK\r\nconnection: keep-alive, Close\r\ncontent-length: 0\r\n\r\n");
+    if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
+        != PARSE_OK || response.reusable) { ret 1; }
+    len = load(?data[0], "HTTP/1.0 200 OK\r\ncontent-length: 0\r\n\r\n");
+    if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
+        != PARSE_OK || response.reusable) { ret 2; }
+    len = load(?data[0], "HTTP/1.1 200 OK\r\n\r\nall of it");
+    if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
+        != PARSE_INCOMPLETE) { ret 3; }
+    if (parse_response(?data[0], len, true, method.GET, ?fields, ?response)
+        != PARSE_OK || response.reusable
+        || !view.view_eq_str(response.body, "all of it")) { ret 4; }
+    ret 0;
+}
+
+test parse_response__interim_response_stepped_over {
+    var items:  [16]field.Field;
+    var fields: field.Fields = test_fields(?items[0], 16);
+    var data:   [160]u8;
+    val len:    usize        = load(?data[0],
+        "HTTP/1.1 103 Early Hints\r\nlink: </a>\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+    var response: Parsed;
+    if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
+        != PARSE_OK) { ret 1; }
+    if (response.status != 200 || !view.view_eq_str(response.body, "ok")
+        || fields.len != 1) { ret 2; }
     ret 0;
 }
 
@@ -630,7 +811,7 @@ test parse_response__obs_fold_rejected {
     var data:   [128]u8;
     val len:    usize        = load(?data[0],
         "HTTP/1.1 200 OK\r\nx: a\r\n b\r\ncontent-length: 0\r\n\r\n");
-    var response: ac.Response;
+    var response: Parsed;
     if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
         != PARSE_INVALID) { ret 1; }
     ret 0;
@@ -642,14 +823,13 @@ test parse_response__retry_after_seconds_and_date {
     var data:   [256]u8;
     val len:    usize        = load(?data[0],
         "HTTP/1.1 503 Busy\r\nretry-after: 12\r\ncontent-length: 0\r\n\r\n");
-    var response: ac.Response;
+    var response: Parsed;
     if (parse_response(?data[0], len, false, method.GET, ?fields, ?response)
-        != PARSE_OK || response.retry_after_seconds != 12) { ret 1; }
+        != PARSE_OK || retry_after(?fields) != 12) { ret 1; }
     var dated:  [256]u8;
     val second: usize = load(?dated[0],
         "HTTP/1.1 503 Busy\r\ndate: Sun, 06 Nov 1994 08:49:37 GMT\r\nretry-after: Sun, 06 Nov 1994 08:49:47 GMT\r\ncontent-length: 0\r\n\r\n");
-    fields = test_fields(?items[0], 16);
     if (parse_response(?dated[0], second, false, method.GET, ?fields, ?response)
-        != PARSE_OK || response.retry_after_seconds != 10) { ret 2; }
+        != PARSE_OK || retry_after(?fields) != 10) { ret 2; }
     ret 0;
 }
