@@ -422,7 +422,10 @@ list such as `1 2 4 8`, it runs every cell once per count with
 reaches `LOAD_RATE_EFFICIENCY` (0.7) of N over the first count times the
 first count's rate, up to the host's core count. With it empty the lane runs
 the server's default worker count and asserts only that every operation
-succeeds. The lane binds ports 19140 to 19142.
+succeeds. The QUIC cells scale with the rest since #174: on the 5800X3D, with
+`LOAD_RATE_CELLS="h3 quic-handshake" LOAD_RATE_WORKERS="1 4"`, HTTP/3 went
+from 3,866 to 14,051 requests a second and QUIC handshakes from 1,066 to 4,125
+a second, at the same CPU per operation. The lane binds ports 19140 to 19142.
 
 ## The ramp lane
 
@@ -458,16 +461,22 @@ subject. Once every one is held and a period has passed, the socket's drop
 counter is read over `LOAD_KEEPALIVE_SECONDS` (10). The lane passes when every
 dial is held, the socket dropped no datagram over that window, and every
 connection leaves hedge once its client closes it. It prints the server's CPU
-per PING round, the cores it used and the receive queue's peak. The lane binds
-ports 19180 to 19183.
+per PING round, the cores it used, the receive queue's peak and how many
+datagrams were handed to another worker. `LOAD_KEEPALIVE_WORKERS` fixes the
+worker count, one per CPU otherwise, and the connections are held by one
+client process per 10,000, each on its own loopback address (127.0.0.2 up).
+The lane binds ports 19180 to 19183.
 
-The rate is served by the one QUIC worker until #174 routes datagrams to their
-owning worker. Measured on a Ryzen 7 5800X3D over loopback, a round costs
-about 47 us of that worker's CPU, so 10,000 a second takes about half a core
-and the socket's queue peaks in the tens of kilobytes. Past the worker's core
-the queue fills and the kernel drops. About 40% of the round is the kernel's
-(a receive per datagram, and a send per ACK that on loopback carries the
-client's receive), and most of the rest is the transport's.
+Since #174 every worker binds the QUIC port and the kernel spreads the
+connections across their sockets by 4-tuple, so the rate is served by every
+worker. Measured on a Ryzen 7 5800X3D over loopback, a round costs about 47 us
+of a worker's CPU, and one worker saturates near 20,000 a second: at that rate
+it used 0.94 cores, its socket's queue reached 5.5 MB of 8 MB, and 7,572
+closes were dropped at release. Eight workers hold 40,000 a second with no
+drop, at 2.8 cores and a queue peak of 18 KB, and every connection leaves.
+About 40% of the round is the kernel's (a receive per datagram, and a send per
+ACK that on loopback carries the client's receive), and most of the rest is
+the transport's.
 
 ## The churn lane
 
@@ -518,9 +527,9 @@ b163699 (+5.3 MiB against the 4 MiB margin). On two cores of a Ryzen 7
 open, so the step was not a backlog of connections.
 
 CI runs 60 s at the default rates, and allows 50% of CPU drift because the
-client shares the runner's cores. The single QUIC worker (until #174) spends
-about 4 ms of CPU on each HTTP/3 connection, so 100 a second is about 40% of
-one core, on the CI runner and on the 5800X3D alike.
+client shares the runner's cores. An HTTP/3 connection costs the workers about
+4 ms of CPU, so 100 a second is about 40% of one core, on the CI runner and on
+the 5800X3D alike.
 
 ## The migration lane
 
@@ -533,6 +542,9 @@ complete a request. Then `h3load -migrate` moves each connection's socket to a
 new local port without a PATH_CHALLENGE of its own, which is what a NAT
 rebinding looks like to the server, and completes a second request on the
 same connection. The lane passes only if hedge follows every connection to its
-new address. Once workers steer datagrams by connection ID (#174), the new
-4-tuple can land on another worker's socket, and this cell holds that case.
-The lane binds ports 19170 to 19172.
+new address. `LOAD_MIGRATE_WORKERS` workers (4) serve it, so the new 4-tuple
+can land on another worker's socket, and the datagram is then handed to the
+connection's worker by its connection ID (#174). The cell prints the fraction
+handed over, from hedge's counters: 21 to 28% of the run's datagrams on the
+5800X3D, handshakes and first requests included. The lane binds ports 19170 to
+19173.

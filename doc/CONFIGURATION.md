@@ -120,8 +120,12 @@ How connections reach the workers depends on what the platform can do:
   connection to the least loaded worker serving the same configuration. A
   worker whose queue of handed connections is full is passed over, and the
   first worker serves the connection itself.
-- A QUIC listener is served by the first worker until connection IDs route
-  datagrams across workers (#174).
+- Every worker binds its own socket for each QUIC listener with `SO_REUSEPORT`
+  on Linux and darwin, and a datagram reaches the worker that owns its
+  connection by the connection ID hedge minted for it, whichever socket
+  received it. On darwin the last socket bound receives every datagram, so
+  most are handed to another worker there. On Windows the first worker serves
+  QUIC alone (#149).
 
 The caps stay process-wide. `max_connections`, `max_handshakes` and every
 budget's `concurrency` and `memory_bytes` are held as per-worker allowances
@@ -293,6 +297,13 @@ and `hedge_quic_retries_dropped_total` counts the Retries a pump dropped at its
 stateless send ceiling. `hedge_quic_connections` is a gauge of the QUIC
 connections the server holds, from admission until the record is released,
 which for a connection the peer closed is after its draining period.
+`hedge_quic_datagrams_received_total` counts the datagrams the QUIC sockets
+read, `hedge_quic_forwarded_total{direction}` (`out`, `in`) those handed to and
+taken from another worker because their connection lives there, and
+`hedge_quic_forward_dropped_total{reason}` (`ring_full`, `slab_full`,
+`stopped`) those dropped on the way, for the client's retransmission to carry.
+`hedge_quic_unroutable_total` counts datagrams whose connection ID names no
+connection a worker holds, such as one for a connection already released.
 `hedge_timers_claimed` and `hedge_timers_armed` are gauges of the worker's
 timing wheel: the entries a connection or plane has claimed, and those with a
 deadline armed, reported once per loop turn.
@@ -622,7 +633,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 40 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 47 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 

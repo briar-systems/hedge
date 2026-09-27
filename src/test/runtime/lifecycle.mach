@@ -20,6 +20,10 @@ use hedge.protocol.h2;
 use quic_runtime: hedge.protocol.quic.runtime;
 use hedge.serve;
 use hedge.service;
+use observability:     hedge.telemetry;
+use telemetry_admin:   hedge.telemetry.admin;
+use telemetry_health:  hedge.telemetry.health;
+use telemetry_metrics: hedge.telemetry.metrics;
 use hedge.test.runtime.wire;
 use http.core.exchange;
 use http.core.message;
@@ -29,6 +33,8 @@ use heap_allocator: std.allocator;
 use std.allocator.page;
 use std.chrono.time;
 use io_error: std.io.error;
+use std.log.record;
+use std.log.sink;
 use std.net.ip;
 use std.net.tcp;
 use std.runtime;
@@ -158,6 +164,12 @@ fun start(harness: *Harness, generation: u64) bool {
 }
 
 fun start_native(harness: *Harness, generation: u64, native: service.Factory) bool {
+    ret start_observed(harness, generation, native, nil);
+}
+
+# `telemetry`, when given, is the process's telemetry this runtime drives
+fun start_observed(harness: *Harness, generation: u64, native: service.Factory,
+    telemetry: *observability.Recorder) bool {
     var quic_controls: quic_runtime.ControlView;
     service.make_applications(?harness.applications, ?harness.application_slots[0], 4);
     harness.resolver              = service.no_resolver();
@@ -175,6 +187,7 @@ fun start_native(harness: *Harness, generation: u64, native: service.Factory) bo
         ?harness.resolver, nil).status != plan.PLAN_OK) { ret false; }
     page.make(?harness.heap);
     if (!serve.make(?harness.runtime, 0, ?harness.plan, ?harness.graph, ?harness.heap)) { ret false; }
+    if (telemetry != nil && !serve.attach_telemetry(?harness.runtime, telemetry))       { ret false; }
     schema.reset_diagnostics(?harness.diagnostics);
     if (!serve.start(?quic_controls, ?harness.runtime, generation, ?harness.graph, ?harness.diagnostics)) {
         ret false;
@@ -209,6 +222,67 @@ fun reloaded_endpoint(harness: *Harness) ip.Endpoint {
     val owned: *listener.OwnedListener = listener.active_listener(?harness.runtime.owner, 0);
     if (owned == nil || !owned.has_bound_endpoint) { ret harness.endpoint; }
     ret owned.bound_endpoint;
+}
+
+rec TelemetryTarget {
+    writes:  usize;
+    flushes: usize;
+}
+
+fun telemetry_publish(context: ptr, data: *u8, length: usize) sink.WriteReport {
+    val target: *TelemetryTarget = context::*TelemetryTarget;
+    target.writes = target.writes + 1;
+    ret sink.persisted(length);
+}
+
+fun telemetry_flush(context: ptr) bool {
+    val target: *TelemetryTarget = context::*TelemetryTarget;
+    target.flushes = target.flushes + 1;
+    ret true;
+}
+
+fun status_persisted(status: sink.WriteStatus) bool {
+    ret sel status.persisted;
+}
+
+# a runtime that takes the process duties turns the process's telemetry ready
+# when it starts, and on shutdown drains it and flushes what was written
+test shutdown__telemetry_ready_then_flushed {
+    var harness: Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    harness.graph.telemetry.logs             = true;
+    harness.graph.telemetry.log_record_bytes = 512;
+    var target: TelemetryTarget;
+    target.writes  = 0;
+    target.flushes = 0;
+    val contract: sink.Contract = sink.Contract{delivery: sink.DELIVERY_DIRECT, max_record: 512,
+        oversize:       record.OVERSIZE_REJECT, adapter: sink.ADAPTER_CUSTOM, target_atomic_limit: 0,
+        queue_capacity: 0, overload: sink.OVERLOAD_REJECT_NEW};
+    var output:    sink.Sink = sink.Sink{ctx: (?target)::ptr, f_publish: telemetry_publish, contract: contract};
+    var checks:    [1]telemetry_health.Check;
+    var telemetry: observability.Runtime;
+    if (!observability.make(?telemetry, ?harness.graph, ?output,
+        (0::usize)::*telemetry_metrics.Series, 0, ?checks[0], 1, nil,
+        (0::usize)::telemetry_admin.AuthenticateFun, nil,
+        (0::usize)::telemetry_admin.RenderFun,
+        (0::usize)::telemetry_admin.RenderFun,
+        (?target)::ptr, telemetry_flush)) { ret 1; }
+    if (telemetry_health.snapshot(?telemetry.health).ready) { ret 2; }
+    if (!start_observed(?harness, 1, service.Factory{ctx: nil, build: build_stuck}, ?telemetry.own)) {
+        ret 3;
+    }
+    if (!telemetry_health.snapshot(?telemetry.health).ready) { ret 4; }
+    val written: bool = status_persisted(observability.access(?telemetry, observability.Access{
+        listener:    "public", method: "GET", target: "/health", protocol: "HTTP/1.1", status: 200,
+        duration_us: 1, request_bytes: 0, response_bytes: 2, trace_id: nil
+    }).status);
+    var quic_controls: quic_runtime.ControlView;
+    if (!serve.begin_shutdown(?quic_controls, ?harness.runtime, monotonic_now())) { ret 5; }
+    if (!pump(?harness, 200))                                                     { ret 6; }
+    if (!written || target.writes != 1 || target.flushes != 1)                    { ret 7; }
+    val health: telemetry_health.Snapshot = telemetry_health.snapshot(?telemetry.health);
+    if (health.ready || !health.draining) { ret 8; }
+    ret 0;
 }
 
 test drain__finished_connection_not_cancelled {

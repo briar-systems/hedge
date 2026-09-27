@@ -1,0 +1,418 @@
+# datagrams one worker hands to the worker that owns their connection
+#
+# the kernel spreads datagrams across the workers' sockets by 4-tuple, and a
+# connection lives on one worker, so a datagram whose connection ID names
+# another worker is forwarded to it. each worker owns a slab of datagram slots,
+# and each ordered pair of workers has a bounded single-producer,
+# single-consumer ring of slot indices: the sender copies the datagram into a
+# free slot of its own slab and publishes the index, and the owner processes
+# the datagram in place and gives the slot back by clearing it. the bytes are
+# O(workers) and only the rings are O(workers squared).
+#
+# nothing blocks. a full ring, a slab with no free slot or an owner that has
+# stopped drops the datagram, the sender counts it by reason, and the client's
+# retransmission is the retry. a sender wakes an owner at most once until the
+# owner next looks: the owner clears its signal before it drains, so a publish
+# that races the drain always leaves the signal set or the entry visible.
+#
+# the board lives as long as the process, like the handoff board, so a worker
+# that is stopping finds its lane closed rather than freed memory.
+
+use hedge.allowance;
+use hedge.telemetry;
+use quic.connection.assembly;
+use A: std.allocator;
+use std.allocator.page;
+use std_memory: std.memory;
+use net_types:  std.net.async.types;
+use std.net.ip;
+use std.sync.atomic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+
+pub val SLAB_SLOTS:   usize = 1024;
+pub val RING_ENTRIES: usize = 256;
+# how far a sender looks for a free slot before it counts the slab as full
+val SLOT_PROBES: usize = 64;
+
+pub def Outcome: u8;
+pub val FORWARDED: Outcome = 0;
+pub val RING_FULL: Outcome = 1;
+pub val SLAB_FULL: Outcome = 2;
+pub val STOPPED:   Outcome = 3;
+# the drop reasons, each one less than its outcome, the `reason` label of
+# hedge_quic_forward_dropped_total
+pub val DROP_REASONS: usize = telemetry.FORWARD_DROP_REASONS;
+
+# one forwarded datagram, in its sender's slab
+pub rec Datagram {
+    # one from the forward until its owner is done with it
+    busy:                  i64;
+    listener:              usize;
+    arrival_ns:            u64;
+    peer:                  ip.Endpoint;
+    local_destination:     ip.Addr;
+    interface_index:       u32;
+    has_local_destination: bool;
+    length:                usize;
+    data:                  [assembly.MAX_UDP_PAYLOAD]u8;
+}
+
+#[align(64)]
+rec Cursor {
+    value: i64;
+    pad:   [7]i64;
+}
+
+rec Ring {
+    head:    Cursor;
+    tail:    Cursor;
+    entries: [RING_ENTRIES]u32;
+}
+
+rec Lane {
+    # set by a sender that published, cleared by the owner before it drains
+    signalled: Cursor;
+    # one while the owner takes datagrams
+    open: Cursor;
+    # the sender's next slot to try, and the source the owner drains first,
+    # each touched only by the lane's own worker
+    next_slot:   usize;
+    next_source: usize;
+    slab:        *Datagram;
+}
+
+pub rec Board {
+    count:  usize;
+    heap:   *A.Allocator;
+    wakers: *allowance.Wakers;
+    lanes:  *Lane;
+    # ring source * count + target
+    rings: *Ring;
+}
+
+# one datagram an owner took, until it is released
+pub rec Taken {
+    datagram: *Datagram;
+    source:   usize;
+}
+
+fun reset(board: *Board) {
+    board.lanes = nil;
+    board.rings = nil;
+}
+
+# a board for `count` workers. one worker forwards nothing, and holds nothing
+pub fun make_board(board: *Board, heap: *A.Allocator, wakers: *allowance.Wakers,
+    count: usize) bool {
+    if (board == nil || count == 0 || count > allowance.MAX_WORKERS) { ret false; }
+    board.count  = count;
+    board.heap   = heap;
+    board.wakers = wakers;
+    reset(board);
+    if (count == 1)  { ret true; }
+    if (heap == nil) { ret false; }
+    val lanes: res[*Lane, A.Error] = A.allocate[Lane](heap, count);
+    if (sel lanes.err) { ret false; }
+    val rings: res[*Ring, A.Error] = A.allocate[Ring](heap, count * count);
+    if (sel rings.err) {
+        A.deallocate[Lane](heap, lanes.ok, count);
+        ret false;
+    }
+    board.lanes = lanes.ok;
+    board.rings = rings.ok;
+    var i: usize = 0;
+    for (i < count * count) {
+        atomic.store(?board.rings[i].head.value, 0);
+        atomic.store(?board.rings[i].tail.value, 0);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        val lane: *Lane = ?board.lanes[i];
+        atomic.store(?lane.signalled.value, 0);
+        atomic.store(?lane.open.value, 0);
+        lane.next_slot   = 0;
+        lane.next_source = 0;
+        lane.slab        = nil;
+        i                = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        val slab: res[*Datagram, A.Error] = A.allocate[Datagram](heap, SLAB_SLOTS);
+        if (sel slab.err) {
+            destroy_board(board);
+            ret false;
+        }
+        board.lanes[i].slab = slab.ok;
+        var j: usize = 0;
+        for (j < SLAB_SLOTS) {
+            atomic.store(?slab.ok[j].busy, 0);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every worker has stopped
+pub fun destroy_board(board: *Board) {
+    if (board == nil || board.lanes == nil) { ret; }
+    var i: usize = 0;
+    for (i < board.count) {
+        if (board.lanes[i].slab != nil) {
+            A.deallocate[Datagram](board.heap, board.lanes[i].slab, SLAB_SLOTS);
+            board.lanes[i].slab = nil;
+        }
+        i = i + 1;
+    }
+    A.deallocate[Ring](board.heap, board.rings, board.count * board.count);
+    A.deallocate[Lane](board.heap, board.lanes, board.count);
+    reset(board);
+}
+
+# whether datagrams can move between workers at all
+pub fun routes(board: *Board) bool {
+    ret board != nil && board.lanes != nil;
+}
+
+pub fun workers(board: *Board) usize {
+    if (board == nil) { ret 1; }
+    ret board.count;
+}
+
+# `worker` takes forwarded datagrams from now on
+pub fun open(board: *Board, worker: usize) {
+    if (!routes(board) || worker >= board.count) { ret; }
+    atomic.store(?board.lanes[worker].open.value, 1);
+}
+
+# `worker` takes no more, and every datagram already waiting for it is released
+# unprocessed
+pub fun close(board: *Board, worker: usize) {
+    if (!routes(board) || worker >= board.count) { ret; }
+    atomic.store(?board.lanes[worker].open.value, 0);
+    var taken: Taken;
+    for (take(board, worker, ?taken)) { release(?taken); }
+}
+
+fun ring(board: *Board, source: usize, target: usize) *Ring {
+    ret ?board.rings[source * board.count + target];
+}
+
+# owners release slots roughly in the order they were claimed, so the search
+# starts at the slot after the last one claimed and a failed search leaves the
+# start where it was: the oldest slot out is the next to come back
+fun claim_slot(lane: *Lane) usize {
+    var probe: usize = 0;
+    for (probe < SLOT_PROBES) {
+        val index: usize = (lane.next_slot + probe) % SLAB_SLOTS;
+        if (atomic.load(?lane.slab[index].busy) == 0) {
+            lane.next_slot = (index + 1) % SLAB_SLOTS;
+            ret index;
+        }
+        probe = probe + 1;
+    }
+    ret SLAB_SLOTS;
+}
+
+# copy `received` into a slot of `source`'s slab and hand it to `target`
+pub fun forward(board: *Board, source: usize, target: usize, listener: usize,
+    received: *net_types.Packet, arrival_ns: u64) Outcome {
+    if (!routes(board) || source >= board.count || target >= board.count
+        || source == target || received == nil
+        || received.length > assembly.MAX_UDP_PAYLOAD) { ret STOPPED; }
+    if (atomic.load(?board.lanes[target].open.value) == 0) { ret STOPPED; }
+    val lane: *Lane = ?board.lanes[source];
+    val pair: *Ring = ring(board, source, target);
+    val tail: i64   = atomic.load(?pair.tail.value);
+    if (tail - atomic.load(?pair.head.value) >= RING_ENTRIES::i64) { ret RING_FULL; }
+    val index: usize = claim_slot(lane);
+    if (index == SLAB_SLOTS) { ret SLAB_FULL; }
+    val slot: *Datagram = ?lane.slab[index];
+    atomic.store(?slot.busy, 1);
+    std_memory.raw_copy(?slot.data[0], received.buffer, received.length);
+    slot.length                                = received.length;
+    slot.listener                              = listener;
+    slot.arrival_ns                            = arrival_ns;
+    slot.peer                                  = received.peer;
+    slot.local_destination                     = received.local_destination;
+    slot.interface_index                       = received.interface_index;
+    slot.has_local_destination                 = received.has_local_destination;
+    pair.entries[(tail::usize) % RING_ENTRIES] = index::u32;
+    atomic.store(?pair.tail.value, tail + 1);
+    if (atomic.exchange(?board.lanes[target].signalled.value, 1) == 0) {
+        allowance.wake(board.wakers, target);
+    }
+    ret FORWARDED;
+}
+
+# whether a sender published something `worker` has not yet begun to drain
+pub fun signalled(board: *Board, worker: usize) bool {
+    ret routes(board) && worker < board.count
+        && atomic.load(?board.lanes[worker].signalled.value) != 0;
+}
+
+# `worker` is about to drain: what is published from now on signals again
+pub fun begin(board: *Board, worker: usize) {
+    if (!routes(board) || worker >= board.count) { ret; }
+    atomic.store(?board.lanes[worker].signalled.value, 0);
+}
+
+# `worker` stopped draining with datagrams still waiting, so its next turn
+# drains again without a wake
+pub fun resignal(board: *Board, worker: usize) {
+    if (!routes(board) || worker >= board.count) { ret; }
+    atomic.store(?board.lanes[worker].signalled.value, 1);
+}
+
+# the next datagram waiting for `worker`, taking the sources in turn
+pub fun take(board: *Board, worker: usize, output: *Taken) bool {
+    if (!routes(board) || worker >= board.count || output == nil) { ret false; }
+    val lane: *Lane = ?board.lanes[worker];
+    var step: usize = 0;
+    for (step < board.count) {
+        val source: usize = (lane.next_source + step) % board.count;
+        step = step + 1;
+        if (source == worker) { cnt; }
+        val pair: *Ring = ring(board, source, worker);
+        val head: i64   = atomic.load(?pair.head.value);
+        if (atomic.load(?pair.tail.value) == head) { cnt; }
+        val index: u32 = pair.entries[(head::usize) % RING_ENTRIES];
+        atomic.store(?pair.head.value, head + 1);
+        lane.next_source = (source + 1) % board.count;
+        output.datagram  = ?board.lanes[source].slab[index::usize];
+        output.source    = source;
+        ret true;
+    }
+    ret false;
+}
+
+# a packet over the taken datagram's bytes, valid until it is released
+pub fun packet(taken: *Taken) net_types.Packet {
+    val slot:  *Datagram = taken.datagram;
+    var value: net_types.Packet;
+    value.buffer                = ?slot.data[0];
+    value.capacity              = slot.length;
+    value.length                = slot.length;
+    value.peer                  = slot.peer;
+    value.local_destination     = slot.local_destination;
+    value.interface_index       = slot.interface_index;
+    value.has_local_destination = slot.has_local_destination;
+    value.truncated             = false;
+    value.zero_length           = false;
+    ret value;
+}
+
+# the owner is done with the datagram, and its slot goes back to its sender
+pub fun release(taken: *Taken) {
+    if (taken == nil || taken.datagram == nil) { ret; }
+    atomic.store(?taken.datagram.busy, 0);
+    taken.datagram = nil;
+}
+
+#[testing]
+fun test_packet(bytes: *u8, length: usize, port: u16) net_types.Packet {
+    var value: net_types.Packet;
+    value.buffer   = bytes;
+    value.capacity = length;
+    value.length   = length;
+    value.peer     = ip.endpoint(192, 0, 2, 9, port);
+    ret value;
+}
+
+# datagrams reach their owner in order with their bytes and addresses, a
+# closed owner and a full ring refuse, and a released slot is reused
+test forward__bounded_in_order_and_released {
+    var pages: A.Allocator;
+    page.make(?pages);
+    var board: Board;
+    if (!make_board(?board, ?pages, nil, 3)) { ret 1; }
+    var bytes:       [4]u8            = [4]u8{1, 2, 3, 4};
+    var sent_packet: net_types.Packet = test_packet(?bytes[0], 4, 5000);
+    if (forward(?board, 0, 2, 1, ?sent_packet, 10) != STOPPED) { ret 2; }
+    open(?board, 2);
+    if (forward(?board, 0, 2, 1, ?sent_packet, 10) != FORWARDED
+        || !signalled(?board, 2)) { ret 3; }
+    bytes[0] = 9;
+    if (forward(?board, 1, 2, 4, ?sent_packet, 11) != FORWARDED) { ret 4; }
+    begin(?board, 2);
+    var taken: Taken;
+    if (!take(?board, 2, ?taken) || taken.source != 0 || taken.datagram.listener != 1
+        || taken.datagram.data[0] != 1 || taken.datagram.arrival_ns != 10) { ret 5; }
+    var view: net_types.Packet = packet(?taken);
+    if (view.length != 4 || view.peer.port != 5000) { ret 6; }
+    release(?taken);
+    if (!take(?board, 2, ?taken) || taken.source != 1 || taken.datagram.data[0] != 9) {
+        ret 7;
+    }
+    release(?taken);
+    if (take(?board, 2, ?taken) || signalled(?board, 2)) { ret 8; }
+    # the ring holds RING_ENTRIES and refuses the next
+    var i: usize = 0;
+    for (i < RING_ENTRIES) {
+        if (forward(?board, 0, 2, 1, ?sent_packet, 12) != FORWARDED) { ret 9; }
+        i = i + 1;
+    }
+    if (forward(?board, 0, 2, 1, ?sent_packet, 12) != RING_FULL) { ret 10; }
+    close(?board, 2);
+    if (take(?board, 2, ?taken) || forward(?board, 0, 2, 1, ?sent_packet, 12) != STOPPED) {
+        ret 11;
+    }
+    # every slot came back, so the slab serves a full ring again
+    open(?board, 2);
+    i = 0;
+    for (i < RING_ENTRIES) {
+        if (forward(?board, 0, 2, 1, ?sent_packet, 13) != FORWARDED) { ret 12; }
+        i = i + 1;
+    }
+    destroy_board(?board);
+    ret 0;
+}
+
+# a slab whose slots are all out drops until the owner releases one
+test forward__slab_full_until_released {
+    var pages: A.Allocator;
+    page.make(?pages);
+    var board: Board;
+    if (!make_board(?board, ?pages, nil, SLAB_SLOTS / RING_ENTRIES + 2)) { ret 1; }
+    var bytes:       [1]u8            = [1]u8{7};
+    var sent_packet: net_types.Packet = test_packet(?bytes[0], 1, 1);
+    var target:      usize            = 1;
+    for (target < board.count) {
+        open(?board, target);
+        target = target + 1;
+    }
+    var sent:    usize   = 0;
+    var outcome: Outcome = FORWARDED;
+    target = 1;
+    for (outcome == FORWARDED) {
+        outcome = forward(?board, 0, target, 0, ?sent_packet, 1);
+        if (outcome == RING_FULL) {
+            target  = target + 1;
+            outcome = FORWARDED;
+            cnt;
+        }
+        if (outcome == FORWARDED) { sent = sent + 1; }
+    }
+    if (outcome != SLAB_FULL || sent != SLAB_SLOTS) { ret 2; }
+    var taken: Taken;
+    if (!take(?board, 1, ?taken)) { ret 3; }
+    release(?taken);
+    if (forward(?board, 0, 1, 0, ?sent_packet, 1) != FORWARDED) { ret 4; }
+    destroy_board(?board);
+    ret 0;
+}
+
+test make_board__one_worker_holds_nothing {
+    var board: Board;
+    if (!make_board(?board, nil, nil, 1) || routes(?board) || workers(?board) != 1) { ret 1; }
+    var bytes:       [1]u8            = [1]u8{7};
+    var sent_packet: net_types.Packet = test_packet(?bytes[0], 1, 1);
+    if (forward(?board, 0, 0, 0, ?sent_packet, 1) != STOPPED) { ret 2; }
+    if (make_board(?board, nil, nil, 2))                      { ret 3; }
+    ret 0;
+}

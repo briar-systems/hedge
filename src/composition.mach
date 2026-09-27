@@ -14,13 +14,16 @@ use hedge.allowance;
 use http_cache:  hedge.cache;
 use cache_store: hedge.cache.store;
 use hedge.cache.store_worker;
+use hedge.clock;
 use hedge.config.schema;
 use hedge.dispatch.plan;
 use hedge.handoff;
 use hedge.lifecycle;
 use hedge.listener;
+use quic_keys:    hedge.protocol.quic.keys;
 use quic_runtime: hedge.protocol.quic.runtime;
-use hedge_tls:    hedge.protocol.tls;
+use hedge.protocol.quic.steering;
+use hedge_tls: hedge.protocol.tls;
 use hedge.serve;
 use hedge.service;
 use hedge.task;
@@ -107,8 +110,12 @@ pub rec Runtime {
     # start. a peer who could guess it could aim collisions at one bucket
     key: siphash.Key;
     # the caps every worker shares, and where a worker waiting for one is woken
-    wakers:          allowance.Wakers;
-    board:           handoff.Board;
+    wakers: allowance.Wakers;
+    board:  handoff.Board;
+    # the board datagrams cross workers on, and whether the process keyed its
+    # QUIC listeners (hedge.protocol.quic.keys), made only when one is configured
+    steering:        steering.Board;
+    quic_keyed:      bool;
     connections:     process_admission.Shared;
     handshakes:      process_admission.Shared;
     handshake_slots: allowance.Pool;
@@ -199,7 +206,28 @@ fun make_caps(runtime: *Runtime, configured: *schema.Graph, generation_id: u64,
     }
     runtime.budget_pools[1].generation = 0;
     runtime.budget_pools[1].count      = 0;
-    runtime.caps_live                  = true;
+    if (!make_quic_caps(runtime, configured, workers)) {
+        process_admission.destroy_shared(?runtime.connections);
+        process_admission.destroy_shared(?runtime.handshakes);
+        handoff.destroy_board(?runtime.board);
+        ret false;
+    }
+    runtime.caps_live = true;
+    ret true;
+}
+
+# a board for `workers` workers that forwards nothing when there is one, and
+# keys for every listener index, which only QUIC listeners use
+fun make_quic_caps(runtime: *Runtime, configured: *schema.Graph, workers: usize) bool {
+    runtime.quic_keyed = false;
+    if (!steering.make_board(?runtime.steering, nil, nil, 1)) { ret false; }
+    if (!worker.quic_required(configured))                    { ret true; }
+    if (!quic_keys.make(configured.listener_count))           { ret false; }
+    if (!steering.make_board(?runtime.steering, runtime.heap, ?runtime.wakers, workers)) {
+        quic_keys.destroy();
+        ret false;
+    }
+    runtime.quic_keyed = true;
     ret true;
 }
 
@@ -207,7 +235,8 @@ fun make_caps(runtime: *Runtime, configured: *schema.Graph, generation_id: u64,
 fun caps(runtime: *Runtime) serve.Caps {
     ret serve.Caps{connections: ?runtime.connections, handshakes: ?runtime.handshakes,
         handshake_slots: ?runtime.handshake_slots, budgets: ?runtime.budget_pools[0],
-        wakers:          ?runtime.wakers, board: ?runtime.board};
+        wakers:          ?runtime.wakers, board: ?runtime.board,
+        steering:        ?runtime.steering};
 }
 
 fun built_events(runtime: *Runtime, given: *worker.Inputs) {
@@ -300,6 +329,11 @@ fun close_process(runtime: *Runtime, report: *worker.StopReport) {
             report.cleanup_failures = report.cleanup_failures + 1;
         }
         handoff.destroy_board(?runtime.board);
+        steering.destroy_board(?runtime.steering);
+        if (runtime.quic_keyed) {
+            quic_keys.destroy();
+            runtime.quic_keyed = false;
+        }
         runtime.caps_live = false;
     }
 }
@@ -623,8 +657,30 @@ pub fun stage_reload(runtime: *Runtime, configured: *schema.Graph,
     if (runtime == nil || configured == nil || !runtime.caps_live) { ret false; }
     var slot: usize = 0;
     if (runtime.budget_pools[0].generation == runtime.generation_id) { slot = 1; }
-    ret allowance.make_budget_pools(?runtime.budget_pools[slot], configured,
-        generation_id, runtime.worker_count, ?runtime.wakers);
+    if (!allowance.make_budget_pools(?runtime.budget_pools[slot], configured,
+        generation_id, runtime.worker_count, ?runtime.wakers)) { ret false; }
+    rotate_quic_keys(runtime, configured);
+    ret true;
+}
+
+# every reload moves each QUIC listener's connection IDs and tokens onto fresh
+# keys. the old codepoint decodes on until nothing can carry it: no live
+# connection holds it, and a Retry minted under it has outlived its token and
+# the handshake that could follow. a rotation that finds no free codepoint
+# leaves the current keys and is counted
+fun rotate_quic_keys(runtime: *Runtime, configured: *schema.Graph) {
+    if (!runtime.quic_keyed) { ret; }
+    val grace_ns: u64 = serve.QUIC_RETRY_MAX_AGE_NS
+        + configured.timeouts.handshake_ms * 1000000;
+    val now_ns: u64   = clock.monotonic_ns();
+    var i:      usize = 0;
+    for (i < configured.listener_count) {
+        if (configured.listeners[i].transport == schema.TRANSPORT_QUIC) {
+            quic_keys.rotate(quic_keys.listener_at(i), now_ns, grace_ns,
+                runtime.worker_count);
+        }
+        i = i + 1;
+    }
 }
 
 # the first step of a reload, on worker `index`'s thread: build the candidate's
