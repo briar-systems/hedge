@@ -447,6 +447,15 @@ GOAWAY, HTTP/1 marks its responses for close and stops reading — exchanges
 already in flight are given until the `drain_ms` deadline to finish, whatever
 remains is cancelled, telemetry is flushed, and the resources are released last.
 
+An HTTP/1 connection closing, at a drain or at any other close, lingers after
+its last response: it shuts its write side, then reads and discards what the
+client still sends until the client closes, 1 MiB has arrived, or
+`server.timeouts.linger_ms` (default 5000, 5 seconds; 0 for none) passes.
+Closing over unread input would have the client's stack reset the connection
+under a response it had not read yet. A drain waits for a lingering connection
+like any other, so a client that keeps an idle connection open without reading
+it holds the drain for up to `linger_ms`.
+
 Every hosted application drains alongside the workers, toward the same
 deadline, and is stopped once the last worker has.
 
