@@ -121,6 +121,8 @@ pub rec Recorder {
 
 # a recorder per worker and the process's own
 pub val MAX_RECORDERS: usize = 257;
+# the collectors a render appends after the recorders
+pub val MAX_COLLECTORS: usize = 8;
 
 pub rec Runtime {
     logger:            telemetry_log.Logger;
@@ -142,8 +144,11 @@ pub rec Runtime {
     # every recorder a render merges, the process's first
     recorders:      [MAX_RECORDERS]*Recorder;
     recorder_count: usize;
-    recorders_lock: mutex.Mutex;
-    initialized:    bool;
+    # process-scoped sources read at every render, under `recorders_lock`
+    collectors:      [MAX_COLLECTORS]telemetry_metrics.Collector;
+    collector_count: usize;
+    recorders_lock:  mutex.Mutex;
+    initialized:     bool;
 }
 
 pub rec Access {
@@ -189,11 +194,14 @@ pub rec MetricsStream {
     lines:   usize;
     line:    usize;
     sample:  telemetry_metrics.Sample;
-    text:    [telemetry_metrics.MAX_LINE_BYTES]u8;
-    length:  usize;
-    offset:  usize;
-    written: bool;
-    done:    bool;
+    # the collector being drawn from once the series are sent, and its place
+    collector: usize;
+    cursor:    telemetry_metrics.CollectCursor;
+    text:      [telemetry_metrics.MAX_LINE_BYTES]u8;
+    length:    usize;
+    offset:    usize;
+    written:   bool;
+    done:      bool;
 }
 
 fun stream_text(stream: *MetricsStream, value: str) {
@@ -215,14 +223,60 @@ fun merge_series(runtime: *Runtime, series: usize, output: *telemetry_metrics.Sa
     ret telemetry_metrics.sample_merged(?registries[0], count, series, output);
 }
 
+# the collector at `index`, or false past the last
+fun collector_at(runtime: *Runtime, index: usize, output: *telemetry_metrics.Collector) bool {
+    mutex.lock(?runtime.recorders_lock);
+    val found: bool = index < runtime.collector_count;
+    if (found) { @output = runtime.collectors[index]; }
+    mutex.unlock(?runtime.recorders_lock);
+    ret found;
+}
+
+# `collector` is streamed after the recorders' series from here until the
+# runtime shuts down, so what it reads must outlive the runtime. false when
+# metrics are off or MAX_COLLECTORS are already added
+pub fun add_collector(runtime: *Runtime, collector: telemetry_metrics.Collector) bool {
+    if (runtime == nil || !runtime.initialized || !runtime.metrics_enabled
+        || collector.collect::usize == 0) { ret false; }
+    mutex.lock(?runtime.recorders_lock);
+    if (runtime.collector_count >= MAX_COLLECTORS) {
+        mutex.unlock(?runtime.recorders_lock);
+        ret false;
+    }
+    runtime.collectors[runtime.collector_count] = collector;
+    runtime.collector_count                     = runtime.collector_count + 1;
+    mutex.unlock(?runtime.recorders_lock);
+    ret true;
+}
+
 val LINE_READY:  u8 = 1;
 val LINE_END:    u8 = 2;
 val LINE_FAILED: u8 = 3;
 
-# the next line into the stream's text
+fun line_written(stream: *MetricsStream, writer: *telemetry_metrics.Writer) u8 {
+    if (writer.length > telemetry_metrics.MAX_LINE_BYTES) { ret LINE_FAILED; }
+    stream.length  = writer.length;
+    stream.offset  = 0;
+    stream.written = true;
+    ret LINE_READY;
+}
+
+# the next line into the stream's text: the recorders' series, then each
+# collector's lines in the order they were added
 fun next_line(stream: *MetricsStream) u8 {
+    var writer: telemetry_metrics.Writer = telemetry_metrics.Writer{output: ?stream.text[0],
+        capacity: telemetry_metrics.MAX_LINE_BYTES, length: 0};
     for (stream.line >= stream.lines) {
         if (stream.series >= telemetry_metrics.series_count(?stream.runtime.own.metrics)) {
+            var collector: telemetry_metrics.Collector;
+            for (collector_at(stream.runtime, stream.collector, ?collector)) {
+                if (collector.collect(collector.ctx, ?stream.cursor, ?writer)) {
+                    ret line_written(stream, ?writer);
+                }
+                stream.collector = stream.collector + 1;
+                stream.cursor    = telemetry_metrics.CollectCursor{item: 0, line: 0};
+                writer.length    = 0;
+            }
             ret LINE_END;
         }
         stream.line  = 0;
@@ -232,15 +286,9 @@ fun next_line(stream: *MetricsStream) u8 {
         }
         stream.series = stream.series + 1;
     }
-    var writer: telemetry_metrics.Writer = telemetry_metrics.Writer{output: ?stream.text[0],
-        capacity: telemetry_metrics.MAX_LINE_BYTES, length: 0};
     telemetry_metrics.write_line(?writer, ?stream.sample, stream.line);
     stream.line = stream.line + 1;
-    if (writer.length > telemetry_metrics.MAX_LINE_BYTES) { ret LINE_FAILED; }
-    stream.length  = writer.length;
-    stream.offset  = 0;
-    stream.written = true;
-    ret LINE_READY;
+    ret line_written(stream, ?writer);
 }
 
 # a /metrics body over `runtime` from the request's allocator
@@ -250,14 +298,16 @@ fun open_metrics(context: ptr, a: *allocator.Allocator) ptr {
     val allocated: res[*MetricsStream, allocator.Error] = allocator.allocate[MetricsStream](a, 1);
     if (sel allocated.err) { ret nil; }
     val stream: *MetricsStream = allocated.ok;
-    stream.runtime = runtime;
-    stream.series  = 0;
-    stream.lines   = 0;
-    stream.line    = 0;
-    stream.length  = 0;
-    stream.offset  = 0;
-    stream.written = false;
-    stream.done    = false;
+    stream.runtime   = runtime;
+    stream.series    = 0;
+    stream.lines     = 0;
+    stream.line      = 0;
+    stream.collector = 0;
+    stream.cursor    = telemetry_metrics.CollectCursor{item: 0, line: 0};
+    stream.length    = 0;
+    stream.offset    = 0;
+    stream.written   = false;
+    stream.done      = false;
     if (!runtime.metrics_enabled) {
         stream_text(stream, "# metrics disabled\n");
         stream.written = true;
@@ -469,6 +519,7 @@ pub fun make(
     runtime.metric_series     = graph.telemetry.metric_series;
     runtime.recorders_lock    = mutex.make();
     runtime.recorder_count    = 0;
+    runtime.collector_count   = 0;
     runtime.own.runtime       = runtime;
     runtime.own.live          = false;
     reset_seen(?runtime.own);

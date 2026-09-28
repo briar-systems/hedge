@@ -1,0 +1,291 @@
+# background task reports as metric series
+#
+# every task registered in the facility is streamed from its `task.report` a
+# line at a time, labelled `task` with its name. the tasks are a bounded set
+# fixed at registration, so the series are too, and the last success's age is
+# as old as the render says rather than as old as the last report pushed
+
+use hedge.clock;
+use hedge.config.schema;
+use hedge.secret;
+use hedge.service;
+use hedge.task;
+use hedge.telemetry;
+use telemetry_admin:   hedge.telemetry.admin;
+use telemetry_health:  hedge.telemetry.health;
+use telemetry_metrics: hedge.telemetry.metrics;
+use std.allocator;
+use std.allocator.fixed;
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+# the facility's tasks, streamed on every render of the runtime it is added to
+pub fun collector(tasks: *task.Tasks) telemetry_metrics.Collector {
+    ret telemetry_metrics.Collector{ctx: tasks::ptr, collect: collect};
+}
+
+fun collect(context: ptr, cursor: *telemetry_metrics.CollectCursor,
+    writer: *telemetry_metrics.Writer) bool {
+    ret write_next(context::*task.Tasks, cursor, writer, clock.monotonic_ns());
+}
+
+# the lines one task renders as, one of which is absent before its first success
+val TASK_LINES: usize = 10;
+
+fun flag(value: bool) i64 {
+    if (value) { ret 1; }
+    ret 0;
+}
+
+fun gauge_ns(value: u64) i64 {
+    if (value > 0x7fffffffffffffff) { ret 0x7fffffffffffffff; }
+    ret value::i64;
+}
+
+fun write_outcome(writer: *telemetry_metrics.Writer, name: str, outcome: str, value: u64) bool {
+    var labels: [2]telemetry_metrics.LabelView = [2]telemetry_metrics.LabelView{
+        telemetry_metrics.LabelView{key: "outcome", value: outcome},
+        telemetry_metrics.LabelView{key: "task", value: name}
+    };
+    ret telemetry_metrics.write_counter(writer, "hedge_task_runs_total", ?labels[0], 2, value);
+}
+
+# line `line` of one task's series, or false when that line is absent
+fun write_task_line(writer: *telemetry_metrics.Writer, label: str, report: *task.Report,
+    now_ns: u64, line: usize) bool {
+    if (line == 0) { ret write_outcome(writer, label, "completed", report.completed); }
+    if (line == 1) { ret write_outcome(writer, label, "failed", report.failed); }
+    if (line == 2) { ret write_outcome(writer, label, "abandoned", report.abandoned); }
+    var labels: [1]telemetry_metrics.LabelView = [1]telemetry_metrics.LabelView{
+        telemetry_metrics.LabelView{key: "task", value: label}
+    };
+    if (line == 3) {
+        ret telemetry_metrics.write_counter(writer, "hedge_task_coalesced_total", ?labels[0], 1,
+            report.coalesced);
+    }
+    if (line == 4) {
+        ret telemetry_metrics.write_gauge(writer, "hedge_task_running", ?labels[0], 1,
+            flag(report.running));
+    }
+    if (line == 5) {
+        ret telemetry_metrics.write_gauge(writer, "hedge_task_queued", ?labels[0], 1,
+            flag(report.queued));
+    }
+    if (line == 6) {
+        ret telemetry_metrics.write_gauge(writer, "hedge_task_last_duration_ns", ?labels[0], 1,
+            gauge_ns(report.last_duration_ns));
+    }
+    if (line == 7) {
+        ret telemetry_metrics.write_gauge(writer, "hedge_task_max_duration_ns", ?labels[0], 1,
+            gauge_ns(report.max_duration_ns));
+    }
+    if (line == 8) {
+        val age: opt[u64] = task.success_age_ns(report, now_ns);
+        if (!(sel age.some)) { ret false; }
+        ret telemetry_metrics.write_gauge(writer, "hedge_task_last_success_age_ns", ?labels[0], 1,
+            gauge_ns(age.some));
+    }
+    ret telemetry_metrics.write_counter(writer, "hedge_task_snapshots_published_total",
+        ?labels[0], 1, report.published);
+}
+
+# the next line of every registered task's series at monotonic `now_ns`, each
+# read from its report as it is written, or false once every task is written
+pub fun write_next(tasks: *task.Tasks, cursor: *telemetry_metrics.CollectCursor,
+    writer: *telemetry_metrics.Writer, now_ns: u64) bool {
+    if (tasks == nil || cursor == nil || writer == nil) { ret false; }
+    for (cursor.item < task.MAX_TASKS) {
+        var report: task.Report;
+        var name:   view.View;
+        if (task.report_at(tasks, cursor.item, ?report, ?name) == task.STATUS_OK
+            && name.len != 0 && name.len <= task.MAX_NAME_BYTES) {
+            var text: [task.MAX_NAME_BYTES + 1]u8;
+            var i:    usize = 0;
+            for (i < name.len) {
+                text[i] = name.data[i];
+                i       = i + 1;
+            }
+            text[name.len] = 0;
+            for (cursor.line < TASK_LINES) {
+                val line: usize = cursor.line;
+                cursor.line = cursor.line + 1;
+                if (write_task_line(writer, (?text[0])::str, ?report, now_ns, line)) { ret true; }
+            }
+        }
+        cursor.item = cursor.item + 1;
+        cursor.line = 0;
+    }
+    ret false;
+}
+
+#[testing]
+fun done_step(context: ptr, run: *task.Run) service.Step {
+    ret service.Step{status: service.STEP_DONE, detail: view.view(nil, 0)};
+}
+
+#[testing]
+fun rendered(tasks: *task.Tasks, now_ns: u64, output: *u8, capacity: usize) usize {
+    var writer: telemetry_metrics.Writer = telemetry_metrics.Writer{output: output,
+        capacity: capacity, length: 0};
+    var cursor: telemetry_metrics.CollectCursor = telemetry_metrics.CollectCursor{item: 0, line: 0};
+    for (write_next(tasks, ?cursor, ?writer, now_ns)) {}
+    if (writer.length > capacity) { ret 0; }
+    ret writer.length;
+}
+
+#[testing]
+fun contains(data: *u8, length: usize, needle: str) bool {
+    var size: usize = 0;
+    for (needle[size] != 0) { size = size + 1; }
+    var i: usize = 0;
+    for (i + size <= length) {
+        var j: usize = 0;
+        for (j < size && data[i + j] == needle[j]) { j = j + 1; }
+        if (j == size) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a task's series carry its name, and its last success's age appears once it
+# has one, measured at the render
+test write__series_per_task {
+    var tasks: task.Tasks;
+    if (!task.make(?tasks, task.default_options())) { ret 1; }
+    var spec: task.Spec = task.Spec{name: view.view("refresh", 7), state: nil,
+        step:       done_step, period_ns: 0, timeout_ns: 0, slots: nil, slot_bytes: 0,
+        slot_count: 0};
+    var handle: task.Handle;
+    if (task.register(?tasks, ?spec, ?handle) != task.STATUS_OK) { ret 2; }
+    var text:   [2048]u8;
+    var length: usize = rendered(?tasks, 1, ?text[0], 2048);
+    if (length == 0
+        || !contains(?text[0], length, "hedge_task_runs_total{outcome=\"completed\",task=\"refresh\"} 0\n")
+        || !contains(?text[0], length, "hedge_task_snapshots_published_total{task=\"refresh\"} 0\n")
+        || contains(?text[0], length, "hedge_task_last_success_age_ns")) { ret 3; }
+    val started: time.Instant = time.Instant{sec: 1, nsec: 0};
+    if (task.trigger(?tasks, handle) != task.STATUS_OK || task.poll(?tasks, started) != 1) {
+        ret 4;
+    }
+    length = rendered(?tasks, clock.to_ns(started) + 3000000000, ?text[0], 2048);
+    if (length == 0
+        || !contains(?text[0], length, "hedge_task_runs_total{outcome=\"completed\",task=\"refresh\"} 1\n")
+        || !contains(?text[0], length, "hedge_task_runs_total{outcome=\"failed\",task=\"refresh\"} 0\n")
+        || !contains(?text[0], length, "hedge_task_running{task=\"refresh\"} 0\n")
+        || !contains(?text[0], length, "hedge_task_last_success_age_ns{task=\"refresh\"} 3000000000\n")) {
+        ret 5;
+    }
+    if (task.drain(?tasks, started).status != task.DRAIN_DONE || task.stop(?tasks) != task.STATUS_OK
+        || !task.close(?tasks, 0)) { ret 6; }
+    # a stopped facility renders nothing
+    if (rendered(?tasks, 1, ?text[0], 2048) != 0) { ret 7; }
+    ret 0;
+}
+
+# every task at the name limit, named in bytes that all escape, streams whole
+# through /metrics after the built-in series in the same memory as any render
+test stream__every_task_at_the_name_limit {
+    clock.freeze();
+    var tasks: task.Tasks;
+    if (!task.make(?tasks, task.default_options())) { ret 1; }
+    var names:   [task.MAX_TASKS][task.MAX_NAME_BYTES]u8;
+    var specs:   [task.MAX_TASKS]task.Spec;
+    var handles: [task.MAX_TASKS]task.Handle;
+    var slot:    usize = 0;
+    for (slot < task.MAX_TASKS) {
+        var i: usize = 0;
+        for (i < task.MAX_NAME_BYTES - 1) {
+            if (i % 2 == 0) { names[slot][i] = '"'; }
+            or              { names[slot][i] = '\\'; }
+            i = i + 1;
+        }
+        names[slot][task.MAX_NAME_BYTES - 1] = 'a' + slot::u8;
+        specs[slot]                          = task.Spec{name: view.view(?names[slot][0], task.MAX_NAME_BYTES),
+            state:      nil, step: done_step, period_ns: 0, timeout_ns: 0, slots: nil,
+            slot_bytes: 0, slot_count: 0};
+        if (task.register(?tasks, ?specs[slot], ?handles[slot]) != task.STATUS_OK
+            || task.trigger(?tasks, handles[slot]) != task.STATUS_OK) { ret 2; }
+        slot = slot + 1;
+    }
+    if (task.poll(?tasks, time.Instant{sec: 1, nsec: 0}) != task.MAX_TASKS) { ret 3; }
+
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs           = false;
+    graph.telemetry.metrics        = true;
+    graph.telemetry.metric_series  = telemetry.BUILT_IN_METRIC_SERIES;
+    graph.admin.enabled            = true;
+    graph.admin.max_response_bytes = 256;
+    schema.set_text(?graph.admin.listener, "admin");
+    var series:     [telemetry.BUILT_IN_METRIC_SERIES]telemetry_metrics.Series;
+    var checks:     [1]telemetry_health.Check;
+    var runtime:    telemetry.Runtime;
+    var credential: secret.Held;
+    if (!secret.test_hold("test", ?credential)
+        || !telemetry.make(?runtime, ?graph, nil, ?series[0], telemetry.BUILT_IN_METRIC_SERIES,
+        ?checks[0], 1, credential, nil, (0::usize)::telemetry_admin.RenderFun, nil,
+        (0::usize)::telemetry.FlushFun)
+        || !telemetry.add_collector(?runtime, collector(?tasks))) { ret 4; }
+
+    var memory: [8192]u8;
+    var state:  fixed.FixedState;
+    var heap:   allocator.Allocator;
+    fixed.make(?heap, ?state, ?memory[0], 8192);
+    val stream: ptr = runtime.admin.policy.open_metrics(runtime.admin.policy.metrics_context,
+        ?heap);
+    if (stream == nil) { ret 5; }
+    var streamed: [65536]u8;
+    var length:   usize = 0;
+    for (true) {
+        val count: i64 = runtime.admin.policy.fill_metrics(stream, ?streamed[length], 1000);
+        if (count < 0 || count > 1000) { ret 6; }
+        if (count == 0)                { brk; }
+        length = length + count::usize;
+        if (length + 1000 > 65536) { ret 7; }
+    }
+
+    # the stream is the built-in series and then every task's, whole
+    var expected: [65536]u8;
+    val built_in: telemetry_metrics.Rendered = telemetry_metrics.render(?runtime.own.metrics,
+        ?expected[0], 65536);
+    if (!built_in.ok) { ret 8; }
+    val task_bytes: usize = rendered(?tasks, clock.monotonic_ns(), ?expected[built_in.len],
+        65536 - built_in.len);
+    if (task_bytes < task.MAX_TASKS * 10 * 150 || built_in.len + task_bytes != length) { ret 9; }
+    var i: usize = 0;
+    for (i < length) {
+        if (streamed[i] != expected[i]) { ret 10; }
+        i = i + 1;
+    }
+    var needle: [256]u8;
+    val prefix: str   = "hedge_task_runs_total{outcome=\"completed\",task=\"";
+    var at:     usize = 0;
+    for (prefix[at] != 0) {
+        needle[at] = prefix[at];
+        at         = at + 1;
+    }
+    i = 0;
+    for (i < task.MAX_NAME_BYTES - 1) {
+        needle[at] = '\\';
+        if (i % 2 == 0) { needle[at + 1] = '"'; }
+        or              { needle[at + 1] = '\\'; }
+        at = at + 2;
+        i  = i + 1;
+    }
+    val suffix: str = "p\"} 1\n";
+    i = 0;
+    for (suffix[i] != 0) {
+        needle[at] = suffix[i];
+        at         = at + 1;
+        i          = i + 1;
+    }
+    needle[at] = 0;
+    if (!contains(?streamed[0], length, (?needle[0])::str)) { ret 11; }
+    ret 0;
+}
