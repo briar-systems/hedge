@@ -427,6 +427,46 @@ succeeds. The QUIC cells scale with the rest since #174: on the 5800X3D, with
 from 3,866 to 14,051 requests a second and QUIC handshakes from 1,066 to 4,125
 a second, at the same CPU per operation. The lane binds ports 19140 to 19142.
 
+## The handoff lane
+
+```sh
+./test/load/handoff.sh
+```
+
+`handoff.sh` drives the handoff (#173): a listener one worker accepts for,
+which hands each connection to the least loaded worker. On Linux a TCP listener
+spreads through `SO_REUSEPORT` instead, so the lane uses a local listener, and
+runs every cell over TCP on the same server as well, which is the reuseport
+lane it is compared against. It uses `test/load/rate` over HTTP/1.1, with
+`-network unix` for the local socket. The cells are:
+
+- `requests`: requests for a 1 KiB body back to back on
+  `LOAD_HANDOFF_CONNECTIONS` (64) held connections, so the rate is what the
+  spread of those connections serves;
+- `connections`: a fresh connection per request, closed-loop with as many in
+  flight, so every operation over the local socket is an accept and a
+  handoff.
+
+Each cell runs against a fresh server at each count in `LOAD_HANDOFF_WORKERS`
+(`1 2 4 8`), for a `LOAD_HANDOFF_WARMUP` (2 s) warm-up and a
+`LOAD_HANDOFF_DURATION` (10 s) window, and prints the rate, the server's CPU per
+operation and the cores it used, then the local rate against the TCP rate at
+that count. hedge says at shutdown where the handed-off connections were
+served, as `hedge: handoff served <n> ... by worker, <k> kept with a full
+inbox`, and the lane prints that split and how many connections a full inbox
+left with the acceptor. It fails when:
+
+- a worker served less than `LOAD_HANDOFF_SPLIT` (0.5) of an even share of the
+  local connections, or a TCP listener handed any off;
+- a rate at N workers is below a fraction of N over the first count times the
+  first count's rate, up to the host's core count: `LOAD_HANDOFF_EFFICIENCY`
+  (0.7) for `requests` and `LOAD_HANDOFF_ACCEPT_EFFICIENCY` (0.5) for
+  `connections`, since the one acceptor bounds how far those scale.
+
+`LOAD_HANDOFF_CELLS` picks the cells. CI runs 1 and 4 workers, so the split
+is asserted past the runner's two cores and the scaling is left to a measured
+run. The lane binds ports 19190 to 19192.
+
 ## The ramp lane
 
 ```sh
