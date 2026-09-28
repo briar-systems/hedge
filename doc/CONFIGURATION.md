@@ -120,7 +120,10 @@ How connections reach the workers depends on what the platform can do:
 - Elsewhere, and for local listeners, the first worker accepts and hands each
   connection to the least loaded worker serving the same configuration. A
   worker whose queue of handed connections is full is passed over, and the
-  first worker serves the connection itself.
+  first worker serves the connection itself. At shutdown hedge prints how many
+  of these connections each worker served and how many a full queue left with
+  the first worker, as `hedge: handoff served <n> ... by worker, <k> kept with
+  a full inbox`.
 - Every worker binds its own socket for each QUIC listener with `SO_REUSEPORT`
   on Linux and darwin, and a datagram reaches the worker that owns its
   connection by the connection ID hedge minted for it, whichever socket
