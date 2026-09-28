@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.16.0] - 2026-09-27
+
+### Migration
+
+- **Key file permissions.** Every key file hedge reads, a configured TLS private key, a QUIC key file and a key in the ACME store, is refused when group or other can read it, and startup fails with a diagnostic naming the file and the fix, `chmod 600` (#450). Until now only QUIC key files were checked. Windows is not checked.
+- **Embedders.** The public `secret.Resolver`, `ResolveFun`, `no_resolver`, `resolve`, `clear` and `MAX_VALUE_BYTES`, `telemetry_production.Options.secrets` and `telemetry.admin.AuthenticateFun` are removed with no shim (#444). The administration credential resolves through `composition.Options.providers` like every other secret.
+- **Telemetry.** The built-in metric series rise from 50 to 52 with the stateless reset series (#406), so `telemetry.metric_series` must cover at least 52.
+- **Dependencies.** std `^9.3`, crypto `^0.25`, tls `^0.15`, quic `^0.24`, http `^0.25` and acme `^0.13` (#453). An application that depends on hedge resolves with it, so it moves to ranges these satisfy.
+
+### Security
+
+- The administration credential is held in secret-welded storage for the life of the process (#444). `secret.hold` resolves it through the same path as the secrets granted to hosted applications, and `secret.matches` compares a presented bearer token against every byte of it in constant time, declassifying only the verdict. A credential holding a NUL, CR or LF byte is refused with a diagnostic keyed to its declaration, never its value, and its maximum length rises from 512 to 4096 bytes. `doc/SECURITY.md` lists every secret hedge holds and where each becomes public.
+- A configured TLS private key is read straight into secret storage and handed to `mach-tls` from there, so it never passes through public memory (#447).
+- One exposure check for every key file (#450). `hedge.secret_file` opens a key file once, stats that handle and reads the same handle with `std.filesystem.read_secret_of`, so the file checked is the file read.
+
+### Added
+
+- Stateless resets for QUIC (#406). hedge advertises the handshake connection ID's reset token in its transport parameters, and answers a short-header datagram for one of its codepoints that no connection holds with a stateless reset (RFC 9000 10.3): 42 bytes, sent only for a datagram longer than a reset and at most 64 a second per worker. A datagram for another worker's connection is forwarded, never answered. The token is `HMAC-SHA256(K_reset, cid)` truncated to 16 bytes, computed with mach-crypto's `hmac.sha256_secret` so it stays in secret storage until it is written out. `hedge_quic_stateless_resets_total{outcome}` counts `sent` and `limited`.
+- `server.timeouts.linger_ms` (default 5000, 0 for none) bounds how long a closing HTTP/1 connection reads and discards what its client still sends, the lingering close mach-http 0.25 adds (#453). A drain waits for a lingering connection like any other.
+
+### Fixed
+
+- A graceful HTTP/1 drain serves a request that was read while the memory pool could not fund its slot, where it closed the connection over it (#451).
+
 ## [0.15.0] - 2026-09-27
 
 ### Added

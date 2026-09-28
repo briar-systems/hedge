@@ -61,7 +61,12 @@ offers its client spare IDs minted the same way, up to the client's
 to move to (#404). After a rotation, a connection raises `retire_prior_to` and
 mints its next IDs under the new codepoint. The old codepoint is freed once
 the client retires the IDs minted under it, without waiting for the
-connection to close.
+connection to close. Every ID carries a stateless reset token derived from its
+codepoint's reset key (#406). A short-header datagram whose ID decodes to this
+worker but names no connection it holds, such as one the server has shed, is
+answered with a stateless reset: one smaller than the datagram, never to one
+no longer than a reset, and at most `RESETS_PER_SECOND` a second per worker.
+A datagram for another worker's connection is forwarded, never answered.
 Every worker binds every QUIC listener's address, and a datagram the kernel
 delivers to a worker other than its connection's is handed over a bounded
 single-producer ring to the one that owns it; a full ring drops it and counts

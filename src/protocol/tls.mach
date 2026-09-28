@@ -19,8 +19,8 @@ use hedge.clock;
 use hedge.config.schema;
 use hedge.memory;
 use hedge_credentials: hedge.protocol.credentials;
+use hedge.secret_file;
 use std.chrono.time;
-use std.crypto.ct;
 use std.filesystem;
 use io_error: std.io.error;
 use std.io.file;
@@ -75,6 +75,8 @@ pub val EXHAUSTED:   Status = 6;
 # a replacement arrived while the previously retired generation still has a live
 # lease, so there is no bank free to build the new one in
 pub val RETIRED_IN_USE: Status = 7;
+# a private key file group or other can read
+pub val EXPOSED: Status = 8;
 
 # the largest handshake messages a listener takes and sends. their buffers come
 # from the connection's TLS lane, so a configuration whose flight cannot fit
@@ -180,7 +182,6 @@ var policy_count: usize;
 # pointer read from a dead frame. This lives beside the table the keys do.
 var identity_owner: secret.Allocator;
 var scratch:        [MAX_PEM_BYTES]u8;
-var key_scratch:    [MAX_KEY_BYTES]^u8;
 
 pub fun reset() {
     destroy();
@@ -309,15 +310,33 @@ fun read_file(path: str, buffer: *u8, capacity: usize, length: *usize) bool {
     ret @length != 0 && @length < capacity;
 }
 
-# the key never stays in shared public storage: it is copied up into secret
-# storage and the staging bytes are overwritten before the parse runs
-#[oblivious]
-fun copy_secret(destination: *^u8, source: *u8, length: usize) {
-    var i: usize = 0;
-    for (i < length) {
-        destination[i] = source[i];
-        i              = i + 1;
+# the private key file the last failed publish could not load
+var refused_key_path: str = nil;
+
+# the private key file the last failed publish could not load, nil when a
+# publish failed before any key or on something else
+pub fun refused_key() str {
+    ret refused_key_path;
+}
+
+# the key file is read straight into secret storage and parsed from there, so
+# no key byte is ever public. one group or other can read is refused
+# (hedge.secret_file), and the read storage is wiped when it is released
+fun load_key(path: str, owner: *secret.Allocator,
+    output: *keys.PrivateKey) Status {
+    var bytes: filesystem.SecretBytes;
+    val read:  secret_file.Status = secret_file.read(path, MAX_KEY_BYTES + 1, ?bytes);
+    if (read == secret_file.EXPOSED)   { ret EXPOSED; }
+    if (read == secret_file.TOO_LARGE) { ret UNDECODABLE; }
+    if (read != secret_file.OK)        { ret UNREADABLE; }
+    var status: Status = UNREADABLE;
+    if (bytes.size != 0) {
+        status = UNDECODABLE;
+        if (load.private_pem(contracts.SecretBytes{data: bytes.data, len: bytes.size},
+            owner, output) == contracts.OK) { status = OK; }
     }
+    secret_file.release(?bytes);
+    ret status;
 }
 
 #[oblivious]
@@ -346,21 +365,13 @@ fun load_identity(policy: *Policy, bank: usize, configured: *schema.TlsIdentity,
         contracts.Buffer{data: ?identity.der[0], capacity: MAX_PEM_BYTES},
         ?identity.certificates[0], MAX_CHAIN, ?chain);
     if (decoded.error != contracts.OK || chain.len == 0) { ret UNDECODABLE; }
-    var key_length: usize = 0;
-    if (!read_file(schema.text(?configured.key), ?scratch[0], MAX_PEM_BYTES,
-        ?key_length)) { ret UNREADABLE; }
-    if (key_length > MAX_KEY_BYTES) {
-        wipe(?scratch[0], MAX_PEM_BYTES);
-        ret UNDECODABLE;
-    }
-    copy_secret(?key_scratch[0], ?scratch[0], key_length);
-    wipe(?scratch[0], MAX_PEM_BYTES);
     identity.private_key = keys.empty_private();
-    val parsed: contracts.Error = load.private_pem(
-        contracts.SecretBytes{data: ?key_scratch[0], len: key_length}, owner,
+    val loaded: Status = load_key(schema.text(?configured.key), owner,
         ?identity.private_key);
-    ct.zeroize(?key_scratch[0], MAX_KEY_BYTES);
-    if (parsed != contracts.OK) { ret UNDECODABLE; }
+    if (loaded != OK) {
+        refused_key_path = schema.text(?configured.key);
+        ret loaded;
+    }
     var name: contracts.Bytes;
     name.data = nil;
     name.len  = 0;
@@ -589,6 +600,7 @@ fun destroy_bank(policy: *Policy, bank: usize) bool {
 # share one published generation.
 fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
     options: PublishOptions) Status {
+    refused_key_path = nil;
     if (configured == nil || name == nil) { ret INVALID; }
     if (policy_count >= MAX_POLICIES)     { ret EXHAUSTED; }
     identity_owner = secret.system_allocator();
@@ -1017,6 +1029,52 @@ test publish__unreadable_or_empty_refused {
     configured.identity_count = 0;
     if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != INVALID) { ret 4; }
     if (count() != 0)                                                     { ret 5; }
+    # the key is read into secret storage: a missing key file is unreadable, one
+    # group or other can read is exposed and named, and one that is not a key,
+    # or is past the bound, is undecodable
+    val dir: str = "out/tls-load";
+    if (!material_written(dir)) { ret 6; }
+    var oversized: [MAX_KEY_BYTES + 1]u8;
+    var i:         usize = 0;
+    for (i < MAX_KEY_BYTES + 1) {
+        oversized[i] = 'A';
+        i            = i + 1;
+    }
+    if (!secret_file.write_owner_only(joined(dir, "big.key", 1), ?oversized[0],
+        MAX_KEY_BYTES + 1)
+        || !secret_file.write_owner_only(joined(dir, "cert.key", 2), api_cert_pem::*u8,
+        str_len(api_cert_pem))) { ret 7; }
+    configure(?configured, "api.hedge.test", joined(dir, "api.pem", 0),
+        joined(dir, "none.key", 1));
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != UNREADABLE) {
+        ret 8;
+    }
+    $if ($mach.build.os != $mach.os.windows) {
+        # a key others can read is refused before a byte of it is read
+        configure(?configured, "api.hedge.test", joined(dir, "api.pem", 0),
+            joined(dir, "api.pem", 1));
+        if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != EXPOSED
+            || !schema.text_equals(?configured.identities[0].key, refused_key())) {
+            ret 13;
+        }
+    }
+    configure(?configured, "api.hedge.test", joined(dir, "api.pem", 0),
+        joined(dir, "cert.key", 2));
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != UNDECODABLE) {
+        ret 9;
+    }
+    configure(?configured, "api.hedge.test", joined(dir, "api.pem", 0),
+        joined(dir, "big.key", 1));
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != UNDECODABLE) {
+        ret 10;
+    }
+    if (count() != 0) { ret 11; }
+    api_policy(?configured, dir);
+    if (publish("secure", ?configured, schema.PROTOCOL_HTTP1) != OK) {
+        destroy();
+        ret 12;
+    }
+    reset();
     ret 0;
 }
 
@@ -1045,7 +1103,7 @@ fun ensure_dir(path: str) bool {
 # rewriting the same files while another was reading them, which shows up as a
 # publish that fails perhaps one run in three.
 #[testing]
-var path_storage: [2][64]u8;
+var path_storage: [3][64]u8;
 
 #[testing]
 fun joined(dir: str, leaf: str, slot: usize) str {
@@ -1069,7 +1127,8 @@ fun joined(dir: str, leaf: str, slot: usize) str {
 fun material_written(dir: str) bool {
     if (!ensure_dir("out") || !ensure_dir(dir)) { ret false; }
     ret write_pem(joined(dir, "api.pem", 0), api_cert_pem)
-        && write_pem(joined(dir, "api.key", 0), api_key_pem);
+        && secret_file.write_owner_only(joined(dir, "api.key", 0), api_key_pem::*u8,
+        str_len(api_key_pem));
 }
 
 #[testing]

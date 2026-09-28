@@ -13,6 +13,9 @@ cd "$root" || exit 1
 
 binary="${HEDGE_BINARY:-out/linux-x86_64/debug/bin/hedge}"
 fixtures="test/interop/fixtures"
+# git keeps no mode bit but the executable one, and hedge refuses a private key
+# file group or other can read
+chmod 600 "$fixtures"/*.key
 work="$(mktemp -d)"
 origin_pid=""
 trap 'rm -rf "$work"; stop_server; stop_origin' EXIT

@@ -60,6 +60,66 @@ Secrets use dedicated types and explicit lifetimes. Copies are minimized and obs
 
 Certificate private keys support reload without exposing mutable key state to request handlers. Session ticket keys rotate through immutable key generations with controlled overlap.
 
+Every secret hedge holds, and where it becomes public:
+
+- the administration credential: welded storage in `hedge.secret`, compared in
+  constant time, never declassified beyond two one-bit verdicts: whether it
+  holds a NUL, CR or LF byte, and whether a presented token matches it
+- secrets granted to hosted applications: welded storage in `hedge.secret`,
+  never declassified by hedge
+- automatically managed certificate and account keys: a ring of secret slots,
+  made public only by `keys.publish` for the durable form
+- QUIC listener keys: secret-typed storage, never declassified beyond a key
+  file's layout and a reload's comparison verdict
+- configured TLS private keys: read with `std.filesystem.read_secret_of`
+  straight into welded storage, parsed by `mach-tls` from there, never
+  declassified
+- session ticket keys: drawn from the operating system entropy source into
+  `mach-tls`'s key ring, which owns their storage
+
+Every key file hedge reads, a configured TLS private key, a QUIC listener key
+file and a key in the ACME store, goes through one check in
+`src/secret_file.mach`. The file is opened once, and that handle is stat'd and
+read with `std.filesystem.read_secret_of`, so the file checked is the file
+read. One group or other can read is refused before a byte of it is read, with
+a diagnostic naming the file and the fix, `chmod 600`. Windows synthesizes the
+mode from attributes, so the check is skipped there.
+
+The administration credential and the secrets granted to hosted applications
+resolve through one path in `src/secret.mach`. A `file` secret is read with
+`std.filesystem.read_secret`, straight into its own welded allocation. An
+`os` or `application` secret is written by the embedding program's registered
+`secret.Provider` into secret scratch storage and copied into one. An `env`
+secret is the one exception: the process already holds its environment in
+public memory, so the value is copied out of it and the public copy is cleared.
+
+The administration credential is resolved once, when the process starts. A
+reload that would change which secret it names, or that secret's provider or
+key, is not reload-compatible, so a credential rotated at its source takes
+effect at the next start. hedge holds it in a bounded table of
+welded slots, and the admin handler refers to it by a public handle, a slot
+and generation that is not an address. The handler checks the public `Bearer `
+scheme, then compares the presented token against every byte of the credential
+in constant time. That path has two `:>` sites, each declassifying one bit
+computed over every byte without a branch on the value:
+
+- `secret.presentable`: whether the credential holds a NUL, CR or LF byte. No
+  request can present such a credential, so hedge refuses to start with it
+  rather than hold one that nothing could match. The refusal is diagnosed
+  against the secret's declaration (source `secret`, path its name), never by
+  its value. This is the same kind of structural verdict the QUIC key file
+  parser declassifies.
+- `secret.matches`: whether a presented token equals the credential.
+ The credential is wiped and its slot freed when telemetry
+closes, and a stale handle authenticates nothing.
+
+A hosted application's secrets are resolved again for every generation, into a
+bank beside the one borrows read, and the replaced bank is wiped when the new
+one is published. A borrow copies one value into secret scratch storage, hands
+it to the borrower's callback as `contracts.SecretBytes`, and wipes the scratch
+once the callback returns. hedge never declassifies them. What the borrower
+does with a value is its own.
+
 Automatically managed certificate and account keys, and the ephemeral
 TLS-ALPN-01 key, are secret-typed for their whole life. Mach welds secret
 storage transitively: a record that holds it, or a pointer to one, cannot be
@@ -83,8 +143,8 @@ Key material becomes public at exactly one site, a `:>` declassify in
 `keys.publish`, which produces the durable form. It is forced: `mach-acme`'s
 file store frames and digests public bytes. The published scalar and the
 document encoded around it are wiped as soon as the write returns, and the
-file is created owner-only. A key file is read back with
-`std.filesystem.read_secret`, straight into secret storage. Its frame (magic,
+file is created owner-only. A key file is read back through
+`src/secret_file.mach`, straight into secret storage. Its frame (magic,
 version, kind and length) is read in the clear, its digest is checked over the
 secret payload without a branch on it, and `keys.adopt` copies the scalar into
 its slot. The read storage is wiped when it is released, so the material is
@@ -94,8 +154,8 @@ QUIC listener keys (the CID, stateless reset and Retry/NEW_TOKEN keys) are
 secret-typed for their whole life in `src/protocol/quic/keys.mach`. By default
 they are drawn by the secret CSPRNG straight into that storage. An operator's
 key file (`quic_keys`) is the one way they enter from outside. It is refused
-when group or other can read it. It is read with
-`std.filesystem.read_secret`, straight into secret storage, and
+when group or other can read it. It is read through `src/secret_file.mach`,
+straight into secret storage, and
 `src/protocol/quic/keyfile.mach` parses it there, decoding each key's hex
 without a branch on a digit. The parser declassifies only the file's layout:
 which bytes separate words and lines, whether a word is a keyword, the numbers
