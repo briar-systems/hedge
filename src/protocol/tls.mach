@@ -22,10 +22,13 @@ use hedge.config.schema;
 use hedge.memory;
 use hedge_credentials: hedge.protocol.credentials;
 use hedge.secret_file;
+use A: std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use std.filesystem;
 use io_error: std.io.error;
 use std.io.file;
+use std.memory.buffers;
 use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -36,11 +39,13 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.view;
+use tls_buffer: tls.buffer;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
 use tls_clock:  tls.clock;
 use tls_config: tls.config;
+use tls.record;
 use tls_server: tls.server;
 use tls.session;
 use tls.tls13;
@@ -191,23 +196,31 @@ pub rec Policy {
     challenges:      [MAX_CHALLENGES]Challenge;
     # beside the slots rather than in them, so the selector walks them as one
     # array from the one store pointer it is handed
-    challenge_stores:            [MAX_CHALLENGES]credentials.Store;
-    challenge_enabled:           bool;
-    anchor_der:                  [MAX_PEM_BYTES]u8;
-    anchor_certificates:         [MAX_ANCHORS]cert.Certificate;
-    client_trust:                cert.TrustStore;
-    require_client_auth:         bool;
-    alpn_storage:                [MAX_ALPN][MAX_ALPN_BYTES]u8;
-    alpn:                        [MAX_ALPN]tls_config.ProtocolName;
-    alpn_len:                    usize;
-    require_alpn:                bool;
-    versions:                    [1]u16;
-    suites:                      [3]tls13.CipherSuite;
-    groups:                      [2]tls13.NamedGroup;
-    signatures:                  [4]tls13.SignatureScheme;
-    entropy:                     secret.Entropy;
-    clock:                       tls_clock.Source;
-    ticket_ring:                 session.KeyRing;
+    challenge_stores:    [MAX_CHALLENGES]credentials.Store;
+    challenge_enabled:   bool;
+    anchor_der:          [MAX_PEM_BYTES]u8;
+    anchor_certificates: [MAX_ANCHORS]cert.Certificate;
+    client_trust:        cert.TrustStore;
+    require_client_auth: bool;
+    alpn_storage:        [MAX_ALPN][MAX_ALPN_BYTES]u8;
+    alpn:                [MAX_ALPN]tls_config.ProtocolName;
+    alpn_len:            usize;
+    require_alpn:        bool;
+    versions:            [1]u16;
+    suites:              [3]tls13.CipherSuite;
+    groups:              [2]tls13.NamedGroup;
+    signatures:          [4]tls13.SignatureScheme;
+    entropy:             secret.Entropy;
+    clock:               tls_clock.Source;
+    ticket_ring:         session.KeyRing;
+    # the ring takes each ticket key's cipher context under its own lock from
+    # whichever worker rotates, so it borrows from a pool of its own
+    ticket_backing:              A.Allocator;
+    ticket_classes:              [1]buffers.ClassConfig;
+    ticket_pool:                 buffers.Pool;
+    ticket_secrets:              buffers.SecretSource;
+    ticket_account:              buffers.Account;
+    ticket_memory_live:          bool;
     replay_window:               session.ReplayWindow;
     ticket_key_lifetime_seconds: u32;
     # when the ticket key is next due, in monotonic nanoseconds. every worker
@@ -262,12 +275,13 @@ pub fun reset() {
             clear_challenge(?policies[i].challenges[j]);
             j = j + 1;
         }
-        policies[i].active           = 0;
-        policies[i].name_len         = 0;
-        policies[i].tickets_live     = false;
-        policies[i].replay_live      = false;
-        policies[i].ticket_rotate_ns = 0;
-        i                            = i + 1;
+        policies[i].active             = 0;
+        policies[i].name_len           = 0;
+        policies[i].tickets_live       = false;
+        policies[i].ticket_memory_live = false;
+        policies[i].replay_live        = false;
+        policies[i].ticket_rotate_ns   = 0;
+        i                              = i + 1;
     }
     i = 0;
     for (i < MAX_MANAGED) {
@@ -600,6 +614,47 @@ fun build_configuration(policy: *Policy) Status {
     ret OK;
 }
 
+fun ticket_ignore_misuse(context: ptr) {}
+
+# one context class, sized for every key the ring can hold at once
+fun make_ticket_memory(policy: *Policy) bool {
+    var made: err[A.Error] = page.make(?policy.ticket_backing);
+    if (sel made.err) { ret false; }
+    val budget: usize = session.MAX_TICKET_KEYS * record.CONTEXT_SIZE;
+    policy.ticket_classes[0] = buffers.ClassConfig{size: record.CONTEXT_SIZE,
+        align: record.CONTEXT_ALIGN, secret: true, high_water: session.MAX_TICKET_KEYS};
+    var config: buffers.Config;
+    config.classes        = ?policy.ticket_classes[0];
+    config.class_count    = 1;
+    config.lanes          = 1;
+    config.global_budget  = budget;
+    config.initial_slots  = session.MAX_TICKET_KEYS;
+    config.notify         = (0::usize)::fun(ptr, u64);
+    config.notify_context = nil;
+    config.trap           = ticket_ignore_misuse;
+    config.trap_context   = nil;
+    if (!buffers.make(?policy.ticket_pool, config, ?policy.ticket_backing)) { ret false; }
+    policy.ticket_secrets = buffers.secret_source(?policy.ticket_pool);
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 1;
+    budgets.bytes[0] = budget;
+    var opened: buffers.Reason = buffers.open_account(?policy.ticket_pool,
+        ?policy.ticket_account, 1, budgets, 0);
+    if (!(sel opened.none)) {
+        buffers.destroy(?policy.ticket_pool);
+        ret false;
+    }
+    policy.ticket_memory_live = true;
+    ret true;
+}
+
+fun destroy_ticket_memory(policy: *Policy) {
+    if (!policy.ticket_memory_live) { ret; }
+    buffers.close_account(?policy.ticket_pool, ?policy.ticket_account);
+    buffers.destroy(?policy.ticket_pool);
+    policy.ticket_memory_live = false;
+}
+
 fun destroy_resumption(policy: *Policy) {
     if (policy.replay_live) {
         session.replay_destroy(?policy.replay_window);
@@ -609,11 +664,13 @@ fun destroy_resumption(policy: *Policy) {
         session.keyring_destroy(?policy.ticket_ring);
         policy.tickets_live = false;
     }
+    destroy_ticket_memory(policy);
     policy.ticket_rotate_ns = 0;
 }
 
 fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Status {
     policy.tickets_live           = false;
+    policy.ticket_memory_live     = false;
     policy.replay_live            = false;
     policy.ticket_rotate_ns       = 0;
     policy.ticket_replay_policy   = session.REPLAY_PERMISSIVE;
@@ -624,10 +681,17 @@ fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Sta
         (session.MAX_TICKET_KEYS - 1)) { ret INVALID; }
     var moment: tls_clock.Moment;
     if (!tls_clock.read(?policy.clock, ?moment)) { ret UNSUPPORTED; }
-    if (!session.keyring_init(?policy.ticket_ring, ?policy.entropy, moment,
+    if (!make_ticket_memory(policy))             { ret UNSUPPORTED; }
+    val secrets: tls_buffer.SecretLease = tls_buffer.SecretLease{
+        source: ?policy.ticket_secrets, account: ?policy.ticket_account, lane: 0
+    };
+    if (!session.keyring_init(?policy.ticket_ring, secrets, ?policy.entropy, moment,
         configured.key_lifetime_seconds,
         configured.retirement_overlap_seconds,
-        configured.ticket_lifetime_seconds)) { ret UNSUPPORTED; }
+        configured.ticket_lifetime_seconds)) {
+        destroy_ticket_memory(policy);
+        ret UNSUPPORTED;
+    }
     policy.tickets_live                = true;
     policy.ticket_key_lifetime_seconds = configured.key_lifetime_seconds;
     atomic.store(?policy.ticket_rotate_ns, rotation_after(moment.monotonic,
@@ -811,6 +875,7 @@ fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
     policy.alpn_len             = 0;
     policy.require_client_auth  = configured.client_auth;
     policy.tickets_live         = false;
+    policy.ticket_memory_live   = false;
     policy.replay_live          = false;
     policy.ticket_rotate_ns     = 0;
     policy.client_trust.anchors = nil;
@@ -1245,11 +1310,12 @@ test build_configuration__bounded_tls13_only {
     policy.alpn_len = 0;
     # the widest offer this listener can make, which is what sizes the flight
     offer_protocols(?policy, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2);
-    policy.require_alpn   = true;
-    policy.bindings.store = credentials.empty_store();
-    policy.bindings.live  = false;
-    policy.tickets_live   = false;
-    policy.replay_live    = false;
+    policy.require_alpn       = true;
+    policy.bindings.store     = credentials.empty_store();
+    policy.bindings.live      = false;
+    policy.tickets_live       = false;
+    policy.ticket_memory_live = false;
+    policy.replay_live        = false;
     # the same call the listener makes, so an oversized configuration is caught
     # here rather than at the first handshake
     if (build_configuration(?policy) != OK) { ret 1; }
@@ -1342,7 +1408,7 @@ test publish__unreadable_or_empty_refused {
 #[testing]
 val api_cert_pem: str = "-----BEGIN CERTIFICATE-----\nMIIBhjCCATigAwIBAgIUb1yMHSXgfQwYEQyY37QwWtTUVfMwBQYDK2VwMBkxFzAV\nBgNVBAMMDmFwaS5oZWRnZS50ZXN0MB4XDTI2MDgyOTAzNDQ1MVoXDTM2MDgyNjAz\nNDQ1MVowGTEXMBUGA1UEAwwOYXBpLmhlZGdlLnRlc3QwKjAFBgMrZXADIQC6GbDj\nK+V+WR5whTjn+IHlf+2kR5/3HNyHoPA271PhLKOBkTCBjjAdBgNVHQ4EFgQU2Ucc\nT9sn30693AkomFKf64g+djowHwYDVR0jBBgwFoAU2UccT9sn30693AkomFKf64g+\ndjowGQYDVR0RBBIwEIIOYXBpLmhlZGdlLnRlc3QwDgYDVR0PAQH/BAQDAgeAMBMG\nA1UdJQQMMAoGCCsGAQUFBwMBMAwGA1UdEwEB/wQCMAAwBQYDK2VwA0EA8KdvXtof\nftWx7/8unun/tMfnuk6UJPliBSRaKZOKwAMgv+h2yVgkTlrqBbfSajC2jbKLICdK\ncJHdzizPtTmRBg==\n-----END CERTIFICATE-----\n";
 #[testing]
-val api_key_pem: str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIBRn6QSXLVl2hvtWrT5gXwgtwIJ3Uh0xz+u7ILSYzppC\n-----END PRIVATE KEY-----\n";
+val api_key_pem:  str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIBRn6QSXLVl2hvtWrT5gXwgtwIJ3Uh0xz+u7ILSYzppC\n-----END PRIVATE KEY-----\n";
 
 #[testing]
 fun write_pem(path: str, contents: str) bool {
@@ -1469,6 +1535,6 @@ test prepare__ticket_keys_rotate_on_schedule {
     }
     reset();
     if (count() != 0 || policy.tickets_live || policy.replay_live
-        || policy.ticket_ring.initialized) { ret 6; }
+        || policy.ticket_memory_live || policy.ticket_ring.initialized) { ret 6; }
     ret 0;
 }
