@@ -161,6 +161,10 @@ pub val MIN_INITIAL_BYTES: usize = 1200;
 pub val PREFLIGHT_BUDGET: usize = 4 * RECEIVE_BATCH;
 # datagrams other workers forwarded, taken per turn at most
 pub val FORWARD_BUDGET: usize = 4 * RECEIVE_BATCH;
+# a stateless reset's length, long enough to pass for a short header carrying
+# one of hedge's IDs (RFC 9000 10.3), and the most a worker sends a second
+pub val RESET_BYTES:       usize = CONNECTION_ID_BYTES + 22;
+pub val RESETS_PER_SECOND: u64   = 64;
 
 pub def Status: u8;
 pub val OK:      Status = 1;
@@ -664,6 +668,12 @@ pub rec Runtime {
     forwarded_in:    u64;
     forward_dropped: [steering.DROP_REASONS]u64;
     unroutable:      u64;
+    # stateless resets sent, and those the rate limit held back, with the
+    # current second's window of the limit
+    resets:          u64;
+    resets_limited:  u64;
+    reset_window_ns: u64;
+    reset_window:    u64;
     # the queued initials, so a sweep costs what is queued rather than what
     # the configured connection limit reserved
     pending_live_head:     usize;
@@ -1378,13 +1388,17 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.superseded_total  = 0;
     runtime.stateless_dropped = 0;
     clear_arrival_drops(runtime);
-    runtime.replay_full   = 0;
-    runtime.worker        = config.worker;
-    runtime.steering      = config.steering;
-    runtime.received      = 0;
-    runtime.forwarded_out = 0;
-    runtime.forwarded_in  = 0;
-    runtime.unroutable    = 0;
+    runtime.replay_full     = 0;
+    runtime.worker          = config.worker;
+    runtime.steering        = config.steering;
+    runtime.received        = 0;
+    runtime.forwarded_out   = 0;
+    runtime.forwarded_in    = 0;
+    runtime.unroutable      = 0;
+    runtime.resets          = 0;
+    runtime.resets_limited  = 0;
+    runtime.reset_window_ns = 0;
+    runtime.reset_window    = 0;
     var reason: usize = 0;
     for (reason < steering.DROP_REASONS) {
         runtime.forward_dropped[reason] = 0;
@@ -2713,6 +2727,16 @@ fun tend_connection_ids(runtime: *Runtime, pump: *Pump, value: *Connection, inde
     hold_codepoints(runtime, pump, value, routed_codepoints(value));
 }
 
+# the handshake ID's stateless reset token, as the transport parameter the
+# server sends (RFC 9000 18.2)
+fun advertise_reset_token(pump: *Pump, config: *assembly.Config) bool {
+    if (!cid.reset_token(pump.keys, config.local_source, ?config.stateless_reset_token[0])) {
+        ret false;
+    }
+    config.stateless_reset_token_present = true;
+    ret true;
+}
+
 fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize, index: usize, accepted: *quic_listener.Accepted,
     received: *net_types.Packet, config_snapshot: *ConnectionConfig,
@@ -2755,12 +2779,17 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
         value.local, value.peer);
     config.local_source        = ?value.storage.local_cid[0];
     config.local_source_length = CONNECTION_ID_BYTES;
-    config.alpn                = "h3"::*u8;
-    config.alpn_length         = 2;
-    config.server_name         = nil;
-    config.server_name_length  = 0;
-    config.max_idle_timeout    = config_snapshot.idle_timeout_ms::i64 * duration.MILLISECOND;
-    config.drain_timeout       = config_snapshot.drain_timeout_ns::i64 * duration.NANOSECOND;
+    if (!advertise_reset_token(pump, ?config)) {
+        value.state = CONNECTION_CLEANUP;
+        cleanup_accepting(controls, runtime, index, now_ns);
+        ret false;
+    }
+    config.alpn               = "h3"::*u8;
+    config.alpn_length        = 2;
+    config.server_name        = nil;
+    config.server_name_length = 0;
+    config.max_idle_timeout   = config_snapshot.idle_timeout_ms::i64 * duration.MILLISECOND;
+    config.drain_timeout      = config_snapshot.drain_timeout_ns::i64 * duration.NANOSECOND;
     # the deadline counts from arrival: time spent waiting for a slot was the
     # client's, and a wait that could not fit was refused before this
     value.handshake_started_ns  = now_ns;
@@ -3953,7 +3982,58 @@ fun process_datagram(controls: *ControlView, runtime: *Runtime, pump_index: usiz
     }
     runtime.unroutable = runtime.unroutable + 1;
     if (!routable) { ret OK; }
+    if (classified.class == quic_listener.DATAGRAM_ESTABLISHED && !classified.long_header) {
+        send_reset(controls, runtime, pump_index, received,
+            ?classified.destination.data[0], now_ns);
+    }
     ret STALE;
+}
+
+# whether the rate limit lets this worker send one more reset now
+fun reset_allowed(runtime: *Runtime, now_ns: u64) bool {
+    if (runtime.reset_window_ns == 0 || now_ns < runtime.reset_window_ns
+        || now_ns - runtime.reset_window_ns >= 1000000000) {
+        runtime.reset_window_ns = now_ns;
+        runtime.reset_window    = 0;
+    }
+    if (runtime.reset_window >= RESETS_PER_SECOND) { ret false; }
+    runtime.reset_window = runtime.reset_window + 1;
+    ret true;
+}
+
+# the stateless reset (RFC 9000 10.3) owed a short-header datagram whose ID
+# this worker minted under a codepoint it still keys, for one of its own slots,
+# when no connection there holds the ID, into `output`, RESET_BYTES long. its
+# length, or 0 when none is owed. routing sends every other datagram to its
+# connection's worker, so no reset reaches a live connection (21.11). a reset
+# looks like a short header, unpredictable bytes and then the ID's token. it
+# answers only a longer datagram, so it is always smaller than what drew it,
+# and a reset, which is never longer, draws none (10.3.3)
+fun build_reset(runtime: *Runtime, pump: *Pump, received: *net_types.Packet, id: *u8,
+    now_ns: u64, output: *u8) usize {
+    if (received.length <= RESET_BYTES) { ret 0; }
+    if (!reset_allowed(runtime, now_ns)) {
+        runtime.resets_limited = runtime.resets_limited + 1;
+        ret 0;
+    }
+    val filled: err[io_error.Error] = random.fill(output, RESET_BYTES - cid.RESET_TOKEN_BYTES);
+    if (sel filled.err) { ret 0; }
+    output[0] = (output[0] & 0x3f) | 0x40;
+    if (!cid.reset_token(pump.keys, id, ?output[RESET_BYTES - cid.RESET_TOKEN_BYTES])) {
+        ret 0;
+    }
+    ret RESET_BYTES;
+}
+
+fun send_reset(controls: *ControlView, runtime: *Runtime, pump_index: usize,
+    received: *net_types.Packet, id: *u8, now_ns: u64) {
+    var reset:  [RESET_BYTES]u8;
+    val length: usize = build_reset(runtime, ?controls.pumps[pump_index], received, id,
+        now_ns, ?reset[0]);
+    if (length != 0
+        && submit_stateless(controls, runtime, pump_index, received, ?reset[0], length) == OK) {
+        runtime.resets = runtime.resets + 1;
+    }
 }
 
 # the datagrams other workers forwarded here since the last turn, each to the
@@ -4780,10 +4860,12 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
 pub fun steering_report(runtime: *Runtime) telemetry.SteeringReport {
     var value: telemetry.SteeringReport;
     if (runtime == nil || !runtime.initialized) { ret value; }
-    value.received      = runtime.received;
-    value.forwarded_out = runtime.forwarded_out;
-    value.forwarded_in  = runtime.forwarded_in;
-    value.unroutable    = runtime.unroutable;
+    value.received       = runtime.received;
+    value.forwarded_out  = runtime.forwarded_out;
+    value.forwarded_in   = runtime.forwarded_in;
+    value.unroutable     = runtime.unroutable;
+    value.resets         = runtime.resets;
+    value.resets_limited = runtime.resets_limited;
     var reason: usize = 0;
     for (reason < steering.DROP_REASONS) {
         value.forward_dropped[reason] = runtime.forward_dropped[reason];
@@ -5523,8 +5605,10 @@ fun test_server_accept(prepared: *TestServer, fixture: *TestControls,
     val config: *assembly.Config = ?prepared.config;
     @config = assembly.default_config(81,
         ip.endpoint(192, 0, 2, 1, 4433), accepted.peer);
-    config.local_source         = local;
-    config.local_source_length  = local_length;
+    config.local_source        = local;
+    config.local_source_length = local_length;
+    if (local_length == CONNECTION_ID_BYTES
+        && !advertise_reset_token(?controls.pumps[0], config)) { ret 4; }
     config.alpn                 = ?prepared.protocol_bytes[0];
     config.alpn_length          = 2;
     config.entropy_context_size = 0;
@@ -7554,46 +7638,66 @@ fun test_routes_decode(controls: *ControlView, runtime: *Runtime, pump: *Pump,
     ret found != 0;
 }
 
-# a connection offers its peer spare IDs minted for its slot, up to the peer's
-# limit. the client moves to one, and a datagram on it that another worker
-# decoded reaches the connection. a rotation then moves the connection off its
-# codepoint: once the client retires the old IDs the codepoint is held by
-# nothing, and the next rotation retires it with the connection still open
-test connection_ids__spares_route_to_the_owner_and_rotation_moves_them {
-    var fixture:      TestControls;
-    val controls:     *ControlView = test_controls(?fixture);
-    var runtime:      Runtime;
-    var pump_storage: PumpStorage;
-    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    var protocol_bytes: [2]u8 = [2]u8{'h', '3'};
-    var protocols:      [1]tls_config.ProtocolName;
-    var policy:         hedge_tls.Policy;
-    test_policy(?policy, ?protocols[0], ?protocol_bytes[0]);
-    var spare_plan: plan.Plan;
-    spare_plan.generation = 1;
-    spare_plan.sealed     = true;
-    var budgets: budget.Set;
-    var config:  PumpConfig = test_pump_config(40, ?policy, ?spare_plan, ?budgets);
-    val pump:    *Pump      = ?controls.pumps[0];
-    if (!test_prepare_pump(?runtime, pump, ?pump_storage, 1, ?config)) { ret 1; }
-    var tls_server: TestServer;
-    val loaded:     i32 = test_server_credentials(?tls_server);
+# a server connection on worker 0, established with the test dialer: what a
+# test that drives one after its handshake needs held in one place
+#[testing]
+rec TestEstablished {
+    pump_storage:   PumpStorage;
+    protocol_bytes: [2]u8;
+    protocols:      [1]tls_config.ProtocolName;
+    policy:         hedge_tls.Policy;
+    selected_plan:  plan.Plan;
+    budgets:        budget.Set;
+    config:         PumpConfig;
+    tls_server:     TestServer;
+    index:          usize;
+    now_ns:         u64;
+}
+
+#[testing]
+fun test_server_at() ip.Endpoint {
+    ret ip.endpoint(192, 0, 2, 1, 4433);
+}
+
+#[testing]
+fun test_client_at() ip.Endpoint {
+    ret ip.endpoint(192, 0, 2, 2, 55000);
+}
+
+# establish a connection on pump 0 of `runtime`, with its first ID minted and
+# both ends ACTIVE. 0, or the failing step's code
+#[testing]
+fun test_establish(fixture: *TestControls, controls: *ControlView, runtime: *Runtime,
+    established: *TestEstablished) i32 {
+    established.protocol_bytes[0] = 'h';
+    established.protocol_bytes[1] = '3';
+    test_policy(?established.policy, ?established.protocols[0],
+        ?established.protocol_bytes[0]);
+    established.selected_plan.generation = 1;
+    established.selected_plan.sealed     = true;
+    established.config                   = test_pump_config(40, ?established.policy,
+        ?established.selected_plan, ?established.budgets);
+    val pump: *Pump = ?controls.pumps[0];
+    if (!test_prepare_pump(runtime, pump, ?established.pump_storage, 1,
+        ?established.config)) { ret 1; }
+    val tls_server: *TestServer = ?established.tls_server;
+    val loaded:     i32         = test_server_credentials(tls_server);
     if (loaded != 0) { ret loaded; }
-    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+    val index: usize = acquire_connection(controls, runtime, 0, 0,
         process_admission.no_lease());
     if (index == NO_CONNECTION) { ret 2; }
+    established.index = index;
     val value: *Connection = connection_at(controls, index);
-    if (!mint_local_cid(?runtime, pump, value, index)) { ret 3; }
-    val first_codepoint: u8                      = value.issuing;
-    val accepted:        *quic_listener.Accepted = ?tls_server.accepted;
+    if (!mint_local_cid(runtime, pump, value, index)) { ret 3; }
+    val accepted: *quic_listener.Accepted = ?tls_server.accepted;
     accepted.action = quic_listener.ACTION_ACCEPT;
     packet.set_connection_id(?accepted.original_destination, ?tls_server.initial_id[0], 8);
     packet.set_connection_id(?accepted.initial_destination, ?tls_server.initial_id[0], 8);
     packet.set_connection_id(?accepted.initial_source, ?tls_server.peer_id[0], 8);
-    accepted.peer           = ip.endpoint(192, 0, 2, 2, 55000);
+    accepted.peer           = test_client_at();
     accepted.version        = packet.VERSION_1;
     accepted.peer_validated = true;
-    val prepared: i32 = test_server_accept(?tls_server, ?fixture, controls, index, accepted,
+    val prepared: i32 = test_server_accept(tls_server, fixture, controls, index, accepted,
         ?value.storage.local_cid[0], CONNECTION_ID_BYTES);
     if (prepared != 0) { ret prepared; }
     var now_ns:      u64                 = 1000000000;
@@ -7607,18 +7711,16 @@ test connection_ids__spares_route_to_the_owner_and_rotation_moves_them {
     if (!initialized.ok || !value.assembly.initialized) { ret 4; }
     value.tls_live           = true;
     value.assembly_attempted = true;
-    val server_at: ip.Endpoint = ip.endpoint(192, 0, 2, 1, 4433);
-    val client_at: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
-    var wire:      [assembly.MAX_UDP_PAYLOAD]u8;
-    val dialed:    usize       = test_dial(?tls_server, ?pump.secret_scratch, ?wire[0],
+    var wire:   [assembly.MAX_UDP_PAYLOAD]u8;
+    val dialed: usize = test_dial(tls_server, ?pump.secret_scratch, ?wire[0],
         assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns));
     if (dialed == 0) { ret 5; }
     val server_driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
     val client_driver: *qt.Driver[binding.Binding] = ?dialer.driver;
     var input:         qt.Datagram;
     now_ns            = now_ns + 1000;
-    input.local       = server_at;
-    input.peer        = client_at;
+    input.local       = test_server_at();
+    input.peer        = test_client_at();
     input.data        = ?wire[0];
     input.length      = dialed;
     input.received_at = clock.from_ns(now_ns);
@@ -7629,13 +7731,41 @@ test connection_ids__spares_route_to_the_owner_and_rotation_moves_them {
     var round: usize = 0;
     for (round < 24 && (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE
         || qt.snapshot[binding.Binding](client_driver).state != qt.ACTIVE)) {
-        if (!test_carry(server_driver, ?value.storage.scope, client_driver, client_at,
-            server_at, ?now_ns)
-            || !test_carry(client_driver, ?dialer_scope, server_driver, server_at,
-            client_at, ?now_ns)) { ret 7; }
+        if (!test_carry(server_driver, ?value.storage.scope, client_driver, test_client_at(),
+            test_server_at(), ?now_ns)
+            || !test_carry(client_driver, ?dialer_scope, server_driver, test_server_at(),
+            test_client_at(), ?now_ns)) { ret 7; }
         round = round + 1;
     }
     if (qt.snapshot[binding.Binding](server_driver).state != qt.ACTIVE) { ret 8; }
+    established.now_ns = now_ns;
+    ret 0;
+}
+
+# a connection offers its peer spare IDs minted for its slot, up to the peer's
+# limit. the client moves to one, and a datagram on it that another worker
+# decoded reaches the connection. a rotation then moves the connection off its
+# codepoint: once the client retires the old IDs the codepoint is held by
+# nothing, and the next rotation retires it with the connection still open
+test connection_ids__spares_route_to_the_owner_and_rotation_moves_them {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    var established: TestEstablished;
+    val made:        i32 = test_establish(?fixture, controls, ?runtime, ?established);
+    if (made != 0) { ret made; }
+    val pump:            *Pump                       = ?controls.pumps[0];
+    val index:           usize                       = established.index;
+    val value:           *Connection                 = connection_at(controls, index);
+    val first_codepoint: u8                          = value.issuing;
+    val server_at:       ip.Endpoint                 = test_server_at();
+    val client_at:       ip.Endpoint                 = test_client_at();
+    var now_ns:          u64                         = established.now_ns;
+    var wire:            [assembly.MAX_UDP_PAYLOAD]u8;
+    val server_driver:   *qt.Driver[binding.Binding] = ?value.assembly.driver;
+    val client_driver:   *qt.Driver[binding.Binding] = ?dialer.driver;
+    var round:           usize                       = 0;
     # the client's limit is two, so one spare joins the connection's own ID
     tend_connection_ids(?runtime, pump, value, index);
     if (assembly.routing_snapshot(?value.assembly).active != 2
@@ -7716,6 +7846,106 @@ test connection_ids__spares_route_to_the_owner_and_rotation_moves_them {
         ?host_bits);
     ct.zeroize(?key[0], quic_keys.CID_KEY_BYTES);
     if (keyed != 0) { ret 25; }
+    ret 0;
+}
+
+# the handshake advertises its ID's token, and a datagram for the connection
+# that another worker takes is forwarded there, never answered. once the server
+# has shed the connection the same datagram draws a reset the client accepts,
+# while one no longer than a reset draws none and the rate limit holds (#406)
+test stateless_reset__answers_only_a_shed_connection {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
+    var established: TestEstablished;
+    val made:        i32 = test_establish(?fixture, controls, ?runtime, ?established);
+    if (made != 0) { ret made; }
+    val pump:          *Pump                       = ?controls.pumps[0];
+    val value:         *Connection                 = connection_at(controls, established.index);
+    val client_driver: *qt.Driver[binding.Binding] = ?dialer.driver;
+    var now_ns:        u64                         = established.now_ns;
+    # the handshake ID's token is the one the client holds for it
+    var token: [cid.RESET_TOKEN_BYTES]u8;
+    if (!cid.reset_token(pump.keys, ?value.storage.local_cid[0], ?token[0])
+        || !dialer.cids.storage.peer[0].reset_token_present) { ret 20; }
+    var i: usize = 0;
+    for (i < cid.RESET_TOKEN_BYTES) {
+        if (dialer.cids.storage.peer[0].reset_token[i] != token[i]) { ret 21; }
+        i = i + 1;
+    }
+    val opened: qt.OpenResult = qt.open_stream[binding.Binding](client_driver,
+        qt.UNIDIRECTIONAL);
+    # enough stream bytes that the datagram is longer than a reset
+    var bytes: [32]u8;
+    if (opened.status != qt.STATUS_OK
+        || qt.write_stream[binding.Binding](client_driver, opened.stream, ?bytes[0], 32).count
+        != 32) { ret 22; }
+    var wire: [assembly.MAX_UDP_PAYLOAD]u8;
+    now_ns = now_ns + 1000;
+    val sent: qt.Generated = qt.generate[binding.Binding](client_driver, ?dialer_scope,
+        ?wire[0], assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns), 0);
+    if (sent.status != qt.STATUS_OK || sent.count <= RESET_BYTES
+        || qt.complete_send[binding.Binding](client_driver, sent.token, qt.SEND_SENT,
+        sent.count, clock.from_ns(now_ns)).status != qt.STATUS_OK) { ret 23; }
+    var datagram: net_types.Packet;
+    datagram.buffer   = ?wire[0];
+    datagram.capacity = sent.count;
+    datagram.length   = sent.count;
+    datagram.peer     = test_client_at();
+    # the send queue has no room, so a reset the runtime owes shows as a drop
+    if (!stateless_sends.make[CompletionContext](?pump.stateless, test_allocator(), 0)) {
+        ret 24;
+    }
+    # worker 1 takes the datagram and forwards it to worker 0, answering nothing
+    var board: steering.Board;
+    if (!steering.make_board(?board, test_allocator(), nil, 2)) { ret 25; }
+    steering.open(?board, 0);
+    runtime.steering = ?board;
+    runtime.worker   = 1;
+    if (process_datagram(controls, ?runtime, 0, ?datagram, false, now_ns,
+        clock.from_ns(now_ns), now_ns) != OK
+        || runtime.forwarded_out != 1 || runtime.stateless_dropped != 0) { ret 26; }
+    runtime.worker = 0;
+    # the server sheds the connection, and its slot holds nothing live
+    value.live = false;
+    if (process_datagram(controls, ?runtime, 0, ?datagram, true, now_ns,
+        clock.from_ns(now_ns), now_ns) != STALE || runtime.stateless_dropped != 1) { ret 27; }
+    # a datagram no longer than a reset draws none
+    datagram.length = RESET_BYTES;
+    if (process_datagram(controls, ?runtime, 0, ?datagram, true, now_ns,
+        clock.from_ns(now_ns), now_ns) != STALE || runtime.stateless_dropped != 1) { ret 28; }
+    datagram.length = sent.count;
+    # the reset the runtime builds is smaller than what drew it, and the client
+    # takes it as a reset
+    var reset:  [RESET_BYTES]u8;
+    val length: usize = build_reset(?runtime, pump, ?datagram, ?value.storage.local_cid[0],
+        now_ns, ?reset[0]);
+    if (length == 0 || length >= sent.count) { ret 29; }
+    var input: qt.Datagram;
+    now_ns            = now_ns + 1000;
+    input.local       = test_client_at();
+    input.peer        = test_server_at();
+    input.data        = ?reset[0];
+    input.length      = length;
+    input.received_at = clock.from_ns(now_ns);
+    input.ecn         = 0;
+    qt.receive_datagram[binding.Binding](client_driver, ?input);
+    if (qt.snapshot[binding.Binding](client_driver).state != qt.DRAINING) { ret 30; }
+    # the rest of the second's allowance, then the limit
+    i = 2;
+    for (i < RESETS_PER_SECOND) {
+        if (build_reset(?runtime, pump, ?datagram, ?value.storage.local_cid[0], now_ns,
+            ?reset[0]) == 0) { ret 31; }
+        i = i + 1;
+    }
+    if (build_reset(?runtime, pump, ?datagram, ?value.storage.local_cid[0], now_ns,
+        ?reset[0]) != 0 || runtime.resets_limited != 1) { ret 32; }
+    if (build_reset(?runtime, pump, ?datagram, ?value.storage.local_cid[0],
+        now_ns + 1000000000, ?reset[0]) == 0) { ret 33; }
+    value.live       = true;
+    runtime.steering = nil;
+    steering.destroy_board(?board);
     ret 0;
 }
 

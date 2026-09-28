@@ -325,6 +325,9 @@ taken from another worker because their connection lives there, and
 `stopped`) those dropped on the way, for the client's retransmission to carry.
 `hedge_quic_unroutable_total` counts datagrams whose connection ID names no
 connection a worker holds, such as one for a connection already released.
+`hedge_quic_stateless_resets_total{outcome}` (`sent`, `limited`) counts the
+stateless resets a worker sent for such a datagram, and those its rate limit
+held back.
 `hedge_timers_claimed` and `hedge_timers_armed` are gauges of the worker's
 timing wheel: the entries a connection or plane has claimed, and those with a
 deadline armed, reported once per loop turn.
@@ -674,7 +677,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 50 built-in series. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
