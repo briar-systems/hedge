@@ -15,6 +15,7 @@ use http.core.field;
 use http.core.message;
 use http.core.method;
 use std.allocator;
+use std.allocator.fixed;
 use std.log.record;
 use std.log.sink;
 use std.sync.mutex;
@@ -196,9 +197,30 @@ fun copy_text(output: *u8, capacity: usize, value: str) usize {
     ret length;
 }
 
-fun built_in_metrics(context: ptr, output: *u8, capacity: usize) usize {
-    val runtime: *Runtime = context::*Runtime;
-    if (!runtime.metrics_enabled) { ret copy_text(output, capacity, "# metrics disabled\n"); }
+# one /metrics body, rendered a line at a time as the engine asks for it: the
+# series in registration order, each merged across the recorders once and
+# kept whole until its lines are sent. whatever the series count, a body holds
+# this much memory and no more
+pub rec MetricsStream {
+    runtime: *Runtime;
+    series:  usize;
+    lines:   usize;
+    line:    usize;
+    sample:  telemetry_metrics.Sample;
+    text:    [telemetry_metrics.MAX_LINE_BYTES]u8;
+    length:  usize;
+    offset:  usize;
+    written: bool;
+    done:    bool;
+}
+
+fun stream_text(stream: *MetricsStream, value: str) {
+    stream.length = copy_text(?stream.text[0], telemetry_metrics.MAX_LINE_BYTES, value);
+    stream.offset = 0;
+}
+
+# the stream's merged sample of `series`, or false when no recorder holds it
+fun merge_series(runtime: *Runtime, series: usize, output: *telemetry_metrics.Sample) bool {
     var registries: [MAX_RECORDERS]*telemetry_metrics.Registry;
     mutex.lock(?runtime.recorders_lock);
     val count: usize = runtime.recorder_count;
@@ -208,11 +230,84 @@ fun built_in_metrics(context: ptr, output: *u8, capacity: usize) usize {
         i             = i + 1;
     }
     mutex.unlock(?runtime.recorders_lock);
-    val rendered: telemetry_metrics.Rendered = telemetry_metrics.render_all(?registries[0],
-        count, output, capacity);
-    if (!rendered.ok)      { ret 0; }
-    if (rendered.len == 0) { ret copy_text(output, capacity, "# no metrics\n"); }
-    ret rendered.len;
+    ret telemetry_metrics.sample_merged(?registries[0], count, series, output);
+}
+
+val LINE_READY:  u8 = 1;
+val LINE_END:    u8 = 2;
+val LINE_FAILED: u8 = 3;
+
+# the next line into the stream's text
+fun next_line(stream: *MetricsStream) u8 {
+    for (stream.line >= stream.lines) {
+        if (stream.series >= telemetry_metrics.series_count(?stream.runtime.own.metrics)) {
+            ret LINE_END;
+        }
+        stream.line  = 0;
+        stream.lines = 0;
+        if (merge_series(stream.runtime, stream.series, ?stream.sample)) {
+            stream.lines = telemetry_metrics.sample_lines(?stream.sample);
+        }
+        stream.series = stream.series + 1;
+    }
+    var writer: telemetry_metrics.Writer = telemetry_metrics.Writer{output: ?stream.text[0],
+        capacity: telemetry_metrics.MAX_LINE_BYTES, length: 0};
+    telemetry_metrics.write_line(?writer, ?stream.sample, stream.line);
+    stream.line = stream.line + 1;
+    if (writer.length > telemetry_metrics.MAX_LINE_BYTES) { ret LINE_FAILED; }
+    stream.length  = writer.length;
+    stream.offset  = 0;
+    stream.written = true;
+    ret LINE_READY;
+}
+
+# a /metrics body over `runtime` from the request's allocator
+fun open_metrics(context: ptr, a: *allocator.Allocator) ptr {
+    val runtime: *Runtime = context::*Runtime;
+    if (runtime == nil || a == nil) { ret nil; }
+    val allocated: res[*MetricsStream, allocator.Error] = allocator.allocate[MetricsStream](a, 1);
+    if (sel allocated.err) { ret nil; }
+    val stream: *MetricsStream = allocated.ok;
+    stream.runtime = runtime;
+    stream.series  = 0;
+    stream.lines   = 0;
+    stream.line    = 0;
+    stream.length  = 0;
+    stream.offset  = 0;
+    stream.written = false;
+    stream.done    = false;
+    if (!runtime.metrics_enabled) {
+        stream_text(stream, "# metrics disabled\n");
+        stream.written = true;
+        stream.done    = true;
+    }
+    ret stream::ptr;
+}
+
+# fills `output` with the lines that fit, carrying a line that does not over
+# into the next fill
+fun fill_metrics(context: ptr, output: *u8, capacity: usize) i64 {
+    val stream: *MetricsStream = context::*MetricsStream;
+    var count:  usize          = 0;
+    for (count < capacity) {
+        if (stream.offset < stream.length) {
+            output[count] = stream.text[stream.offset];
+            stream.offset = stream.offset + 1;
+            count         = count + 1;
+            cnt;
+        }
+        if (stream.done) { brk; }
+        val status: u8 = next_line(stream);
+        if (status == LINE_FAILED) { ret -1; }
+        if (status == LINE_END) {
+            stream.done = true;
+            if (!stream.written) {
+                stream_text(stream, "# no metrics\n");
+                stream.written = true;
+            }
+        }
+    }
+    ret count::i64;
 }
 
 fun built_in_state(context: ptr, output: *u8, capacity: usize) usize {
@@ -416,7 +511,6 @@ pub fun make(
     check_capacity: usize,
     credential: secret.Held,
     render_context: ptr,
-    render_metrics: telemetry_admin.RenderFun,
     render_state: telemetry_admin.RenderFun,
     flush_context: ptr,
     flush: FlushFun,
@@ -465,14 +559,8 @@ pub fun make(
     runtime.recorders[0]   = ?runtime.own;
     runtime.recorder_count = 1;
     if (runtime.admin_enabled) {
-        var metrics_context:  ptr                       = render_context;
-        var state_context:    ptr                       = render_context;
-        var selected_metrics: telemetry_admin.RenderFun = render_metrics;
-        var selected_state:   telemetry_admin.RenderFun = render_state;
-        if (selected_metrics::usize == 0) {
-            selected_metrics = built_in_metrics;
-            metrics_context  = runtime::ptr;
-        }
+        var state_context:  ptr                       = render_context;
+        var selected_state: telemetry_admin.RenderFun = render_state;
         if (selected_state::usize == 0) {
             selected_state = built_in_state;
             state_context  = runtime::ptr;
@@ -480,8 +568,9 @@ pub fun make(
         val policy: telemetry_admin.Policy = telemetry_admin.Policy{
             listener:           schema.text(?graph.admin.listener),
             credential:         credential,
-            metrics_context:    metrics_context,
-            render_metrics:     selected_metrics,
+            metrics_context:    runtime::ptr,
+            open_metrics:       open_metrics,
+            fill_metrics:       fill_metrics,
             state_context:      state_context,
             render_state:       selected_state,
             max_response_bytes: graph.admin.max_response_bytes,
@@ -1149,7 +1238,7 @@ test runtime__access_readiness_shutdown {
     var checks:   [2]telemetry_health.Check;
     var runtime:  Runtime;
     if (!make(?runtime, ?graph, 1, ?output, ?series[0], BUILT_IN_METRIC_SERIES,
-        ?checks[0], 2, secret.no_held(), nil, test_render, test_render,
+        ?checks[0], 2, secret.no_held(), nil, test_render,
         nil, (0::usize)::FlushFun)) { ret 1; }
     if (!begin_ready(?runtime)) { ret 2; }
     val report: sink.WriteReport = access(?runtime, Access{listener: "public", method: "GET", target: "/", protocol: "HTTP/1.1", status: 200, duration_us: 10, request_bytes: 0, response_bytes: 2, trace_id: nil});
@@ -1172,7 +1261,7 @@ test access_request__method_and_target_as_text {
     var output:   sink.Sink     = sink.Sink{ctx: (?target)::ptr, f_publish: test_publish, contract: contract};
     var checks:   [1]telemetry_health.Check;
     var runtime:  Runtime;
-    if (!make(?runtime, ?graph, 1, ?output, nil, 0, ?checks[0], 1, secret.no_held(), nil, test_render, test_render, nil, (0::usize)::FlushFun)) { ret 1; }
+    if (!make(?runtime, ?graph, 1, ?output, nil, 0, ?checks[0], 1, secret.no_held(), nil, test_render, nil, (0::usize)::FlushFun)) { ret 1; }
     var request: message.Request;
     request.method     = method.from_kind(method.GET);
     request.target.raw = view.view("/hello", 6);
@@ -1199,7 +1288,7 @@ test shutdown__flushes_once {
     var flush_state: TestFlush;
     flush_state.calls   = 0;
     flush_state.succeed = true;
-    if (!make(?runtime, ?graph, 1, ?output, nil, 0, ?checks[0], 1, secret.no_held(), nil, test_render, test_render, (?flush_state)::ptr, test_flush))                                                             { ret 1; }
+    if (!make(?runtime, ?graph, 1, ?output, nil, 0, ?checks[0], 1, secret.no_held(), nil, test_render, (?flush_state)::ptr, test_flush))                                                                          { ret 1; }
     if (!status_enqueued(access(?runtime, Access{listener: "public", method: "GET", target: "/", protocol: "HTTP/1.1", status: 200, duration_us: 1, request_bytes: 0, response_bytes: 0, trace_id: nil}).status)) { ret 2; }
     if (!shutdown(?runtime) || flush_state.calls != 1 || target.writes != 1)                                                                                                                                      { ret 3; }
     if (shutdown(?runtime) || flush_state.calls != 1)                                                                                                                                                             { ret 4; }
@@ -1207,12 +1296,14 @@ test shutdown__flushes_once {
     flush_state.succeed = false;
     var failed_checks:  [1]telemetry_health.Check;
     var failed_runtime: Runtime;
-    if (!make(?failed_runtime, ?graph, 1, ?output, nil, 0, ?failed_checks[0], 1, secret.no_held(), nil, test_render, test_render, (?flush_state)::ptr, test_flush)) { ret 5; }
-    if (shutdown(?failed_runtime) || flush_state.calls != 1)                                                                                                        { ret 6; }
+    if (!make(?failed_runtime, ?graph, 1, ?output, nil, 0, ?failed_checks[0], 1, secret.no_held(), nil, test_render, (?flush_state)::ptr, test_flush)) { ret 5; }
+    if (shutdown(?failed_runtime) || flush_state.calls != 1)                                                                                           { ret 6; }
     ret 0;
 }
 
-test admin__custom_metrics_renderer {
+# /state takes a custom renderer, and /metrics streams the series a line at a
+# time however small each fill, matching the registry's own render
+test admin__metrics_streamed {
     var graph: schema.Graph;
     schema.reset_graph(?graph);
     graph.telemetry.logs           = false;
@@ -1229,15 +1320,122 @@ test admin__custom_metrics_renderer {
     var credential: secret.Held;
     if (!secret.test_hold("test", ?credential)) { ret 4; }
     if (!make(?runtime, ?graph, 1, nil, ?series[0], BUILT_IN_METRIC_SERIES,
-        ?checks[0], 1, credential, (?render_state)::ptr,
-        test_context_render, (0::usize)::telemetry_admin.RenderFun,
+        ?checks[0], 1, credential, (?render_state)::ptr, test_context_render,
         nil, (0::usize)::FlushFun)) { ret 1; }
     var output:   [256]u8;
     var response: telemetry_admin.Response;
     if (!telemetry_admin.handle(?runtime.admin, telemetry_admin.Request{listener: "admin", method: "GET", path: "/metrics", authorization: "Bearer test"}, ?output[0], 256, ?response)
-        || response.status != 200 || render_state.calls != 1) { ret 2; }
+        || response.status != 200 || !response.stream || render_state.calls != 0) { ret 2; }
     if (!telemetry_admin.handle(?runtime.admin, telemetry_admin.Request{listener: "admin", method: "GET", path: "/state", authorization: "Bearer test"}, ?output[0], 256, ?response)
-        || response.status != 200 || render_state.calls != 1) { ret 3; }
+        || response.status != 200 || response.stream || render_state.calls != 1) { ret 3; }
+
+    telemetry_metrics.counter_add(?runtime.own.metrics, runtime.own.requests, 3);
+    telemetry_metrics.observe(?runtime.own.metrics, runtime.own.duration_us, 1500);
+    var memory: [16384]u8;
+    var state:  fixed.FixedState;
+    var heap:   allocator.Allocator;
+    fixed.make(?heap, ?state, ?memory[0], 16384);
+    val stream: ptr = open_metrics(?runtime, ?heap);
+    if (stream == nil) { ret 5; }
+    var streamed: [16384]u8;
+    var length:   usize = 0;
+    for (true) {
+        val count: i64 = fill_metrics(stream, ?streamed[length], 7);
+        if (count < 0 || count > 7) { ret 6; }
+        if (count == 0)             { brk; }
+        length = length + count::usize;
+        if (length + 7 >= 16384) { ret 7; }
+    }
+    var rendered: [16384]u8;
+    val whole:    telemetry_metrics.Rendered = telemetry_metrics.render(?runtime.own.metrics,
+        ?rendered[0], 16384);
+    if (!whole.ok || whole.len != length || length == 0) { ret 8; }
+    var i: usize = 0;
+    for (i < length) {
+        if (streamed[i] != rendered[i]) { ret 9; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# series at every bound hedge accepts, with each label byte escaped, stream
+# through a fixed stream state at any fill size to what the registry renders
+test admin__metrics_streamed_at_bounds {
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs          = false;
+    graph.telemetry.metrics       = true;
+    graph.telemetry.metric_series = BUILT_IN_METRIC_SERIES + 8;
+    graph.admin.enabled           = false;
+    var series:  [BUILT_IN_METRIC_SERIES + 8]telemetry_metrics.Series;
+    var checks:  [1]telemetry_health.Check;
+    var runtime: Runtime;
+    if (!make(?runtime, ?graph, 1, nil, ?series[0], BUILT_IN_METRIC_SERIES + 8, ?checks[0], 1,
+        secret.no_held(), nil, (0::usize)::telemetry_admin.RenderFun, nil,
+        (0::usize)::FlushFun)) { ret 1; }
+    var keys:   [telemetry_metrics.MAX_LABELS][telemetry_metrics.NAME_CAPACITY]u8;
+    var value:  [telemetry_metrics.VALUE_CAPACITY]u8;
+    var name:   [telemetry_metrics.NAME_CAPACITY]u8;
+    var labels: [telemetry_metrics.MAX_LABELS]telemetry_metrics.LabelView;
+    var bounds: [telemetry_metrics.MAX_BUCKETS]u64;
+    var i:      usize = 0;
+    for (i < telemetry_metrics.VALUE_CAPACITY - 1) {
+        value[i] = '"';
+        i        = i + 1;
+    }
+    value[telemetry_metrics.VALUE_CAPACITY - 1] = 0;
+    var k: usize = 0;
+    for (k < telemetry_metrics.MAX_LABELS) {
+        i = 0;
+        for (i < telemetry_metrics.NAME_CAPACITY - 2) {
+            keys[k][i] = 'k';
+            i          = i + 1;
+        }
+        keys[k][telemetry_metrics.NAME_CAPACITY - 2] = 'a' + k::u8;
+        keys[k][telemetry_metrics.NAME_CAPACITY - 1] = 0;
+        labels[k]                                    = telemetry_metrics.LabelView{key: (?keys[k][0])::str, value: (?value[0])::str};
+        k                                            = k + 1;
+    }
+    i = 0;
+    for (i < telemetry_metrics.MAX_BUCKETS) {
+        bounds[i] = 0x7fffffffffffff00 + i::u64;
+        i         = i + 1;
+    }
+    var s: usize = 0;
+    for (s < 8) {
+        i = 0;
+        for (i < telemetry_metrics.NAME_CAPACITY - 2) {
+            name[i] = 'm';
+            i       = i + 1;
+        }
+        name[telemetry_metrics.NAME_CAPACITY - 2] = 'a' + s::u8;
+        name[telemetry_metrics.NAME_CAPACITY - 1] = 0;
+        var token: telemetry_metrics.Token;
+        if (!telemetry_metrics.register(?runtime.own.metrics, telemetry_metrics.HISTOGRAM,
+            (?name[0])::str, ?labels[0], telemetry_metrics.MAX_LABELS, ?bounds[0],
+            telemetry_metrics.MAX_BUCKETS, ?token)) { ret 2; }
+        telemetry_metrics.observe(?runtime.own.metrics, token, 0x7fffffffffffffff);
+        s = s + 1;
+    }
+    val whole: telemetry_metrics.Rendered = telemetry_metrics.render(?runtime.own.metrics, nil, 0);
+    if (whole.required < 8 * 18 * 2000) { ret 3; }
+    var memory: [8192]u8;
+    var state:  fixed.FixedState;
+    var heap:   allocator.Allocator;
+    fixed.make(?heap, ?state, ?memory[0], 8192);
+    val stream: ptr = open_metrics(?runtime, ?heap);
+    if (stream == nil) { ret 4; }
+    var chunk: [4099]u8;
+    var total: usize = 0;
+    var size:  usize = 1;
+    for (true) {
+        val count: i64 = fill_metrics(stream, ?chunk[0], size);
+        if (count < 0 || count::usize > size) { ret 5; }
+        if (count == 0)                       { brk; }
+        total = total + count::usize;
+        size  = size * 3 % 4099 + 1;
+    }
+    if (total != whole.required) { ret 6; }
     ret 0;
 }
 
@@ -1249,7 +1447,7 @@ test parse_trace__state_budget {
     graph.telemetry.trace_state_bytes = 8;
     var checks:  [1]telemetry_health.Check;
     var runtime: Runtime;
-    if (!make(?runtime, ?graph, 1, nil, nil, 0, ?checks[0], 1, secret.no_held(), nil, test_render, test_render, nil, (0::usize)::FlushFun)) { ret 1; }
+    if (!make(?runtime, ?graph, 1, nil, nil, 0, ?checks[0], 1, secret.no_held(), nil, test_render, nil, (0::usize)::FlushFun)) { ret 1; }
     var context:     telemetry_trace.Context;
     val traceparent: str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     if (!parse_trace(?runtime, traceparent, "a=value", ?context))                                                                 { ret 2; }
@@ -1268,7 +1466,7 @@ test recorder__running_totals_add_only_rise {
     var checks:  [2]telemetry_health.Check;
     var runtime: Runtime;
     if (!make(?runtime, ?graph, 1, nil, ?series[0], BUILT_IN_METRIC_SERIES,
-        ?checks[0], 2, secret.no_held(), nil, test_render, test_render,
+        ?checks[0], 2, secret.no_held(), nil, test_render,
         nil, (0::usize)::FlushFun)) { ret 1; }
     var pool: hedge_memory.Snapshot;
     val io:   usize = hedge_memory.LANE_IO::usize;
