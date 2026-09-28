@@ -14,8 +14,10 @@
 #   flight, so every operation is an accept and, over the local socket, a
 #   handoff
 #
-# hedge says at shutdown how many handed-off connections each worker served
-# and how many a full inbox left with the acceptor. Every worker has to have
+# hedge counts the connections each worker served from a listener that hands
+# off (hedge_handoff_served_total{worker}) and those a full inbox left with the
+# acceptor (hedge_handoff_kept_total), read from an admin listener before the
+# server stops. With more than one worker, every worker has to have
 # served at least LOAD_HANDOFF_SPLIT of an even share. A rate at N workers has
 # to reach a fraction of N over the first count times the first count's rate,
 # up to the host's core count, over either transport: LOAD_HANDOFF_EFFICIENCY
@@ -42,6 +44,9 @@ trap cleanup_load EXIT
 CLEARTEXT_PORT=19190
 SECURE_PORT=19191
 QUIC_PORT=19192
+ADMIN_PORT=19193
+HEDGE_ADMIN_TOKEN="handoff-$$-$RANDOM"
+export HEDGE_ADMIN_TOKEN
 
 prepare_load
 if ! resolve_go_tool rate; then exit 1; fi
@@ -59,7 +64,9 @@ memory_bytes = $((connections * 4 * 1048576 + 1073741824))" \
 name = \"local\"
 address = \"$socket\"
 transport = \"local\"
-protocols = [\"http/1.1\"]" \
+protocols = [\"http/1.1\"]
+
+$(admin_config)" \
         "$workers"
     start_hedge "$work/handoff.toml"
 }
@@ -91,21 +98,24 @@ run_cell() {
     echo "$rate $cpu"
 }
 
-# the stopped server's handoff line, as `kept served...`, or nothing when it
-# handed nothing off
+# the running server's handoff counters, as `kept served...` with one served
+# count per worker, or `missing` when it has no handoff series
 handoff_served() {
-    awk '/^hedge: handoff served / {
-        line = ""
-        for (i = 4; i <= NF && $i != "by"; i++) line = line " " $i
-        print $(i + 2) line
-    }' "$work/hedge.log"
+    local workers="$1" index line kept
+    kept="$(metric hedge_handoff_kept_total)"
+    if [ "$kept" = missing ]; then echo missing; return; fi
+    line="$kept"
+    for ((index = 0; index < workers; index++)); do
+        line="$line $(metric "hedge_handoff_served_total{worker=\"$index\"}")"
+    done
+    echo "$line"
 }
 
 # checks the split of `served` (a kept count, then one count per worker) and
 # prints it
 check_split() {
     local label="$1" workers="$2" served="$3"
-    if [ -z "$served" ]; then
+    if [ "$served" = missing ] || [[ "$served" == *missing* ]]; then
         report 1 "$label: hedge reported where the handed-off connections were served"
         return
     fi
@@ -142,14 +152,17 @@ measure_workers() {
             else
                 report 1 "$label: every operation succeeded (see $label.out)"
             fi
-            if ! stop_hedge; then failed=$((failed + 1)); fi
-            served="$(handoff_served)"
-            if [ "$transport" = local ]; then
-                check_split "$label" "$workers" "$served"
-            else
-                test -z "$served"
-                report $? "$label: a reuseport listener hands nothing off"
+            # one worker hands nothing off, and hedge keeps no series for it
+            if [ "$workers" -gt 1 ]; then
+                served="$(handoff_served "$workers")"
+                if [ "$transport" = local ]; then
+                    check_split "$label" "$workers" "$served"
+                else
+                    awk -v s="$served" 'BEGIN { n = split(s, v, " "); for (i = 1; i <= n; i++) if (v[i] != "0") exit 1 }'
+                    report $? "$label: a reuseport listener hands nothing off ($served)"
+                fi
             fi
+            if ! stop_hedge; then failed=$((failed + 1)); fi
         done
     done
 }

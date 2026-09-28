@@ -451,13 +451,15 @@ Each cell runs against a fresh server at each count in `LOAD_HANDOFF_WORKERS`
 (`1 2 4 8`), for a `LOAD_HANDOFF_WARMUP` (2 s) warm-up and a
 `LOAD_HANDOFF_DURATION` (10 s) window, and prints the rate, the server's CPU per
 operation and the cores it used, then the local rate against the TCP rate at
-that count. hedge says at shutdown where the handed-off connections were
-served, as `hedge: handoff served <n> ... by worker, <k> kept with a full
-inbox`, and the lane prints that split and how many connections a full inbox
-left with the acceptor. It fails when:
+that count. The lane reads from an admin listener, before each server stops,
+the connections each worker served from a listener that hands off
+(`hedge_handoff_served_total{worker}`) and those a full inbox left with the
+acceptor (`hedge_handoff_kept_total`), and prints that split and the
+full-inbox count. It fails when:
 
-- a worker served less than `LOAD_HANDOFF_SPLIT` (0.5) of an even share of the
-  local connections, or a TCP listener handed any off;
+- with more than one worker, a worker served less than `LOAD_HANDOFF_SPLIT`
+  (0.5) of an even share of the local connections, or a TCP listener handed
+  any off;
 - a rate at N workers is below a fraction of N over the first count times the
   first count's rate, up to the host's core count: `LOAD_HANDOFF_EFFICIENCY`
   (0.7) for `requests` and `LOAD_HANDOFF_ACCEPT_EFFICIENCY` (0.5) for
@@ -465,7 +467,7 @@ left with the acceptor. It fails when:
 
 `LOAD_HANDOFF_CELLS` picks the cells. CI runs 1 and 4 workers, so the split
 is asserted past the runner's two cores and the scaling is left to a measured
-run. The lane binds ports 19190 to 19192.
+run. The lane binds ports 19190 to 19193.
 
 ## The ramp lane
 
