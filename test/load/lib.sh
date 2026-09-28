@@ -394,6 +394,8 @@ prepare_load() {
     openssl pkcs8 -topk8 -nocrypt -in "$work/load.key" -out "$work/load.pk8" \
         >/dev/null 2>&1 || { echo "could not convert the key"; exit 1; }
     mv "$work/load.pk8" "$work/load.key"
+    # hedge refuses a private key file group or other can read
+    chmod 600 "$work/load.key"
 }
 
 # written here rather than checked in, because it carries absolute paths to the

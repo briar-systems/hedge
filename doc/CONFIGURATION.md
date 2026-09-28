@@ -146,6 +146,11 @@ its server name matches none of them. Omitting `default` is a policy decision,
 not an oversight: an unmatched server name is then refused with
 `unrecognized_name` rather than served somebody else's certificate.
 
+A `key` file is refused when group or other can read it, and startup fails with
+a diagnostic naming the file: restrict it with `chmod 600`. The same rule holds
+for every key file hedge reads, QUIC key files and the ACME store included.
+Windows is not checked, since it has no such mode.
+
 `client_auth` requires and verifies a client certificate against `client_trust`.
 
 Session resumption is disabled unless the policy contains a `resumption` table:
