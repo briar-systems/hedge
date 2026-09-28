@@ -44,6 +44,7 @@ use fs:        std.filesystem;
 use io_error:  std.io.error;
 use net_async: std.net.async;
 use std.net.ip;
+use std.sync.mutex;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -98,6 +99,20 @@ pub val ISSUING:     State = 2;
 pub val INSTALLING: State = 3;
 pub val ADVISING:   State = 4;
 pub val STOPPED:    State = 5;
+
+# a certificate's standing as telemetry reads it at scrape time, on a thread
+# other than the supervisor's that drives the manager
+pub rec Report {
+    # a certificate is held, and when it expires, as unix seconds
+    held:      bool;
+    not_after: u64;
+    # issuance attempts by outcome, and failures since the last success
+    succeeded:            u64;
+    failed:               u64;
+    consecutive_failures: u64;
+    # when this process last obtained a certificate, zero until it has
+    last_issued_unix: u64;
+}
 
 pub rec Manager {
     store:    durable.Store;
@@ -162,6 +177,12 @@ pub rec Manager {
     issued:        u64;
     failures:      u64;
     last_failure:  problem.Error;
+    # failures since the last issuance, and when this process last issued one
+    consecutive_failures: u64;
+    last_issued_unix:     u64;
+    # what telemetry reads from another thread, published under `report_lock`
+    report_lock: mutex.Mutex;
+    reported:    Report;
 
     state: State;
     live:  bool;
@@ -266,6 +287,20 @@ pub fun label(manager: *Manager) str {
 pub fun component(manager: *Manager) str {
     if (manager == nil) { ret nil; }
     ret (?manager.component[0])::str;
+}
+
+# a manager as telemetry sees one, for tests of what is read from it
+#[testing]
+pub fun test_reported(manager: *Manager, id: str, value: Report) {
+    var length: usize = 0;
+    for (id[length] != 0 && length + 1 < MAX_LABEL_BYTES) {
+        manager.label[length] = id[length];
+        length                = length + 1;
+    }
+    manager.label[length] = 0;
+    manager.label_len     = length;
+    manager.report_lock   = mutex.make();
+    manager.reported      = value;
 }
 
 # which configured certificate the manager holds
@@ -546,23 +581,26 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
     keys.clear(?manager.account);
     keys.clear(?manager.pending_key);
     keys.clear(?manager.active_key);
-    manager.live                = false;
-    manager.state               = STOPPED;
-    manager.observability       = nil;
-    manager.issued              = 0;
-    manager.failures            = 0;
-    manager.last_failure        = problem.none();
-    manager.generation          = 0;
-    manager.have_certificate    = false;
-    manager.chain_bytes         = 0;
-    manager.chain_count         = 0;
-    manager.not_before          = 0;
-    manager.not_after           = 0;
-    manager.advice_len          = 0;
-    manager.advice              = renewal_info.empty_window();
-    manager.certificate_url_len = 0;
-    manager.contact_len         = 0;
-    manager.index               = index;
+    manager.live                 = false;
+    manager.state                = STOPPED;
+    manager.observability        = nil;
+    manager.issued               = 0;
+    manager.failures             = 0;
+    manager.consecutive_failures = 0;
+    manager.last_issued_unix     = 0;
+    manager.report_lock          = mutex.make();
+    manager.last_failure         = problem.none();
+    manager.generation           = 0;
+    manager.have_certificate     = false;
+    manager.chain_bytes          = 0;
+    manager.chain_count          = 0;
+    manager.not_before           = 0;
+    manager.not_after            = 0;
+    manager.advice_len           = 0;
+    manager.advice               = renewal_info.empty_window();
+    manager.certificate_url_len  = 0;
+    manager.contact_len          = 0;
+    manager.index                = index;
     if (!graph.acme.enabled || !graph.features.acme) { ret INVALID; }
     if (!copy_names(manager, certificate) || !set_label(manager, certificate)) {
         ret INVALID;
@@ -658,6 +696,7 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
         }
     }
     manager.state = IDLE;
+    publish_report(manager);
     ret OK;
 }
 
@@ -676,13 +715,36 @@ fun context(manager: *Manager) issue.Context {
     ret value;
 }
 
+# copies the manager's standing where telemetry reads it
+fun publish_report(manager: *Manager) {
+    mutex.lock(?manager.report_lock);
+    manager.reported.held                 = manager.have_certificate && manager.chain_count != 0;
+    manager.reported.not_after            = manager.not_after;
+    manager.reported.succeeded            = manager.issued;
+    manager.reported.failed               = manager.failures;
+    manager.reported.consecutive_failures = manager.consecutive_failures;
+    manager.reported.last_issued_unix     = manager.last_issued_unix;
+    mutex.unlock(?manager.report_lock);
+}
+
+# the certificate's standing as last published, safe to read from any thread
+pub fun report_of(manager: *Manager, output: *Report) bool {
+    if (manager == nil || output == nil) { ret false; }
+    mutex.lock(?manager.report_lock);
+    @output = manager.reported;
+    mutex.unlock(?manager.report_lock);
+    ret true;
+}
+
 fun record_failure(manager: *Manager, cause: problem.Error, now: T.Time) {
-    manager.failures     = manager.failures + 1;
-    manager.last_failure = cause;
+    manager.failures             = manager.failures + 1;
+    manager.consecutive_failures = manager.consecutive_failures + 1;
+    manager.last_failure         = cause;
     renewal.failed(?manager.schedule, cause, jitter(), now.sec::u64,
         renewal.no_observer());
     report(manager, "issue", "failed", cause.detail);
     manager.state = IDLE;
+    publish_report(manager);
 }
 
 fun persist(manager: *Manager, now: T.Time) Status {
@@ -726,10 +788,13 @@ fun persist(manager: *Manager, now: T.Time) Status {
     manager.not_before       = parsed.not_before_unix;
     manager.not_after        = parsed.not_after_unix;
     manager.have_certificate = true;
-    manager.issued           = manager.issued + 1;
     if (!keys.replace(?manager.active_key, ?manager.pending_key)) {
         ret FAILED;
     }
+    manager.issued               = manager.issued + 1;
+    manager.consecutive_failures = 0;
+    manager.last_issued_unix     = now.sec::u64;
+    publish_report(manager);
     if (superseded != 0) {
         durable.discard_certificate_key(?manager.store, superseded);
     }
