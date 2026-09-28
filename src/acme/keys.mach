@@ -11,9 +11,10 @@
 # certification-request signer takes a typed `*Key`, but the manager that owns
 # the account and certificate keys is reachable from the worker threads' `*u8`
 # start argument, and a welded key would weld it. so the secret half lives
-# here, in a bounded ring of secret slots, and a `Key` is the public half plus
-# a handle to its slot. a handle names a slot and a generation, is not an
-# address, and unlocks nothing but the operations below.
+# here, in a ring of secret slots sized from the certificates a deployment
+# manages, and a `Key` is the public half plus a handle to its slot. a handle
+# names a slot and a generation, is not an address, and unlocks nothing but
+# the operations below.
 #
 # the material is drawn straight into its slot, signed with in place, and
 # handed to mach-tls as secret bytes. it becomes public at exactly one `:>`
@@ -89,21 +90,83 @@ fun write_pkcs8_frame(output: *^u8) {
     }
 }
 
-# every key alive in the process at once: a manager holds three and a
-# tls-alpn-01 presentation one
-pub val MAX_KEYS: usize = 64;
+# the keys one managed certificate holds at once: the account key its session
+# signs with, the pending and active certificate keys, and a tls-alpn-01
+# presentation key
+pub val KEYS_PER_CERTIFICATE: usize = 4;
+# the handle of a key that holds no slot
+pub val NO_SLOT: usize = 0xffffffffffffffff;
 
+# a claimed slot belongs to the key that holds it, and a handle holds it only
+# while the generations agree
 rec Slot {
-    material: ^[SCALAR_BYTES]u8;
-    pkcs8:    ^[PKCS8_BYTES]u8;
+    material:   ^[SCALAR_BYTES]u8;
+    pkcs8:      ^[PKCS8_BYTES]u8;
+    claimed:    bool;
+    generation: u64;
 }
 
-# a slot is claimed and given back under `ring_lock`, since keys are drawn on
-# more than one thread. a claimed slot belongs to the key that holds it.
-var ring:       [MAX_KEYS]Slot;
-var claimed:    [MAX_KEYS]bool;
-var generation: [MAX_KEYS]u64;
-var ring_lock:  mutex.Mutex;
+# drawn once in secret storage by `reserve`. slots are claimed and given back
+# under `ring_lock`, since keys are drawn on more than one thread. every claim
+# takes the next generation the process has issued, so no handle outlives its
+# key, even across a ring released and drawn again
+var ring:          *Slot;
+var ring_capacity: usize;
+var ring_lock:     mutex.Mutex;
+var generations:   u64;
+
+# sizes the ring for `certificates` managed certificates, once per process.
+# every key drawn afterwards takes a slot from it, and none can be drawn before
+pub fun reserve(certificates: usize) bool {
+    if (certificates == 0 || certificates > NO_SLOT / KEYS_PER_CERTIFICATE) { ret false; }
+    val slots: usize = certificates * KEYS_PER_CERTIFICATE;
+    mutex.lock(?ring_lock);
+    if (ring != nil) {
+        mutex.unlock(?ring_lock);
+        ret false;
+    }
+    val drawn: *Slot = secret.allocate_typed[Slot](slots);
+    if (drawn == nil) {
+        mutex.unlock(?ring_lock);
+        ret false;
+    }
+    ring          = drawn;
+    ring_capacity = slots;
+    mutex.unlock(?ring_lock);
+    ret true;
+}
+
+# how many keys the ring holds at once, zero before `reserve`
+pub fun capacity() usize {
+    ret ring_capacity;
+}
+
+# wipes the ring and gives its storage back. refused while any key still holds
+# a slot, since that key's handle would then name freed storage
+pub fun release_ring() bool {
+    mutex.lock(?ring_lock);
+    if (ring == nil) {
+        mutex.unlock(?ring_lock);
+        ret true;
+    }
+    var i: usize = 0;
+    for (i < ring_capacity) {
+        if (ring[i].claimed) {
+            mutex.unlock(?ring_lock);
+            ret false;
+        }
+        i = i + 1;
+    }
+    val released: err[io_error.Error] = secret.deallocate_typed[Slot](ring, ring_capacity);
+    if (!filled(released)) {
+        mutex.unlock(?ring_lock);
+        ret false;
+    }
+    ring          = nil;
+    ring_capacity = 0;
+    mutex.unlock(?ring_lock);
+    ret true;
+}
 
 pub rec Key {
     point:      [POINT_BYTES]u8;
@@ -117,7 +180,7 @@ pub rec Key {
 # zeroed record already does, since no slot is ever at generation zero.
 pub fun clear(key: *Key) {
     if (key == nil) { ret; }
-    key.slot       = MAX_KEYS;
+    key.slot       = NO_SLOT;
     key.generation = 0;
     key.live       = false;
 }
@@ -125,12 +188,14 @@ pub fun clear(key: *Key) {
 fun claim(key: *Key) bool {
     mutex.lock(?ring_lock);
     var i: usize = 0;
-    for (i < MAX_KEYS) {
-        if (!claimed[i]) {
-            claimed[i]     = true;
-            generation[i]  = generation[i] + 1;
-            key.slot       = i;
-            key.generation = generation[i];
+    for (i < ring_capacity) {
+        val slot: *Slot = ?ring[i];
+        if (!slot.claimed) {
+            generations     = generations + 1;
+            slot.claimed    = true;
+            slot.generation = generations;
+            key.slot        = i;
+            key.generation  = slot.generation;
             mutex.unlock(?ring_lock);
             ret true;
         }
@@ -142,12 +207,17 @@ fun claim(key: *Key) bool {
 
 # the slot a key holds, or nil for a key that holds none
 fun slot_of(key: *Key) *Slot {
-    if (key == nil || key.slot >= MAX_KEYS) { ret nil; }
+    if (key == nil) { ret nil; }
     mutex.lock(?ring_lock);
-    val held: bool = claimed[key.slot] && generation[key.slot] == key.generation;
+    if (key.slot >= ring_capacity) {
+        mutex.unlock(?ring_lock);
+        ret nil;
+    }
+    val slot: *Slot = ?ring[key.slot];
+    val held: bool  = slot.claimed && slot.generation == key.generation;
     mutex.unlock(?ring_lock);
     if (!held) { ret nil; }
-    ret ?ring[key.slot];
+    ret slot;
 }
 
 fun release(key: *Key) {
@@ -156,10 +226,10 @@ fun release(key: *Key) {
         ct.zeroize(?slot.material[0], SCALAR_BYTES);
         ct.zeroize(?slot.pkcs8[0], PKCS8_BYTES);
         mutex.lock(?ring_lock);
-        claimed[key.slot] = false;
+        slot.claimed = false;
         mutex.unlock(?ring_lock);
     }
-    key.slot       = MAX_KEYS;
+    key.slot       = NO_SLOT;
     key.generation = 0;
 }
 
@@ -197,7 +267,7 @@ pub fun adopt(key: *Key, material: *^u8) bool {
     if (key == nil || material == nil) { ret false; }
     destroy(key);
     if (!claim(key)) { ret false; }
-    val slot: *Slot = ?ring[key.slot];
+    val slot: *Slot = slot_of(key);
     var i:    usize = 0;
     for (i < SCALAR_BYTES) {
         slot.material[i] = material[i];
@@ -216,7 +286,7 @@ pub fun generate(key: *Key) bool {
     if (key == nil) { ret false; }
     destroy(key);
     if (!claim(key)) { ret false; }
-    val slot:     *Slot = ?ring[key.slot];
+    val slot:     *Slot = slot_of(key);
     var attempts: usize = 0;
     for (attempts < 8) {
         if (!filled(secret.random_fill(?slot.material[0], SCALAR_BYTES))) {
@@ -245,7 +315,7 @@ pub fun replace(target: *Key, source: *Key) bool {
         || slot_of(source) == nil) { ret false; }
     destroy(target);
     @target     = @source;
-    source.slot = MAX_KEYS;
+    source.slot = NO_SLOT;
     source.live = false;
     ret true;
 }
@@ -338,6 +408,7 @@ pub fun csr_signer(key: *Key) cert.CsrSigner[Key] {
 }
 
 test generate__valid_signer_and_encodings {
+    if (!reserve(1)) { ret 99; }
     var key: Key;
     if (!generate(?key))                                           { ret 1; }
     if (!key.live || key.point[0] != 4)                            { ret 2; }
@@ -356,6 +427,7 @@ test generate__valid_signer_and_encodings {
 }
 
 test adopt__reproduces_the_key {
+    if (!reserve(1)) { ret 99; }
     var first: Key;
     if (!generate(?first)) { ret 1; }
     var carried: [SCALAR_BYTES]u8;
@@ -388,20 +460,22 @@ test adopt__reproduces_the_key {
 }
 
 test replace__moves_the_key {
+    if (!reserve(1)) { ret 99; }
     var active:  Key;
     var pending: Key;
     if (!generate(?active) || !generate(?pending)) { ret 1; }
     val moved: usize = pending.slot;
     val freed: usize = active.slot;
-    if (!replace(?active, ?pending))                        { ret 2; }
-    if (!active.live || pending.live)                       { ret 3; }
-    if (active.slot != moved || replace(?active, ?pending)) { ret 4; }
-    if (claimed[freed] || private_der(?active).len == 0)    { ret 5; }
+    if (!replace(?active, ?pending))                          { ret 2; }
+    if (!active.live || pending.live)                         { ret 3; }
+    if (active.slot != moved || replace(?active, ?pending))   { ret 4; }
+    if (ring[freed].claimed || private_der(?active).len == 0) { ret 5; }
     destroy(?active);
     ret 0;
 }
 
 test csr_signer__verifiable_signature {
+    if (!reserve(1)) { ret 99; }
     var key: Key;
     if (!generate(?key)) { ret 1; }
     val csr: cert.CsrSigner[Key] = csr_signer(?key);
@@ -422,6 +496,7 @@ test csr_signer__verifiable_signature {
 }
 
 test destroy__stops_signing_and_zeroes {
+    if (!reserve(1)) { ret 99; }
     var key: Key;
     if (!generate(?key)) { ret 1; }
     val held: usize               = key.slot;
@@ -444,6 +519,7 @@ test destroy__stops_signing_and_zeroes {
 }
 
 test generate__stale_handle_holds_nothing {
+    if (!reserve(1)) { ret 99; }
     var first: Key;
     if (!generate(?first)) { ret 1; }
     var stale: Key = first;
@@ -457,9 +533,11 @@ test generate__stale_handle_holds_nothing {
 }
 
 test generate__refused_when_the_ring_is_full {
-    var held: [MAX_KEYS]Key;
+    if (!reserve(1)) { ret 99; }
+    # one certificate's worth of slots
+    var held: [KEYS_PER_CERTIFICATE]Key;
     var i:    usize = 0;
-    for (i < MAX_KEYS) {
+    for (i < KEYS_PER_CERTIFICATE) {
         if (!generate(?held[i])) { ret 1; }
         i = i + 1;
     }
@@ -468,15 +546,19 @@ test generate__refused_when_the_ring_is_full {
     destroy(?held[3]);
     if (!generate(?extra) || extra.slot != 3) { ret 3; }
     destroy(?extra);
+    # the ring is sized once, and cannot be given back while a key holds a slot
+    if (reserve(1) || release_ring()) { ret 4; }
     i = 0;
-    for (i < MAX_KEYS) {
+    for (i < KEYS_PER_CERTIFICATE) {
         destroy(?held[i]);
         i = i + 1;
     }
+    if (!release_ring() || capacity() != 0 || generate(?extra)) { ret 5; }
     ret 0;
 }
 
 test generate__keys_differ {
+    if (!reserve(1)) { ret 99; }
     var first:  Key;
     var second: Key;
     if (!generate(?first) || !generate(?second)) { ret 1; }

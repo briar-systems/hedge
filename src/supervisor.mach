@@ -162,6 +162,9 @@ pub rec Supervisor {
     tasks_settled:   bool;
     tasks_abandoned: usize;
     tasks_reported:  bool;
+    # each managed certificate's health check, ready while it holds a
+    # certificate that has not expired
+    certificate_checks: [schema.MAX_ACME_CERTIFICATES]telemetry_health.Token;
 }
 
 fun runtime_ok(outcome: err[io_error.Error]) bool {
@@ -263,13 +266,26 @@ pub fun make(supervisor: *Supervisor, composed: *composition.Runtime,
     }
     supervisor.wakes_live = true;
     if (composed.acme_live) {
-        if (!acme.attach_driver(composed.certificates, ?supervisor.network,
-            hedge_wake.waker(?supervisor.wakes, hedge_wake.PLANE_OWNER))) {
-            close_runtime(supervisor);
-            ret false;
+        var i: usize = 0;
+        for (i < composed.certificate_count) {
+            val manager: *acme.Manager = composition.certificate(composed, i);
+            if (!acme.attach_driver(manager, ?supervisor.network,
+                hedge_wake.waker(?supervisor.wakes, hedge_wake.PLANE_OWNER))) {
+                close_runtime(supervisor);
+                ret false;
+            }
+            acme.attach_telemetry(manager, ?composed.observability.runtime);
+            # reported, never required: one certificate that cannot renew must
+            # not take the others' sites out of rotation
+            if (!telemetry_health.register(?composed.observability.runtime.health,
+                acme.component(manager), false, false, ?supervisor.certificate_checks[i])) {
+                close_runtime(supervisor);
+                ret false;
+            }
+            i = i + 1;
         }
-        acme.attach_telemetry(composed.certificates, ?composed.observability.runtime);
         supervisor.acme_live = true;
+        report_certificates(supervisor);
     }
     ret true;
 }
@@ -496,8 +512,20 @@ fun wait_ms(supervisor: *Supervisor) i32 {
     # without ACME nothing but a signal, a worker or a request ends the wait
     if (!supervisor.acme_live) { ret -1; }
     if (supervisor.acme_due)   { ret 0; }
-    var at: u64 = 0;
-    if (!acme.deadline(supervisor.composed.certificates, ?at)) { ret -1; }
+    # the earliest any certificate is next due
+    var at:    u64   = 0;
+    var found: bool  = false;
+    var i:     usize = 0;
+    for (i < supervisor.composed.certificate_count) {
+        var due: u64 = 0;
+        if (acme.deadline(composition.certificate(supervisor.composed, i), ?due)
+            && (!found || due < at)) {
+            at    = due;
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (!found) { ret -1; }
     val now: u64 = clock.monotonic_ns();
     if (at <= now) { ret 0; }
     var left: u64 = (at - now + 999999) / 1000000;
@@ -514,8 +542,9 @@ pub fun announce_certificate(certificates: *acme.Manager) {
         i           = i + 1;
     }
     rendered[i] = 0;
-    print.printlnf("hedge: certificate ready for {} until {}",
-        (?rendered[0])::str, acme.not_after(certificates)::u64);
+    print.printlnf("hedge: certificate {} ready for {} until {}",
+        acme.label(certificates), (?rendered[0])::str,
+        acme.not_after(certificates)::u64);
 }
 
 # one ACME step when it is due, and the TLS policies' upkeep
@@ -523,24 +552,53 @@ fun drive_certificates(supervisor: *Supervisor) {
     val composed: *composition.Runtime = supervisor.composed;
     if (supervisor.acme_live && (supervisor.acme_due || wait_ms(supervisor) == 0)) {
         supervisor.acme_due = false;
-        # renewal is scheduled against certificate validity, which is calendar time
-        acme.poll((composed.certificates)::ptr, clock.wall());
+        # renewal is scheduled against certificate validity, which is calendar
+        # time. each certificate takes its own step, so one's failure or backoff
+        # never holds another back
+        var i: usize = 0;
+        for (i < composed.certificate_count) {
+            acme.poll((composition.certificate(composed, i))::ptr, clock.wall());
+            i = i + 1;
+        }
     }
     hedge_tls.maintain();
 }
 
-# install a certificate ACME has finished issuing
+# each certificate's health: ready while it holds one that has not expired
+fun report_certificates(supervisor: *Supervisor) {
+    val composed: *composition.Runtime = supervisor.composed;
+    val now:      u64                  = clock.wall_seconds()::u64;
+    var i:        usize                = 0;
+    for (i < composed.certificate_count) {
+        val manager: *acme.Manager = composition.certificate(composed, i);
+        telemetry_health.set_ready(?composed.observability.runtime.health,
+            supervisor.certificate_checks[i],
+            acme.certificate_ready(manager) && acme.not_after(manager) > now);
+        i = i + 1;
+    }
+}
+
+# install each certificate ACME has finished issuing
 fun install_certificates(supervisor: *Supervisor) {
     val composed: *composition.Runtime = supervisor.composed;
-    if (!supervisor.acme_live || !acme.installation_ready(composed.certificates)) { ret; }
-    val installed: hedge_tls.Status = composition.install_certificate(composed,
-        clock.wall());
-    if (installed == hedge_tls.OK) {
-        announce_certificate(composed.certificates);
+    if (!supervisor.acme_live) { ret; }
+    var i: usize = 0;
+    for (i < composed.certificate_count) {
+        val manager: *acme.Manager = composition.certificate(composed, i);
+        if (acme.installation_ready(manager)) {
+            val installed: hedge_tls.Status = composition.install_certificate(composed,
+                i, clock.wall());
+            if (installed == hedge_tls.OK) {
+                announce_certificate(manager);
+            }
+            or (installed != hedge_tls.RETIRED_IN_USE) {
+                print.eprint("hedge: renewed ACME certificate could not be installed: ");
+                print.eprintln(acme.label(manager));
+            }
+        }
+        i = i + 1;
     }
-    or (installed != hedge_tls.RETIRED_IN_USE) {
-        print.eprintln("hedge: renewed ACME certificate could not be installed");
-    }
+    report_certificates(supervisor);
 }
 
 # one turn of the supervisor's own work for a caller that runs the workers on
@@ -1301,15 +1359,24 @@ fun wait_before(deadline: u64) i32 {
 # supervisor's runtime, within the stop deadline
 fun quiesce_certificates(supervisor: *Supervisor) bool {
     if (!supervisor.acme_live) { ret true; }
-    var status:   acme.Status = acme.quiesce(supervisor.composed.certificates);
-    val deadline: u64         = clock.after_ns(clock.monotonic_ns(),
+    val composed: *composition.Runtime = supervisor.composed;
+    val deadline: u64                  = clock.after_ns(clock.monotonic_ns(),
         supervisor.stop_timeout_ns);
-    for (status == acme.PENDING) {
+    for (true) {
+        var pending: bool  = false;
+        var failed:  bool  = false;
+        var i:       usize = 0;
+        for (i < composed.certificate_count) {
+            val status: acme.Status = acme.quiesce(composition.certificate(composed, i));
+            if (status == acme.PENDING) { pending = true; }
+            or (status != acme.OK)      { failed = true; }
+            i = i + 1;
+        }
+        if (!pending) { ret !failed; }
         val left: i32 = wait_before(deadline);
         if (left == 0 || !deliver(supervisor, left)) { ret false; }
-        status = acme.quiesce(supervisor.composed.certificates);
     }
-    ret status == acme.OK;
+    ret false;
 }
 
 # the supervisor's own teardown for a caller that ran the workers itself and has
