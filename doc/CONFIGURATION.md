@@ -682,13 +682,15 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets and counters are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
 The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. The `env` and `file` secret providers resolve in the binary. Embedded deployments may supply `os` and `application` providers through the typed resolver contract. Resolved administration credentials are limited to 512 bytes, reject line breaks, remain in one production owner, and are cleared at shutdown.
 
 The administration service exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
+
+`/metrics` is streamed as it is sent, a line at a time, chunked to an HTTP/1.1 client, so it renders every series whatever their number, in a fixed amount of memory per request. `admin.max_response_bytes` bounds the other administration responses. Like any response body, `/metrics` is still held to `server.limits.max_body_bytes`.
 
 ## Static files
 
