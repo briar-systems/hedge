@@ -1,0 +1,262 @@
+# managed certificates as metric series
+#
+# every configured certificate is streamed from its manager's published report
+# a line at a time, labelled `certificate` with its id. the certificates are
+# fixed at start, so the series are too, and the time left before expiry is as
+# short as the scrape says rather than as the last report left it
+
+use hedge.acme.manager;
+use hedge.clock;
+use hedge.config.schema;
+use hedge.secret;
+use hedge.telemetry;
+use telemetry_admin:   hedge.telemetry.admin;
+use telemetry_health:  hedge.telemetry.health;
+use telemetry_metrics: hedge.telemetry.metrics;
+use std.allocator;
+use std.allocator.fixed;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# the managers a deployment runs, which outlive the telemetry that reads them
+pub rec Certificates {
+    managers: *manager.Manager;
+    count:    usize;
+}
+
+# every certificate in `certificates`, streamed on each render of the runtime
+# it is added to
+pub fun collector(certificates: *Certificates) telemetry_metrics.Collector {
+    ret telemetry_metrics.Collector{ctx: certificates::ptr, collect: collect};
+}
+
+fun collect(context: ptr, cursor: *telemetry_metrics.CollectCursor,
+    writer: *telemetry_metrics.Writer) bool {
+    ret write_next(context::*Certificates, cursor, writer, clock.wall_seconds());
+}
+
+# the lines one certificate renders as
+val CERTIFICATE_LINES: usize = 5;
+
+fun saturated(value: u64) i64 {
+    if (value > 0x7fffffffffffffff) { ret 0x7fffffffffffffff; }
+    ret value::i64;
+}
+
+# seconds from `now_unix` until the held certificate expires, negative once it
+# has, and zero while none is held
+fun expires_in(report: *manager.Report, now_unix: i64) i64 {
+    if (!report.held) { ret 0; }
+    ret saturated(report.not_after) - now_unix;
+}
+
+fun write_outcome(writer: *telemetry_metrics.Writer, id: str, outcome: str, value: u64) bool {
+    var labels: [2]telemetry_metrics.LabelView = [2]telemetry_metrics.LabelView{
+        telemetry_metrics.LabelView{key: "certificate", value: id},
+        telemetry_metrics.LabelView{key: "outcome", value: outcome}
+    };
+    ret telemetry_metrics.write_counter(writer, "hedge_acme_renewals_total", ?labels[0], 2,
+        value);
+}
+
+# line `line` of one certificate's series
+fun write_certificate_line(writer: *telemetry_metrics.Writer, id: str, report: *manager.Report,
+    now_unix: i64, line: usize) bool {
+    if (line == 1) { ret write_outcome(writer, id, "failed", report.failed); }
+    if (line == 2) { ret write_outcome(writer, id, "succeeded", report.succeeded); }
+    var labels: [1]telemetry_metrics.LabelView = [1]telemetry_metrics.LabelView{
+        telemetry_metrics.LabelView{key: "certificate", value: id}
+    };
+    if (line == 0) {
+        ret telemetry_metrics.write_gauge(writer, "hedge_acme_certificate_expiry_seconds",
+            ?labels[0], 1, expires_in(report, now_unix));
+    }
+    if (line == 3) {
+        ret telemetry_metrics.write_gauge(writer, "hedge_acme_consecutive_failures",
+            ?labels[0], 1, saturated(report.consecutive_failures));
+    }
+    ret telemetry_metrics.write_gauge(writer, "hedge_acme_last_issued_timestamp_seconds",
+        ?labels[0], 1, saturated(report.last_issued_unix));
+}
+
+# the next line of every certificate's series at unix `now_unix`, each read
+# from its manager's report as it is written, or false once all are written
+pub fun write_next(certificates: *Certificates, cursor: *telemetry_metrics.CollectCursor,
+    writer: *telemetry_metrics.Writer, now_unix: i64) bool {
+    if (certificates == nil || cursor == nil || writer == nil) { ret false; }
+    for (cursor.item < certificates.count) {
+        val held:   *manager.Manager = ?certificates.managers[cursor.item];
+        var report: manager.Report;
+        if (manager.report_of(held, ?report)) {
+            for (cursor.line < CERTIFICATE_LINES) {
+                val line: usize = cursor.line;
+                cursor.line = cursor.line + 1;
+                if (write_certificate_line(writer, manager.label(held), ?report, now_unix, line)) {
+                    ret true;
+                }
+            }
+        }
+        cursor.item = cursor.item + 1;
+        cursor.line = 0;
+    }
+    ret false;
+}
+
+#[testing]
+fun rendered(certificates: *Certificates, now_unix: i64, output: *u8, capacity: usize) usize {
+    var writer: telemetry_metrics.Writer = telemetry_metrics.Writer{output: output,
+        capacity: capacity, length: 0};
+    var cursor: telemetry_metrics.CollectCursor = telemetry_metrics.CollectCursor{item: 0, line: 0};
+    for (write_next(certificates, ?cursor, ?writer, now_unix)) {}
+    if (writer.length > capacity) { ret 0; }
+    ret writer.length;
+}
+
+#[testing]
+fun contains(data: *u8, length: usize, needle: str) bool {
+    var size: usize = 0;
+    for (needle[size] != 0) { size = size + 1; }
+    var i: usize = 0;
+    for (i + size <= length) {
+        var j: usize = 0;
+        for (j < size && data[i + j] == needle[j]) { j = j + 1; }
+        if (j == size) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+#[testing]
+fun made(outcome: err[allocator.Error]) bool {
+    ret sel outcome.ok;
+}
+
+#[testing]
+fun managers(heap: *allocator.Allocator, count: usize) *manager.Manager {
+    val allocated: res[*manager.Manager, allocator.Error] =
+        allocator.allocate[manager.Manager](heap, count);
+    if (sel allocated.err) { ret nil; }
+    ret allocated.ok;
+}
+
+# every series is present for a certificate that holds nothing yet, and reads
+# the report of one that does as of the scrape
+test write__series_per_certificate {
+    var heap: allocator.Allocator;
+    if (!made(page.make(?heap))) { ret 1; }
+    val held: *manager.Manager = managers(?heap, 2);
+    if (held == nil) { ret 1; }
+    manager.test_reported(?held[0], "blog", manager.Report{held: true, not_after: 1000100,
+        succeeded: 3, failed: 2, consecutive_failures: 1, last_issued_unix: 999000});
+    manager.test_reported(?held[1], "shop", manager.Report{held: false, not_after: 0,
+        succeeded: 0, failed: 4, consecutive_failures: 4, last_issued_unix: 0});
+    var certificates: Certificates = Certificates{managers: held, count: 2};
+    var text:         [2048]u8;
+    val length:       usize        = rendered(?certificates, 1000000, ?text[0], 2048);
+    if (length == 0
+        || !contains(?text[0], length, "hedge_acme_certificate_expiry_seconds{certificate=\"blog\"} 100\n")
+        || !contains(?text[0], length, "hedge_acme_renewals_total{certificate=\"blog\",outcome=\"succeeded\"} 3\n")
+        || !contains(?text[0], length, "hedge_acme_renewals_total{certificate=\"blog\",outcome=\"failed\"} 2\n")
+        || !contains(?text[0], length, "hedge_acme_consecutive_failures{certificate=\"blog\"} 1\n")
+        || !contains(?text[0], length, "hedge_acme_last_issued_timestamp_seconds{certificate=\"blog\"} 999000\n")) {
+        ret 2;
+    }
+    if (!contains(?text[0], length, "hedge_acme_certificate_expiry_seconds{certificate=\"shop\"} 0\n")
+        || !contains(?text[0], length, "hedge_acme_renewals_total{certificate=\"shop\",outcome=\"succeeded\"} 0\n")
+        || !contains(?text[0], length, "hedge_acme_consecutive_failures{certificate=\"shop\"} 4\n")
+        || !contains(?text[0], length, "hedge_acme_last_issued_timestamp_seconds{certificate=\"shop\"} 0\n")) {
+        ret 3;
+    }
+    # a certificate past its expiry reads how long ago it lapsed
+    val lapsed: usize = rendered(?certificates, 1000160, ?text[0], 2048);
+    if (!contains(?text[0], lapsed, "hedge_acme_certificate_expiry_seconds{certificate=\"blog\"} -60\n")) {
+        ret 4;
+    }
+    ret 0;
+}
+
+# the most certificates a deployment manages, each at the longest id, stream
+# whole through /metrics after the built-in series
+test stream__every_certificate {
+    var heap: allocator.Allocator;
+    if (!made(page.make(?heap))) { ret 1; }
+    val held: *manager.Manager = managers(?heap, schema.MAX_ACME_CERTIFICATES);
+    if (held == nil) { ret 1; }
+    var ids:  [schema.MAX_ACME_CERTIFICATES][49]u8;
+    var slot: usize = 0;
+    for (slot < schema.MAX_ACME_CERTIFICATES) {
+        var i: usize = 0;
+        for (i < 47) {
+            ids[slot][i] = '_';
+            i            = i + 1;
+        }
+        ids[slot][47] = 'a' + slot::u8;
+        ids[slot][48] = 0;
+        manager.test_reported(?held[slot], (?ids[slot][0])::str, manager.Report{held: false,
+            not_after:        0, succeeded: slot::u64, failed: 0, consecutive_failures: 0,
+            last_issued_unix: 0});
+        slot = slot + 1;
+    }
+    var certificates: Certificates = Certificates{managers: held,
+        count: schema.MAX_ACME_CERTIFICATES};
+
+    var graph: schema.Graph;
+    schema.reset_graph(?graph);
+    graph.telemetry.logs           = false;
+    graph.telemetry.metrics        = true;
+    graph.telemetry.metric_series  = telemetry.BUILT_IN_METRIC_SERIES;
+    graph.admin.enabled            = true;
+    graph.admin.max_response_bytes = 256;
+    schema.set_text(?graph.admin.listener, "admin");
+    var series:     [telemetry.BUILT_IN_METRIC_SERIES]telemetry_metrics.Series;
+    var checks:     [1]telemetry_health.Check;
+    var runtime:    telemetry.Runtime;
+    var credential: secret.Held;
+    if (!secret.test_hold("test", ?credential)
+        || !telemetry.make(?runtime, ?graph, 1, nil, ?series[0], telemetry.BUILT_IN_METRIC_SERIES,
+        ?checks[0], 1, credential, nil, (0::usize)::telemetry_admin.RenderFun, nil,
+        (0::usize)::telemetry.FlushFun)
+        || !telemetry.add_collector(?runtime, collector(?certificates))) { ret 2; }
+
+    var memory: [8192]u8;
+    var state:  fixed.FixedState;
+    var arena:  allocator.Allocator;
+    fixed.make(?arena, ?state, ?memory[0], 8192);
+    val stream: ptr = runtime.admin.policy.open_metrics(runtime.admin.policy.metrics_context,
+        ?arena);
+    if (stream == nil) { ret 3; }
+    var streamed: [65536]u8;
+    var length:   usize = 0;
+    for (true) {
+        val count: i64 = runtime.admin.policy.fill_metrics(stream, ?streamed[length], 1000);
+        if (count < 0 || count > 1000) { ret 4; }
+        if (count == 0)                { brk; }
+        length = length + count::usize;
+        if (length + 1000 > 65536) { ret 5; }
+    }
+    # the stream is the built-in series and then every certificate's, whole
+    var expected: [65536]u8;
+    val built_in: telemetry_metrics.Rendered = telemetry_metrics.render(?runtime.own.metrics,
+        ?expected[0], 65536);
+    if (!built_in.ok) { ret 6; }
+    val certificate_bytes: usize = rendered(?certificates, 0, ?expected[built_in.len],
+        65536 - built_in.len);
+    if (certificate_bytes < schema.MAX_ACME_CERTIFICATES * CERTIFICATE_LINES * 60
+        || built_in.len + certificate_bytes != length) { ret 7; }
+    var i: usize = 0;
+    for (i < length) {
+        if (streamed[i] != expected[i]) { ret 8; }
+        i = i + 1;
+    }
+    if (!contains(?streamed[0], length,
+        "hedge_acme_renewals_total{certificate=\"_______________________________________________p\",outcome=\"succeeded\"} 15\n")) {
+        ret 9;
+    }
+    ret 0;
+}
