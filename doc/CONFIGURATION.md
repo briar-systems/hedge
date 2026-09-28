@@ -669,6 +669,24 @@ never required for readiness, since one certificate that cannot renew must not
 take every other site out of rotation. Failure logs name the certificate by
 the same `acme.<id>` component.
 
+With metrics on, every configured certificate is reported under a
+`certificate` label naming its id, read from its manager as `/metrics`
+streams, so these series take nothing from `metric_series`:
+
+- `hedge_acme_certificate_expiry_seconds{certificate}`: seconds until the held
+  certificate expires, measured at the scrape, negative once it has, and 0
+  while none is held.
+- `hedge_acme_renewals_total{certificate,outcome}`: issuance attempts that
+  `succeeded` or `failed`, counting every attempt from discovery to storing the
+  certificate.
+- `hedge_acme_consecutive_failures{certificate}`: failed attempts since the
+  last one that succeeded.
+- `hedge_acme_last_issued_timestamp_seconds{certificate}`: the unix time this
+  process last obtained the certificate, 0 until it has. A certificate
+  recovered from storage at start does not set it.
+
+The counters and the timestamp start over when the process does.
+
 `renew_before` is the lead, in seconds, before expiry at which each certificate
 is renewed. It defaults to thirty days, which suits the ninety-day certificates
 public authorities issue, and is bounded at one year.
