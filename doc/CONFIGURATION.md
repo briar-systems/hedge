@@ -92,6 +92,21 @@ The implemented schema accepts these top-level sections:
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
+### CONNECT routes
+
+A route matches a request by its path, and so never matches a `CONNECT`, whose target is an authority (`host:port`) rather than a path. A route with `method = "CONNECT"` matches `CONNECT` requests by that authority instead, and only them:
+
+```toml
+[[route]]
+name = "database"
+host = "example"
+method = "CONNECT"
+authority = "db.internal:5432"
+service = "tunnels"
+```
+
+`authority` is a pattern with the rules a host's names follow: an exact `host:port`, a `*.suffix` wildcard, or `*` for any authority, each with or without a port. A pattern without a port matches every port. The most specific pattern that matches wins. The route's host names its budget and scopes its name, but its names do not apply, since the authority is what the request asked for. A `CONNECT` route without a `name` is named after its authority. A `CONNECT` that no route matches is answered `404`, and a request of any other method never matches a `CONNECT` route. The configuration is refused when a route names an `authority` without `method = "CONNECT"`, a `CONNECT` route has no `authority` or also names a `path`, or `method` has any other value. The service behind a `CONNECT` route takes the connection over with a `2xx` (see [Upgrades](HOSTING.md#upgrades)).
+
 ## Workers
 
 hedge runs a supervisor and one worker per CPU. The supervisor takes the
