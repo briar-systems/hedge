@@ -71,10 +71,19 @@ Every secret hedge holds, and where it becomes public:
   made public only by `keys.publish` for the durable form
 - QUIC listener keys: secret-typed storage, never declassified beyond a key
   file's layout and a reload's comparison verdict
-- configured TLS private keys: read with `std.filesystem.read_secret` straight
-  into welded storage, parsed by `mach-tls` from there, never declassified
+- configured TLS private keys: read with `std.filesystem.read_secret_of`
+  straight into welded storage, parsed by `mach-tls` from there, never
+  declassified
 - session ticket keys: drawn from the operating system entropy source into
   `mach-tls`'s key ring, which owns their storage
+
+Every key file hedge reads, a configured TLS private key, a QUIC listener key
+file and a key in the ACME store, goes through one check in
+`src/secret_file.mach`. The file is opened once, and that handle is stat'd and
+read with `std.filesystem.read_secret_of`, so the file checked is the file
+read. One group or other can read is refused before a byte of it is read, with
+a diagnostic naming the file and the fix, `chmod 600`. Windows synthesizes the
+mode from attributes, so the check is skipped there.
 
 The administration credential and the secrets granted to hosted applications
 resolve through one path in `src/secret.mach`. A `file` secret is read with
@@ -134,8 +143,8 @@ Key material becomes public at exactly one site, a `:>` declassify in
 `keys.publish`, which produces the durable form. It is forced: `mach-acme`'s
 file store frames and digests public bytes. The published scalar and the
 document encoded around it are wiped as soon as the write returns, and the
-file is created owner-only. A key file is read back with
-`std.filesystem.read_secret`, straight into secret storage. Its frame (magic,
+file is created owner-only. A key file is read back through
+`src/secret_file.mach`, straight into secret storage. Its frame (magic,
 version, kind and length) is read in the clear, its digest is checked over the
 secret payload without a branch on it, and `keys.adopt` copies the scalar into
 its slot. The read storage is wiped when it is released, so the material is
@@ -145,8 +154,8 @@ QUIC listener keys (the CID, stateless reset and Retry/NEW_TOKEN keys) are
 secret-typed for their whole life in `src/protocol/quic/keys.mach`. By default
 they are drawn by the secret CSPRNG straight into that storage. An operator's
 key file (`quic_keys`) is the one way they enter from outside. It is refused
-when group or other can read it. It is read with
-`std.filesystem.read_secret`, straight into secret storage, and
+when group or other can read it. It is read through `src/secret_file.mach`,
+straight into secret storage, and
 `src/protocol/quic/keyfile.mach` parses it there, decoding each key's hex
 without a branch on a digit. The parser declassifies only the file's layout:
 which bytes separate words and lines, whether a word is a keyword, the numbers
