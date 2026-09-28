@@ -461,13 +461,14 @@ full-inbox count. It fails when:
   (0.5) of an even share of the local connections, or a TCP listener handed
   any off;
 - a rate at N workers is below a fraction of N over the first count times the
-  first count's rate, up to the host's core count: `LOAD_HANDOFF_EFFICIENCY`
+  first count's rate, up to half the host's cores, since the closed-loop
+  client on the same host needs the other half: `LOAD_HANDOFF_EFFICIENCY`
   (0.7) for `requests` and `LOAD_HANDOFF_ACCEPT_EFFICIENCY` (0.5) for
   `connections`, since the one acceptor bounds how far those scale.
 
-`LOAD_HANDOFF_CELLS` picks the cells. CI runs 1 and 4 workers, so the split
-is asserted past the runner's two cores and the scaling is left to a measured
-run. The lane binds ports 19190 to 19193.
+`LOAD_HANDOFF_CELLS` picks the cells. CI runs 1 and 4 workers on a
+four-core runner, so the split is asserted there and the scaling is left to a
+measured run. The lane binds ports 19190 to 19193.
 
 ## The ramp lane
 

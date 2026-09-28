@@ -24,8 +24,8 @@ case "$MACH_CI_LEG" in
         LOAD_CHURN_SECONDS=60 LOAD_CHURN_SAMPLE=5 LOAD_CHURN_CPU_TOLERANCE=50 test/load/churn.sh
         LOAD_RATE_DURATION=5 LOAD_RATE_WARMUP=1 test/load/rate.sh
         # the handoff over a local listener against reuseport TCP (#299). four
-        # workers is past the runner's cores, so the split is asserted there
-        # and the scaling is left to a measured run
+        # workers is past half the runner's cores, which is as far as the lane
+        # asserts scaling beside its client, so CI asserts the split alone
         LOAD_HANDOFF_WORKERS="1 4" LOAD_HANDOFF_DURATION=5 LOAD_HANDOFF_WARMUP=1 test/load/handoff.sh
         test/load/migrate.sh
         ;;

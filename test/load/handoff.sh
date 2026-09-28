@@ -20,7 +20,8 @@
 # server stops. With more than one worker, every worker has to have
 # served at least LOAD_HANDOFF_SPLIT of an even share. A rate at N workers has
 # to reach a fraction of N over the first count times the first count's rate,
-# up to the host's core count, over either transport: LOAD_HANDOFF_EFFICIENCY
+# up to half the host's cores, since the closed-loop client on the same host
+# needs the other half, over either transport: LOAD_HANDOFF_EFFICIENCY
 # for requests and LOAD_HANDOFF_ACCEPT_EFFICIENCY for connections, since one
 # worker accepts every local connection and that bounds how far they scale.
 # LOAD_HANDOFF_CELLS picks the cells.
@@ -177,7 +178,8 @@ sha256sum "$binary" | awk '{ print "  sha256 " $1 }'
 echo "connections=$connections duration=${duration}s warmup=${warmup}s workers=\"$worker_counts\" cores=$(nproc)"
 echo
 
-cores="$(nproc)"
+# the counts the scaling is asserted at leave the client as many cores
+cores="$(($(nproc) / 2))"
 first=""
 for workers in $worker_counts; do
     measure_workers "$workers"
