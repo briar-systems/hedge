@@ -7,6 +7,7 @@
 # tears them down in one order.
 
 use hedge.acme.handler;
+use hedge.acme.keys;
 use acme: hedge.acme.manager;
 use hedge.acme.tlsalpn;
 use process_admission: hedge.admission;
@@ -119,14 +120,20 @@ pub rec Runtime {
     heap:  *allocator.Allocator;
     graph: *schema.Graph;
     # the generation the process serves, which every worker builds from
-    generation_id:      u64;
-    caching:            *http_cache.Layer;
-    certificates:       *acme.Manager;
-    challenge_binding:  handler.Binding;
-    alpn_challenge:     tlsalpn.Alpn;
-    certificate_policy: usize;
-    observability:      telemetry_production.Production;
-    options:            Options;
+    generation_id: u64;
+    caching:       *http_cache.Layer;
+    # one manager per configured certificate, `certificate_count` of them, and
+    # beside each the tls-alpn-01 presentation it answers through and the
+    # listener policy it is installed into
+    certificates:         *acme.Manager;
+    alpn_challenges:      *tlsalpn.Alpn;
+    certificate_policies: [schema.MAX_ACME_CERTIFICATES]usize;
+    certificate_count:    usize;
+    # how many managers opened, which is how many close
+    certificates_opened: usize;
+    challenge_binding:   handler.Binding;
+    observability:       telemetry_production.Production;
+    options:             Options;
     # the secret the process's peer-keyed tables are placed by, drawn once at
     # start. a peer who could guess it could aim collisions at one bucket
     key: siphash.Key;
@@ -153,16 +160,16 @@ pub rec Runtime {
     bound:       [schema.MAX_LISTENERS]Bound;
     bound_count: usize;
     # every worker, allocated at start and owned for the process lifetime
-    workers:             *worker.Worker;
-    worker_count:        usize;
-    cache_live:          bool;
-    acme_live:           bool;
-    alpn_challenge_live: bool;
-    tls_live:            bool;
-    telemetry_live:      bool;
-    hosted_live:         bool;
-    events:              [16]Event;
-    event_count:         usize;
+    workers:        *worker.Worker;
+    worker_count:   usize;
+    cache_live:     bool;
+    acme_live:      bool;
+    key_ring_live:  bool;
+    tls_live:       bool;
+    telemetry_live: bool;
+    hosted_live:    bool;
+    events:         [16]Event;
+    event_count:    usize;
 }
 
 fun event(runtime: *Runtime, value: Event) {
@@ -196,7 +203,7 @@ fun inputs(runtime: *Runtime, current: *worker.Worker,
     value.challenge              = nil;
     value.recording              = current.recording;
     if (runtime.cache_live) { value.caching = runtime.caching; }
-    if (runtime.acme_live && configured.acme.challenge == schema.CHALLENGE_HTTP_01) {
+    if (runtime.acme_live && schema.acme_uses(configured, schema.CHALLENGE_HTTP_01)) {
         value.challenge = ?runtime.challenge_binding;
     }
     ret value;
@@ -343,18 +350,34 @@ fun close_process(runtime: *Runtime, report: *worker.StopReport) {
         runtime.telemetry_live = false;
         event(runtime, TELEMETRY_CLOSED);
     }
-    if (runtime.acme_live) {
-        if (!acme.close(runtime.certificates)) {
-            report.cleanup_failures = report.cleanup_failures + 1;
+    if (runtime.certificates_opened != 0) {
+        i = 0;
+        for (i < runtime.certificates_opened) {
+            if (!acme.close(?runtime.certificates[i])) {
+                report.cleanup_failures = report.cleanup_failures + 1;
+            }
+            i = i + 1;
         }
-        runtime.acme_live = false;
+        runtime.certificates_opened = 0;
+        runtime.acme_live           = false;
         event(runtime, ACME_CLOSED);
     }
-    if (runtime.alpn_challenge_live) {
-        if (!tlsalpn.destroy(?runtime.alpn_challenge)) {
+    if (runtime.alpn_challenges != nil) {
+        i = 0;
+        for (i < runtime.certificate_count) {
+            val presentation: *tlsalpn.Alpn = ?runtime.alpn_challenges[i];
+            if (presentation.live && !tlsalpn.destroy(presentation)) {
+                report.cleanup_failures = report.cleanup_failures + 1;
+            }
+            i = i + 1;
+        }
+    }
+    # every key the managers and presentations drew is destroyed by now
+    if (runtime.key_ring_live) {
+        if (!keys.release_ring()) {
             report.cleanup_failures = report.cleanup_failures + 1;
         }
-        runtime.alpn_challenge_live = false;
+        runtime.key_ring_live = false;
     }
     if (runtime.tls_live) {
         if (!hedge_tls.destroy()) { report.cleanup_failures = report.cleanup_failures + 1; }
@@ -432,6 +455,124 @@ pub fun start(runtime: *Runtime, controls: *worker.Controls,
     ret started;
 }
 
+# whether a managed certificate that `challenge` validates is served by the
+# listener named `listener`
+fun validates_through(configured: *schema.Graph, listener: str, challenge: u8) bool {
+    if (!configured.acme.enabled) { ret false; }
+    var i: usize = 0;
+    for (i < configured.acme.certificate_count) {
+        val certificate: *schema.AcmeCertificate = ?configured.acme.certificates[i];
+        if (certificate.challenge == challenge
+            && schema.text_equals(?certificate.listener, listener)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# one manager per configured certificate, over a key ring sized for them all.
+# a certificate whose stored state cannot be opened refuses the start, since
+# its key files are the ones the exposure check guards
+fun open_certificates(runtime: *Runtime, heap: *allocator.Allocator,
+    configured: *schema.Graph, diagnostics: *schema.Diagnostics) worker.StartReport {
+    val count:          usize                               = configured.acme.certificate_count;
+    val manager_memory: res[*acme.Manager, allocator.Error] =
+        allocator.allocate[acme.Manager](heap, count);
+    val alpn_memory: res[*tlsalpn.Alpn, allocator.Error] =
+        allocator.allocate[tlsalpn.Alpn](heap, count);
+    if (sel manager_memory.err) {
+        ret fail(runtime, nil, worker.START_RUNTIME, "certificate manager allocation failed");
+    }
+    if (sel alpn_memory.err) {
+        ret fail(runtime, nil, worker.START_RUNTIME, "certificate manager allocation failed");
+    }
+    runtime.certificates      = manager_memory.ok;
+    runtime.alpn_challenges   = alpn_memory.ok;
+    runtime.certificate_count = count;
+    var i: usize = 0;
+    for (i < count) {
+        runtime.alpn_challenges[i].live = false;
+        runtime.certificate_policies[i] = hedge_tls.NO_POLICY;
+        i                               = i + 1;
+    }
+    if (!keys.reserve(count)) {
+        ret fail(runtime, nil, worker.START_RUNTIME, "the certificate key ring could not be reserved");
+    }
+    runtime.key_ring_live = true;
+    i                     = 0;
+    for (i < count) {
+        val manager:     *acme.Manager           = ?runtime.certificates[i];
+        val certificate: *schema.AcmeCertificate = ?configured.acme.certificates[i];
+        var opened:      acme.Status             = acme.INVALID;
+        if (certificate.challenge == schema.CHALLENGE_TLS_ALPN_01) {
+            val presentation: *tlsalpn.Alpn = ?runtime.alpn_challenges[i];
+            if (!tlsalpn.make(presentation)) {
+                ret fail(runtime, nil, worker.START_RUNTIME,
+                    "TLS-ALPN challenge state could not be constructed");
+            }
+            opened = acme.open_with_tls_alpn(manager, heap, configured, i,
+                tlsalpn.provider(presentation));
+        }
+        or {
+            opened = acme.open(manager, heap, configured, i);
+        }
+        if (opened == acme.EXPOSED) {
+            val refusal: str = secret_file.message(secret_file.EXPOSED);
+            schema.add_diagnostic(diagnostics, schema.ERROR, schema.INVALID_VALUE,
+                acme.refused_key(manager), "acme.storage", refusal);
+            ret fail(runtime, nil, worker.START_CONFIG, refusal);
+        }
+        if (opened != acme.OK) {
+            ret fail(runtime, nil, worker.START_CONFIG, "certificate manager could not open its state");
+        }
+        runtime.certificates_opened = i + 1;
+        if (certificate.challenge == schema.CHALLENGE_HTTP_01 &&
+            !handler.bind(?runtime.challenge_binding, acme.challenge_table(manager))) {
+            ret fail(runtime, nil, worker.START_RUNTIME,
+                "challenge route could not be bound");
+        }
+        i = i + 1;
+    }
+    runtime.acme_live = true;
+    ret worker.ok();
+}
+
+# each certificate into the policy of the listener it names: a tls-alpn-01
+# presentation claims its slot there, and a certificate recovered from storage
+# is installed before the listener accepts
+fun place_certificates(runtime: *Runtime, configured: *schema.Graph) worker.StartReport {
+    var i: usize = 0;
+    for (i < runtime.certificate_count) {
+        val manager: *acme.Manager = ?runtime.certificates[i];
+        val policy:  usize         = hedge_tls.find(
+            schema.text(?configured.acme.certificates[i].listener));
+        if (policy == hedge_tls.NO_POLICY) {
+            ret fail(runtime, nil, worker.START_CONFIG,
+                "ACME listener has no published TLS policy");
+        }
+        runtime.certificate_policies[i] = policy;
+        if (runtime.alpn_challenges[i].live &&
+            !tlsalpn.bind_listener(?runtime.alpn_challenges[i], policy)) {
+            ret fail(runtime, nil, worker.START_CONFIG,
+                "TLS-ALPN challenge could not bind its listener");
+        }
+        if (acme.certificate_ready(manager) &&
+            hedge_tls.install_acme(policy, manager) != hedge_tls.OK) {
+            ret fail(runtime, nil, worker.START_CONFIG,
+                "stored ACME certificate could not be installed");
+        }
+        i = i + 1;
+    }
+    ret worker.ok();
+}
+
+# the manager of configured certificate `index`, or nil past the last
+pub fun certificate(runtime: *Runtime, index: usize) *acme.Manager {
+    if (runtime == nil || !runtime.acme_live || index >= runtime.certificate_count) {
+        ret nil;
+    }
+    ret ?runtime.certificates[index];
+}
+
 # what the process owns, and `workers` workers that own nothing yet. each
 # worker is brought up by `start_worker`, on whichever thread will run it
 pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
@@ -446,18 +587,21 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
     runtime.generation_id       = generation_id;
     runtime.caching             = nil;
     runtime.certificates        = nil;
+    runtime.alpn_challenges     = nil;
+    runtime.certificate_count   = 0;
+    runtime.certificates_opened = 0;
+    runtime.key_ring_live       = false;
     runtime.options             = options;
     runtime.cache_live          = false;
     runtime.acme_live           = false;
-    runtime.alpn_challenge_live = false;
     runtime.tls_live            = false;
     runtime.telemetry_live      = false;
     runtime.hosted_live         = false;
     runtime.event_count         = 0;
-    runtime.certificate_policy  = hedge_tls.NO_POLICY;
-    runtime.workers             = nil;
-    runtime.worker_count        = 0;
-    runtime.bound_count         = 0;
+    handler.reset(?runtime.challenge_binding);
+    runtime.workers      = nil;
+    runtime.worker_count = 0;
+    runtime.bound_count  = 0;
     # no fallback: a table placed by a guessable key is one a peer can flood
     val key: opt[siphash.Key] = options.entropy();
     if (!(sel key.some)) {
@@ -508,41 +652,9 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
     }
 
     if (configured.acme.enabled) {
-        val manager_memory: res[*acme.Manager, allocator.Error] =
-            allocator.allocate[acme.Manager](heap, 1);
-        if (sel manager_memory.err) {
-            ret fail(runtime, nil, worker.START_RUNTIME, "certificate manager allocation failed");
-        }
-        runtime.certificates = manager_memory.ok;
-        var opened: acme.Status = acme.INVALID;
-        if (configured.acme.challenge == schema.CHALLENGE_TLS_ALPN_01) {
-            if (!tlsalpn.make(?runtime.alpn_challenge)) {
-                ret fail(runtime, nil, worker.START_RUNTIME,
-                    "TLS-ALPN challenge state could not be constructed");
-            }
-            runtime.alpn_challenge_live = true;
-            opened                      = acme.open_with_tls_alpn(runtime.certificates, heap,
-                configured, tlsalpn.provider(?runtime.alpn_challenge));
-        }
-        or {
-            opened = acme.open(runtime.certificates, heap, configured);
-        }
-        if (opened == acme.EXPOSED) {
-            val refusal: str = secret_file.message(secret_file.EXPOSED);
-            schema.add_diagnostic(diagnostics, schema.ERROR, schema.INVALID_VALUE,
-                acme.refused_key(runtime.certificates), "acme.storage", refusal);
-            ret fail(runtime, nil, worker.START_CONFIG, refusal);
-        }
-        if (opened != acme.OK) {
-            ret fail(runtime, nil, worker.START_CONFIG, "certificate manager could not open its state");
-        }
-        runtime.acme_live = true;
-        if (configured.acme.challenge == schema.CHALLENGE_HTTP_01 &&
-            !handler.bind(?runtime.challenge_binding,
-            acme.challenge_table(runtime.certificates))) {
-            ret fail(runtime, nil, worker.START_RUNTIME,
-                "challenge route could not be bound");
-        }
+        val opened: worker.StartReport = open_certificates(runtime, heap, configured,
+            diagnostics);
+        if (opened.status != worker.START_OK) { ret opened; }
     }
 
     val secrets: str = secret.open_store(configured, options.applications,
@@ -575,10 +687,8 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
             ret fail(runtime, nil, worker.START_CONFIG, "listener references an unknown TLS policy");
         }
         var tls_options: hedge_tls.PublishOptions = hedge_tls.publish_options();
-        tls_options.tls_alpn_challenge = configured.acme.enabled &&
-            configured.acme.challenge == schema.CHALLENGE_TLS_ALPN_01 &&
-            schema.text_equals(?selected.name,
-            schema.text(?configured.acme.listener));
+        tls_options.tls_alpn_challenge = validates_through(configured,
+            schema.text(?selected.name), schema.CHALLENGE_TLS_ALPN_01);
         val published: hedge_tls.Status = hedge_tls.publish_with_options(
             schema.text(?selected.name), policy, selected.protocols, tls_options);
         if (published == hedge_tls.EXPOSED) {
@@ -592,24 +702,8 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
         }
     }
     if (runtime.acme_live) {
-        runtime.certificate_policy = hedge_tls.find(
-            schema.text(?configured.acme.listener));
-        if (runtime.certificate_policy == hedge_tls.NO_POLICY) {
-            ret fail(runtime, nil, worker.START_CONFIG,
-                "ACME listener has no published TLS policy");
-        }
-        if (runtime.alpn_challenge_live &&
-            !tlsalpn.bind_listener(?runtime.alpn_challenge,
-            runtime.certificate_policy)) {
-            ret fail(runtime, nil, worker.START_CONFIG,
-                "TLS-ALPN challenge could not bind its listener");
-        }
-        if (acme.certificate_ready(runtime.certificates) &&
-            hedge_tls.install_acme(runtime.certificate_policy,
-            runtime.certificates) != hedge_tls.OK) {
-            ret fail(runtime, nil, worker.START_CONFIG,
-                "stored ACME certificate could not be installed");
-        }
+        val installed: worker.StartReport = place_certificates(runtime, configured);
+        if (installed.status != worker.START_OK) { ret installed; }
     }
     ret worker.ok();
 }
@@ -731,15 +825,17 @@ pub fun stop(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
     ret clean(runtime, controls);
 }
 
-pub fun install_certificate(runtime: *Runtime, now: time.Time)
+# installs what certificate `index` finished issuing into its listener
+pub fun install_certificate(runtime: *Runtime, index: usize, now: time.Time)
     hedge_tls.Status {
-    if (runtime == nil || !runtime.acme_live || !runtime.tls_live ||
-        runtime.certificate_policy == hedge_tls.NO_POLICY ||
-        !acme.installation_ready(runtime.certificates)) { ret hedge_tls.INVALID; }
+    val manager: *acme.Manager = certificate(runtime, index);
+    if (manager == nil || !runtime.tls_live ||
+        runtime.certificate_policies[index] == hedge_tls.NO_POLICY ||
+        !acme.installation_ready(manager)) { ret hedge_tls.INVALID; }
     val installed: hedge_tls.Status = hedge_tls.install_acme(
-        runtime.certificate_policy, runtime.certificates);
+        runtime.certificate_policies[index], manager);
     if (installed == hedge_tls.OK) {
-        acme.installed(runtime.certificates, now);
+        acme.installed(manager, now);
     }
     ret installed;
 }

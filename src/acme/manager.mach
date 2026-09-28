@@ -1,5 +1,8 @@
-# the certificate manager: one account, one certificate, one schedule
+# the certificate manager: one managed certificate, its account session and
+# its schedule
 #
+# a deployment runs one manager per configured certificate, so each renews on
+# its own schedule and one certificate's failure never holds another back.
 # this is the part of acme that runs forever. it owns the durable state, the
 # renewal schedule, and the issuance run, and it advances all three from the
 # serving loop's plane without ever blocking it.
@@ -74,6 +77,8 @@ pub val REQUEST_BYTES:   usize = 8192;
 pub val RESPONSE_BYTES:  usize = 65536;
 pub val MAX_FIELDS:      usize = 64;
 pub val MAX_CHAIN_BYTES: usize = 16384;
+# a certificate's label: its id, or `default` for the top-level form
+pub val MAX_LABEL_BYTES: usize = 49;
 
 pub def Status: u8;
 pub val OK:      Status = 1;
@@ -116,6 +121,13 @@ pub rec Manager {
     account:     keys.Key;
     pending_key: keys.Key;
     active_key:  keys.Key;
+
+    # which configured certificate this is, and how reports name it
+    index:         usize;
+    label:         [MAX_LABEL_BYTES]u8;
+    label_len:     usize;
+    component:     [MAX_LABEL_BYTES + 6]u8;
+    component_len: usize;
 
     name_bytes: [MAX_NAMES][MAX_NAME_BYTES]u8;
     name_lens:  [MAX_NAMES]usize;
@@ -177,7 +189,7 @@ fun policy(graph: *schema.Graph) renewal.Policy {
 fun report(manager: *Manager, operation: str, code: str, message: str) {
     if (manager.observability == nil) { ret; }
     telemetry.error(manager.observability, telemetry.Failure{
-        component: "acme", operation: operation, code: code,
+        component: (?manager.component[0])::str, operation: operation, code: code,
         message:   message, trace_id: nil
     });
 }
@@ -195,12 +207,12 @@ pub fun attach_telemetry(manager: *Manager,
     ret true;
 }
 
-fun copy_names(manager: *Manager, graph: *schema.Graph) bool {
-    if (graph.acme.name_count == 0
-        || graph.acme.name_count > MAX_NAMES) { ret false; }
+fun copy_names(manager: *Manager, certificate: *schema.AcmeCertificate) bool {
+    if (certificate.name_count == 0
+        || certificate.name_count > MAX_NAMES) { ret false; }
     var i: usize = 0;
-    for (i < graph.acme.name_count) {
-        val configured: *schema.Text = ?graph.acme.names[i];
+    for (i < certificate.name_count) {
+        val configured: *schema.Text = ?certificate.names[i];
         if (configured.len == 0 || configured.len >= MAX_NAME_BYTES) {
             ret false;
         }
@@ -214,9 +226,50 @@ fun copy_names(manager: *Manager, graph: *schema.Graph) bool {
             value: view.view(?manager.name_bytes[i][0], configured.len)};
         i = i + 1;
     }
-    manager.name_count  = graph.acme.name_count;
+    manager.name_count  = certificate.name_count;
     manager.storage_key = manager.names[0].value;
     ret true;
+}
+
+# the label reports carry, and the telemetry component `acme.<label>`
+fun set_label(manager: *Manager, certificate: *schema.AcmeCertificate) bool {
+    var label: str = schema.ACME_DEFAULT_LABEL;
+    if (certificate.id.len != 0) { label = schema.text(?certificate.id); }
+    var length: usize = 0;
+    for (label[length] != 0) {
+        if (length + 1 >= MAX_LABEL_BYTES) { ret false; }
+        manager.label[length]         = label[length];
+        manager.component[5 + length] = label[length];
+        length                        = length + 1;
+    }
+    val prefix: str   = "acme.";
+    var i:      usize = 0;
+    for (i < 5) {
+        manager.component[i] = prefix[i];
+        i                    = i + 1;
+    }
+    manager.label[length]         = 0;
+    manager.label_len             = length;
+    manager.component[5 + length] = 0;
+    manager.component_len         = 5 + length;
+    ret true;
+}
+
+# the certificate's label: its id, or `default` for the top-level form
+pub fun label(manager: *Manager) str {
+    if (manager == nil) { ret nil; }
+    ret (?manager.label[0])::str;
+}
+
+# `acme.<label>`, which names the certificate in telemetry and health
+pub fun component(manager: *Manager) str {
+    if (manager == nil) { ret nil; }
+    ret (?manager.component[0])::str;
+}
+
+# which configured certificate the manager holds
+pub fun certificate_index(manager: *Manager) usize {
+    ret manager.index;
 }
 
 fun copy_text(target: *u8, capacity: usize, source: *schema.Text,
@@ -424,33 +477,44 @@ fun load_certificate(manager: *Manager) Status {
 # a toml deployment can select. dns-01 needs a zone, which hedge does not have
 # and will not invent: an embedder supplies the two calls that publish and
 # withdraw a record, and gets dns-01 with everything else identical.
+# the configured certificate at `index`, or nil past the last
+fun configured(graph: *schema.Graph, index: usize) *schema.AcmeCertificate {
+    if (graph == nil || index >= graph.acme.certificate_count) { ret nil; }
+    ret ?graph.acme.certificates[index];
+}
+
+# `index` names the configured certificate the manager holds
 pub fun open(manager: *Manager, a: *allocator.Allocator,
-    graph: *schema.Graph) Status {
-    if (manager == nil || graph == nil)                   { ret INVALID; }
-    if (graph.acme.challenge != schema.CHALLENGE_HTTP_01) { ret INVALID; }
+    graph: *schema.Graph, index: usize) Status {
+    val certificate: *schema.AcmeCertificate = configured(graph, index);
+    if (manager == nil || certificate == nil)              { ret INVALID; }
+    if (certificate.challenge != schema.CHALLENGE_HTTP_01) { ret INVALID; }
     if (!challenge.answer_http01(?manager.responder,
         challenge.http01_provider(?manager.table))) { ret INVALID; }
-    ret open_managed(manager, a, graph);
+    ret open_managed(manager, a, graph, index);
 }
 
 pub fun open_with_publisher(manager: *Manager, a: *allocator.Allocator,
-    graph: *schema.Graph, publisher: challenge.Publisher) Status {
-    if (manager == nil || graph == nil)                  { ret INVALID; }
-    if (graph.acme.challenge != schema.CHALLENGE_DNS_01) { ret INVALID; }
-    if (!challenge.dns01_make(?manager.zone, publisher)) { ret INVALID; }
+    graph: *schema.Graph, index: usize, publisher: challenge.Publisher) Status {
+    val certificate: *schema.AcmeCertificate = configured(graph, index);
+    if (manager == nil || certificate == nil)             { ret INVALID; }
+    if (certificate.challenge != schema.CHALLENGE_DNS_01) { ret INVALID; }
+    if (!challenge.dns01_make(?manager.zone, publisher))  { ret INVALID; }
     if (!challenge.answer_dns01(?manager.responder,
         challenge.dns01_provider(?manager.zone))) { ret INVALID; }
-    ret open_managed(manager, a, graph);
+    ret open_managed(manager, a, graph, index);
 }
 
 pub fun open_with_tls_alpn(manager: *Manager, a: *allocator.Allocator,
-    graph: *schema.Graph, provider: ch.Provider[challenge.Alpn]) Status {
-    if (manager == nil || graph == nil ||
-        graph.acme.challenge != schema.CHALLENGE_TLS_ALPN_01) { ret INVALID; }
+    graph: *schema.Graph, index: usize,
+    provider: ch.Provider[challenge.Alpn]) Status {
+    val certificate: *schema.AcmeCertificate = configured(graph, index);
+    if (manager == nil || certificate == nil ||
+        certificate.challenge != schema.CHALLENGE_TLS_ALPN_01) { ret INVALID; }
     if (!challenge.answer_tls_alpn(?manager.responder, provider)) {
         ret INVALID;
     }
-    ret open_managed(manager, a, graph);
+    ret open_managed(manager, a, graph, index);
 }
 
 fun release_anchors(manager: *Manager) {
@@ -475,8 +539,9 @@ fun abort_open(manager: *Manager, session_live: bool,
 }
 
 fun open_managed(manager: *Manager, a: *allocator.Allocator,
-    graph: *schema.Graph) Status {
-    if (manager == nil || a == nil || graph == nil) { ret INVALID; }
+    graph: *schema.Graph, index: usize) Status {
+    val certificate: *schema.AcmeCertificate = configured(graph, index);
+    if (manager == nil || a == nil || certificate == nil) { ret INVALID; }
     keys.clear(?manager.account);
     keys.clear(?manager.pending_key);
     keys.clear(?manager.active_key);
@@ -496,8 +561,11 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
     manager.advice              = renewal_info.empty_window();
     manager.certificate_url_len = 0;
     manager.contact_len         = 0;
+    manager.index               = index;
     if (!graph.acme.enabled || !graph.features.acme) { ret INVALID; }
-    if (!copy_names(manager, graph))                 { ret INVALID; }
+    if (!copy_names(manager, certificate) || !set_label(manager, certificate)) {
+        ret INVALID;
+    }
     if (!copy_text(?manager.directory_url[0], MAX_URL_BYTES,
         ?graph.acme.directory, ?manager.directory_len)
         || manager.directory_len == 0) { ret INVALID; }
@@ -505,7 +573,7 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
         ?manager.contact_len);
     manager.agree_terms = graph.acme.terms_agreed;
     challenge.http01_reset(?manager.table);
-    manager.challenge_kind = graph.acme.challenge;
+    manager.challenge_kind = certificate.challenge;
     manager.heap           = a;
     manager.anchors_live   = false;
     bundle.empty(?manager.anchors);
@@ -527,6 +595,8 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
         abort_open(manager, false, true);
         ret FAILED;
     }
+    # the account key is the storage root's, and the certificate's documents
+    # are in its own directory beneath it, or the root itself when it has no id
     var storage_path: [512]u8;
     var storage_len:  usize = 0;
     if (!copy_text(?storage_path[0], 512, ?graph.acme.storage, ?storage_len)
@@ -535,8 +605,25 @@ fun open_managed(manager: *Manager, a: *allocator.Allocator,
         ret INVALID;
     }
     storage_path[storage_len] = 0;
-    if (durable.open(?manager.store, a, (?storage_path[0])::str)
-        != durable.OK) {
+    var certificate_path: [512]u8;
+    var certificate_len:  usize = 0;
+    copy_text(?certificate_path[0], 512, ?graph.acme.storage, ?certificate_len);
+    if (certificate.id.len != 0) {
+        if (certificate_len + 1 + certificate.id.len >= 512) {
+            abort_open(manager, true, true);
+            ret INVALID;
+        }
+        certificate_path[certificate_len] = '/';
+        var i: usize = 0;
+        for (i < certificate.id.len) {
+            certificate_path[certificate_len + 1 + i] = certificate.id.data[i];
+            i                                         = i + 1;
+        }
+        certificate_len = certificate_len + 1 + certificate.id.len;
+    }
+    certificate_path[certificate_len] = 0;
+    if (durable.open(?manager.store, a, (?storage_path[0])::str,
+        (?certificate_path[0])::str) != durable.OK) {
         abort_open(manager, true, true);
         ret FAILED;
     }
@@ -852,10 +939,13 @@ fun test_graph(graph: *schema.Graph, directory: str, origin: str) {
     schema.set_text(?graph.acme.directory, "https://acme.example/dir");
     schema.set_text(?graph.acme.storage, directory);
     schema.set_text(?graph.acme.origin, origin);
-    graph.acme.terms_agreed = true;
-    graph.acme.challenge    = schema.CHALLENGE_HTTP_01;
-    graph.acme.name_count   = 1;
-    schema.set_text(?graph.acme.names[0], "managed.example");
+    graph.acme.terms_agreed      = true;
+    graph.acme.certificate_count = 1;
+    val certificate: *schema.AcmeCertificate = ?graph.acme.certificates[0];
+    schema.clear_acme_certificate(certificate);
+    certificate.challenge  = schema.CHALLENGE_HTTP_01;
+    certificate.name_count = 1;
+    schema.set_text(?certificate.names[0], "managed.example");
 }
 
 # a der certificate this test can store: a SEQUENCE with a known length, which
@@ -882,7 +972,7 @@ fun test_chain(buffer: *u8, count: usize) usize {
 fun store_certificate(directory: str, a: *allocator.Allocator,
     not_after: u64) bool {
     var store: durable.Store;
-    if (durable.open(?store, a, directory) != durable.OK) { ret false; }
+    if (durable.open(?store, a, directory, directory) != durable.OK) { ret false; }
     var account: keys.Key;
     if (durable.open_account_key(?store, ?account) != durable.OK) { ret false; }
     var certificate: keys.Key;
@@ -912,6 +1002,7 @@ fun store_certificate(directory: str, a: *allocator.Allocator,
 }
 
 test open__recovers_stored_certificate_idle {
+    if (!keys.reserve(2)) { ret 99; }
     var memory: [262144]u8;
     var arena:  fixed.FixedState;
     var a:      allocator.Allocator;
@@ -923,7 +1014,7 @@ test open__recovers_stored_certificate_idle {
     var graph: schema.Graph;
     test_graph(?graph, directory, "127.0.0.1:1");
     var manager: Manager;
-    if (open(?manager, ?a, ?graph) != OK) { ret 3; }
+    if (open(?manager, ?a, ?graph, 0) != OK) { ret 3; }
     if (!manager.have_certificate || manager.chain_count != 2
         || manager.not_after != expiry || manager.generation != 1) {
         close(?manager);
@@ -967,6 +1058,7 @@ test open__recovers_stored_certificate_idle {
 }
 
 test poll__clock_moved_back_replans {
+    if (!keys.reserve(2)) { ret 99; }
     var memory: [262144]u8;
     var arena:  fixed.FixedState;
     var a:      allocator.Allocator;
@@ -980,7 +1072,7 @@ test poll__clock_moved_back_replans {
     var graph: schema.Graph;
     test_graph(?graph, directory, "127.0.0.1:1");
     var manager: Manager;
-    if (open(?manager, ?a, ?graph) != OK) { ret 3; }
+    if (open(?manager, ?a, ?graph, 0) != OK) { ret 3; }
     poll((?manager)::ptr, now);
     val before: u64 = manager.schedule.last_seen_unix;
     if (before == 0) {
@@ -1009,6 +1101,7 @@ test poll__clock_moved_back_replans {
 }
 
 test poll__unreachable_authority_backs_off {
+    if (!keys.reserve(2)) { ret 99; }
     var memory: [262144]u8;
     var arena:  fixed.FixedState;
     var a:      allocator.Allocator;
@@ -1019,7 +1112,7 @@ test poll__unreachable_authority_backs_off {
     # port 1 serves nothing, so every attempt fails at connect
     test_graph(?graph, directory, "127.0.0.1:1");
     var manager: Manager;
-    if (open(?manager, ?a, ?graph) != OK) { ret 2; }
+    if (open(?manager, ?a, ?graph, 0) != OK) { ret 2; }
     # with nothing stored the first order is due immediately
     var rounds: usize = 0;
     for (rounds < 100000 && failure_count(?manager) == 0) {
@@ -1072,7 +1165,68 @@ test poll__unreachable_authority_backs_off {
     ret 0;
 }
 
+test open__certificates_renew_and_fail_on_their_own {
+    if (!keys.reserve(2)) { ret 99; }
+    var memory: [262144]u8;
+    var arena:  fixed.FixedState;
+    var a:      allocator.Allocator;
+    if (!test_allocator(?a, ?arena, ?memory[0], 262144)) { ret 1; }
+    val directory: str = "out/acme-manager-pair";
+    fs.remove_all(?a, directory::Path);
+    if (!store_certificate(directory, ?a, wall_now().sec::u64 + 7776000)) { ret 2; }
+    var graph: schema.Graph;
+    test_graph(?graph, directory, "127.0.0.1:1");
+    graph.acme.certificate_count = 2;
+    val second: *schema.AcmeCertificate = ?graph.acme.certificates[1];
+    schema.clear_acme_certificate(second);
+    schema.set_text(?second.id, "second");
+    second.name_count = 1;
+    schema.set_text(?second.names[0], "second.example");
+    var first:  Manager;
+    var latter: Manager;
+    if (open(?first, ?a, ?graph, 0) != OK) { ret 3; }
+    if (open(?latter, ?a, ?graph, 1) != OK) {
+        close(?first);
+        ret 4;
+    }
+    # one account: both sign with the key at the storage root, and the second
+    # keeps its record in a directory of its own
+    var same: bool  = true;
+    var i:    usize = 0;
+    for (i < keys.POINT_BYTES) {
+        if (first.account.point[i] != latter.account.point[i]) { same = false; }
+        i = i + 1;
+    }
+    if (!same || !present(fs.is_dir("out/acme-manager-pair/second"::Path))
+        || !view.view_eq_str(view.view(label(?first), 7), "default")
+        || !view.view_eq_str(view.view(component(?latter), 11), "acme.second")
+        || !certificate_ready(?first) || certificate_ready(?latter)) {
+        close(?first);
+        close(?latter);
+        ret 5;
+    }
+    # the second's first order fails against an authority that is not there,
+    # and the first, nowhere near renewal, neither notices nor stops being served
+    var rounds: usize = 0;
+    for (rounds < 100000 && failure_count(?latter) == 0) {
+        poll((?first)::ptr, wall_now());
+        poll((?latter)::ptr, wall_now());
+        rounds = rounds + 1;
+    }
+    if (failure_count(?latter) != 1 || failure_count(?first) != 0
+        || state(?first) != IDLE || !certificate_ready(?first)) {
+        close(?first);
+        close(?latter);
+        ret 6;
+    }
+    close(?first);
+    close(?latter);
+    fs.remove_all(?a, directory::Path);
+    ret 0;
+}
+
 test open__failure_releases_subsystems {
+    if (!keys.reserve(2)) { ret 99; }
     var memory: [1048576]u8;
     var state:  fixed.FixedState;
     var a:      allocator.Allocator;
@@ -1081,7 +1235,7 @@ test open__failure_releases_subsystems {
     test_graph(?graph, "out/acme-manager-unwind", "127.0.0.1:14001");
     schema.clear_text(?graph.acme.storage);
     var manager: Manager;
-    if (open(?manager, ?a, ?graph) != INVALID) { ret 2; }
+    if (open(?manager, ?a, ?graph, 0) != INVALID) { ret 2; }
     if (manager.live || manager.client.live || manager.session.live
         || manager.account.live || manager.pending_key.live
         || manager.active_key.live) { ret 3; }
@@ -1089,6 +1243,7 @@ test open__failure_releases_subsystems {
 }
 
 test open__refuses_disabled_or_unsupported {
+    if (!keys.reserve(2)) { ret 99; }
     var memory: [262144]u8;
     var arena:  fixed.FixedState;
     var a:      allocator.Allocator;
@@ -1097,12 +1252,12 @@ test open__refuses_disabled_or_unsupported {
     test_graph(?graph, "out/acme-manager-off", "127.0.0.1:1");
     graph.acme.enabled = false;
     var manager: Manager;
-    if (open(?manager, ?a, ?graph) != INVALID)      { ret 2; }
+    if (open(?manager, ?a, ?graph, 0) != INVALID)   { ret 2; }
     if (manager.live || state(?manager) != STOPPED) { ret 3; }
     # a challenge type this build cannot answer is refused at construction
-    graph.acme.enabled   = true;
-    graph.acme.challenge = schema.CHALLENGE_DNS_01;
-    if (open(?manager, ?a, ?graph) != INVALID)             { ret 4; }
+    graph.acme.enabled                   = true;
+    graph.acme.certificates[0].challenge = schema.CHALLENGE_DNS_01;
+    if (open(?manager, ?a, ?graph, 0) != INVALID)          { ret 4; }
     if (!present(fs.is_dir("out/acme-manager-off"::Path))) { ret 0; }
     ret 5;
 }
