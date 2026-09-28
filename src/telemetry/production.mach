@@ -1,6 +1,7 @@
 # production ownership for telemetry storage, sinks, credentials, and shutdown
 
 use hedge.config.schema;
+use hedge.observe;
 use hedge.secret;
 use hedge.service;
 use hedge.telemetry;
@@ -18,6 +19,7 @@ use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 
 fun sink_ok(outcome: sink.Operation) bool {
     ret sel outcome.ok;
@@ -31,29 +33,31 @@ fun status_enqueued(status: sink.WriteStatus) bool {
     ret sel status.enqueued;
 }
 
+val HEALTH_CHECKS: usize = service.MAX_APPLICATIONS * (1 + observe.MAX_APPLICATION_CHECKS);
+
 pub rec Options {
-    secrets:    secret.Resolver;
     downstream: *sink.Sink;
 }
 
 pub fun default_options() Options {
-    ret Options{secrets: secret.no_resolver(), downstream: nil};
+    ret Options{downstream: nil};
 }
 
 pub rec Production {
-    heap:                   *allocator.Allocator;
-    runtime:                telemetry.Runtime;
-    direct:                 sink.Direct;
-    direct_output:          sink.Sink;
-    queue:                  sink.Queued;
-    queue_storage:          *sink.QueuedRecord;
-    queue_capacity:         usize;
-    queued_output:          sink.Sink;
-    metric_storage:         *telemetry_metrics.Series;
-    metric_capacity:        usize;
-    checks:                 [service.MAX_APPLICATIONS]telemetry_health.Check;
-    secret_value:           [secret.MAX_VALUE_BYTES + 1]u8;
-    credential:             telemetry_admin.Credential;
+    heap:            *allocator.Allocator;
+    runtime:         telemetry.Runtime;
+    direct:          sink.Direct;
+    direct_output:   sink.Sink;
+    queue:           sink.Queued;
+    queue_storage:   *sink.QueuedRecord;
+    queue_capacity:  usize;
+    queued_output:   sink.Sink;
+    metric_storage:  *telemetry_metrics.Series;
+    metric_capacity: usize;
+    # each hosted application's readiness and the checks it adds itself
+    checks: [HEALTH_CHECKS]telemetry_health.Check;
+    # the administration credential, held in welded storage
+    credential:             secret.Held;
     listener_services:      [1]service.ListenerService;
     listener_service_count: usize;
     queue_live:             bool;
@@ -98,15 +102,20 @@ fun cleanup(production: *Production) bool {
             production.queue_capacity = 0;
         }
     }
-    secret.clear(?production.secret_value[0], secret.MAX_VALUE_BYTES + 1);
-    production.credential.data        = nil;
-    production.credential.len         = 0;
+    if (secret.holds(production.credential) && !secret.release(production.credential)) {
+        ok = false;
+    }
+    production.credential             = secret.no_held();
     production.listener_service_count = 0;
     ret ok;
 }
 
+# `source` names the provider the administration credential resolves through
+# when it is an `os` or `application` secret. a credential that cannot be held
+# is diagnosed against its secret declaration, never by its value
 pub fun make(production: *Production, heap: *allocator.Allocator,
-    graph: *schema.Graph, options: Options) bool {
+    graph: *schema.Graph, source: secret.Providers, options: Options,
+    diagnostics: *schema.Diagnostics) bool {
     if (production == nil || heap == nil || graph == nil) { ret false; }
     production.heap                   = heap;
     production.queue_storage          = nil;
@@ -116,7 +125,7 @@ pub fun make(production: *Production, heap: *allocator.Allocator,
     production.queue_live             = false;
     production.live                   = false;
     production.listener_service_count = 0;
-    secret.clear(?production.secret_value[0], secret.MAX_VALUE_BYTES + 1);
+    production.credential             = secret.no_held();
 
     var output:        *sink.Sink         = nil;
     var flush_context: ptr                = nil;
@@ -166,26 +175,20 @@ pub fun make(production: *Production, heap: *allocator.Allocator,
         production.metric_capacity = metric_capacity;
     }
 
-    var authenticate: telemetry_admin.AuthenticateFun =
-        (0::usize)::telemetry_admin.AuthenticateFun;
-    var auth_context: ptr = nil;
     if (graph.admin.enabled) {
-        val length: usize = secret.resolve(graph,
-            schema.text(?graph.admin.auth_secret), options.secrets,
-            ?production.secret_value[0], secret.MAX_VALUE_BYTES + 1);
-        if (length == 0) {
+        val name: str         = schema.text(?graph.admin.auth_secret);
+        val held: secret.Hold = secret.hold(graph, name, source, ?production.credential);
+        if (held != secret.HOLD_OK) {
+            schema.add_diagnostic(diagnostics, schema.ERROR, schema.INVALID_VALUE,
+                "secret", name, secret.hold_message(held));
             cleanup(production);
             ret false;
         }
-        production.credential.data = ?production.secret_value[0];
-        production.credential.len  = length;
-        authenticate               = telemetry_admin.authenticate_bearer;
-        auth_context               = (?production.credential)::ptr;
     }
 
     if (!telemetry.make(?production.runtime, graph, output,
         production.metric_storage, metric_capacity,
-        ?production.checks[0], service.MAX_APPLICATIONS, auth_context, authenticate,
+        ?production.checks[0], HEALTH_CHECKS, production.credential,
         nil, (0::usize)::telemetry_admin.RenderFun,
         (0::usize)::telemetry_admin.RenderFun,
         flush_context, flush)) {
@@ -218,20 +221,25 @@ pub fun close(production: *Production) bool {
 }
 
 #[testing]
-fun test_secret(context: ptr, provider: str, key: str, output: *u8,
+fun test_secret(context: ptr, provider: str, key: str, output: *^u8,
     capacity: usize) i64 {
-    if (capacity < 7) { ret -1; }
+    if (!str_equals(provider, "application") || capacity < 7) { ret -1; }
+    if (str_equals(key, "line")) {
+        output[0] = 's';
+        output[1] = '\n';
+        ret 2;
+    }
+    if (!str_equals(key, "token")) { ret -1; }
     output[0] = 's';
     output[1] = 'e';
     output[2] = 'c';
     output[3] = 'r';
     output[4] = 'e';
     output[5] = 't';
-    output[6] = 0;
     ret 6;
 }
 
-test make__admin_credential_cleared_on_close {
+test make__admin_credential_released_on_close {
     var graph: schema.Graph;
     schema.reset_graph(?graph);
     graph.telemetry.logs = false;
@@ -242,30 +250,36 @@ test make__admin_credential_cleared_on_close {
     schema.set_text(?graph.secrets[0].name, "admin-token");
     schema.set_text(?graph.secrets[0].provider, "application");
     schema.set_text(?graph.secrets[0].key, "token");
+    var provider: secret.Provider = secret.Provider{ctx: nil, provide: test_secret};
+    var named:    secret.Providers;
+    if (!secret.register_provider(?provider, ?named)) { ret 5; }
     var memory: [1024]u8;
     var state:  fixed.FixedState;
     var heap:   allocator.Allocator;
     fixed.make(?heap, ?state, ?memory[0], 1024);
-    var production: Production;
-    if (!make(?production, ?heap, ?graph,
-        Options{secrets: secret.Resolver{context: nil,
-        resolve: test_secret}, downstream: nil})) { ret 1; }
+    var production:  Production;
+    var diagnostics: schema.Diagnostics;
+    schema.reset_diagnostics(?diagnostics);
+    if (!make(?production, ?heap, ?graph, named, default_options(), ?diagnostics)) { ret 1; }
+    val held: secret.Held = production.credential;
     if (production.listener_service_count != 1
         || !service.has_handler(production.listener_services[0].handler)
         || telemetry.observer(?production.runtime.own).begin::usize == 0
-        || !telemetry_admin.authenticate_bearer((?production.credential)::ptr,
-        "Bearer secret")
-        || telemetry_admin.authenticate_bearer((?production.credential)::ptr,
-        "Bearer wrong")) {
+        || !telemetry_admin.authenticate_bearer(held, "Bearer secret")
+        || telemetry_admin.authenticate_bearer(held, "Bearer wrong")) {
         close(?production);
         ret 2;
     }
-    if (!telemetry.shutdown(?production.runtime) || !close(?production)) { ret 3; }
-    var i: usize = 0;
-    for (i < secret.MAX_VALUE_BYTES + 1) {
-        if (production.secret_value[i] != 0) { ret 4; }
-        i = i + 1;
-    }
+    if (!telemetry.shutdown(?production.runtime) || !close(?production))                  { ret 3; }
+    if (secret.holds(held) || telemetry_admin.authenticate_bearer(held, "Bearer secret")) { ret 4; }
+    # a credential ending in a newline could never be presented, so the start
+    # is refused against its declaration and nothing is held
+    schema.set_text(?graph.secrets[0].key, "line");
+    if (make(?production, ?heap, ?graph, named, default_options(), ?diagnostics)
+        || secret.holds(production.credential) || diagnostics.count != 1
+        || !schema.text_equals(?diagnostics.items[0].source, "secret")
+        || !schema.text_equals(?diagnostics.items[0].path, "admin-token")) { ret 7; }
+    if (!secret.unregister_provider(named)) { ret 6; }
     ret 0;
 }
 
@@ -282,7 +296,7 @@ test close__releases_sink_and_metrics {
     var heap:   allocator.Allocator;
     fixed.make(?heap, ?state, ?memory[0], 131072);
     var production: Production;
-    if (!make(?production, ?heap, ?graph, default_options())) { ret 1; }
+    if (!make(?production, ?heap, ?graph, secret.no_providers(), default_options(), nil)) { ret 1; }
     if (!production.live || !production.queue_live
         || production.queue_storage == nil || production.metric_storage == nil) {
         close(?production);
@@ -325,9 +339,8 @@ test close__reports_downstream_failure {
     var heap:   allocator.Allocator;
     fixed.make(?heap, ?state, ?memory[0], 16384);
     var production: Production;
-    if (!make(?production, ?heap, ?graph, Options{
-        secrets: secret.no_resolver(), downstream: ?downstream
-    })) { ret 1; }
+    if (!make(?production, ?heap, ?graph, secret.no_providers(),
+        Options{downstream: ?downstream}, nil)) { ret 1; }
     val report: sink.WriteReport = telemetry.access(?production.runtime,
         telemetry.Access{listener: "public", method: "GET", target: "/",
         protocol:      "HTTP/1.1", status: 200, duration_us: 1,

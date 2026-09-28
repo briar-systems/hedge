@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.15.0] - 2026-09-27
+
+### Added
+
+- The host contract moves to version 1.7, which supplies hosted code what laurel#183 asked of it (#423, #427, #420, #421, #422, #439). `doc/HOSTING.md` states each addition, and graft bridges them to laurel (graft#4). Every change is additive, so a binding written against 1.2 builds unchanged:
+  - **Bound endpoints (1.3, #423).** `composition.bound_count` and `composition.bound` report every listener as the process bound it, once `supervisor.start` answers `START_OK`: its name, transport, protocols, whether it is secure, and the address its socket holds, so a configured port of 0 reads as the port the system chose. A local listener reports its configured endpoint. The first worker records them once it serves, a listener that cannot read its own address fails the start with `START_RUNTIME`, and hedge's `hedge: listening` lines come from the report, local listeners included.
+  - **Connection upgrades (1.4, #427).** A hosted handler names a `TunnelOwner` with `call.tunnel` before it commits a 101, or a 2xx to CONNECT, and once the exchange settles its HTTP/1.1 connection, in cleartext or over TLS, is handed to the owner with the bytes past the request, hedge's waker, the drain deadline and the request arena. The owner answers `TUNNEL_DONE` to close gracefully or `TUNNEL_FAILED` to close abortively, and `abandon` runs once when hedge cuts it. A tunnel keeps its connection, per-peer and memory charges, and a drain or a reload's supersede drains it toward the deadline and cuts it there. On HTTP/2 and HTTP/3 `call.tunnel` answers false until extended CONNECT ships, and no CONNECT reaches a hosted handler yet, since a route path cannot match an authority-form target.
+  - **Secrets for hosted code (1.5, #420).** `[application.<name>.secrets]` grants an application `[secret]` declarations under names of its own. Every generation resolves its grants into secret-welded memory before it is published, a `file` secret straight from `std.filesystem.read_secret` and `os` and `application` secrets through a secret-typed `secret.Provider` registered behind the public `secret.Providers` handle in `composition.Options.providers`, and a secret that cannot be resolved refuses the generation. `secret.source` names one application and `secret.borrow` lends it one grant as `contracts.SecretBytes` for a single call, then clears the scratch. The statuses match `task.borrow` and `laurel.secret`. A reload resolves every grant again, so a rotated secret reaches hosted code with the next reload. Values are at most 4096 bytes.
+  - **Settings for hosted code (1.6, #421).** `[application.<name>.settings]` is carried without interpretation and flattened under dotted keys. `hedge.settings` copies each published generation, `settings.current` gives a `View` that reads one generation whole through the next reload, and `read`, `read_integer`, `read_float` and `read_boolean` answer statuses 1 to 4 as laurel's `READ_*`. A value that is exactly `${SECRET:name}` must name one of the application's own grants and reads as `READ_SECRET` with the grant's name, never the secret.
+  - **The optional lifecycle `reload` step (1.6, #421).** Once a reload publishes, the supervisor calls `service.Lifecycle.reload` for every started application that sets it, again every 10 ms while it answers pending, so the application can take the new generation's settings and secrets. A failure is reported with operation `reload` and leaves the application running. Record literals zero omitted fields, so existing lifecycles are unaffected.
+  - **Telemetry from hosted code (1.7, #422).** `hedge.observe` writes an application's log records through hedge's own logger and sink, adding `kind="application"`, `application` and the request's `trace_id`, keys the application may not set. `observe.metric` registers or finds a series named `app_<name>` with an `application` label, at most 64 per application inside `telemetry.metric_series`, and `observe.check` adds up to 4 health checks named `<application>.<name>`, a required one holding readiness. A framework's request span joins hedge's trace by parenting on `active.telemetry`. `telemetry.metrics.find` finds a registered series without registering one.
+  - **Stop ordering (#439).** Every stop path, including a failed start and a failed reload, settles the task facility's drain and then every started application's drain before any application stops, and every started application gets drain then stop. A failed start drains toward the instant it failed, so a task run in flight is abandoned at once. In 0.14.0 an abnormal stop could stop an application while a task run it registered was still in flight.
+- Tunnel bounds and metrics (#427). `server.timeouts.tunnel_ms` (default 60000, 0 for none) cuts a tunnel whose bytes stand still. `hedge_tunnels_open`, `hedge_tunnels_total` and `hedge_tunnels_abandoned_total` report tunnels per worker, the last counting every cut: at `tunnel_ms`, at a drain deadline, or on a connection failure.
+- QUIC connections get spare connection IDs and move on rotation (#404). hedge issues NEW_CONNECTION_ID up to the client's limit, less one table entry kept free, each ID minted for the connection's worker and slot, so a client that moves to a spare reaches the worker that owns it. A listener key rotation raises `retire_prior_to`, moving the connection onto the new codepoint, and the old codepoint is released once the peer retires its IDs, so the next rotation retires it with the connection still open.
+
+### Fixed
+
+- An abnormal stop no longer stops hosted applications before their task runs have drained (#439). See the stop ordering above.
+
+### Changed
+
+- The built-in metric series rise from 47 to 50 with the tunnel series (#427), so `telemetry.metric_series` must cover at least 50. Hosted applications' series share what remains. The checked-in telemetry configurations cover the new minimum.
+
+## [0.14.0] - 2026-09-27
+
+### Migration
+
+- **Configuration.** The `laurel` service kind is now `application`, the kind every hosted application is routed under whatever its framework (#398). Replace `kind = "laurel"` with `kind = "application"`. The old name is refused like any unknown kind, with no alias.
+- **Composing laurel.** hedge no longer depends on laurel and no longer ships `hedge.service.laurel` (#398). A laurel application is composed through [graft](https://github.com/briar-systems/graft), which binds it to hedge's host contract. Register it through graft where `hedge.service.laurel.register` was called.
+- **Dependencies.** hedge's dependencies are caret ranges, and std moves to 9.2 and mach-http to 0.24 (#430). An application that depends on hedge resolves with it, so it moves to ranges these satisfy.
+
+### Security
+
+- Peer-keyed tables are placed by SipHash under a secret key from the operating system's entropy source, and hedge refuses to start when it cannot draw that key (#403). The admission table seeded FNV with a fixed fallback when the random draw failed, and the cache store and the QUIC arrival index hashed with unkeyed FNV, so a peer could choose inputs that collide. The process draws one key before it builds anything and fails `START_RUNTIME` with `ENTROPY_UNAVAILABLE` without it. A standalone admission manager and each QUIC arrival queue draw their own. A datagram with no valid destination connection ID is no longer indexed, where each one added an entry that was never removed.
+- ACME key material is secret-typed for its whole life (#413, #430). Keys live in a bounded ring of 64 secret slots, drawn with `std.memory.secret.random_fill`, signed from in place and wiped on destroy, and a `Key` holds only its public half and a generational handle to its slot. The one declassify is `keys.publish`, which writes the durable key document. Key documents and QUIC key files are read with `std.filesystem.read_secret` and checked in secret storage. `doc/SECURITY.md` states the property and its one crossing.
+
+### Added
+
+- Background tasks, `hedge.task`, in host contract 1.2 (#305). A `Tasks` facility runs registered periodic or triggered tasks as non-blocking steps on one supervisor-owned thread with its own io runtime and `outbound.Loop`. Triggers are single-flight and coalesce, each run has a cancel scope and a deadline, and snapshots are published through caller-owned slots and read by counted leases without waiting on a run. A registered `task.Resolver` fills a secret into scratch the facility owns and zeroizes, `task.borrow` hands it to the task as `contracts.SecretBytes`, and `outbound.secret_header` is the one place such a secret becomes a public header value. `composition.Options.tasks` hands the facility to the supervisor, which starts the thread before hosted applications, drains tasks toward the workers' drain deadline, and counts runs abandoned at drain in the new `StopReport.tasks_abandoned`. The API mirrors `laurel.task` so graft can adapt it.
+- QUIC datagrams reach the worker that owns their connection (#174). Every worker binds every QUIC listener with `SO_REUSEPORT` on Linux and darwin, and Windows stays on one worker until #149. Connection IDs are 20 bytes encrypted with the four-pass AES-128 construction of draft-ietf-quic-load-balancers-21, under per-listener keys drawn per process and rotated on every reload, and a datagram whose ID names another worker is forwarded to it over per-pair rings. Retry and NEW_TOKEN keys belong to the listener and every worker shares them. New series count datagrams received, forwarded by direction, dropped by reason and unroutable. On one host over loopback, 4 workers served about 3.6 times one worker's HTTP/3 requests a second and 3.9 times its QUIC handshakes, and 8 workers held 40,000 keep-alives a second with no drop.
+- QUIC listener keys from an operator's key file (#405). A listener's `quic_keys` names a file of connection ID, stateless reset and token keys by codepoint and generation, and `quic_host_id` places a host ID in the connection IDs it mints, so hosts that share a key file mint distinct IDs. The file is refused when group or other can read it or when it is malformed. A reload re-reads it, keeps unchanged keys, adds new ones, retires dropped ones, and keeps the old keys with a logged reason when the new file would re-key a codepoint or token generation still in use. Without a file, keys stay random per process. `doc/CONFIGURATION.md` describes the settings and the file format.
+
+### Fixed
+
+- A listener's `max_retry_replay` is accepted (#405). The listener parser checked one field fewer than it lists, so the setting was refused as an unknown field in every configuration.
+
+### Changed
+
+- **Breaking.** The `laurel` service kind is renamed `application` (#398). See Migration.
+- **Breaking.** Dependencies are caret ranges at the current family releases (#430): mach-std `^9.2` (v9.2.0, was v9.0.0), mach-crypto `^0.24` (v0.24.1, was v0.24.0), mach-http `^0.24` (v0.24.0, was v0.23.0), mach-tls `^0.14` (v0.14.0), mach-quic `^0.23` (v0.23.0, was v0.22.0) and mach-acme `^0.12` (v0.12.0, was v0.11.0), in the root, `test/acme` and `test/fuzz`, with gitlinks at those releases. ACME's challenge providers and CSR signer use mach-acme 0.12's typed contexts, through one `challenge.Responder` that forwards to the selected kind, and `Manager.provider` is `Manager.responder`.
+- A QUIC teardown step that cannot finish waits on the timer wheel for a 10 ms retry, and a closing connection whose HTTP/3 session is winding down is woken by its own events rather than polled (#418, #265). Every such connection was serviced on every turn, so a drain cost work in proportion to the connections closing. With 1,000 clients abandoning in-flight requests, hedge's CPU fell about 8%.
+
+### Removed
+
+- **Breaking.** `hedge.service.laurel` and the laurel dependency (#398). See Migration.
+- `hedge.VERSION`, `implementation_ready` and the `hedge.hedge` module that held them (#400). The constant read 0.6.0 and nothing read it.
+- `hedge.server`, `src/config.mach` and `src/lib.mach`, which nothing that ships reached (#267). The host contract names full module paths, so none of them was part of it.
+
 ## [0.13.0] - 2026-09-27
 
 ### Added

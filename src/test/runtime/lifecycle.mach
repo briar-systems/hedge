@@ -9,6 +9,7 @@
 
 use hedge.budget;
 use hedge.clock;
+use hedge.config.lanes;
 use hedge.config.schema;
 use hedge.connection;
 use hedge.dispatch.call;
@@ -16,8 +17,10 @@ use hedge.dispatch.middleware;
 use hedge.dispatch.plan;
 use hedge.lifecycle;
 use hedge.listener;
+use hedge_memory: hedge.memory;
 use hedge.protocol.h2;
 use quic_runtime: hedge.protocol.quic.runtime;
+use hedge.secret;
 use hedge.serve;
 use hedge.service;
 use observability:     hedge.telemetry;
@@ -262,8 +265,8 @@ test shutdown__telemetry_ready_then_flushed {
     var checks:    [1]telemetry_health.Check;
     var telemetry: observability.Runtime;
     if (!observability.make(?telemetry, ?harness.graph, ?output,
-        (0::usize)::*telemetry_metrics.Series, 0, ?checks[0], 1, nil,
-        (0::usize)::telemetry_admin.AuthenticateFun, nil,
+        (0::usize)::*telemetry_metrics.Series, 0, ?checks[0], 1,
+        secret.no_held(), nil,
         (0::usize)::telemetry_admin.RenderFun,
         (0::usize)::telemetry_admin.RenderFun,
         (?target)::ptr, telemetry_flush)) { ret 1; }
@@ -457,6 +460,131 @@ test drain__silent_peer_cancelled_at_deadline {
     val reason: lifecycle.Reason = serve.shutdown_reason(?harness.runtime);
     tcp.stream_close(?client);
     if (reason != lifecycle.DEADLINE) { ret 7; }
+    ret 0;
+}
+
+fun build_wake_holder(context: ptr, configured: *schema.Service,
+    handler: *service.Handler) bool {
+    @handler = service.Handler{ctx: context, serve: wire.wake_holding_serve};
+    ret true;
+}
+
+fun count_of(buffer: *u8, length: usize, needle: str) usize {
+    var count: usize = 0;
+    var at:    usize = 0;
+    for (at < length) {
+        val found: usize = wire.index_of(?buffer[at], length - at, needle);
+        if (found == length - at) { brk; }
+        count = count + 1;
+        at    = at + found + 1;
+    }
+    ret count;
+}
+
+# a request already received when the drain begins is served before the close,
+# including one pipelined behind the exchange in flight (#451)
+test drain__serves_buffered_pipelined_request {
+    var quic_controls: quic_runtime.ControlView;
+    var harness:       Harness;
+    var holder:        wire.WakeHolder;
+    wire.make_wake_holder(?holder);
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, true);
+    if (!start_native(?harness, 1,
+        service.Factory{ctx: (?holder)::ptr, build: build_wake_holder})) { ret 1; }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) {
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 2;
+    }
+    var code: i32 = 0;
+    if (!wire.send(?client, "GET /1 HTTP/1.1\r\nHost: localhost\r\n\r\nGET /2 HTTP/1.1\r\nHost: localhost\r\n\r\nGET /3 HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+        code = 3;
+    }
+    # the first request is read and parked, the second waits in the buffer
+    var i: usize = 0;
+    for (code == 0 && i < 40 && holder.held < 1) {
+        serve.poll(?quic_controls, ?harness.runtime, 2);
+        i = i + 1;
+    }
+    if (code == 0 && holder.held != 1) { code = 4; }
+    if (code == 0 && !serve.begin_shutdown(?quic_controls, ?harness.runtime, monotonic_now())) {
+        code = 5;
+    }
+    # the holder knows a call by its record, which the second request reuses, so
+    # releasing the first answers both
+    if (code == 0 && !wire.release_held(?holder, 0)) { code = 6; }
+    var response: [RESPONSE_BYTES]u8;
+    var received: usize = 0;
+    if (code == 0) {
+        received = wire.drain(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES);
+    }
+    if (code == 0 && count_of(?response[0], received, "released") != 3) { code = 7; }
+    # the client closes once answered, which ends the server's linger
+    tcp.stream_close(?client);
+    if (code == 0 && !pump(?harness, 400)) { code = 8; }
+    if (code != 0) {
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret code;
+    }
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.DRAINED) { ret 9; }
+    if (harness.runtime.served != 3)                                  { ret 10; }
+    ret 0;
+}
+
+# a request read while the pool cannot fund its slot waits unparsed in the
+# engine's buffer. a graceful drain beginning then serves it once memory
+# returns, rather than closing over it (#451)
+test drain__serves_request_read_while_memory_blocked {
+    var quic_controls: quic_runtime.ControlView;
+    var harness:       Harness;
+    base_graph(?harness.graph, schema.PROTOCOL_HTTP1, 5000, false);
+    if (!start(?harness, 1)) { ret 1; }
+    var hog: wire.Hog;
+    if (!wire.hog_take(?hog, ?harness.runtime.memory, lanes.RESERVE)) {
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 2;
+    }
+    var client: tcp.Stream;
+    if (!wire.connect(harness.endpoint, ?client)) {
+        wire.hog_free(?hog);
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret 3;
+    }
+    var code: i32 = 0;
+    if (!wire.send(?client, REQUEST)) { code = 4; }
+    var i: usize = 0;
+    for (code == 0 && i < 40 && hedge_memory.snapshot(?harness.runtime.memory).waiters == 0) {
+        serve.poll(?quic_controls, ?harness.runtime, 2);
+        i = i + 1;
+    }
+    # the read landed and only the request's slot is refused
+    val blocked: hedge_memory.Snapshot = hedge_memory.snapshot(?harness.runtime.memory);
+    if (code == 0 && (blocked.waiters == 0
+        || blocked.lanes[hedge_memory.LANE_REQUEST::usize].exhausted == 0)) { code = 5; }
+    if (code == 0 && !serve.begin_shutdown(?quic_controls, ?harness.runtime, monotonic_now())) {
+        code = 6;
+    }
+    i = 0;
+    for (code == 0 && i < 20) {
+        serve.poll(?quic_controls, ?harness.runtime, 2);
+        i = i + 1;
+    }
+    if (!wire.hog_free(?hog) && code == 0) { code = 7; }
+    var response: [RESPONSE_BYTES]u8;
+    var received: usize = 0;
+    if (code == 0) {
+        received = wire.collect(?harness.runtime, ?client, ?response[0], RESPONSE_BYTES, "served");
+    }
+    if (code == 0 && !wire.contains(?response[0], received, "served")) { code = 8; }
+    # the client closes once answered, which ends the server's linger
+    tcp.stream_close(?client);
+    if (code == 0 && !pump(?harness, 400)) { code = 9; }
+    if (code != 0) {
+        serve.stop(?quic_controls, ?harness.runtime);
+        ret code;
+    }
+    if (serve.shutdown_reason(?harness.runtime) != lifecycle.DRAINED) { ret 10; }
+    if (harness.runtime.served != 1)                                  { ret 11; }
     ret 0;
 }
 

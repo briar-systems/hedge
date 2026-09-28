@@ -1,0 +1,395 @@
+# the settings hosted code reads, per configuration generation
+#
+# each hosted application's section may carry a `settings` table, which hedge
+# checks only for its shape and hands over flattened under dotted keys. every
+# generation's settings are copied here when it is published, and the one
+# before it is kept, so a reader holding a view of the generation a reload just
+# replaced reads it whole until the reload after. a `${SECRET:name}` value is a
+# reference to one of the application's own grants, never the secret itself.
+
+use hedge.config.schema;
+use hedge.dispatch.call;
+use hedge.service;
+use http.core.exchange;
+use std.sync.mutex;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+# the longest key a setting is read by
+pub val MAX_KEY_BYTES: usize = schema.MAX_SETTING_KEY_BYTES;
+
+pub def Kind: u8;
+pub val KIND_STRING:  Kind = schema.SETTING_STRING;
+pub val KIND_INTEGER: Kind = schema.SETTING_INTEGER;
+pub val KIND_FLOAT:   Kind = schema.SETTING_FLOAT;
+pub val KIND_BOOLEAN: Kind = schema.SETTING_BOOLEAN;
+pub val KIND_ARRAY:   Kind = schema.SETTING_ARRAY;
+pub val KIND_TABLE:   Kind = schema.SETTING_TABLE;
+pub val KIND_SECRET:  Kind = schema.SETTING_SECRET;
+
+pub def Status: u8;
+pub val READ_FOUND:   Status = 1;
+pub val READ_MISSING: Status = 2;
+# the value is larger than the output, and `len` is the size it needs
+pub val READ_TOO_LARGE: Status = 3;
+# the key is malformed, or the view's generation is no longer kept
+pub val READ_INVALID: Status = 4;
+# the value is a secret reference, and the output holds the grant's name
+pub val READ_SECRET: Status = 5;
+# a typed read found a value of another kind
+pub val READ_MISMATCH: Status = 6;
+
+pub rec Read {
+    status: Status;
+    kind:   Kind;
+    len:    usize;
+}
+
+# the application a view reads the settings of
+pub rec Source {
+    application: *service.Application;
+}
+
+# one application's settings in one generation
+pub rec View {
+    application: *service.Application;
+    generation:  u64;
+}
+
+rec Section {
+    name:  schema.Text;
+    first: usize;
+    count: usize;
+}
+
+rec Bank {
+    generation:    u64;
+    section_count: usize;
+    sections:      [schema.MAX_APPLICATIONS]Section;
+    settings:      schema.Settings;
+}
+
+# the published generation's bank and the one it replaced
+var banks:             [2]Bank;
+var current_bank:      usize         = 0;
+var store_open:        bool          = false;
+var staged:            *schema.Graph = nil;
+var staged_generation: u64           = 0;
+var store_lock:        mutex.Mutex   = 0;
+
+# names the registered application `name` for `current`
+pub fun source(registry: *service.Applications, name: str, output: *Source) bool {
+    if (registry == nil || name == nil || output == nil) { ret false; }
+    val found: *service.Application = service.find_application(registry, name);
+    if (found == nil) { ret false; }
+    @output = Source{application: found};
+    ret true;
+}
+
+# `source`'s settings in the generation the process has published
+pub fun current(source: Source) View {
+    mutex.lock(?store_lock);
+    var generation: u64 = 0;
+    if (store_open) { generation = banks[current_bank].generation; }
+    mutex.unlock(?store_lock);
+    ret View{application: source.application, generation: generation};
+}
+
+fun copy_bank(bank: *Bank, configured: *schema.Graph, generation: u64) {
+    bank.generation    = generation;
+    bank.section_count = configured.application_count;
+    var i: usize = 0;
+    for (i < configured.application_count) {
+        bank.sections[i].name  = configured.applications[i].name;
+        bank.sections[i].first = configured.applications[i].setting_first;
+        bank.sections[i].count = configured.applications[i].setting_count;
+        i                      = i + 1;
+    }
+    bank.settings = configured.settings;
+}
+
+# copies the first generation's settings and opens reading
+pub fun open_store(configured: *schema.Graph, generation: u64) bool {
+    if (configured == nil || generation == 0) { ret false; }
+    mutex.lock(?store_lock);
+    if (store_open) {
+        mutex.unlock(?store_lock);
+        ret false;
+    }
+    copy_bank(?banks[0], configured, generation);
+    banks[1].generation = 0;
+    current_bank        = 0;
+    staged              = nil;
+    store_open          = true;
+    mutex.unlock(?store_lock);
+    ret true;
+}
+
+# a reload's settings, taken when it publishes. the candidate stays live and
+# unchanged until then
+pub fun stage_store(configured: *schema.Graph, generation: u64) bool {
+    if (configured == nil || generation == 0) { ret false; }
+    mutex.lock(?store_lock);
+    if (!store_open) {
+        mutex.unlock(?store_lock);
+        ret false;
+    }
+    staged            = configured;
+    staged_generation = generation;
+    mutex.unlock(?store_lock);
+    ret true;
+}
+
+# views read the staged generation from here on, the one it replaces stays
+# readable, and the one before that is gone
+pub fun publish_store(generation: u64) bool {
+    mutex.lock(?store_lock);
+    if (!store_open || staged == nil || staged_generation != generation) {
+        mutex.unlock(?store_lock);
+        ret false;
+    }
+    val next: usize = 1 - current_bank;
+    copy_bank(?banks[next], staged, generation);
+    current_bank = next;
+    staged       = nil;
+    mutex.unlock(?store_lock);
+    ret true;
+}
+
+pub fun discard_store() {
+    mutex.lock(?store_lock);
+    staged = nil;
+    mutex.unlock(?store_lock);
+}
+
+pub fun close_store() {
+    mutex.lock(?store_lock);
+    store_open          = false;
+    staged              = nil;
+    banks[0].generation = 0;
+    banks[1].generation = 0;
+    mutex.unlock(?store_lock);
+}
+
+# lowercase or not, printable, without spaces, and dotted without empty segments
+pub fun key_valid(key: view.View) bool {
+    if (key.data == nil || key.len == 0 || key.len > MAX_KEY_BYTES
+        || key.data[0] == '.' || key.data[key.len - 1] == '.') { ret false; }
+    var i: usize = 0;
+    for (i < key.len) {
+        if (key.data[i] < 0x21 || key.data[i] > 0x7e)     { ret false; }
+        if (key.data[i] == '.' && key.data[i - 1] == '.') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the setting `key` in `view`, found under the store's lock
+fun find_locked(target: View, key: view.View, bank_out: **Bank) *schema.Setting {
+    if (!store_open || target.generation == 0 || target.application == nil) { ret nil; }
+    var bank: *Bank = nil;
+    if (banks[0].generation == target.generation) { bank = ?banks[0]; }
+    or (banks[1].generation == target.generation) { bank = ?banks[1]; }
+    if (bank == nil)                              { ret nil; }
+    @bank_out = bank;
+    var s: usize = 0;
+    for (s < bank.section_count) {
+        val section: *Section = ?bank.sections[s];
+        if (schema.text_equals(?section.name, target.application.name)) {
+            var k: usize = 0;
+            for (k < section.count) {
+                val item: *schema.Setting = ?bank.settings.items[section.first + k];
+                if (item.key_len == key.len) {
+                    var i: usize = 0;
+                    for (i < key.len && bank.settings.bytes[item.key_at + i] == key.data[i]) {
+                        i = i + 1;
+                    }
+                    if (i == key.len) { ret item; }
+                }
+                k = k + 1;
+            }
+            ret nil;
+        }
+        s = s + 1;
+    }
+    ret nil;
+}
+
+fun kept_locked(target: View) bool {
+    ret store_open && target.generation != 0
+        && (banks[0].generation == target.generation
+        || banks[1].generation == target.generation);
+}
+
+# copies the text of setting `key` into `output`: a string as written, an
+# integer in decimal, a float in its shortest decimal, a boolean as `true` or
+# `false`, an array's or a table's member count, and a secret reference's grant
+# name with `READ_SECRET`
+pub fun read(target: View, key: view.View, output: *u8, capacity: usize) Read {
+    if (!key_valid(key) || (capacity != 0 && output == nil)) {
+        ret Read{status: READ_INVALID, kind: 0, len: 0};
+    }
+    mutex.lock(?store_lock);
+    var bank:  *Bank           = nil;
+    val found: *schema.Setting = find_locked(target, key, ?bank);
+    if (found == nil) {
+        val kept: bool = kept_locked(target);
+        mutex.unlock(?store_lock);
+        if (!kept) { ret Read{status: READ_INVALID, kind: 0, len: 0}; }
+        ret Read{status: READ_MISSING, kind: 0, len: 0};
+    }
+    val kind:   Kind  = found.kind;
+    val length: usize = found.value_len;
+    if (length > capacity) {
+        mutex.unlock(?store_lock);
+        ret Read{status: READ_TOO_LARGE, kind: kind, len: length};
+    }
+    var i: usize = 0;
+    for (i < length) {
+        output[i] = bank.settings.bytes[found.value_at + i];
+        i         = i + 1;
+    }
+    mutex.unlock(?store_lock);
+    if (kind == KIND_SECRET) { ret Read{status: READ_SECRET, kind: kind, len: length}; }
+    ret Read{status: READ_FOUND, kind: kind, len: length};
+}
+
+# the setting's kind and number, or why there is none
+fun typed(target: View, key: view.View, expected: Kind, integer: *i64, float: *f64) Status {
+    if (!key_valid(key)) { ret READ_INVALID; }
+    mutex.lock(?store_lock);
+    var bank:  *Bank           = nil;
+    val found: *schema.Setting = find_locked(target, key, ?bank);
+    if (found == nil) {
+        val kept: bool = kept_locked(target);
+        mutex.unlock(?store_lock);
+        if (!kept) { ret READ_INVALID; }
+        ret READ_MISSING;
+    }
+    if (found.kind != expected) {
+        mutex.unlock(?store_lock);
+        ret READ_MISMATCH;
+    }
+    @integer = found.integer;
+    @float   = found.float;
+    mutex.unlock(?store_lock);
+    ret READ_FOUND;
+}
+
+pub fun read_integer(target: View, key: view.View, output: *i64) Status {
+    if (output == nil) { ret READ_INVALID; }
+    var float: f64 = 0.0;
+    ret typed(target, key, KIND_INTEGER, output, ?float);
+}
+
+pub fun read_float(target: View, key: view.View, output: *f64) Status {
+    if (output == nil) { ret READ_INVALID; }
+    var integer: i64 = 0;
+    ret typed(target, key, KIND_FLOAT, ?integer, output);
+}
+
+pub fun read_boolean(target: View, key: view.View, output: *bool) Status {
+    if (output == nil) { ret READ_INVALID; }
+    var integer: i64    = 0;
+    var float:   f64    = 0.0;
+    val status:  Status = typed(target, key, KIND_BOOLEAN, ?integer, ?float);
+    if (status == READ_FOUND) { @output = integer != 0; }
+    ret status;
+}
+
+#[testing]
+fun test_setting(graph: *schema.Graph, kind: Kind, key: str, value: str, integer: i64) {
+    val settings: *schema.Settings = ?graph.settings;
+    val item:     *schema.Setting  = ?settings.items[settings.count];
+    item.kind    = kind;
+    item.key_at  = settings.used;
+    item.key_len = 0;
+    for (key[item.key_len] != 0) {
+        settings.bytes[settings.used] = key[item.key_len];
+        settings.used                 = settings.used + 1;
+        item.key_len                  = item.key_len + 1;
+    }
+    item.value_at  = settings.used;
+    item.value_len = 0;
+    for (value[item.value_len] != 0) {
+        settings.bytes[settings.used] = value[item.value_len];
+        settings.used                 = settings.used + 1;
+        item.value_len                = item.value_len + 1;
+    }
+    item.integer   = integer;
+    settings.count = settings.count + 1;
+}
+
+#[testing]
+fun test_section(graph: *schema.Graph, name: str, first: usize) {
+    val index: usize = graph.application_count;
+    graph.application_count = index + 1;
+    schema.set_text(?graph.applications[index].name, name);
+    graph.applications[index].setting_first = first;
+    graph.applications[index].setting_count = graph.settings.count - first;
+}
+
+#[testing]
+fun test_serve(context: ptr, active: *call.Call) exchange.ServiceStatus {
+    ret exchange.SERVICE_FAILED;
+}
+
+test store__views_read_their_generation {
+    var slots:    [2]service.Application;
+    var registry: service.Applications;
+    val handler:  service.Handler = service.Handler{ctx: nil, serve: test_serve};
+    if (!service.make_applications(?registry, ?slots[0], 2)
+        || !service.register_application(?registry, "site", handler, 0)
+        || !service.register_application(?registry, "other", handler, 0)) { ret 1; }
+    var site:  Source;
+    var other: Source;
+    if (!source(?registry, "site", ?site) || !source(?registry, "other", ?other)) { ret 2; }
+
+    var first: schema.Graph;
+    schema.reset_graph(?first);
+    test_setting(?first, KIND_INTEGER, "pool.size", "8", 8);
+    test_setting(?first, KIND_SECRET, "db.password", "database", 0);
+    test_section(?first, "site", 0);
+    test_setting(?first, KIND_BOOLEAN, "debug", "true", 1);
+    test_section(?first, "other", 2);
+    if (!open_store(?first, 1)) { ret 3; }
+
+    var output: [16]u8;
+    var number: i64  = 0;
+    var flag:   bool = false;
+    val one:    View = current(site);
+    val found:  Read = read(one, view.view("pool.size", 9), ?output[0], 16);
+    if (found.status != READ_FOUND || found.kind != KIND_INTEGER || found.len != 1
+        || output[0] != '8' || read_integer(one, view.view("pool.size", 9), ?number) != READ_FOUND
+        || number != 8) { ret 4; }
+    # a secret reference reads as the grant it names, never as a string
+    val secret: Read = read(one, view.view("db.password", 11), ?output[0], 16);
+    if (secret.status != READ_SECRET || secret.len != 8 || output[0] != 'd') { ret 5; }
+    # one application never reads another's settings
+    if (read(one, view.view("debug", 5), ?output[0], 16).status != READ_MISSING
+        || read_boolean(current(other), view.view("debug", 5), ?flag) != READ_FOUND || !flag
+        || read_boolean(one, view.view("pool.size", 9), ?flag) != READ_MISMATCH
+        || read(one, view.view("pool.size", 9), ?output[0], 0).status != READ_TOO_LARGE
+        || read(one, view.view("pool..size", 10), ?output[0], 16).status != READ_INVALID) { ret 6; }
+
+    # a view keeps reading its generation across one reload, and not two
+    var second: schema.Graph;
+    schema.reset_graph(?second);
+    test_setting(?second, KIND_INTEGER, "pool.size", "9", 9);
+    test_section(?second, "site", 0);
+    if (!stage_store(?second, 2) || !publish_store(2)) { ret 7; }
+    val two: View = current(site);
+    if (two.generation != 2
+        || read_integer(two, view.view("pool.size", 9), ?number) != READ_FOUND || number != 9
+        || read_integer(one, view.view("pool.size", 9), ?number) != READ_FOUND || number != 8) { ret 8; }
+    if (!stage_store(?first, 3) || !publish_store(3)
+        || read_integer(one, view.view("pool.size", 9), ?number) != READ_INVALID
+        || read_integer(two, view.view("pool.size", 9), ?number) != READ_FOUND) { ret 9; }
+    close_store();
+    if (read(two, view.view("pool.size", 9), ?output[0], 16).status != READ_INVALID) { ret 10; }
+    ret 0;
+}

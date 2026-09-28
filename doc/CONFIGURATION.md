@@ -85,6 +85,7 @@ The implemented schema accepts these top-level sections:
   protocol sets. A `quic` listener binds a UDP endpoint, becomes ready, and
   serves HTTP/3 to clients that select `h3` through ALPN inside QUIC
 - named `tls`, `host`, `service`, `budget`, and `secret` tables
+- named `application` tables, one for each hosted application that has a section of its own: the secrets it is granted and its settings
 - direct `route` arrays or named `routes` groups
 - bounded `telemetry` and isolated `admin` policy
 - `cache` policy and `acme` certificate management
@@ -330,6 +331,10 @@ held back.
 `hedge_timers_claimed` and `hedge_timers_armed` are gauges of the worker's
 timing wheel: the entries a connection or plane has claimed, and those with a
 deadline armed, reported once per loop turn.
+`hedge_tunnels_open` is a gauge of the tunnels hosted applications run on
+connections they upgraded, `hedge_tunnels_total` counts those opened, and
+`hedge_tunnels_abandoned_total` those hedge cut while their owner still ran them:
+at `tunnel_ms`, at a drain deadline, or when the connection failed.
 
 `server.limits.max_pipeline_depth` bounds HTTP/1 requests admitted into one
 connection before earlier responses release their slots. The default and fixed
@@ -445,8 +450,24 @@ GOAWAY, HTTP/1 marks its responses for close and stops reading — exchanges
 already in flight are given until the `drain_ms` deadline to finish, whatever
 remains is cancelled, telemetry is flushed, and the resources are released last.
 
+An HTTP/1 connection closing, at a drain or at any other close, lingers after
+its last response: it shuts its write side, then reads and discards what the
+client still sends until the client closes, 1 MiB has arrived, or
+`server.timeouts.linger_ms` (default 5000, 5 seconds; 0 for none) passes.
+Closing over unread input would have the client's stack reset the connection
+under a response it had not read yet. A drain waits for a lingering connection
+like any other, so a client that keeps an idle connection open without reading
+it holds the drain for up to `linger_ms`.
+
 Every hosted application drains alongside the workers, toward the same
 deadline, and is stopped once the last worker has.
+
+A connection a hosted application upgraded is told the drain began and when its
+deadline is, and ends on its owner's terms, a WebSocket with a close for
+instance, until then. It is cut at the deadline like any other, and a reload
+drains the upgraded connections of the generation it supersedes the same way.
+While it runs, `server.timeouts.tunnel_ms` (default 60000, 60 seconds; 0 for
+none) cuts one whose bytes have stood still in both directions for that long.
 
 The exit status reports which of those happened. A clean drain exits 0. A drain
 whose deadline passed with exchanges or a hosted application's drain still
@@ -656,7 +677,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 49 built-in series. A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
@@ -763,6 +784,39 @@ TOML can reference a secret by provider and key. Secret values are not interpola
 
 Providers may include restricted files, environment delivery, operating-system stores, and application-defined services. Provider support is explicit per target.
 
+### Secrets for hosted applications
+
+A hosted application borrows only the secrets its own section grants it:
+
+```toml
+[secret.db-password]
+provider = "file"
+key = "/run/secrets/db"
+
+[application.site.secrets]
+database = "db-password"
+```
+
+`[application.<name>]` is the section of the application registered as `<name>`, and a section for a name the registry does not hold refuses the configuration, at startup or at a reload. Each key of its `secrets` table is the name the application borrows by, from 1 to 64 printable characters without spaces, and each value names a `[secret]` declaration. An application holds at most 16 grants, and a configuration at most 32 sections. Two applications may borrow different secrets under the same name, and neither can borrow the other's.
+
+Every generation resolves the secrets it grants before it is published, into secret-welded memory, and a secret that cannot be resolved refuses the generation. A `file` secret is the file's bytes, read straight into that memory and handed over as they are, a trailing newline included. An `env` secret is the variable's value, and `os` and `application` secrets come from the provider the embedding program registers (see [Secrets](HOSTING.md#secrets)). A value is at most 4096 bytes. A reload resolves every grant again, so a secret rotated at its source reaches hosted code with the next reload, and grants and declarations may change at a reload. The administration credential is the exception: it is resolved once at startup, so a reload that changes its declaration is refused.
+
+### Application settings
+
+A hosted application's section may carry a `settings` table, which hedge hands to the application as it is (see [Settings](HOSTING.md#settings)):
+
+```toml
+[application.site.settings]
+greeting = "hello"
+ratio = 0.5
+peers = ["a", "b"]
+
+[application.site.settings.database]
+pool = 8
+password = "${SECRET:database}"
+```
+
+hedge does not interpret the table. It checks that every key can be addressed, as one of up to 128 bytes of dotted segments that are each printable and hold no space or dot, and flattens it: an array's elements sit under their indices (`peers.0`), a table's members under its key (`database.pool`), and a value may be a string, an integer, a float, a boolean, an array or a table. `${ENV:...}` is not expanded inside it. A string that is exactly `${SECRET:name}` refers to the grant `name` in the same application's `secrets` table, and one that names no grant of that application refuses the configuration. The settings of every section together hold at most 1024 values and 65536 bytes of keys and values. A reload hands the application its new settings with its new generation.
 ## Lightweight behavior
 
 Disabled sections create no worker, timer, cache, or background task. Default configuration does not enable proxying, caching, ACME, admin networking, templates, or application sessions.

@@ -20,13 +20,16 @@ use hedge.dispatch.plan;
 use hedge.handoff;
 use hedge.lifecycle;
 use hedge.listener;
+use hedge.observe;
 use hedge.protocol.quic.keyfile;
 use quic_keys:    hedge.protocol.quic.keys;
 use quic_runtime: hedge.protocol.quic.runtime;
 use hedge.protocol.quic.steering;
 use hedge_tls: hedge.protocol.tls;
+use hedge.secret;
 use hedge.serve;
 use hedge.service;
+use hedge.settings;
 use hedge.task;
 use hedge.telemetry;
 use telemetry_production: hedge.telemetry.production;
@@ -82,7 +85,10 @@ pub rec Options {
     native:       service.Factory;
     applications: *service.Applications;
     # the background task facility the supervisor runs, or nil for none
-    tasks:     *task.Tasks;
+    tasks: *task.Tasks;
+    # the provider the `os` and `application` secrets resolve through: the ones
+    # granted to hosted applications, and the administration credential
+    providers: secret.Providers;
     pseudonym: str;
     telemetry: telemetry_production.Options;
     # where the process key comes from: the operating system entropy source
@@ -91,8 +97,21 @@ pub rec Options {
 
 pub fun default_options() Options {
     ret Options{native: service.no_factory(), applications: nil, tasks: nil,
-        pseudonym: "hedge", telemetry: telemetry_production.default_options(),
+        providers: secret.no_providers(), pseudonym: "hedge", telemetry: telemetry_production.default_options(),
         entropy:   siphash.random_key};
+}
+
+# one listener as the process bound it. a TCP or QUIC listener's `address` is
+# its socket's own, so a configured port of 0 reads as the port the system
+# chose. a local listener has no IP address, and `local` is its configured
+# endpoint. listeners never change without a restart, so neither does this
+pub rec Bound {
+    name:      schema.Text;
+    transport: u8;
+    protocols: u8;
+    secure:    bool;
+    address:   ip.Endpoint;
+    local:     schema.Text;
 }
 
 pub rec Runtime {
@@ -129,6 +148,9 @@ pub rec Runtime {
     # the address each listener's first worker bound, which the other workers
     # bind again beside it
     endpoints: [schema.MAX_LISTENERS]ip.Endpoint;
+    # every listener as the first worker bound it, recorded once it serves
+    bound:       [schema.MAX_LISTENERS]Bound;
+    bound_count: usize;
     # every worker, allocated at start and owned for the process lifetime
     workers:             *worker.Worker;
     worker_count:        usize;
@@ -137,6 +159,7 @@ pub rec Runtime {
     alpn_challenge_live: bool;
     tls_live:            bool;
     telemetry_live:      bool;
+    hosted_live:         bool;
     events:              [16]Event;
     event_count:         usize;
 }
@@ -306,7 +329,13 @@ fun clean(runtime: *Runtime, controls: *worker.Controls) worker.StopReport {
 
 fun close_process(runtime: *Runtime, report: *worker.StopReport) {
     var i: usize = 0;
+    if (runtime.hosted_live) {
+        secret.close_store();
+        settings.close_store();
+        runtime.hosted_live = false;
+    }
     if (runtime.telemetry_live) {
+        observe.close();
         if (!telemetry_production.close(?runtime.observability)) {
             report.cleanup_failures = report.cleanup_failures + 1;
         }
@@ -422,10 +451,12 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
     runtime.alpn_challenge_live = false;
     runtime.tls_live            = false;
     runtime.telemetry_live      = false;
+    runtime.hosted_live         = false;
     runtime.event_count         = 0;
     runtime.certificate_policy  = hedge_tls.NO_POLICY;
     runtime.workers             = nil;
     runtime.worker_count        = 0;
+    runtime.bound_count         = 0;
     # no fallback: a table placed by a guessable key is one a peer can flood
     val key: opt[siphash.Key] = options.entropy();
     if (!(sel key.some)) {
@@ -507,11 +538,22 @@ pub fun start_process(runtime: *Runtime, heap: *allocator.Allocator,
         }
     }
 
+    val secrets: str = secret.open_store(configured, options.applications,
+        generation_id, options.providers);
+    if (secrets != nil) { ret fail(runtime, nil, worker.START_CONFIG, secrets); }
+    runtime.hosted_live = true;
+    if (!settings.open_store(configured, generation_id)) {
+        ret fail(runtime, nil, worker.START_RUNTIME, "application settings could not be opened");
+    }
+
     if (!telemetry_production.make(?runtime.observability, heap, configured,
-        options.telemetry)) {
+        options.providers, options.telemetry, diagnostics)) {
         ret fail(runtime, nil, worker.START_CONFIG, "telemetry could not be constructed");
     }
     runtime.telemetry_live = true;
+    if (!observe.open(?runtime.observability.runtime)) {
+        ret fail(runtime, nil, worker.START_RUNTIME, "hosted telemetry could not be opened");
+    }
 
     hedge_tls.reset();
     runtime.tls_live = true;
@@ -589,26 +631,60 @@ pub fun start_worker(runtime: *Runtime, index: usize, controls: *worker.Controls
         runtime.graph, runtime.generation_id, ?given);
     if (built.status != worker.START_OK) { ret built; }
     if (index == 0)                      { built_events(runtime, ?given); }
-    ret worker.start(current, controls, runtime.heap, runtime.graph,
-        runtime.generation_id, caps(runtime), runtime.worker_count > 1, placed,
-        supervised, diagnostics);
+    val started: worker.StartReport = worker.start(current, controls, runtime.heap,
+        runtime.graph, runtime.generation_id, caps(runtime), runtime.worker_count > 1,
+        placed, supervised, diagnostics);
+    if (started.status != worker.START_OK || index != 0) { ret started; }
+    if (!record_bound(runtime, current)) {
+        ret worker.failed(worker.START_RUNTIME,
+            "a listener's bound address could not be read");
+    }
+    ret started;
 }
 
-# record what the first worker's listeners bound, once it serves and before
-# any other worker starts
-pub fun record_endpoints(runtime: *Runtime) bool {
-    val first: *worker.Worker = worker_at(runtime, 0);
-    if (first == nil) { ret false; }
+# record what the first worker's listeners bound, on its own thread once it
+# serves and before any other worker starts, which binds the same addresses.
+# false when an IP listener's socket could not say where it is bound
+fun record_bound(runtime: *Runtime, first: *worker.Worker) bool {
+    runtime.bound_count = 0;
     var i: usize = 0;
     for (i < runtime.graph.listener_count) {
-        val owned: *listener.OwnedListener = listener.active_listener(
-            ?first.serving.owner, i);
-        if (owned != nil && owned.has_bound_endpoint) {
+        val configured: *schema.Listener = ?runtime.graph.listeners[i];
+        val entry:      *Bound           = ?runtime.bound[i];
+        var unbound:    ip.Endpoint;
+        entry.name      = configured.name;
+        entry.transport = configured.transport;
+        entry.protocols = configured.protocols;
+        entry.secure    = configured.tls_policy.len != 0;
+        entry.address   = unbound;
+        schema.clear_text(?entry.local);
+        if (configured.transport == schema.TRANSPORT_LOCAL) {
+            entry.local = configured.address;
+        }
+        or {
+            val owned: *listener.OwnedListener = listener.active_listener(
+                ?first.serving.owner, i);
+            if (owned == nil || !owned.has_bound_endpoint) { ret false; }
+            entry.address        = owned.bound_endpoint;
             runtime.endpoints[i] = owned.bound_endpoint;
         }
         i = i + 1;
     }
+    runtime.bound_count = runtime.graph.listener_count;
     ret true;
+}
+
+# how many listeners `bound` reports: every configured one once the first
+# worker serves, and none before
+pub fun bound_count(runtime: *Runtime) usize {
+    if (runtime == nil) { ret 0; }
+    ret runtime.bound_count;
+}
+
+# the listener at `index` as the process bound it, or nil past the last
+pub fun bound(runtime: *Runtime, index: usize) *Bound {
+    if (runtime == nil || index >= runtime.bound_count) { ret nil; }
+    ret ?runtime.bound[index];
 }
 
 # stop worker `index` serving, on the thread that runs it, and release its QUIC
@@ -709,6 +785,29 @@ pub fun stage_reload(runtime: *Runtime, configured: *schema.Graph,
     ret true;
 }
 
+# what a candidate hands hosted applications, beside what they read now: the
+# secrets it grants, resolved, and its settings. nil, or why it could not
+pub fun stage_hosted(runtime: *Runtime, configured: *schema.Graph,
+    generation_id: u64) str {
+    if (runtime == nil || !runtime.hosted_live) { ret "hosted application state is not open"; }
+    val secrets: str = secret.stage_store(configured, runtime.options.applications,
+        generation_id);
+    if (secrets != nil) { ret secrets; }
+    if (!settings.stage_store(configured, generation_id)) {
+        secret.discard_store();
+        ret "application settings could not be staged";
+    }
+    ret nil;
+}
+
+# drops what `stage_hosted` took for a reload that was not published
+pub fun discard_hosted(runtime: *Runtime) {
+    if (runtime != nil && runtime.hosted_live) {
+        secret.discard_store();
+        settings.discard_store();
+    }
+}
+
 # every reload moves each QUIC listener's connection IDs and tokens onto fresh
 # keys, or onto what its key file now holds. live connections move off the old
 # codepoint as their clients retire the IDs minted under it, and it decodes on
@@ -807,6 +906,10 @@ pub fun abort_reload(runtime: *Runtime, index: usize) bool {
 pub fun reloaded(runtime: *Runtime, configured: *schema.Graph, generation_id: u64) {
     runtime.graph         = configured;
     runtime.generation_id = generation_id;
+    if (runtime.hosted_live) {
+        secret.publish_store(generation_id);
+        settings.publish_store(generation_id);
+    }
     # the handshake caps move once for every worker. the connection caps are
     # startup-owned
     if (runtime.caps_live) {
@@ -827,6 +930,8 @@ pub fun reload(runtime: *Runtime, controls: *worker.Controls,
         ret worker.failed(worker.START_CONFIG,
             "startup-owned configuration changed; restart required");
     }
+    val staged: str = stage_hosted(runtime, configured, generation_id);
+    if (staged != nil) { ret worker.failed(worker.START_CONFIG, staged); }
     var i: usize = 0;
     for (i < runtime.worker_count) {
         val prepared: worker.StartReport = prepare_reload(runtime, i, controls,
@@ -837,6 +942,7 @@ pub fun reload(runtime: *Runtime, controls: *worker.Controls,
                 abort_reload(runtime, j);
                 j = j + 1;
             }
+            discard_hosted(runtime);
             ret prepared;
         }
         i = i + 1;
@@ -849,13 +955,17 @@ pub fun reload(runtime: *Runtime, controls: *worker.Controls,
             abort_reload(runtime, i);
             i = i + 1;
         }
+        discard_hosted(runtime);
         ret worker.failed(worker.START_RUNTIME, "budget caps could not be constructed");
     }
     i = 0;
     for (i < runtime.worker_count) {
         val published: worker.StartReport = commit_reload(runtime, i, controls,
             configured, generation_id, diagnostics);
-        if (published.status != worker.START_OK) { ret published; }
+        if (published.status != worker.START_OK) {
+            discard_hosted(runtime);
+            ret published;
+        }
         i = i + 1;
     }
     reloaded(runtime, configured, generation_id);
