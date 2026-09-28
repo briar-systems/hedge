@@ -290,9 +290,12 @@ listener change requires a process restart.
 
 ## Certificate management
 
-ACME is an optional control-plane subsystem. It owns an account, one
-certificate covering the configured names, its durable state, and the schedule
-that renews it. It performs no work when it is not configured.
+ACME is an optional control-plane subsystem. It owns one account and every
+configured certificate, each with its own names, durable state and renewal
+schedule, so one certificate's failure never holds another back. A listener's
+TLS generation publishes its configured identities beside every managed
+certificate installed into it, and a handshake selects among them by SNI. It
+performs no work when it is not configured.
 
 Every step is a step the serving loop takes: one outbound exchange at a time
 per manager on the subsystem's own completion runtime, one protocol decision
