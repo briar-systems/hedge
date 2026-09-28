@@ -1,8 +1,9 @@
 # the TLS listener runtime: one credential generation per configured policy
 #
 # a policy names certificate and key files; this loads them once, publishes them
-# as one immutable mach-tls credential generation, and holds the listener
-# configuration every connection on that listener borrows. nothing here is
+# with every managed certificate installed into the listener as one immutable
+# mach-tls credential generation, and holds the listener configuration every
+# connection on that listener borrows. nothing here is
 # per-connection: the generation is shared, and a connection pins it with a
 # lease for exactly as long as it lives.
 #
@@ -13,6 +14,7 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use hedge.acme.challenge;
 use acme_keys: hedge.acme.keys;
 use acme:      hedge.acme.manager;
 use hedge.clock;
@@ -20,10 +22,13 @@ use hedge.config.schema;
 use hedge.memory;
 use hedge_credentials: hedge.protocol.credentials;
 use hedge.secret_file;
+use A: std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use std.filesystem;
 use io_error: std.io.error;
 use std.io.file;
+use std.memory.buffers;
 use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -34,11 +39,13 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.view;
+use tls_buffer: tls.buffer;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
 use tls_clock:  tls.clock;
 use tls_config: tls.config;
+use tls.record;
 use tls_server: tls.server;
 use tls.session;
 use tls.tls13;
@@ -99,6 +106,7 @@ pub fun listener_limits() tls_config.Limits {
 rec Identity {
     der:          [MAX_PEM_BYTES]u8;
     certificates: [MAX_CHAIN]cert.Certificate;
+    chain_len:    usize;
     private_key:  keys.PrivateKey;
     name:         [schema.TEXT_CAP]u8;
     name_len:     usize;
@@ -115,45 +123,104 @@ rec Identity {
 # is still leased is refused rather than allowed to overwrite it.
 pub val BANKS: usize = 2;
 
+# the managed certificates the TLS layer holds, one per configured certificate
+pub val MAX_MANAGED: usize = schema.MAX_ACME_CERTIFICATES;
+# what one generation can publish: every configured identity and every name of
+# every managed certificate
+pub val MAX_PUBLISHED: usize = MAX_IDENTITIES + MAX_MANAGED * schema.MAX_ACME_NAMES;
+# the tls-alpn-01 presentations one listener holds at once, one per managed
+# certificate that could validate through it
+pub val MAX_CHALLENGES: usize = schema.MAX_ACME_CERTIFICATES;
+pub val NO_CHALLENGE:   usize = MAX_CHALLENGES;
+# the largest rfc 8737 certificate a presentation carries
+pub val CHALLENGE_BYTES: usize = challenge.ALPN_CERTIFICATE_BYTES;
+
+# one issuance of a managed certificate: its chain, its key, and the names it
+# is published under. every name shares the one chain and key
+rec Issued {
+    der:          [MAX_PEM_BYTES]u8;
+    certificates: [MAX_CHAIN]cert.Certificate;
+    chain_len:    usize;
+    private_key:  keys.PrivateKey;
+    names:        [schema.MAX_ACME_NAMES][schema.TEXT_CAP]u8;
+    name_lens:    [schema.MAX_ACME_NAMES]usize;
+    name_count:   usize;
+    live:         bool;
+}
+
+# a managed certificate as the TLS layer holds it. it belongs to one policy for
+# the life of the process, and alternates between two issuances so a renewal is
+# built while connections still hold the one it replaces
+rec Managed {
+    policy:    usize;
+    issued:    [BANKS]Issued;
+    current:   usize;
+    installed: bool;
+}
+
+# one tls-alpn-01 presentation slot, claimed by the one certificate that
+# presents through it
+rec Challenge {
+    der:         [CHALLENGE_BYTES]u8;
+    certificate: cert.Certificate;
+    key:         keys.PrivateKey;
+    name:        [schema.TEXT_CAP]u8;
+    name_len:    usize;
+    identity:    credentials.Identity;
+    generation:  credentials.Generation;
+    claimed:     bool;
+    live:        bool;
+    retiring:    bool;
+}
+
 pub rec Policy {
-    name:            [schema.TEXT_CAP]u8;
-    name_len:        usize;
-    identity_counts: [BANKS]usize;
-    identities:      [BANKS][MAX_IDENTITIES]Identity;
-    published:       [BANKS][MAX_IDENTITIES]credentials.Identity;
-    generations:     [BANKS]credentials.Generation;
+    name:     [schema.TEXT_CAP]u8;
+    name_len: usize;
+    # the configured identities, loaded once and served by every generation
+    # except under a name a managed certificate has taken over
+    identities:     [MAX_IDENTITIES]Identity;
+    identity_count: usize;
+    # the configured default identity's name, resolved in every generation
+    default_name:     [schema.TEXT_CAP]u8;
+    default_name_len: usize;
+    has_default:      bool;
+    published_counts: [BANKS]usize;
+    published:        [BANKS][MAX_PUBLISHED]credentials.Identity;
+    generations:      [BANKS]credentials.Generation;
     # whether that bank's generation was ever published, which `reclaimable`
     # cannot tell us: it reports false for a generation that was never published
     # and for one still leased alike
-    generation_live:             [BANKS]bool;
-    active:                      usize;
-    bindings:                    hedge_credentials.Bindings;
-    challenge_der:               [MAX_PEM_BYTES]u8;
-    challenge_certificate:       cert.Certificate;
-    challenge_key:               keys.PrivateKey;
-    challenge_name:              [schema.TEXT_CAP]u8;
-    challenge_name_len:          usize;
-    challenge_identity:          credentials.Identity;
-    challenge_generation:        credentials.Generation;
-    challenge_store:             credentials.Store;
-    challenge_live:              bool;
-    challenge_retiring:          bool;
-    challenge_enabled:           bool;
-    anchor_der:                  [MAX_PEM_BYTES]u8;
-    anchor_certificates:         [MAX_ANCHORS]cert.Certificate;
-    client_trust:                cert.TrustStore;
-    require_client_auth:         bool;
-    alpn_storage:                [MAX_ALPN][MAX_ALPN_BYTES]u8;
-    alpn:                        [MAX_ALPN]tls_config.ProtocolName;
-    alpn_len:                    usize;
-    require_alpn:                bool;
-    versions:                    [1]u16;
-    suites:                      [3]tls13.CipherSuite;
-    groups:                      [2]tls13.NamedGroup;
-    signatures:                  [4]tls13.SignatureScheme;
-    entropy:                     secret.Entropy;
-    clock:                       tls_clock.Source;
-    ticket_ring:                 session.KeyRing;
+    generation_live: [BANKS]bool;
+    active:          usize;
+    bindings:        hedge_credentials.Bindings;
+    challenges:      [MAX_CHALLENGES]Challenge;
+    # beside the slots rather than in them, so the selector walks them as one
+    # array from the one store pointer it is handed
+    challenge_stores:    [MAX_CHALLENGES]credentials.Store;
+    challenge_enabled:   bool;
+    anchor_der:          [MAX_PEM_BYTES]u8;
+    anchor_certificates: [MAX_ANCHORS]cert.Certificate;
+    client_trust:        cert.TrustStore;
+    require_client_auth: bool;
+    alpn_storage:        [MAX_ALPN][MAX_ALPN_BYTES]u8;
+    alpn:                [MAX_ALPN]tls_config.ProtocolName;
+    alpn_len:            usize;
+    require_alpn:        bool;
+    versions:            [1]u16;
+    suites:              [3]tls13.CipherSuite;
+    groups:              [2]tls13.NamedGroup;
+    signatures:          [4]tls13.SignatureScheme;
+    entropy:             secret.Entropy;
+    clock:               tls_clock.Source;
+    ticket_ring:         session.KeyRing;
+    # the ring takes each ticket key's cipher context under its own lock from
+    # whichever worker rotates, so it borrows from a pool of its own
+    ticket_backing:              A.Allocator;
+    ticket_classes:              [1]buffers.ClassConfig;
+    ticket_pool:                 buffers.Pool;
+    ticket_secrets:              buffers.SecretSource;
+    ticket_account:              buffers.Account;
+    ticket_memory_live:          bool;
     replay_window:               session.ReplayWindow;
     ticket_key_lifetime_seconds: u32;
     # when the ticket key is next due, in monotonic nanoseconds. every worker
@@ -175,6 +242,8 @@ pub val NO_POLICY:    usize = MAX_POLICIES;
 
 var policies:     [MAX_POLICIES]Policy;
 var policy_count: usize;
+# every managed certificate, by its configured index
+var managed: [MAX_MANAGED]Managed;
 # a parsed private key stores a *pointer* to the allocator that owns its secret
 # memory and calls back through it when destroyed, so the allocator must outlive
 # every key. A stack local in the function that loads them does not: it leaves
@@ -183,25 +252,44 @@ var policy_count: usize;
 var identity_owner: secret.Allocator;
 var scratch:        [MAX_PEM_BYTES]u8;
 
+fun clear_challenge(slot: *Challenge) {
+    slot.claimed  = false;
+    slot.live     = false;
+    slot.retiring = false;
+    slot.name_len = 0;
+}
+
 pub fun reset() {
     destroy();
     var i: usize = 0;
     for (i < MAX_POLICIES) {
-        policies[i].live               = false;
-        policies[i].identity_counts[0] = 0;
-        policies[i].identity_counts[1] = 0;
-        policies[i].generation_live[0] = false;
-        policies[i].generation_live[1] = false;
-        policies[i].challenge_live     = false;
-        policies[i].challenge_retiring = false;
-        policies[i].challenge_enabled  = false;
-        policies[i].challenge_name_len = 0;
+        policies[i].live                = false;
+        policies[i].identity_count      = 0;
+        policies[i].published_counts[0] = 0;
+        policies[i].published_counts[1] = 0;
+        policies[i].generation_live[0]  = false;
+        policies[i].generation_live[1]  = false;
+        policies[i].challenge_enabled   = false;
+        var j: usize = 0;
+        for (j < MAX_CHALLENGES) {
+            clear_challenge(?policies[i].challenges[j]);
+            j = j + 1;
+        }
         policies[i].active             = 0;
         policies[i].name_len           = 0;
         policies[i].tickets_live       = false;
+        policies[i].ticket_memory_live = false;
         policies[i].replay_live        = false;
         policies[i].ticket_rotate_ns   = 0;
         i                              = i + 1;
+    }
+    i = 0;
+    for (i < MAX_MANAGED) {
+        managed[i].installed      = false;
+        managed[i].policy         = NO_POLICY;
+        managed[i].issued[0].live = false;
+        managed[i].issued[1].live = false;
+        i                         = i + 1;
     }
     policy_count   = 0;
     identity_owner = secret.system_allocator();
@@ -348,11 +436,10 @@ fun wipe(buffer: *u8, length: usize) {
     }
 }
 
-fun load_identity(policy: *Policy, bank: usize, configured: *schema.TlsIdentity,
+fun load_identity(policy: *Policy, configured: *schema.TlsIdentity,
     owner: *secret.Allocator) Status {
-    if (policy.identity_counts[bank] >= MAX_IDENTITIES) { ret EXHAUSTED; }
-    val slot:     usize     = policy.identity_counts[bank];
-    val identity: *Identity = ?policy.identities[bank][slot];
+    if (policy.identity_count >= MAX_IDENTITIES) { ret EXHAUSTED; }
+    val identity: *Identity = ?policy.identities[policy.identity_count];
     identity.live = false;
     if (!copy_name(?identity.name[0], ?identity.name_len,
         schema.text(?configured.server_name))) { ret INVALID; }
@@ -372,20 +459,9 @@ fun load_identity(policy: *Policy, bank: usize, configured: *schema.TlsIdentity,
         refused_key_path = schema.text(?configured.key);
         ret loaded;
     }
-    var name: contracts.Bytes;
-    name.data = nil;
-    name.len  = 0;
-    if (identity.name_len != 0) {
-        name.data = ?identity.name[0];
-        name.len  = identity.name_len;
-    }
-    var published: credentials.Identity;
-    published.server_name        = name;
-    published.chain              = chain;
-    published.private_key        = ?identity.private_key;
-    policy.published[bank][slot] = published;
-    identity.live                = true;
-    policy.identity_counts[bank] = slot + 1;
+    identity.chain_len    = chain.len;
+    identity.live         = true;
+    policy.identity_count = policy.identity_count + 1;
     ret OK;
 }
 
@@ -441,20 +517,37 @@ fun offer_protocols(policy: *Policy, protocols: u8) {
     }
 }
 
-fun default_index(policy: *Policy, bank: usize,
-    configured: *schema.TlsPolicy) usize {
-    if (!configured.has_default) { ret credentials.NO_DEFAULT; }
-    val wanted: str   = schema.text(?configured.default_name);
-    var i:      usize = 0;
-    for (i < policy.identity_counts[bank]) {
-        val identity: *Identity = ?policy.identities[bank][i];
-        if (identity.name_len == str_len(wanted)) {
-            var j: usize = 0;
-            for (j < identity.name_len && identity.name[j] == wanted[j]) {
-                j = j + 1;
-            }
-            if (j == identity.name_len) { ret i; }
-        }
+# server names compare as dns names do: ascii case folded, and a trailing dot
+# ignored
+fun same_name(first: contracts.Bytes, second: contracts.Bytes) bool {
+    var first_len:  usize = first.len;
+    var second_len: usize = second.len;
+    if (first_len > 0 && first.data[first_len - 1] == '.')    { first_len = first_len - 1; }
+    if (second_len > 0 && second.data[second_len - 1] == '.') { second_len = second_len - 1; }
+    if (first_len != second_len)                              { ret false; }
+    var i: usize = 0;
+    for (i < first_len) {
+        var left:  u8 = first.data[i];
+        var right: u8 = second.data[i];
+        if (left >= 'A' && left <= 'Z')   { left = left + ('a' - 'A'); }
+        if (right >= 'A' && right <= 'Z') { right = right + ('a' - 'A'); }
+        if (left != right)                { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the published identity the configured default names in `bank`, which may be
+# a managed certificate that took the name over, or none
+fun default_index(policy: *Policy, bank: usize) usize {
+    if (!policy.has_default) { ret credentials.NO_DEFAULT; }
+    val wanted: contracts.Bytes = contracts.Bytes{data: ?policy.default_name[0],
+        len: policy.default_name_len};
+    var i: usize = 0;
+    for (i < policy.published_counts[bank]) {
+        val name: contracts.Bytes = policy.published[bank][i].server_name;
+        if ((wanted.len == 0 && name.len == 0)
+            || (wanted.len != 0 && name.len != 0 && same_name(name, wanted))) { ret i; }
         i = i + 1;
     }
     ret credentials.NO_DEFAULT;
@@ -521,6 +614,47 @@ fun build_configuration(policy: *Policy) Status {
     ret OK;
 }
 
+fun ticket_ignore_misuse(context: ptr) {}
+
+# one context class, sized for every key the ring can hold at once
+fun make_ticket_memory(policy: *Policy) bool {
+    var made: err[A.Error] = page.make(?policy.ticket_backing);
+    if (sel made.err) { ret false; }
+    val budget: usize = session.MAX_TICKET_KEYS * record.CONTEXT_SIZE;
+    policy.ticket_classes[0] = buffers.ClassConfig{size: record.CONTEXT_SIZE,
+        align: record.CONTEXT_ALIGN, secret: true, high_water: session.MAX_TICKET_KEYS};
+    var config: buffers.Config;
+    config.classes        = ?policy.ticket_classes[0];
+    config.class_count    = 1;
+    config.lanes          = 1;
+    config.global_budget  = budget;
+    config.initial_slots  = session.MAX_TICKET_KEYS;
+    config.notify         = (0::usize)::fun(ptr, u64);
+    config.notify_context = nil;
+    config.trap           = ticket_ignore_misuse;
+    config.trap_context   = nil;
+    if (!buffers.make(?policy.ticket_pool, config, ?policy.ticket_backing)) { ret false; }
+    policy.ticket_secrets = buffers.secret_source(?policy.ticket_pool);
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 1;
+    budgets.bytes[0] = budget;
+    var opened: buffers.Reason = buffers.open_account(?policy.ticket_pool,
+        ?policy.ticket_account, 1, budgets, 0);
+    if (!(sel opened.none)) {
+        buffers.destroy(?policy.ticket_pool);
+        ret false;
+    }
+    policy.ticket_memory_live = true;
+    ret true;
+}
+
+fun destroy_ticket_memory(policy: *Policy) {
+    if (!policy.ticket_memory_live) { ret; }
+    buffers.close_account(?policy.ticket_pool, ?policy.ticket_account);
+    buffers.destroy(?policy.ticket_pool);
+    policy.ticket_memory_live = false;
+}
+
 fun destroy_resumption(policy: *Policy) {
     if (policy.replay_live) {
         session.replay_destroy(?policy.replay_window);
@@ -530,11 +664,13 @@ fun destroy_resumption(policy: *Policy) {
         session.keyring_destroy(?policy.ticket_ring);
         policy.tickets_live = false;
     }
+    destroy_ticket_memory(policy);
     policy.ticket_rotate_ns = 0;
 }
 
 fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Status {
     policy.tickets_live           = false;
+    policy.ticket_memory_live     = false;
     policy.replay_live            = false;
     policy.ticket_rotate_ns       = 0;
     policy.ticket_replay_policy   = session.REPLAY_PERMISSIVE;
@@ -545,10 +681,17 @@ fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Sta
         (session.MAX_TICKET_KEYS - 1)) { ret INVALID; }
     var moment: tls_clock.Moment;
     if (!tls_clock.read(?policy.clock, ?moment)) { ret UNSUPPORTED; }
-    if (!session.keyring_init(?policy.ticket_ring, ?policy.entropy, moment,
+    if (!make_ticket_memory(policy))             { ret UNSUPPORTED; }
+    val secrets: tls_buffer.SecretLease = tls_buffer.SecretLease{
+        source: ?policy.ticket_secrets, account: ?policy.ticket_account, lane: 0
+    };
+    if (!session.keyring_init(?policy.ticket_ring, secrets, ?policy.entropy, moment,
         configured.key_lifetime_seconds,
         configured.retirement_overlap_seconds,
-        configured.ticket_lifetime_seconds)) { ret UNSUPPORTED; }
+        configured.ticket_lifetime_seconds)) {
+        destroy_ticket_memory(policy);
+        ret UNSUPPORTED;
+    }
     policy.tickets_live                = true;
     policy.ticket_key_lifetime_seconds = configured.key_lifetime_seconds;
     atomic.store(?policy.ticket_rotate_ns, rotation_after(moment.monotonic,
@@ -572,16 +715,15 @@ fun configure_resumption(policy: *Policy, configured: *schema.TlsResumption) Sta
     ret OK;
 }
 
-# release one bank's private keys and forget what it held
+# release the configured identities' keys
 #
-# the caller must have established that this bank's generation is reclaimable.
-# Destroying a key an established connection is still handshaking against would
-# be exactly the failure lease pinning exists to prevent.
-fun destroy_bank(policy: *Policy, bank: usize) bool {
+# the caller must have established that no generation still reaches them. every
+# generation publishes them, so that is only ever the policy's teardown.
+fun destroy_statics(policy: *Policy) bool {
     var success: bool  = true;
     var i:       usize = 0;
-    for (i < policy.identity_counts[bank]) {
-        val identity: *Identity = ?policy.identities[bank][i];
+    for (i < policy.identity_count) {
+        val identity: *Identity = ?policy.identities[i];
         if (identity.live
             && keys.destroy_private(?identity.private_key) != contracts.OK) {
             success = false;
@@ -589,9 +731,113 @@ fun destroy_bank(policy: *Policy, bank: usize) bool {
         identity.live = false;
         i             = i + 1;
     }
-    policy.identity_counts[bank] = 0;
-    policy.generation_live[bank] = false;
+    policy.identity_count = 0;
     ret success;
+}
+
+# release one issuance's key and forget it. the caller must have established
+# that no live generation publishes it
+fun destroy_issued(issued: *Issued) bool {
+    var success: bool = true;
+    if (issued.live && keys.destroy_private(?issued.private_key) != contracts.OK) {
+        success = false;
+    }
+    issued.live       = false;
+    issued.name_count = 0;
+    issued.chain_len  = 0;
+    ret success;
+}
+
+# forget what a bank's generation published. its keys belong to the configured
+# identities and the managed certificates, never to the bank
+fun clear_bank(policy: *Policy, bank: usize) {
+    policy.published_counts[bank] = 0;
+    policy.generation_live[bank]  = false;
+    policy.generations[bank]      = credentials.empty_generation();
+}
+
+fun publish_entry(policy: *Policy, bank: usize, name: contracts.Bytes,
+    chain: cert.Chain, private_key: *keys.PrivateKey) bool {
+    val slot: usize = policy.published_counts[bank];
+    if (slot >= MAX_PUBLISHED) { ret false; }
+    var entry: credentials.Identity;
+    entry.server_name             = name;
+    entry.chain                   = chain;
+    entry.private_key             = private_key;
+    policy.published[bank][slot]  = entry;
+    policy.published_counts[bank] = slot + 1;
+    ret true;
+}
+
+fun issued_name(issued: *Issued, index: usize) contracts.Bytes {
+    ret contracts.Bytes{data: ?issued.names[index][0], len: issued.name_lens[index]};
+}
+
+# the issuance managed certificate `certificate` publishes on policy `index`:
+# `pending` for the one being replaced, the current one for any other installed
+# there, or nil
+fun issuance(index: usize, certificate: usize, replacing: usize,
+    pending: *Issued) *Issued {
+    if (certificate == replacing) { ret pending; }
+    val held: *Managed = ?managed[certificate];
+    if (!held.installed || held.policy != index) { ret nil; }
+    ret ?held.issued[held.current];
+}
+
+fun managed_serves(index: usize, replacing: usize, pending: *Issued,
+    name: contracts.Bytes) bool {
+    var certificate: usize = 0;
+    for (certificate < MAX_MANAGED) {
+        val issued: *Issued = issuance(index, certificate, replacing, pending);
+        if (issued != nil) {
+            var i: usize = 0;
+            for (i < issued.name_count) {
+                if (same_name(issued_name(issued, i), name)) { ret true; }
+                i = i + 1;
+            }
+        }
+        certificate = certificate + 1;
+    }
+    ret false;
+}
+
+# fills `bank` with everything the policy serves: each configured identity
+# whose name no managed certificate has taken over, then every name of every
+# managed certificate on the listener, with `pending` standing in for
+# certificate `replacing`. sni then selects across both
+fun compose_bank(index: usize, bank: usize, replacing: usize,
+    pending: *Issued) bool {
+    val policy: *Policy = ?policies[index];
+    policy.published_counts[bank] = 0;
+    var i: usize = 0;
+    for (i < policy.identity_count) {
+        val identity: *Identity       = ?policy.identities[i];
+        var name:     contracts.Bytes = contracts.Bytes{data: nil, len: 0};
+        if (identity.name_len != 0) {
+            name = contracts.Bytes{data: ?identity.name[0], len: identity.name_len};
+        }
+        if (name.len == 0 || !managed_serves(index, replacing, pending, name)) {
+            if (!publish_entry(policy, bank, name, cert.Chain{
+                certificates: ?identity.certificates[0], len: identity.chain_len
+            }, ?identity.private_key)) { ret false; }
+        }
+        i = i + 1;
+    }
+    var certificate: usize = 0;
+    for (certificate < MAX_MANAGED) {
+        val issued: *Issued = issuance(index, certificate, replacing, pending);
+        if (issued != nil) {
+            i = 0;
+            for (i < issued.name_count) {
+                if (!publish_entry(policy, bank, issued_name(issued, i), cert.Chain{
+                    certificates: ?issued.certificates[0], len: issued.chain_len
+                }, ?issued.private_key)) { ret false; }
+                i = i + 1;
+            }
+        }
+        certificate = certificate + 1;
+    }
+    ret true;
 }
 
 # published once per secure listener rather than once per configured policy, and
@@ -604,43 +850,53 @@ fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
     if (configured == nil || name == nil) { ret INVALID; }
     if (policy_count >= MAX_POLICIES)     { ret EXHAUSTED; }
     identity_owner = secret.system_allocator();
-    val policy: *Policy = ?policies[policy_count];
-    policy.live                 = false;
-    policy.identity_counts[0]   = 0;
-    policy.identity_counts[1]   = 0;
-    policy.generation_live[0]   = false;
-    policy.generation_live[1]   = false;
-    policy.challenge_live       = false;
-    policy.challenge_retiring   = false;
-    policy.challenge_enabled    = options.tls_alpn_challenge;
-    policy.challenge_name_len   = 0;
-    policy.challenge_generation = credentials.empty_generation();
-    policy.challenge_store      = credentials.empty_store();
-    policy.challenge_key        = keys.empty_private();
-    if (policy.challenge_enabled &&
-        credentials.initialize_vacant_store(?policy.challenge_store) !=
-        contracts.OK) { ret UNSUPPORTED; }
+    val index:  usize   = policy_count;
+    val policy: *Policy = ?policies[index];
+    policy.live                = false;
+    policy.identity_count      = 0;
+    policy.published_counts[0] = 0;
+    policy.published_counts[1] = 0;
+    policy.generation_live[0]  = false;
+    policy.generation_live[1]  = false;
+    policy.challenge_enabled   = options.tls_alpn_challenge;
+    var slot: usize = 0;
+    for (slot < MAX_CHALLENGES) {
+        val challenge_slot: *Challenge = ?policy.challenges[slot];
+        clear_challenge(challenge_slot);
+        challenge_slot.generation     = credentials.empty_generation();
+        challenge_slot.key            = keys.empty_private();
+        policy.challenge_stores[slot] = credentials.empty_store();
+        if (policy.challenge_enabled &&
+            credentials.initialize_vacant_store(?policy.challenge_stores[slot]) !=
+            contracts.OK) { ret UNSUPPORTED; }
+        slot = slot + 1;
+    }
     policy.active               = 0;
     policy.alpn_len             = 0;
     policy.require_client_auth  = configured.client_auth;
     policy.tickets_live         = false;
+    policy.ticket_memory_live   = false;
     policy.replay_live          = false;
     policy.ticket_rotate_ns     = 0;
     policy.client_trust.anchors = nil;
     policy.client_trust.len     = 0;
+    policy.has_default          = configured.has_default;
+    policy.default_name_len     = 0;
     if (!copy_name(?policy.name[0], ?policy.name_len, name)) { ret INVALID; }
-    if (configured.identity_count == 0)                      { ret INVALID; }
+    if (configured.has_default && !copy_name(?policy.default_name[0],
+        ?policy.default_name_len, schema.text(?configured.default_name))) { ret INVALID; }
+    if (configured.identity_count == 0) { ret INVALID; }
     policy.entropy = secret.system_entropy();
     policy.clock   = tls_clock.system();
     val resumable: Status = configure_resumption(policy, ?configured.resumption);
     if (resumable != OK) { ret resumable; }
     var i: usize = 0;
     for (i < configured.identity_count) {
-        val loaded: Status = load_identity(policy, 0, ?configured.identities[i],
+        val loaded: Status = load_identity(policy, ?configured.identities[i],
             ?identity_owner);
         if (loaded != OK) {
             destroy_resumption(policy);
-            destroy_bank(policy, 0);
+            destroy_statics(policy);
             ret loaded;
         }
         i = i + 1;
@@ -651,7 +907,7 @@ fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
             schema.text(?configured.client_trust));
         if (anchored != OK) {
             destroy_resumption(policy);
-            destroy_bank(policy, 0);
+            destroy_statics(policy);
             ret anchored;
         }
         trust = ?policy.client_trust;
@@ -662,19 +918,21 @@ fun publish_inner(name: str, configured: *schema.TlsPolicy, protocols: u8,
     # client that offers nothing we serve is refused rather than defaulted
     policy.require_alpn   = policy.alpn_len != 0;
     policy.generations[0] = credentials.empty_generation();
-    if (hedge_credentials.publish(?policy.bindings, ?policy.generations[0],
-        ?policy.published[0][0], policy.identity_counts[0],
-        default_index(policy, 0, configured), trust,
+    # no managed certificate is installed on a policy not yet published
+    if (!compose_bank(index, 0, MAX_MANAGED, nil)
+        || hedge_credentials.publish(?policy.bindings, ?policy.generations[0],
+        ?policy.published[0][0], policy.published_counts[0],
+        default_index(policy, 0), trust,
         configured.client_auth) != hedge_credentials.OK) {
         destroy_resumption(policy);
-        destroy_bank(policy, 0);
+        destroy_statics(policy);
         ret UNSUPPORTED;
     }
     policy.generation_live[0] = true;
     val built: Status = build_configuration(policy);
     if (built != OK) {
         destroy_resumption(policy);
-        destroy_bank(policy, 0);
+        destroy_statics(policy);
         ret built;
     }
     policy.live  = true;
@@ -709,113 +967,140 @@ pub fun servable(index: usize, name: str) bool {
     ret true;
 }
 
-# imports ACME source bytes into the listener-owned idle bank.
+# copies one managed certificate's chain and PKCS#8 key into `issued`
+fun load_issued(issued: *Issued, manager: *acme.Manager) Status {
+    val names:     usize = acme.name_count(manager);
+    val chain_len: usize = acme.chain_count(manager);
+    if (names == 0 || names > schema.MAX_ACME_NAMES || chain_len == 0
+        || chain_len > MAX_CHAIN) { ret INVALID; }
+    var name_index: usize = 0;
+    for (name_index < names) {
+        var length: usize = 0;
+        if (!copy_view_name(?issued.names[name_index][0], ?length,
+            acme.name(manager, name_index))) { ret INVALID; }
+        issued.name_lens[name_index] = length;
+        name_index                   = name_index + 1;
+    }
+    var chain_bytes:       usize = 0;
+    var certificate_index: usize = 0;
+    for (certificate_index < chain_len) {
+        var encoded: view.View;
+        if (!acme.chain_entry(manager, certificate_index, ?encoded)
+            || encoded.data == nil || encoded.len == 0) { ret UNDECODABLE; }
+        if (encoded.len > MAX_PEM_BYTES - chain_bytes) { ret EXHAUSTED; }
+        var byte_index: usize = 0;
+        for (byte_index < encoded.len) {
+            issued.der[chain_bytes + byte_index] = encoded.data[byte_index];
+            byte_index                           = byte_index + 1;
+        }
+        if (load.certificate_der(contracts.Bytes{
+            data: ?issued.der[chain_bytes], len: encoded.len
+        },
+            ?issued.certificates[certificate_index]) != contracts.OK) {
+            ret UNDECODABLE;
+        }
+        chain_bytes       = chain_bytes + encoded.len;
+        certificate_index = certificate_index + 1;
+    }
+    issued.private_key = keys.empty_private();
+    if (load.private_der(acme_keys.private_der(acme.certificate_key(manager)),
+        cert.PKCS8_DER, ?identity_owner, ?issued.private_key) != contracts.OK) {
+        ret UNDECODABLE;
+    }
+    issued.name_count = names;
+    issued.chain_len  = chain_len;
+    issued.live       = true;
+    ret OK;
+}
+
+# publishes the listener's generation with one managed certificate's new
+# issuance, leaving every other certificate and configured identity as it was
 pub fun install_acme(index: usize, manager: *acme.Manager) Status {
     val policy: *Policy = policy_at(index);
     if (policy == nil || !acme.certificate_ready(manager)) { ret INVALID; }
-    val names:     usize = acme.name_count(manager);
-    val chain_len: usize = acme.chain_count(manager);
-    if (names == 0 || names > MAX_IDENTITIES || chain_len == 0
-        || chain_len > MAX_CHAIN) { ret INVALID; }
+    val certificate: usize = acme.certificate_index(manager);
+    if (certificate >= MAX_MANAGED) { ret INVALID; }
+    val held: *Managed = ?managed[certificate];
+    if (held.installed && held.policy != index) { ret INVALID; }
     val target: usize = 1 - policy.active;
     if (policy.generation_live[target]) {
         if (!hedge_credentials.reclaimable(?policy.generations[target])) {
             ret RETIRED_IN_USE;
         }
-        if (!destroy_bank(policy, target)) { ret INVALID; }
+        clear_bank(policy, target);
     }
-    policy.identity_counts[target] = 0;
-    identity_owner                 = secret.system_allocator();
-    var name_index: usize = 0;
-    for (name_index < names) {
-        val slot:     usize     = policy.identity_counts[target];
-        val identity: *Identity = ?policy.identities[target][slot];
-        identity.live = false;
-        if (!copy_view_name(?identity.name[0], ?identity.name_len,
-            acme.name(manager, name_index))) {
-            destroy_bank(policy, target);
-            ret INVALID;
-        }
-        var chain_bytes:       usize = 0;
-        var certificate_index: usize = 0;
-        for (certificate_index < chain_len) {
-            var encoded: view.View;
-            if (!acme.chain_entry(manager, certificate_index, ?encoded)
-                || encoded.data == nil || encoded.len == 0) {
-                destroy_bank(policy, target);
-                ret UNDECODABLE;
-            }
-            if (encoded.len > MAX_PEM_BYTES - chain_bytes) {
-                destroy_bank(policy, target);
-                ret EXHAUSTED;
-            }
-            var byte_index: usize = 0;
-            for (byte_index < encoded.len) {
-                identity.der[chain_bytes + byte_index] = encoded.data[byte_index];
-                byte_index                             = byte_index + 1;
-            }
-            if (load.certificate_der(contracts.Bytes{
-                data: ?identity.der[chain_bytes], len: encoded.len
-            },
-                ?identity.certificates[certificate_index]) != contracts.OK) {
-                destroy_bank(policy, target);
-                ret UNDECODABLE;
-            }
-            chain_bytes       = chain_bytes + encoded.len;
-            certificate_index = certificate_index + 1;
-        }
-        identity.private_key = keys.empty_private();
-        val parsed: contracts.Error = load.private_der(
-            acme_keys.private_der(acme.certificate_key(manager)),
-            cert.PKCS8_DER, ?identity_owner, ?identity.private_key);
-        if (parsed != contracts.OK) {
-            destroy_bank(policy, target);
-            ret UNDECODABLE;
-        }
-        var served: credentials.Identity;
-        served.server_name = contracts.Bytes{data: ?identity.name[0],
-            len: identity.name_len};
-        served.chain = cert.Chain{certificates: ?identity.certificates[0],
-            len: chain_len};
-        served.private_key             = ?identity.private_key;
-        policy.published[target][slot] = served;
-        identity.live                  = true;
-        policy.identity_counts[target] = slot + 1;
-        name_index                     = name_index + 1;
+    # only the active generation is live now, and it reaches this certificate's
+    # current issuance at most, so the other one is free to replace
+    var spare: usize = 0;
+    if (held.installed) { spare = 1 - held.current; }
+    val pending: *Issued = ?held.issued[spare];
+    if (!destroy_issued(pending)) { ret INVALID; }
+    identity_owner = secret.system_allocator();
+    val loaded: Status = load_issued(pending, manager);
+    if (loaded != OK) {
+        destroy_issued(pending);
+        ret loaded;
+    }
+    if (!compose_bank(index, target, certificate, pending)) {
+        destroy_issued(pending);
+        clear_bank(policy, target);
+        ret EXHAUSTED;
     }
     var trust: *cert.TrustStore = nil;
     if (policy.require_client_auth) { trust = ?policy.client_trust; }
     policy.generations[target] = credentials.empty_generation();
     if (credentials.initialize(?policy.generations[target],
-        ?policy.published[target][0], policy.identity_counts[target], 0, trust,
+        ?policy.published[target][0], policy.published_counts[target],
+        default_index(policy, target), trust,
         policy.require_client_auth) != contracts.OK) {
-        destroy_bank(policy, target);
+        destroy_issued(pending);
+        clear_bank(policy, target);
         ret UNSUPPORTED;
     }
     var retired: *credentials.Generation = nil;
     if (hedge_credentials.rotate(?policy.bindings, ?policy.generations[target],
         ?retired) != hedge_credentials.OK || retired == nil) {
-        destroy_bank(policy, target);
+        destroy_issued(pending);
+        clear_bank(policy, target);
         ret UNSUPPORTED;
     }
     policy.generation_live[target] = true;
     policy.active                  = target;
+    held.current                   = spare;
+    held.installed                 = true;
+    held.policy                    = index;
     ret OK;
 }
 
+# answers an `acme-tls/1` handshake from whichever presentation slot holds its
+# server name. `store` is the first of the policy's MAX_CHALLENGES stores
 fun select_tls_alpn(store: *credentials.Store, offer: tls_server.CredentialOffer,
     output: *credentials.Lease) contracts.Error {
     if (store == nil || !tls_server.offered_alpn_exactly(offer,
         contracts.Bytes{data: "acme-tls/1"::*u8, len: 10})) {
         ret contracts.UNSUPPORTED;
     }
-    ret credentials.acquire(store, offer.server_name, output);
+    # a presentation's generation defaults to its one identity, so a store
+    # answers any name. the lease is kept only from the store presenting the
+    # name the client asked for
+    var i: usize = 0;
+    for (i < MAX_CHALLENGES) {
+        if (credentials.acquire(?store[i], offer.server_name, output) == contracts.OK) {
+            if (same_name(output.identity.server_name, offer.server_name)) {
+                ret contracts.OK;
+            }
+            credentials.release(output);
+            @output = credentials.empty_lease();
+        }
+        i = i + 1;
+    }
+    ret contracts.UNSUPPORTED;
 }
 
 pub fun tls_alpn_selector(policy: *Policy) tls_server.CredentialSelector {
     var value: tls_server.CredentialSelector = tls_server.no_credential_selector();
     if (policy == nil || !policy.challenge_enabled) { ret value; }
-    value.store  = ?policy.challenge_store;
+    value.store  = ?policy.challenge_stores[0];
     value.select = select_tls_alpn;
     ret value;
 }
@@ -825,98 +1110,120 @@ pub fun tls_alpn_enabled(index: usize) bool {
     ret policy != nil && policy.challenge_enabled;
 }
 
-fun retire_tls_alpn(policy: *Policy) bool {
-    if (policy == nil || !policy.challenge_live || policy.challenge_retiring) {
-        ret true;
+# a presentation slot of its own for one certificate validating through the
+# listener, or NO_CHALLENGE when the listener answers no tls-alpn-01 or every
+# slot is taken
+pub fun claim_tls_alpn(index: usize) usize {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || !policy.challenge_enabled) { ret NO_CHALLENGE; }
+    var slot: usize = 0;
+    for (slot < MAX_CHALLENGES) {
+        if (!policy.challenges[slot].claimed) {
+            policy.challenges[slot].claimed = true;
+            ret slot;
+        }
+        slot = slot + 1;
     }
+    ret NO_CHALLENGE;
+}
+
+fun challenge_at(index: usize, slot: usize) *Challenge {
+    val policy: *Policy = policy_at(index);
+    if (policy == nil || !policy.challenge_enabled || slot >= MAX_CHALLENGES
+        || !policy.challenges[slot].claimed) { ret nil; }
+    ret ?policy.challenges[slot];
+}
+
+fun retire_tls_alpn(policy: *Policy, slot: usize) bool {
+    val presented: *Challenge = ?policy.challenges[slot];
+    if (!presented.live || presented.retiring) { ret true; }
     var retired: *credentials.Generation = nil;
-    if (credentials.withdraw_store(?policy.challenge_store, ?retired) !=
-        contracts.OK || retired != ?policy.challenge_generation) {
+    if (credentials.withdraw_store(?policy.challenge_stores[slot], ?retired) !=
+        contracts.OK || retired != ?presented.generation) {
         ret false;
     }
-    policy.challenge_retiring = true;
+    presented.retiring = true;
     ret true;
 }
 
-fun reap_tls_alpn(policy: *Policy) Status {
-    if (policy == nil || !policy.challenge_live) { ret OK; }
-    if (!policy.challenge_retiring) {
-        ret INVALID;
-    }
-    if (!credentials.reclaimable(?policy.challenge_generation)) {
+fun reap_tls_alpn(presented: *Challenge) Status {
+    if (!presented.live)     { ret OK; }
+    if (!presented.retiring) { ret INVALID; }
+    if (!credentials.reclaimable(?presented.generation)) {
         ret RETIRED_IN_USE;
     }
-    if (credentials.clear(?policy.challenge_generation) != contracts.OK ||
-        keys.destroy_private(?policy.challenge_key) != contracts.OK) {
+    if (credentials.clear(?presented.generation) != contracts.OK ||
+        keys.destroy_private(?presented.key) != contracts.OK) {
         ret UNSUPPORTED;
     }
-    wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
-    policy.challenge_name_len = 0;
-    policy.challenge_live     = false;
-    policy.challenge_retiring = false;
+    wipe(?presented.der[0], CHALLENGE_BYTES);
+    presented.name_len = 0;
+    presented.live     = false;
+    presented.retiring = false;
     ret OK;
 }
 
-# copies one RFC 8737 certificate and PKCS#8 key into the listener-owned store.
-pub fun install_tls_alpn(index: usize, name: view.View, certificate: view.View,
-    private_der: contracts.SecretBytes) Status {
-    val policy: *Policy = policy_at(index);
-    if (policy == nil || !policy.challenge_enabled || name.data == nil ||
+# copies one RFC 8737 certificate and PKCS#8 key into a claimed slot of the
+# listener-owned store
+pub fun install_tls_alpn(index: usize, slot: usize, name: view.View,
+    certificate: view.View, private_der: contracts.SecretBytes) Status {
+    val presented: *Challenge = challenge_at(index, slot);
+    if (presented == nil || name.data == nil ||
         name.len == 0 || name.len >= schema.TEXT_CAP || certificate.data == nil ||
-        certificate.len == 0 || certificate.len > MAX_PEM_BYTES ||
+        certificate.len == 0 || certificate.len > CHALLENGE_BYTES ||
         private_der.data == nil || private_der.len == 0 ||
         private_der.len > MAX_KEY_BYTES) { ret INVALID; }
-    if (policy.challenge_live) {
-        if (!policy.challenge_retiring) { ret INVALID; }
-        val reaped: Status = reap_tls_alpn(policy);
+    val policy: *Policy = policy_at(index);
+    if (presented.live) {
+        if (!presented.retiring) { ret INVALID; }
+        val reaped: Status = reap_tls_alpn(presented);
         if (reaped != OK) { ret reaped; }
     }
     var i: usize = 0;
     for (i < certificate.len) {
-        policy.challenge_der[i] = certificate.data[i];
-        i                       = i + 1;
+        presented.der[i] = certificate.data[i];
+        i                = i + 1;
     }
-    if (!copy_view_name(?policy.challenge_name[0], ?policy.challenge_name_len,
-        name)) {
-        wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
+    if (!copy_view_name(?presented.name[0], ?presented.name_len, name)) {
+        wipe(?presented.der[0], CHALLENGE_BYTES);
         ret INVALID;
     }
-    policy.challenge_certificate = cert.Certificate{der: ?policy.challenge_der[0],
+    presented.certificate = cert.Certificate{der: ?presented.der[0],
         der_len: certificate.len};
-    policy.challenge_key = keys.empty_private();
+    presented.key = keys.empty_private();
     if (load.private_der(private_der, cert.PKCS8_DER, ?identity_owner,
-        ?policy.challenge_key) != contracts.OK) {
-        wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
-        policy.challenge_name_len = 0;
+        ?presented.key) != contracts.OK) {
+        wipe(?presented.der[0], CHALLENGE_BYTES);
+        presented.name_len = 0;
         ret UNDECODABLE;
     }
-    policy.challenge_identity = credentials.Identity{
-        server_name: contracts.Bytes{data: ?policy.challenge_name[0],
-            len: policy.challenge_name_len},
-        chain:       cert.Chain{certificates: ?policy.challenge_certificate, len: 1},
-        private_key: ?policy.challenge_key
+    presented.identity = credentials.Identity{
+        server_name: contracts.Bytes{data: ?presented.name[0],
+            len: presented.name_len},
+        chain:       cert.Chain{certificates: ?presented.certificate, len: 1},
+        private_key: ?presented.key
     };
-    policy.challenge_generation = credentials.empty_generation();
-    if (credentials.initialize_tls_alpn_challenge(?policy.challenge_generation,
-        ?policy.challenge_identity) != contracts.OK ||
-        credentials.publish_store(?policy.challenge_store,
-        ?policy.challenge_generation) != contracts.OK) {
-        keys.destroy_private(?policy.challenge_key);
-        wipe(?policy.challenge_der[0], MAX_PEM_BYTES);
-        policy.challenge_name_len   = 0;
-        policy.challenge_generation = credentials.empty_generation();
+    presented.generation = credentials.empty_generation();
+    if (credentials.initialize_tls_alpn_challenge(?presented.generation,
+        ?presented.identity) != contracts.OK ||
+        credentials.publish_store(?policy.challenge_stores[slot],
+        ?presented.generation) != contracts.OK) {
+        keys.destroy_private(?presented.key);
+        wipe(?presented.der[0], CHALLENGE_BYTES);
+        presented.name_len   = 0;
+        presented.generation = credentials.empty_generation();
         ret UNSUPPORTED;
     }
-    policy.challenge_live     = true;
-    policy.challenge_retiring = false;
+    presented.live     = true;
+    presented.retiring = false;
     ret OK;
 }
 
-pub fun withdraw_tls_alpn(index: usize) Status {
-    val policy: *Policy = policy_at(index);
-    if (policy == nil || !policy.challenge_live) { ret INVALID; }
-    if (!retire_tls_alpn(policy))                { ret UNSUPPORTED; }
-    val reaped: Status = reap_tls_alpn(policy);
+pub fun withdraw_tls_alpn(index: usize, slot: usize) Status {
+    val presented: *Challenge = challenge_at(index, slot);
+    if (presented == nil || !presented.live)      { ret INVALID; }
+    if (!retire_tls_alpn(policy_at(index), slot)) { ret UNSUPPORTED; }
+    val reaped: Status = reap_tls_alpn(presented);
     if (reaped != OK && reaped != RETIRED_IN_USE) { ret reaped; }
     ret OK;
 }
@@ -926,9 +1233,14 @@ pub fun maintain() bool {
     var i:       usize = 0;
     for (i < policy_count) {
         val policy: *Policy = ?policies[i];
-        if (policy.challenge_live && policy.challenge_retiring) {
-            val reaped: Status = reap_tls_alpn(policy);
-            if (reaped != OK && reaped != RETIRED_IN_USE) { success = false; }
+        var slot:   usize   = 0;
+        for (slot < MAX_CHALLENGES) {
+            val presented: *Challenge = ?policy.challenges[slot];
+            if (presented.live && presented.retiring) {
+                val reaped: Status = reap_tls_alpn(presented);
+                if (reaped != OK && reaped != RETIRED_IN_USE) { success = false; }
+            }
+            slot = slot + 1;
         }
         i = i + 1;
     }
@@ -940,14 +1252,27 @@ pub fun destroy() bool {
     var i:       usize = 0;
     for (i < policy_count) {
         val policy: *Policy = ?policies[i];
-        if (!retire_tls_alpn(policy)) { success = false; }
-        val reaped: Status = reap_tls_alpn(policy);
-        if (reaped != OK) { success = false; }
+        var slot:   usize   = 0;
+        for (slot < MAX_CHALLENGES) {
+            if (!retire_tls_alpn(policy, slot))                { success = false; }
+            if (reap_tls_alpn(?policy.challenges[slot]) != OK) { success = false; }
+            clear_challenge(?policy.challenges[slot]);
+            slot = slot + 1;
+        }
         destroy_resumption(policy);
-        if (!destroy_bank(policy, 0)) { success = false; }
-        if (!destroy_bank(policy, 1)) { success = false; }
+        if (!destroy_statics(policy)) { success = false; }
+        clear_bank(policy, 0);
+        clear_bank(policy, 1);
         policy.live = false;
         i           = i + 1;
+    }
+    i = 0;
+    for (i < MAX_MANAGED) {
+        if (!destroy_issued(?managed[i].issued[0])) { success = false; }
+        if (!destroy_issued(?managed[i].issued[1])) { success = false; }
+        managed[i].installed = false;
+        managed[i].policy    = NO_POLICY;
+        i                    = i + 1;
     }
     policy_count = 0;
     ret success;
@@ -985,11 +1310,12 @@ test build_configuration__bounded_tls13_only {
     policy.alpn_len = 0;
     # the widest offer this listener can make, which is what sizes the flight
     offer_protocols(?policy, schema.PROTOCOL_HTTP1 | schema.PROTOCOL_HTTP2);
-    policy.require_alpn   = true;
-    policy.bindings.store = credentials.empty_store();
-    policy.bindings.live  = false;
-    policy.tickets_live   = false;
-    policy.replay_live    = false;
+    policy.require_alpn       = true;
+    policy.bindings.store     = credentials.empty_store();
+    policy.bindings.live      = false;
+    policy.tickets_live       = false;
+    policy.ticket_memory_live = false;
+    policy.replay_live        = false;
     # the same call the listener makes, so an oversized configuration is caught
     # here rather than at the first handshake
     if (build_configuration(?policy) != OK) { ret 1; }
@@ -1082,7 +1408,7 @@ test publish__unreadable_or_empty_refused {
 #[testing]
 val api_cert_pem: str = "-----BEGIN CERTIFICATE-----\nMIIBhjCCATigAwIBAgIUb1yMHSXgfQwYEQyY37QwWtTUVfMwBQYDK2VwMBkxFzAV\nBgNVBAMMDmFwaS5oZWRnZS50ZXN0MB4XDTI2MDgyOTAzNDQ1MVoXDTM2MDgyNjAz\nNDQ1MVowGTEXMBUGA1UEAwwOYXBpLmhlZGdlLnRlc3QwKjAFBgMrZXADIQC6GbDj\nK+V+WR5whTjn+IHlf+2kR5/3HNyHoPA271PhLKOBkTCBjjAdBgNVHQ4EFgQU2Ucc\nT9sn30693AkomFKf64g+djowHwYDVR0jBBgwFoAU2UccT9sn30693AkomFKf64g+\ndjowGQYDVR0RBBIwEIIOYXBpLmhlZGdlLnRlc3QwDgYDVR0PAQH/BAQDAgeAMBMG\nA1UdJQQMMAoGCCsGAQUFBwMBMAwGA1UdEwEB/wQCMAAwBQYDK2VwA0EA8KdvXtof\nftWx7/8unun/tMfnuk6UJPliBSRaKZOKwAMgv+h2yVgkTlrqBbfSajC2jbKLICdK\ncJHdzizPtTmRBg==\n-----END CERTIFICATE-----\n";
 #[testing]
-val api_key_pem: str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIBRn6QSXLVl2hvtWrT5gXwgtwIJ3Uh0xz+u7ILSYzppC\n-----END PRIVATE KEY-----\n";
+val api_key_pem:  str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIBRn6QSXLVl2hvtWrT5gXwgtwIJ3Uh0xz+u7ILSYzppC\n-----END PRIVATE KEY-----\n";
 
 #[testing]
 fun write_pem(path: str, contents: str) bool {
@@ -1209,6 +1535,6 @@ test prepare__ticket_keys_rotate_on_schedule {
     }
     reset();
     if (count() != 0 || policy.tickets_live || policy.replay_live
-        || policy.ticket_ring.initialized) { ret 6; }
+        || policy.ticket_memory_live || policy.ticket_ring.initialized) { ret 6; }
     ret 0;
 }

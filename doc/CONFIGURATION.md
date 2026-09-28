@@ -92,6 +92,21 @@ The implemented schema accepts these top-level sections:
 
 Every collection has a compile-time upper bound. Every string is copied into generation-owned bounded storage. A configuration that exceeds a bound fails before publication.
 
+### CONNECT routes
+
+A route matches a request by its path, and so never matches a `CONNECT`, whose target is an authority (`host:port`) rather than a path. A route with `method = "CONNECT"` matches `CONNECT` requests by that authority instead, and only them:
+
+```toml
+[[route]]
+name = "database"
+host = "example"
+method = "CONNECT"
+authority = "db.internal:5432"
+service = "tunnels"
+```
+
+`authority` is a pattern with the rules a host's names follow: an exact `host:port`, a `*.suffix` wildcard, or `*` for any authority, each with or without a port. A pattern without a port matches every port. The most specific pattern that matches wins. The route's host names its budget and scopes its name, but its names do not apply, since the authority is what the request asked for. A `CONNECT` route without a `name` is named after its authority. A `CONNECT` that no route matches is answered `404`, and a request of any other method never matches a `CONNECT` route. The configuration is refused when a route names an `authority` without `method = "CONNECT"`, a `CONNECT` route has no `authority` or also names a `path`, or `method` has any other value. The service behind a `CONNECT` route takes the connection over with a `2xx` (see [Upgrades](HOSTING.md#upgrades)).
+
 ## Workers
 
 hedge runs a supervisor and one worker per CPU. The supervisor takes the
@@ -120,7 +135,10 @@ How connections reach the workers depends on what the platform can do:
 - Elsewhere, and for local listeners, the first worker accepts and hands each
   connection to the least loaded worker serving the same configuration. A
   worker whose queue of handed connections is full is passed over, and the
-  first worker serves the connection itself.
+  first worker serves the connection itself. With more than one worker,
+  `hedge_handoff_served_total{worker}` counts the connections each worker
+  served from such a listener, and `hedge_handoff_kept_total` those the first
+  worker served itself because the chosen worker's queue was full.
 - Every worker binds its own socket for each QUIC listener with `SO_REUSEPORT`
   on Linux and darwin, and a datagram reaches the worker that owns its
   connection by the connection ID hedge minted for it, whichever socket
@@ -575,6 +593,8 @@ trust = "/etc/ssl/certs/ca-certificates.crt"
 contact = "mailto:ops@example.com"
 terms_agreed = true
 storage = "/var/lib/hedge/acme"
+
+[acme.certificate.example]
 listener = "public"
 names = ["example.com", "www.example.com"]
 challenge = "http-01"
@@ -590,10 +610,16 @@ path = "/.well-known/acme-challenge/**"
 service = "acme"
 ```
 
-One account and one certificate covering every configured name. Up to eight
-names, which is what the durable record holds. `storage` is a directory the
-process owns: it is created with owner-only permissions and every file in it,
-including both private keys, is written owner-only and replaced atomically.
+`[acme]` holds the account: the authority, how it is trusted, the contact,
+where state is stored, and `renew_before`. Each `[acme.certificate.<id>]`
+table declares one managed certificate with its `names`, `challenge` and
+`listener`, and a certificate covers up to eight names, which is what one
+durable record holds. `names`, `challenge` and `listener` directly in `[acme]`
+are refused with a message naming the table. `storage` is a
+directory the process owns: it is created with owner-only permissions and every
+file in it, including every private key, is written owner-only and replaced
+atomically. Every key file hedge reads back from it goes through the same
+exposure check as a TLS key file.
 
 `listener` names the TCP listener with the TLS policy that owns the live
 credential generation. Hedge copies a verified ACME chain and PKCS#8 key into
@@ -601,11 +627,71 @@ that listener before it begins serving, then rotates later renewals in the
 same listener-owned two-bank store. Existing connections keep their leased
 generation while new handshakes use the replacement.
 
-`renew_before` is the lead, in seconds, before expiry at which a certificate is
-renewed. It defaults to thirty days, which suits the ninety-day certificates
+### Several certificates
+
+Distinct projects on one hedge usually want distinct certificates, so one
+project's failed validation cannot hold back another's renewal and a domain
+never has to share a certificate with an unrelated one. Each table is one
+more certificate:
+
+```toml
+[acme.certificate.blog]
+listener = "public"
+names = ["blog.example", "www.blog.example"]
+
+[acme.certificate.shop]
+listener = "public"
+challenge = "tls-alpn-01"
+names = ["shop.example"]
+```
+
+An id is 1 to 48 of `a-z`, `0-9`, `-` and `_`. Up to sixteen certificates are
+managed, and a configuration that declares more is refused at load, as is one
+that names the same domain in two certificates.
+
+All of them are one ACME account, whose key is `account.key` at the storage
+root. Each certificate keeps its record and keys in a directory of its own,
+`<storage>/<id>/`.
+
+Each certificate renews on its own schedule, backs off on its own failures,
+and is installed into its listener's generation without touching any other.
+A listener serves its TLS policy's configured identities beside every managed
+certificate installed into it, and a handshake selects among them by SNI. A
+managed certificate takes over a configured identity of exactly the same name,
+so a placeholder configured for a name is served only until the first
+issuance. The TLS policy's `default` still names the identity a client reaches when its server
+name matches none of them, whether that identity is configured or has been
+taken over.
+
+Each certificate has a health check, `acme.<id>`, that is ready while the
+certificate it holds has not expired. The checks are reported in `/state` and
+never required for readiness, since one certificate that cannot renew must not
+take every other site out of rotation. Failure logs name the certificate by
+the same `acme.<id>` component.
+
+With metrics on, every configured certificate is reported under a
+`certificate` label naming its id, read from its manager as `/metrics`
+streams, so these series take nothing from `metric_series`:
+
+- `hedge_acme_certificate_expiry_seconds{certificate}`: seconds until the held
+  certificate expires, measured at the scrape, negative once it has, and 0
+  while none is held.
+- `hedge_acme_renewals_total{certificate,outcome}`: issuance attempts that
+  `succeeded` or `failed`, counting every attempt from discovery to storing the
+  certificate.
+- `hedge_acme_consecutive_failures{certificate}`: failed attempts since the
+  last one that succeeded.
+- `hedge_acme_last_issued_timestamp_seconds{certificate}`: the unix time this
+  process last obtained the certificate, 0 until it has. A certificate
+  recovered from storage at start does not set it.
+
+The counters and the timestamp start over when the process does.
+
+`renew_before` is the lead, in seconds, before expiry at which each certificate
+is renewed. It defaults to thirty days, which suits the ninety-day certificates
 public authorities issue, and is bounded at one year.
 
-`challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
+`challenge` selects `http-01` (the default), `dns-01`, or `tls-alpn-01`.
 
 `http-01` requires a route to the native `acme-challenge` service, and a
 configuration that enables `http-01` without one fails to load rather than
@@ -619,7 +705,9 @@ deployment that selects it fails to load.
 
 `tls-alpn-01` answers RFC 8737 through the named secure listener. During one
 validation Hedge presents a transient certificate only when the client offers
-`acme-tls/1` and its SNI exactly matches the authorization name. Its critical
+`acme-tls/1` and its SNI exactly matches the authorization name. Each
+certificate presents from a slot of its own, so several certificates can
+validate through one listener at the same time. Its critical
 `acmeIdentifier` extension is accepted only by that explicit challenge path;
 ordinary TLS handshakes continue to select the listener's configured
 certificate.
@@ -682,13 +770,17 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets, counters, and rendered administration output are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. With more than one worker hedge adds its handoff series on top, one per worker and one more, so they never take from `metric_series`. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets and counters are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+
+Each background task (see [Background tasks](HOSTING.md#background-tasks)) is reported under a `task` label naming it, read from its report as `/metrics` streams, so these series take nothing from `metric_series`: `hedge_task_runs_total{outcome,task}` (`completed`, `failed`, `abandoned`, the last counting runs cut at the drain deadline), `hedge_task_coalesced_total` (triggers that joined a run already queued), `hedge_task_running` and `hedge_task_queued` (1 or 0), `hedge_task_last_duration_ns` and `hedge_task_max_duration_ns`, `hedge_task_last_success_age_ns` (how long ago the last completed run ended, absent until one has), and `hedge_task_snapshots_published_total` (the sequence of the task's current snapshot).
 
 Trace propagation accepts strict W3C `traceparent` version 00 and bounded `tracestate`. An invalid or oversized `tracestate` is discarded without breaking a valid `traceparent`, as required by the W3C processing model. Trace IDs and span IDs use operating-system entropy. `trace_state_bytes` cannot exceed 512. Export is an application integration and is not configured by Hedge.
 
 The administration listener cannot be referenced by a public virtual host. Authentication runs after listener identity is checked and before endpoint dispatch. The `env` and `file` secret providers resolve in the binary. Embedded deployments may supply `os` and `application` providers through the typed resolver contract. Resolved administration credentials are limited to 512 bytes, reject line breaks, remain in one production owner, and are cleared at shutdown.
 
-The administration service exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check.
+The administration service exposes `GET /live`, `/ready`, `/metrics`, and `/state`. Liveness reports fatal process health. Readiness additionally requires accepting state, no active drain, and every required health check. `/state` reports liveness, readiness and every registered health check by name, required or not.
+
+`/metrics` is streamed as it is sent, a line at a time, chunked to an HTTP/1.1 client, so it renders every series whatever their number, in a fixed amount of memory per request. `admin.max_response_bytes` bounds the other administration responses. Like any response body, `/metrics` is still held to `server.limits.max_body_bytes`.
 
 ## Static files
 

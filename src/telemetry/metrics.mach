@@ -10,11 +10,15 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 
-pub val NAME_CAPACITY:    usize = 64;
-pub val VALUE_CAPACITY:   usize = 96;
-pub val MAX_LABELS:       usize = 8;
-pub val MAX_BUCKETS:      usize = 15;
-pub val MAX_RENDER_BYTES: usize = 8192;
+pub val NAME_CAPACITY:  usize = 64;
+pub val VALUE_CAPACITY: usize = 96;
+pub val MAX_LABELS:     usize = 8;
+pub val MAX_BUCKETS:    usize = 15;
+# the longest line a series renders as: a histogram bucket with the longest
+# name, every label at its longest value with each byte escaped, and the
+# widest bound and count
+pub val MAX_LINE_BYTES: usize = (NAME_CAPACITY - 1) + 7 + 2
+    + MAX_LABELS * ((NAME_CAPACITY - 1) + 2 * (VALUE_CAPACITY - 1) + 4) + 6 + 20 + 1 + 20 + 1;
 
 pub def Kind: u8;
 pub val COUNTER:   Kind = 1;
@@ -93,10 +97,30 @@ pub rec Rendered {
     required: usize;
 }
 
-rec Cursor {
+# where a render writes. `length` counts every byte asked for, past
+# `capacity` too, so a line that does not fit is known by its length
+pub rec Writer {
     output:   *u8;
     capacity: usize;
     length:   usize;
+}
+
+# where a collector is in what it streams, from zero at the first line
+pub rec CollectCursor {
+    item: usize;
+    line: usize;
+}
+
+# a source of series read from state it owns as they are streamed rather than
+# kept in a registry, so its values are current when sent and spend no series
+# capacity. `collect` writes the one line at `cursor` with `write_counter` or
+# `write_gauge` and moves the cursor past it, or writes nothing and returns
+# false once it has no more
+pub def CollectFun: fun(ptr, *CollectCursor, *Writer) bool;
+
+pub rec Collector {
+    ctx:     ptr;
+    collect: CollectFun;
 }
 
 fun name_char(byte: u8, first: bool, allow_colon: bool) bool {
@@ -420,33 +444,33 @@ pub fun stats(registry: *Registry) Stats {
     ret result;
 }
 
-fun put_byte(cursor: *Cursor, byte: u8) {
-    if (cursor.output != nil && cursor.length < cursor.capacity) { cursor.output[cursor.length] = byte; }
-    cursor.length = cursor.length + 1;
+fun put_byte(writer: *Writer, byte: u8) {
+    if (writer.output != nil && writer.length < writer.capacity) { writer.output[writer.length] = byte; }
+    writer.length = writer.length + 1;
 }
 
-fun put_text(cursor: *Cursor, value: str) {
+fun put_text(writer: *Writer, value: str) {
     var i: usize = 0;
     for (value != nil && value[i] != 0) {
-        put_byte(cursor, value[i]);
+        put_byte(writer, value[i]);
         i = i + 1;
     }
 }
 
-fun put_name(cursor: *Cursor, name: *Name) {
+fun put_name(writer: *Writer, name: *Name) {
     var i: usize = 0;
     for (i < name.len) {
-        put_byte(cursor, name.data[i]);
+        put_byte(writer, name.data[i]);
         i = i + 1;
     }
 }
 
-fun put_u64(cursor: *Cursor, value: u64) {
+fun put_u64(writer: *Writer, value: u64) {
     var digits:    [20]u8;
     var count:     usize = 0;
     var remaining: u64   = value;
     if (remaining == 0) {
-        put_byte(cursor, '0');
+        put_byte(writer, '0');
         ret;
     }
     for (remaining > 0) {
@@ -456,123 +480,157 @@ fun put_u64(cursor: *Cursor, value: u64) {
     }
     for (count > 0) {
         count = count - 1;
-        put_byte(cursor, digits[count]);
+        put_byte(writer, digits[count]);
     }
 }
 
-fun put_i64(cursor: *Cursor, value: i64) {
+fun put_i64(writer: *Writer, value: i64) {
     if (value >= 0) {
-        put_u64(cursor, value::u64);
+        put_u64(writer, value::u64);
         ret;
     }
-    put_byte(cursor, '-');
+    put_byte(writer, '-');
     val magnitude: u64 = (-(value + 1))::u64 + 1;
-    put_u64(cursor, magnitude);
+    put_u64(writer, magnitude);
 }
 
-fun put_label_value(cursor: *Cursor, value: *u8, length: usize) {
+fun put_label_value(writer: *Writer, value: *u8, length: usize) {
     var i: usize = 0;
     for (i < length) {
         val byte: u8 = value[i];
         if (byte == '\\' || byte == '"') {
-            put_byte(cursor, '\\');
-            put_byte(cursor, byte);
+            put_byte(writer, '\\');
+            put_byte(writer, byte);
         }
-        or (byte == '\n') { put_text(cursor, "\\n"); }
-        or                { put_byte(cursor, byte); }
+        or (byte == '\n') { put_text(writer, "\\n"); }
+        or                { put_byte(writer, byte); }
         i = i + 1;
     }
 }
 
-fun put_labels(cursor: *Cursor, sample: *Sample, has_extra: bool, extra: str) {
-    if (sample.label_count == 0 && !has_extra) { ret; }
-    put_byte(cursor, '{');
+val LE_NONE:  u8 = 0;
+val LE_BOUND: u8 = 1;
+val LE_INF:   u8 = 2;
+
+fun put_labels(writer: *Writer, sample: *Sample, le: u8, bound: u64) {
+    if (sample.label_count == 0 && le == LE_NONE) { ret; }
+    put_byte(writer, '{');
     var i: usize = 0;
     for (i < sample.label_count) {
-        if (i > 0) { put_byte(cursor, ','); }
-        put_name(cursor, ?sample.labels[i].key);
-        put_text(cursor, "=\"");
-        put_label_value(cursor, ?sample.labels[i].value[0], sample.labels[i].value_len);
-        put_byte(cursor, '"');
+        if (i > 0) { put_byte(writer, ','); }
+        put_name(writer, ?sample.labels[i].key);
+        put_text(writer, "=\"");
+        put_label_value(writer, ?sample.labels[i].value[0], sample.labels[i].value_len);
+        put_byte(writer, '"');
         i = i + 1;
     }
-    if (has_extra) {
-        if (sample.label_count > 0) { put_byte(cursor, ','); }
-        put_text(cursor, "le=\"");
-        put_text(cursor, extra);
-        put_byte(cursor, '"');
+    if (le != LE_NONE) {
+        if (sample.label_count > 0) { put_byte(writer, ','); }
+        put_text(writer, "le=\"");
+        if (le == LE_BOUND) { put_u64(writer, bound); }
+        or                  { put_text(writer, "+Inf"); }
+        put_byte(writer, '"');
     }
-    put_byte(cursor, '}');
+    put_byte(writer, '}');
 }
 
-fun put_bound(cursor: *Cursor, value: u64) {
-    put_u64(cursor, value);
+# the lines one sample renders as: one for a counter or a gauge, and for a
+# histogram one per bound, the +Inf bucket, the sum and the count
+pub fun sample_lines(sample: *Sample) usize {
+    if (sample.kind == HISTOGRAM) { ret sample.bucket_count + 3; }
+    ret 1;
 }
 
-fun render_sample(cursor: *Cursor, sample: *Sample) {
-    if (sample.kind == COUNTER || sample.kind == GAUGE) {
-        put_name(cursor, ?sample.name);
-        put_labels(cursor, sample, false, nil);
-        put_byte(cursor, ' ');
-        if (sample.kind == GAUGE) { put_i64(cursor, sample.signed_value); }
-        or                        { put_u64(cursor, sample.value); }
-        put_byte(cursor, '\n');
+# line `line` of `sample`, below `sample_lines`, which is never longer than
+# MAX_LINE_BYTES
+pub fun write_line(writer: *Writer, sample: *Sample, line: usize) {
+    put_name(writer, ?sample.name);
+    if (sample.kind != HISTOGRAM) {
+        put_labels(writer, sample, LE_NONE, 0);
+        put_byte(writer, ' ');
+        if (sample.kind == GAUGE) { put_i64(writer, sample.signed_value); }
+        or                        { put_u64(writer, sample.value); }
+        put_byte(writer, '\n');
         ret;
     }
-    var cumulative: u64   = 0;
-    var i:          usize = 0;
-    for (i < sample.bucket_count) {
-        cumulative = cumulative + sample.buckets[i];
-        put_name(cursor, ?sample.name);
-        put_text(cursor, "_bucket");
-        if (sample.label_count == 0) {
-            put_text(cursor, "{le=\"");
+    if (line <= sample.bucket_count) {
+        var cumulative: u64   = 0;
+        var i:          usize = 0;
+        for (i <= line) {
+            cumulative = cumulative + sample.buckets[i];
+            i          = i + 1;
         }
-        or {
-            put_byte(cursor, '{');
-            var label_index: usize = 0;
-            for (label_index < sample.label_count) {
-                if (label_index > 0) { put_byte(cursor, ','); }
-                put_name(cursor, ?sample.labels[label_index].key);
-                put_text(cursor, "=\"");
-                put_label_value(cursor, ?sample.labels[label_index].value[0], sample.labels[label_index].value_len);
-                put_byte(cursor, '"');
-                label_index = label_index + 1;
-            }
-            put_byte(cursor, ',');
-            put_text(cursor, "le=\"");
-        }
-        put_bound(cursor, sample.bounds[i]);
-        put_text(cursor, "\"} ");
-        put_u64(cursor, cumulative);
-        put_byte(cursor, '\n');
+        put_text(writer, "_bucket");
+        if (line < sample.bucket_count) { put_labels(writer, sample, LE_BOUND, sample.bounds[line]); }
+        or                              { put_labels(writer, sample, LE_INF, 0); }
+        put_byte(writer, ' ');
+        put_u64(writer, cumulative);
+    }
+    or (line == sample.bucket_count + 1) {
+        put_text(writer, "_sum");
+        put_labels(writer, sample, LE_NONE, 0);
+        put_byte(writer, ' ');
+        put_u64(writer, sample.sum);
+    }
+    or {
+        put_text(writer, "_count");
+        put_labels(writer, sample, LE_NONE, 0);
+        put_byte(writer, ' ');
+        put_u64(writer, sample.value);
+    }
+    put_byte(writer, '\n');
+}
+
+fun write_sample(writer: *Writer, kind: Kind, name: str, labels: *LabelView,
+    label_count: usize, value: u64, signed_value: i64) bool {
+    if (writer == nil || label_count > MAX_LABELS || (label_count > 0 && labels == nil)) {
+        ret false;
+    }
+    var sample: Sample;
+    if (!copy_name(?sample.name, name, true)) { ret false; }
+    var i: usize = 0;
+    for (i < label_count) {
+        if (!copy_name(?sample.labels[i].key, labels[i].key, false)
+            || !copy_value(?sample.labels[i], labels[i].value)) { ret false; }
         i = i + 1;
     }
-    cumulative = cumulative + sample.buckets[sample.bucket_count];
-    put_name(cursor, ?sample.name);
-    put_text(cursor, "_bucket");
-    put_labels(cursor, sample, true, "+Inf");
-    put_byte(cursor, ' ');
-    put_u64(cursor, cumulative);
-    put_byte(cursor, '\n');
-    put_name(cursor, ?sample.name);
-    put_text(cursor, "_sum");
-    put_labels(cursor, sample, false, nil);
-    put_byte(cursor, ' ');
-    put_u64(cursor, sample.sum);
-    put_byte(cursor, '\n');
-    put_name(cursor, ?sample.name);
-    put_text(cursor, "_count");
-    put_labels(cursor, sample, false, nil);
-    put_byte(cursor, ' ');
-    put_u64(cursor, sample.value);
-    put_byte(cursor, '\n');
+    sample.kind         = kind;
+    sample.label_count  = label_count;
+    sample.value        = value;
+    sample.signed_value = signed_value;
+    sample.bucket_count = 0;
+    write_line(writer, ?sample, 0);
+    ret true;
+}
+
+# one counter line, no longer than MAX_LINE_BYTES, or false with nothing
+# written when a name or label is invalid
+pub fun write_counter(writer: *Writer, name: str, labels: *LabelView, label_count: usize,
+    value: u64) bool {
+    ret write_sample(writer, COUNTER, name, labels, label_count, value, 0);
+}
+
+# one gauge line, no longer than MAX_LINE_BYTES, or false with nothing written
+# when a name or label is invalid
+pub fun write_gauge(writer: *Writer, name: str, labels: *LabelView, label_count: usize,
+    value: i64) bool {
+    ret write_sample(writer, GAUGE, name, labels, label_count, 0, value);
+}
+
+# how many series `registry` holds, which only grows
+pub fun series_count(registry: *Registry) usize {
+    if (registry == nil || !registry.initialized) { ret 0; }
+    mutex.lock(?registry.lock);
+    val count: usize = registry.count;
+    mutex.unlock(?registry.lock);
+    ret count;
 }
 
 # one series summed over registries that registered it at the same index,
 # which every worker's registry does: the value, buckets and sum add, and a
 # gauge is the total of every worker's reading
-fun sample_all(registries: **Registry, count: usize, index: usize, output: *Sample) bool {
+pub fun sample_merged(registries: **Registry, count: usize, index: usize, output: *Sample) bool {
+    if (registries == nil || output == nil) { ret false; }
     var found: bool  = false;
     var r:     usize = 0;
     for (r < count) {
@@ -600,40 +658,28 @@ fun sample_all(registries: **Registry, count: usize, index: usize, output: *Samp
     ret found;
 }
 
-fun render_pass(registries: **Registry, count: usize, output: *u8, capacity: usize) usize {
-    var cursor: Cursor    = Cursor{output: output, capacity: capacity, length: 0};
-    val first:  *Registry = registries[0];
-    mutex.lock(?first.lock);
-    val series_count: usize = first.count;
-    mutex.unlock(?first.lock);
-    var i: usize = 0;
-    for (i < series_count) {
+# every series of one registry written into `output`, which is ok only when
+# it fits, with `required` saying how much would
+pub fun render(registry: *Registry, output: *u8, capacity: usize) Rendered {
+    var result: Rendered = Rendered{ok: false, len: 0, required: 0};
+    if (registry == nil || !registry.initialized || (capacity > 0 && output == nil)) { ret result; }
+    var writer: Writer = Writer{output: output, capacity: capacity, length: 0};
+    val count:  usize  = series_count(registry);
+    var i:      usize  = 0;
+    for (i < count) {
         var current: Sample;
-        if (sample_all(registries, count, i, ?current)) { render_sample(?cursor, ?current); }
+        if (sample(registry, Token{index: i::u32, generation: registry.storage[i].generation},
+            ?current)) {
+            var line: usize = 0;
+            for (line < sample_lines(?current)) {
+                write_line(?writer, ?current, line);
+                line = line + 1;
+            }
+        }
         i = i + 1;
     }
-    ret cursor.length;
-}
-
-pub fun render(registry: *Registry, output: *u8, capacity: usize) Rendered {
-    var one: [1]*Registry = [1]*Registry{registry};
-    ret render_all(?one[0], 1, output, capacity);
-}
-
-# one document for registries that registered the same series in the same
-# order, each series summed across them
-pub fun render_all(registries: **Registry, count: usize, output: *u8, capacity: usize) Rendered {
-    var result: Rendered = Rendered{ok: false, len: 0, required: 0};
-    if (registries == nil || count == 0 || registries[0] == nil
-        || !registries[0].initialized || (capacity > 0 && output == nil)) { ret result; }
-    var staging: [8192]u8;
-    result.required = render_pass(registries, count, ?staging[0], MAX_RENDER_BYTES);
-    if (result.required > MAX_RENDER_BYTES || result.required > capacity) { ret result; }
-    var i: usize = 0;
-    for (i < result.required) {
-        output[i] = staging[i];
-        i         = i + 1;
-    }
+    result.required = writer.length;
+    if (result.required > capacity) { ret result; }
     result.len = result.required;
     result.ok  = true;
     ret result;
@@ -689,10 +735,9 @@ test render__histogram_buckets_and_merge {
     val expected: str = "request_ms_bucket{le=\"10\"} 2\nrequest_ms_bucket{le=\"100\"} 3\nrequest_ms_bucket{le=\"1000\"} 4\nrequest_ms_bucket{le=\"+Inf\"} 5\nrequest_ms_sum 1128\nrequest_ms_count 5\n";
     if (!str_equals((?output[0])::str, expected)) { ret 5; }
     var too_small: [1]u8;
-    too_small[0] = 0xaa;
-    val rejected: Rendered = render(?registry, ?too_small[0], 1);
-    if (rejected.ok || rejected.required != rendered.required || too_small[0] != 0xaa) { ret 6; }
-    # a second worker's registry, registered alike, renders into one document
+    val rejected:  Rendered = render(?registry, ?too_small[0], 1);
+    if (rejected.ok || rejected.required != rendered.required) { ret 6; }
+    # a second worker's registry, registered alike, merges into one sample
     # with every bucket, the sum and the count added
     var other_storage: [1]Series;
     var other:         Registry;
@@ -701,9 +746,15 @@ test render__histogram_buckets_and_merge {
     if (!register(?other, HISTOGRAM, "request_ms", nil, 0, ?bounds[0], 3, ?other_token)) { ret 7; }
     observe(?other, other_token, 7);
     var both:   [2]*Registry = [2]*Registry{?registry, ?other};
-    val merged: Rendered     = render_all(?both[0], 2, ?output[0], 512);
-    if (!merged.ok) { ret 8; }
-    output[merged.len] = 0;
+    var merged: Sample;
+    if (!sample_merged(?both[0], 2, 0, ?merged) || sample_lines(?merged) != 6) { ret 8; }
+    var writer: Writer = Writer{output: ?output[0], capacity: 512, length: 0};
+    var line:   usize  = 0;
+    for (line < 6) {
+        write_line(?writer, ?merged, line);
+        line = line + 1;
+    }
+    output[writer.length] = 0;
     val summed: str = "request_ms_bucket{le=\"10\"} 3\nrequest_ms_bucket{le=\"100\"} 4\nrequest_ms_bucket{le=\"1000\"} 5\nrequest_ms_bucket{le=\"+Inf\"} 6\nrequest_ms_sum 1135\nrequest_ms_count 6\n";
     if (!str_equals((?output[0])::str, summed)) { ret 9; }
     ret 0;

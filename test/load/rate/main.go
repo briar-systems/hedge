@@ -6,7 +6,12 @@
 // back over HTTP/1.1, HTTP/1.1 over TLS, HTTP/2 over TLS or HTTP/3. In
 // handshake mode every operation is a fresh TLS or QUIC connection that
 // completes its handshake and is closed, with no session resumption, so the
-// rate is full handshakes.
+// rate is full handshakes. In connection mode every operation is a fresh
+// connection that carries one request and closes, so the rate is connections
+// accepted and served.
+//
+// With -network unix the address is a local socket, and HTTP/1.1 is spoken
+// over it.
 //
 // In churn mode the load is open-loop instead: operations start at a fixed
 // -rate, each a fresh connection that carries one request and closes, and a
@@ -43,6 +48,7 @@ import (
 )
 
 type options struct {
+	network     string
 	address     string
 	serverName  string
 	path        string
@@ -131,6 +137,12 @@ func roundTripper(o *options) (http.RoundTripper, func(), error) {
 			IdleConnTimeout:     0,
 			TLSHandshakeTimeout: o.timeout,
 		}
+		if o.network == "unix" {
+			transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", o.address)
+			}
+		}
 		switch o.protocol {
 		case "tls":
 			transport.TLSClientConfig = tlsConfig(o, []string{"http/1.1"})
@@ -171,7 +183,11 @@ func scheme(o *options) string {
 }
 
 func request(ctx context.Context, o *options, rt http.RoundTripper) error {
-	url := fmt.Sprintf("%s://%s%s", scheme(o), o.address, o.path)
+	authority := o.address
+	if o.network == "unix" {
+		authority = o.serverName
+	}
+	url := fmt.Sprintf("%s://%s%s", scheme(o), authority, o.path)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -419,9 +435,12 @@ func run(o *options) int {
 				for ctx.Err() == nil {
 					started := time.Now()
 					var err error
-					if o.mode == "requests" {
+					switch o.mode {
+					case "requests":
 						err = request(ctx, o, rt)
-					} else {
+					case "connections":
+						err = churnOnce(ctx, o)
+					default:
 						err = handshake(ctx, o)
 					}
 					t := current()
@@ -479,11 +498,12 @@ func run(o *options) int {
 
 func main() {
 	o := options{}
+	flag.StringVar(&o.network, "network", "tcp", "tcp, or unix for a local socket at -address (h1 only)")
 	flag.StringVar(&o.address, "address", "127.0.0.1:19140", "server address")
 	flag.StringVar(&o.serverName, "server-name", "localhost", "TLS server name and request authority")
 	flag.StringVar(&o.path, "path", "/small", "request path")
 	flag.StringVar(&o.protocol, "protocol", "h1", "h1, tls, h2 or h3")
-	flag.StringVar(&o.mode, "mode", "requests", "requests on held connections, handshakes on fresh ones (tls or h3), or churn: a connection per request at -rate")
+	flag.StringVar(&o.mode, "mode", "requests", "requests on held connections, handshakes on fresh ones (tls or h3), connections: a fresh connection per request, closed-loop, or churn: the same at -rate")
 	flag.IntVar(&o.connections, "connections", 64, "connections, or handshakes or churn operations in flight")
 	flag.IntVar(&o.streams, "streams", 1, "requests in flight per HTTP/2 or HTTP/3 connection")
 	flag.DurationVar(&o.duration, "duration", 10*time.Second, "measured window")
@@ -500,8 +520,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "connections, streams and duration must be positive")
 		os.Exit(2)
 	}
+	if o.network != "tcp" && (o.network != "unix" || o.protocol != "h1") {
+		fmt.Fprintln(os.Stderr, "network is tcp, or unix with protocol h1")
+		os.Exit(2)
+	}
 	switch o.mode {
-	case "requests", "handshakes":
+	case "requests", "handshakes", "connections":
 		os.Exit(run(&o))
 	case "churn":
 		if o.rate <= 0 {
@@ -510,6 +534,6 @@ func main() {
 		}
 		os.Exit(churn(&o))
 	}
-	fmt.Fprintln(os.Stderr, errors.New("mode is requests, handshakes or churn"))
+	fmt.Fprintln(os.Stderr, errors.New("mode is requests, handshakes, connections or churn"))
 	os.Exit(2)
 }

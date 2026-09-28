@@ -129,15 +129,18 @@ The worker threads' start argument is still a `ptr`, and the manager that owns
 the keys is reachable from it, so a key record the manager holds must stay
 public.
 
-So the secret half of every key lives in one bounded ring of secret slots in
+So the secret half of every key lives in one ring of secret slots in
 `src/acme/keys.mach`, and a `keys.Key` is the public half (point and SPKI) plus
 a handle naming its slot and generation. A handle is not an address and
 unlocks only the operations that module defines. The scalar is drawn by the
 secret CSPRNG straight into its slot, signed with in place for JWS and for the
 certification request, and handed to `mach-tls` as secret bytes when a
 certificate is installed. A slot is wiped when its key is destroyed, and a
-stale handle reaches nothing. The ring holds `keys.MAX_KEYS` keys, and drawing
-or loading a key past that fails rather than falling back to public storage.
+stale handle reaches nothing. The ring is drawn once in secret storage when
+the process starts, sized at `keys.KEYS_PER_CERTIFICATE` (the account, pending,
+active and tls-alpn-01 presentation keys) for each configured certificate, and
+drawing or loading a key past that fails rather than falling back to public
+storage.
 
 Key material becomes public at exactly one site, a `:>` declassify in
 `keys.publish`, which produces the durable form. It is forced: `mach-acme`'s
