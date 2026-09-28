@@ -135,7 +135,10 @@ How connections reach the workers depends on what the platform can do:
 - Elsewhere, and for local listeners, the first worker accepts and hands each
   connection to the least loaded worker serving the same configuration. A
   worker whose queue of handed connections is full is passed over, and the
-  first worker serves the connection itself.
+  first worker serves the connection itself. With more than one worker,
+  `hedge_handoff_served_total{worker}` counts the connections each worker
+  served from such a listener, and `hedge_handoff_kept_total` those the first
+  worker served itself because the chosen worker's queue was full.
 - Every worker binds its own socket for each QUIC listener with `SO_REUSEPORT`
   on Linux and darwin, and a datagram reaches the worker that owns its
   connection by the connection ID hedge minted for it, whichever socket
@@ -697,7 +700,7 @@ max_response_bytes = 8192
 
 Log records use bounded structured fields and an atomic sink contract. Queued sinks must use exactly `log_queue_depth` caller-owned slots, must reject or drop on overload, and must provide a shutdown flush operation. Request progress never accepts a blocking overload policy. `log_record_bytes` is limited to 8192.
 
-Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets and counters are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
+Metric storage is caller-owned and fixed at `metric_series`, which must cover at least the 52 built-in series. With more than one worker hedge adds its handoff series on top, one per worker and one more, so they never take from `metric_series`. Hosted applications register their series from the rest, at most 64 each (see [Telemetry](HOSTING.md#telemetry)). A metric has at most eight sorted labels. Label names and values, histogram buckets and counters are bounded. Registration fails when the series budget is exhausted and exposes the rejection count.
 
 Each background task (see [Background tasks](HOSTING.md#background-tasks)) is reported under a `task` label naming it, read from its report as `/metrics` streams, so these series take nothing from `metric_series`: `hedge_task_runs_total{outcome,task}` (`completed`, `failed`, `abandoned`, the last counting runs cut at the drain deadline), `hedge_task_coalesced_total` (triggers that joined a run already queued), `hedge_task_running` and `hedge_task_queued` (1 or 0), `hedge_task_last_duration_ns` and `hedge_task_max_duration_ns`, `hedge_task_last_success_age_ns` (how long ago the last completed run ended, absent until one has), and `hedge_task_snapshots_published_total` (the sequence of the task's current snapshot).
 
