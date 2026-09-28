@@ -19,6 +19,7 @@ use hedge.test.runtime.tlswire;
 use hedge.test.runtime.wire;
 use http_exchange: http.core.exchange;
 use http.core.message;
+use http.core.method;
 use http.core.status;
 use http.core.transport;
 use std.allocator;
@@ -885,8 +886,9 @@ fun echo_abandon(context: ptr, tunnel: *call.Tunnel) {
     echo.app.abandoned = echo.app.abandoned + 1;
 }
 
-# an application that answers an upgrade to `echo` with a 101 and runs the
-# connection afterwards from the request arena. `/stay` ignores a drain
+# an application that answers an upgrade to `echo` with a 101, or a CONNECT
+# with a 200, and runs the connection afterwards from the request arena.
+# `/stay` ignores a drain
 fun serve_upgrade(context: ptr, active: *call.Call) http_exchange.ServiceStatus {
     val arena: *allocator.Allocator        = call.allocator_of(active);
     val made:  res[*Echo, allocator.Error] = allocator.zallocate[Echo](arena, 1);
@@ -896,8 +898,16 @@ fun serve_upgrade(context: ptr, active: *call.Call) http_exchange.ServiceStatus 
     val path: view.View = call.request(active).target.path;
     echo.stays = path.len > 1 && path.data[1] == 's'::u8;
     if (!call.tunnel(active, call.TunnelOwner{ctx: echo::ptr, drive: echo_drive,
-        abandon: echo_abandon})
-        || message.set_status(call.response(active), status.SWITCHING_PROTOCOLS)
+        abandon: echo_abandon})) {
+        ret http_exchange.SERVICE_FAILED;
+    }
+    if (call.request(active).method.kind == method.CONNECT) {
+        if (message.set_status(call.response(active), status.OK) != message.RESPONSE_OK) {
+            ret http_exchange.SERVICE_FAILED;
+        }
+        ret service.commit_bodyless(active, call.BODY_DRAIN);
+    }
+    if (message.set_status(call.response(active), status.SWITCHING_PROTOCOLS)
         != message.RESPONSE_OK
         || !service.add_field(active, "upgrade", "echo")
         || !service.add_field(active, "connection", "upgrade")) {
@@ -911,6 +921,12 @@ fun start_upgrades(harness: *Harness, controls: *composition.Controls,
     upgrades: *Upgrades, drain_ms: u64, secure: bool) bool {
     if (!prepare(harness, false)) { ret false; }
     application_graph(harness);
+    harness.graph.route_count = 2;
+    val tunnel: *schema.Route = ?harness.graph.routes[1];
+    schema.set_text(?tunnel.name, "tunnel");
+    schema.set_text(?tunnel.host, "site");
+    schema.set_text(?tunnel.authority, "db.internal:5432");
+    schema.set_text(?tunnel.service, "application");
     if (secure)        { secure_graph(harness, schema.PROTOCOL_HTTP1); }
     if (drain_ms != 0) { harness.graph.timeouts.drain_ms = drain_ms; }
     if (!service.make_applications(registry, slots, 1)
@@ -921,19 +937,27 @@ fun start_upgrades(harness: *Harness, controls: *composition.Controls,
     ret start_with(harness, controls, options).status == composition.START_OK;
 }
 
+# send `request` and `input` behind it, and see `status_line`, `field` when
+# given, and then `input` echoed through the tunnel it opened
+fun open_tunnel(harness: *Harness, client: *tcp.Stream, request: str, input: str,
+    status_line: str, field: str) bool {
+    if (!wire.connect(harness.endpoint, client))                  { ret false; }
+    if (!wire.send(client, request) || !wire.send(client, input)) { ret false; }
+    var response: [RESPONSE_BYTES]u8;
+    val read:     usize = wire.collect(?harness.runtime.workers[0].serving, client,
+        ?response[0], RESPONSE_BYTES, input);
+    ret read != 0 && wire.starts_with(?response[0], read, status_line)
+        && (field == nil || wire.contains(?response[0], read, field))
+        && wire.body_offset(?response[0], read) < read;
+}
+
 # upgrade on `path` and see `input` echoed past the 101
 fun open_echo(harness: *Harness, client: *tcp.Stream, path: str, input: str) bool {
     var request: [256]u8;
     val length:  usize = wire.build_request(?request[0], 256, "GET ", path::*u8,
         str_len(path), " HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n");
-    if (length == 0 || !wire.connect(harness.endpoint, client))              { ret false; }
-    if (!wire.send(client, (?request[0])::str) || !wire.send(client, input)) { ret false; }
-    var response: [RESPONSE_BYTES]u8;
-    val read:     usize = wire.collect(?harness.runtime.workers[0].serving, client,
-        ?response[0], RESPONSE_BYTES, input);
-    ret read != 0 && wire.starts_with(?response[0], read, "HTTP/1.1 101 Switching Protocols\r\n")
-        && wire.contains(?response[0], read, "upgrade: echo")
-        && wire.body_offset(?response[0], read) < read;
+    ret length != 0 && open_tunnel(harness, client, (?request[0])::str, input,
+        "HTTP/1.1 101 Switching Protocols\r\n", "upgrade: echo");
 }
 
 fun echoes(harness: *Harness, client: *tcp.Stream, text: str) bool {
@@ -974,6 +998,48 @@ test tunnel__hosted_upgrade_owns_the_connection {
     val stopped: composition.StopReport = composition.stop(harness.runtime, ?controls);
     if (!stopped.stopped || stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
         ret 4;
+    }
+    ret 0;
+}
+
+# a CONNECT reaches a hosted handler through the route matching its authority,
+# and the 200 it answers leaves the connection to it as a tunnel. a CONNECT to
+# an authority no route matches is refused and reaches no handler
+test tunnel__routed_connect_reaches_a_hosted_handler {
+    var controls: composition.Controls;
+    var harness:  Harness;
+    var registry: service.Applications;
+    var slots:    [1]service.Application;
+    var upgrades: Upgrades;
+    upgrades.done      = 0;
+    upgrades.failed    = 0;
+    upgrades.abandoned = 0;
+    if (!start_upgrades(?harness, ?controls, ?registry, ?slots[0], ?upgrades, 0, false)) { ret 1; }
+    var client: tcp.Stream;
+    if (!open_tunnel(?harness, ?client,
+        "CONNECT db.internal:5432 HTTP/1.1\r\nHost: db.internal:5432\r\n\r\n", "hello",
+        "HTTP/1.1 200 OK\r\n", nil) || !echoes(?harness, ?client, "again")) {
+        tcp.stream_close(?client);
+        composition.stop(harness.runtime, ?controls);
+        ret 2;
+    }
+    tcp.stream_close(?client);
+    if (!exchange_status(?harness,
+        "CONNECT other.internal:5432 HTTP/1.1\r\nHost: other.internal:5432\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\n")) {
+        composition.stop(harness.runtime, ?controls);
+        ret 3;
+    }
+    val storage: *connection.Storage = ?harness.runtime.workers[0].serving.storage;
+    if (!settle_connections(?harness) || upgrades.done != 1 || upgrades.failed != 0
+        || upgrades.abandoned != 0 || storage.tunnels_opened != 1
+        || storage.tunnels_ended != 1) {
+        composition.stop(harness.runtime, ?controls);
+        ret 4;
+    }
+    val stopped: composition.StopReport = composition.stop(harness.runtime, ?controls);
+    if (!stopped.stopped || stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
+        ret 5;
     }
     ret 0;
 }
