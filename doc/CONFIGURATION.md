@@ -575,6 +575,8 @@ trust = "/etc/ssl/certs/ca-certificates.crt"
 contact = "mailto:ops@example.com"
 terms_agreed = true
 storage = "/var/lib/hedge/acme"
+
+[acme.certificate.example]
 listener = "public"
 names = ["example.com", "www.example.com"]
 challenge = "http-01"
@@ -590,8 +592,12 @@ path = "/.well-known/acme-challenge/**"
 service = "acme"
 ```
 
-This is one account and one certificate covering every configured name. Up
-to eight names, which is what one durable record holds. `storage` is a
+`[acme]` holds the account: the authority, how it is trusted, the contact,
+where state is stored, and `renew_before`. Each `[acme.certificate.<id>]`
+table declares one managed certificate with its `names`, `challenge` and
+`listener`, and a certificate covers up to eight names, which is what one
+durable record holds. `names`, `challenge` and `listener` directly in `[acme]`
+are refused with a message naming the table. `storage` is a
 directory the process owns: it is created with owner-only permissions and every
 file in it, including every private key, is written owner-only and replaced
 atomically. Every key file hedge reads back from it goes through the same
@@ -607,18 +613,10 @@ generation while new handshakes use the replacement.
 
 Distinct projects on one hedge usually want distinct certificates, so one
 project's failed validation cannot hold back another's renewal and a domain
-never has to share a certificate with an unrelated one. Each
-`[acme.certificate.<id>]` table declares one more managed certificate, with
-its own `names`, `challenge` and `listener`:
+never has to share a certificate with an unrelated one. Each table is one
+more certificate:
 
 ```toml
-[acme]
-directory = "https://acme-v02.api.letsencrypt.org/directory"
-trust = "/etc/ssl/certs/ca-certificates.crt"
-contact = "mailto:ops@example.com"
-terms_agreed = true
-storage = "/var/lib/hedge/acme"
-
 [acme.certificate.blog]
 listener = "public"
 names = ["blog.example", "www.blog.example"]
@@ -629,19 +627,13 @@ challenge = "tls-alpn-01"
 names = ["shop.example"]
 ```
 
-The authority, trust, contact, storage and `renew_before` are the account's
-and apply to every certificate. `names`, `challenge` and `listener` directly
-in `[acme]` declare one certificate too, which reports as `default`; the two
-forms may be combined. An id is 1 to 48 of `a-z`, `0-9`, `-` and `_`, and
-`default` is taken. Up to sixteen certificates are managed, and a
-configuration that declares more is refused at load, as is one that names the
-same domain in two certificates.
+An id is 1 to 48 of `a-z`, `0-9`, `-` and `_`. Up to sixteen certificates are
+managed, and a configuration that declares more is refused at load, as is one
+that names the same domain in two certificates.
 
 All of them are one ACME account, whose key is `account.key` at the storage
 root. Each certificate keeps its record and keys in a directory of its own,
-`<storage>/<id>/`. The certificate the top-level form declares keeps the
-storage root itself, which is where a single-certificate deployment has always
-kept it, so upgrading changes nothing on disk.
+`<storage>/<id>/`.
 
 Each certificate renews on its own schedule, backs off on its own failures,
 and is installed into its listener's generation without touching any other.
@@ -649,7 +641,7 @@ A listener serves its TLS policy's configured identities beside every managed
 certificate installed into it, and a handshake selects among them by SNI. A
 managed certificate takes over a configured identity of exactly the same name,
 so a placeholder configured for a name is served only until the first
-issuance. `default` still names the identity a client reaches when its server
+issuance. The TLS policy's `default` still names the identity a client reaches when its server
 name matches none of them, whether that identity is configured or has been
 taken over.
 
@@ -663,7 +655,7 @@ the same `acme.<id>` component.
 is renewed. It defaults to thirty days, which suits the ninety-day certificates
 public authorities issue, and is bounded at one year.
 
-`challenge` selects `http-01`, `dns-01`, or `tls-alpn-01`.
+`challenge` selects `http-01` (the default), `dns-01`, or `tls-alpn-01`.
 
 `http-01` requires a route to the native `acme-challenge` service, and a
 configuration that enables `http-01` without one fails to load rather than
