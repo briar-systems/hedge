@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.17.0] - 2026-09-28
+
+### Migration
+
+- **ACME certificates.** A managed certificate is declared only as an `[acme.certificate.<id>]` table, each with `names`, `challenge` and `listener` (#425). `names`, `challenge` and `listener` directly in `[acme]` are refused at load with a message naming the table. The account settings (`directory`, `trust`, `origin`, `contact`, `terms`, `storage`, `renew_before`) stay in `[acme]`. Every certificate stores under `<storage>/<id>/`, with the one account key at the storage root, and there is no migration from the old root layout, so the first start after upgrading issues afresh.
+- **Route paths.** A path route whose resolved `path` does not start with `/` is refused at load, "a route path must start with /" (#466).
+- **Embedders.** `telemetry.make`, `telemetry_production.make` and `make_recorder` take the worker count or index (#299). The admin `render_metrics` hook becomes `open_metrics` and `fill_metrics`, and `telemetry.metrics` loses `MAX_RENDER_BYTES`, its staging buffer and `render_all` (#462).
+- **Toolchain and dependencies.** mach `^6.5`, since mach-http 0.25.1 requires it, and CI seeds mach v6.5.0. std `^9.4`, crypto `^0.26`, tls `^0.16`, quic `^0.25`, http `^0.25` and acme `^0.14`, at v9.4.1, v0.26.0, v0.16.0, v0.25.1, v0.25.1 and v0.14.0, with `test/acme` and `test/fuzz` following. An application that depends on hedge resolves with it, so it moves to ranges these satisfy.
+
+### Added
+
+- Several managed ACME certificates, selected by SNI (#425). Up to `MAX_ACME_CERTIFICATES` (16) certificates share one ACME account, and each has its own manager, schedule, backoff and failure count, so renewing one leaves the others untouched. A generation serves the configured identities alongside every managed certificate installed on its listener, and a managed name takes over a configured identity of exactly the same name. Each certificate registers a health check `acme.<id>`, which does not gate readiness, and `/state` lists every check by name.
+- Per-certificate ACME series (#468): `hedge_acme_certificate_expiry_seconds`, `hedge_acme_renewals_total{outcome}`, `hedge_acme_consecutive_failures` and `hedge_acme_last_issued_timestamp_seconds`, each labelled `certificate=<id>`.
+- Background task reports as metric series, labelled `task=<name>` and read as `/metrics` streams (#415): `hedge_task_runs_total{outcome}`, `hedge_task_coalesced_total`, `hedge_task_running`, `hedge_task_queued`, `hedge_task_last_duration_ns`, `hedge_task_max_duration_ns`, `hedge_task_last_success_age_ns` and `hedge_task_snapshots_published_total`. They come from `hedge.telemetry.metrics` collectors (`Collector`, `CollectCursor`, up to `MAX_COLLECTORS`), so they take none of `metric_series`.
+- `hedge_handoff_served_total{worker}` and `hedge_handoff_kept_total` count where handed-off connections went, and `test/load/handoff.sh` measures the handoff's split and scaling (#299).
+- Routes match CONNECT requests by authority (#441). A route with `method = "CONNECT"` carries an `authority` pattern (`host:port`, `*.suffix[:port]` or `*[:port]`) in place of `path`.
+- `service.StreamBody` and `service.respond_with_stream`, a response body of unknown length that a producer fills as the engine asks for bytes (#462).
+
+### Changed
+
+- A TLS connection's AES-GCM cipher contexts are borrowed from the worker's buffer pool, as mach-tls 0.16 requires. The pool gains a context-sized secret class, and a connection's TLS lane budget grows by two contexts, so an idle established connection holds exactly those two. Each TLS policy's ticket key ring borrows its keys' contexts from a small pool of its own.
+- `/metrics` is streamed a line at a time, so it renders any number of series in constant memory per request, and the 503 `metrics_unavailable` answer is gone (#462).
+- The TLS default is the configured `default` name in every generation. Installing an ACME certificate no longer replaces the configured identities or makes the first ACME name the default, and a tls-alpn-01 presentation is served only for the SNI it matches (#425).
+
+### Fixed
+
+- A multi-worker runtime on windows starts: `SO_REUSEPORT` is set only on a listener every worker binds, never on one only the first worker binds for handoff (#149). The test suite passes on windows-x86_64.
+- Tests hold their large state on the heap, so no test frame nears the main thread's stack (#471, #473).
+
 ## [0.16.0] - 2026-09-27
 
 ### Migration
