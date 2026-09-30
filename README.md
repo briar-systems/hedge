@@ -85,14 +85,13 @@ Each dependency is selected by an exact released version, and the resolved relea
 
 ```sh
 mach dep pull
-mach test .
-mach test . --lib tests
+mach test . --all
 mach build .
 ```
 
-`mach test . --lib tests` runs the test-only modules the executable never reaches.
+`mach test . --all` selects every artifact, so it also runs the `tests` artifact's test-only modules the executable never reaches.
 
-GitHub Actions CI runs both test selections in both profiles and the live ACME conformance suite on every pull request.
+CI runs `mach test . --all` on every pull request. The load, fuzz and live ACME suites run locally from `test/`.
 
 
 Build output uses Mach's default `out/` directory.
