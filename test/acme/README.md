@@ -6,12 +6,12 @@ the test starts.
 
 ```text
 test/acme/harness/start.sh
-mach test test/acme --profile debug --jobs 1
-mach test test/acme --profile release --jobs 1
+mach test test/acme --profile debug --threads 1
+mach test test/acme --profile release --threads 1
 test/acme/harness/start.sh.stop
 ```
 
-`--jobs 1` is required. Pebble validates HTTP-01 and TLS-ALPN-01 on fixed ports
+`--threads 1` is required. Pebble validates HTTP-01 and TLS-ALPN-01 on fixed ports
 5002 and 5001, so only one test at a time can own the listener that answers a
 challenge.
 
