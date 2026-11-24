@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.19.1] - 2026-11-24
+
+### Fixed
+
+- Updated `mach-std` to `v10.1.1` to fix `std.memory.buffers` slot table exhaustion when retained chunks fill the initial table inside a connection reservation, eliminating intermittent multi-worker HTTP/3 stalls under concurrent large-body transfers (`briar-systems/mach-std#1163`).
+
 ## [0.19.0] - 2026-11-24
 
 ### Added
