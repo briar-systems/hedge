@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.19.0] - 2026-11-24
+
+### Added
+
+- Added `server.limits.max_concurrent_streams` (default and cap 8) to decouple HTTP/2 `MAX_CONCURRENT_STREAMS` and HTTP/3 `max_requests` from HTTP/1 `max_pipeline_depth` (2), deriving `default_connection_bytes` from the binding per-protocol concurrency footprint (#495).
+
+### Changed
+
+- Updated `mach-tls` to `v0.18.1` (O(1) secret overlap checks, 8-byte unrolled copies, single-copy `record.seal_public`) and `mach-quic` to `^0.28.0` (`v0.28.0`, plain transport managers moved out of welded `assembly.Connection` into plain `assembly.Storage`).
+- Decoupled HTTP/1 response write and staging chunks (`WRITE_BYTES = 32768`, `lanes.IO_BUDGET = 98304`) from 8 KiB `READ_BYTES`, and raised `h2.STAGE_BYTES` from 8 KiB to 16 KiB to match `FRAME_PAYLOAD_BYTES` and full TLS 1.3 records (#490).
+
+### Fixed
+
+- Advertise the configured HTTP/3 `max_requests` as QUIC `peer_bidirectional_streams` (`initial_max_streams_bidi`) instead of defaulting to `assembly.H3_REQUEST_STREAMS`, preventing concurrent HTTP/3 clients from hitting immediate `H3_REQUEST_REJECTED` resets (#489).
+- Preserved `runtime.unit_ns` when a handshake step already spent `crypto_budget` and included queued arrivals (`runtime.arrivals_held != 0`) in `quic/runtime.has_ready`, eliminating multi-worker QUIC Initial stranding in `epoll_wait` (#493).
+
 ## [0.18.2] - 2026-11-24
 
 ### Changed
