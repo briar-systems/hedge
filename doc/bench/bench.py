@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import shutil
 import signal
 import socket
@@ -494,9 +495,13 @@ def machine_description(args: argparse.Namespace) -> list[tuple[str, str]]:
     # and src/hedge.mach to one version, so the manifest is the authority.
     hedge_version = read_manifest_version(Path(args.root) / "mach.toml")
 
+    soft_lck, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    memlock = "unlimited" if soft_lck == resource.RLIM_INFINITY else f"{soft_lck // 1024:,} KiB"
+
     return [
         ("CPU", f"{model}, {cores} cores / {threads} threads"),
         ("Memory", memory),
+        ("Memlock", memlock),
         ("Kernel", os.uname().release),
         ("Mach", command_output(["mach", "info"])),
         ("hedge", hedge_version),

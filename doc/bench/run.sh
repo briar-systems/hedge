@@ -27,7 +27,7 @@ say() { printf '%s\n' "$*" >&2; }
 
 # --- the server under test ---------------------------------------------------
 
-if [ ! -x "$hedge_binary" ]; then
+if [ -z "${HEDGE_BINARY:-}" ]; then
     say "building hedge (release)"
     mach build "$root" --profile release
 fi
