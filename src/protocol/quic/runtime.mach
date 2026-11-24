@@ -389,8 +389,9 @@ pub rec PendingInitial {
 # connection and an h3 session are each a pair: the welded record and the plain
 # storage it points into sit at one index and are claimed and released together.
 pub rec ControlView {
-    pumps:       *Pump;
-    connections: *hedge_storage.Pair[ConnectionStorage, Connection];
+    pumps:          *hedge_storage.SecretTable[Pump];
+    secret_scratch: *assembly.SecretScratch;
+    connections:    *hedge_storage.Pair[ConnectionStorage, Connection];
     # tls handshake records, held by a connection only until its handshake
     # has handed everything over, then reused
     handshakes: *hedge_storage.SecretTable[server.Handshake];
@@ -557,11 +558,9 @@ pub rec Pump {
     admissions: [ADMISSION_BANKS]AdmissionGeneration;
     # the listener this pump serves, whose keys every worker shares, and this
     # worker's codec for its connection IDs
-    listener: usize;
-    keys:     *quic_keys.Listener;
-    codec:    cid.Codec;
-    # the secret half of the per-call buffers this pump's connections share
-    secret_scratch:           assembly.SecretScratch;
+    listener:                 usize;
+    keys:                     *quic_keys.Listener;
+    codec:                    cid.Codec;
     driver:                   *net_async.Driver;
     socket:                   *udp.Socket;
     root:                     *cancel.Scope;
@@ -755,6 +754,7 @@ pub rec Runtime {
     # client told nothing. the promotion rule exists to keep this at zero
     handshakes_expired:    u64;
     pump_count:            usize;
+    pump_generation:       u64;
     next_source:           u64;
     connection_generation: u64;
     # calendar time of the current advance, read only to verify certificates.
@@ -850,8 +850,21 @@ pub fun operation_capacity_required(connection_capacity: usize,
 
 # a control view is borrowed for the duration of one call and never retained
 pub fun view_valid(controls: *ControlView) bool {
-    ret controls != nil && controls.pumps != nil && controls.connections != nil
-        && controls.sessions != nil && controls.handshakes != nil;
+    ret controls != nil && controls.pumps != nil && controls.secret_scratch != nil
+        && controls.connections != nil && controls.sessions != nil
+        && controls.handshakes != nil;
+}
+
+fun pump_at(controls: *ControlView, index: usize) *Pump {
+    if (controls == nil || controls.pumps == nil) { ret nil; }
+    ret hedge_storage.secret_table_at[Pump](controls.pumps, index);
+}
+
+fun pump_slots(controls: *ControlView) usize {
+    if (controls == nil || controls.pumps == nil) { ret 0; }
+    val count: usize = hedge_storage.secret_table_capacity[Pump](controls.pumps);
+    if (count > MAX_PUMPS) { ret MAX_PUMPS; }
+    ret count;
 }
 
 pub fun connection_at(controls: *ControlView, index: usize) *Connection {
@@ -1094,12 +1107,12 @@ fun deadline_allows(runtime: *Runtime, arrival_ns: u64, handshake_timeout_ns: u6
 # the deadline drop route here and nothing else does
 fun refuse_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize, initial: *net_types.Packet, now_ns: u64) {
-    val pump: *Pump                = ?controls.pumps[pump_index];
-    val bank: *AdmissionGeneration = ?pump.admissions[bank_index];
-    if (!pump.live || pump.draining || pump.cancelling) {
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil || !pump.live || pump.draining || pump.cancelling) {
         runtime.handshakes_dropped = runtime.handshakes_dropped + 1;
         ret;
     }
+    val bank:    *AdmissionGeneration = ?pump.admissions[bank_index];
     var request: quic_listener.Request;
     request.peer                     = initial.peer;
     request.data                     = initial.buffer;
@@ -1440,15 +1453,20 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.handshakes_completed  = 0;
     runtime.handshakes_expired    = 0;
     runtime.pump_count            = 0;
+    runtime.pump_generation       = next_generation(runtime.pump_generation);
     runtime.next_source           = 1;
     runtime.connection_generation = next_generation(runtime.connection_generation);
     runtime.stopping              = false;
-    var i: usize = 0;
-    for (i < MAX_PUMPS) {
-        controls.pumps[i].live       = false;
-        controls.pumps[i].started    = false;
-        controls.pumps[i].scope_live = false;
-        i                            = i + 1;
+    val slots: usize = pump_slots(controls);
+    var i:     usize = 0;
+    for (i < slots) {
+        val pump: *Pump = pump_at(controls, i);
+        if (pump != nil) {
+            pump.live       = false;
+            pump.started    = false;
+            pump.scope_live = false;
+        }
+        i = i + 1;
     }
     runtime.initialized = true;
     ret true;
@@ -1458,8 +1476,8 @@ fun pump_for(controls: *ControlView, runtime: *Runtime, handle: PumpHandle) *Pum
     if (runtime == nil || !runtime.initialized || handle.index >= MAX_PUMPS) {
         ret nil;
     }
-    val pump: *Pump = ?controls.pumps[handle.index];
-    if (!pump.live || pump.generation != handle.generation) { ret nil; }
+    val pump: *Pump = pump_at(controls, handle.index);
+    if (pump == nil || !pump.live || pump.generation != handle.generation) { ret nil; }
     ret pump;
 }
 
@@ -1720,18 +1738,11 @@ fun abandon_new_pump(runtime: *Runtime, pump: *Pump) {
 
 # the live pump serving listener `listener`, or NO_PUMP
 fun pump_of(controls: *ControlView, listener: usize) usize {
-    var i: usize = 0;
-    for (i < MAX_PUMPS) {
-        if (controls.pumps[i].live && controls.pumps[i].listener == listener) { ret i; }
-        i = i + 1;
-    }
-    ret NO_PUMP;
-}
-
-fun free_pump(controls: *ControlView, runtime: *Runtime) usize {
-    var i: usize = 0;
-    for (i < MAX_PUMPS) {
-        if (!controls.pumps[i].live) { ret i; }
+    val slots: usize = pump_slots(controls);
+    var i:     usize = 0;
+    for (i < slots) {
+        val pump: *Pump = pump_at(controls, i);
+        if (pump != nil && pump.live && pump.listener == listener) { ret i; }
         i = i + 1;
     }
     ret NO_PUMP;
@@ -1747,22 +1758,33 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
         || driver == nil || socket == nil || root == nil || storage == nil
         || output == nil || keys == nil || pump_of(controls, listener) != NO_PUMP
         || !pump_config_valid(?config)) { ret INVALID; }
-    val index: usize = free_pump(controls, runtime);
-    if (index == NO_PUMP) { ret BLOCKED; }
-    val pump: *Pump = ?controls.pumps[index];
-    pump.storage         = storage;
-    pump.backing         = runtime.backing;
-    pump.generation      = next_generation(pump.generation);
-    pump.listener        = listener;
-    pump.keys            = keys;
-    pump.live            = false;
-    pump.scope_live      = false;
-    pump.receive_pending = false;
-    pump.started         = false;
-    pump.draining        = false;
-    pump.cancelling      = false;
+    if (runtime.pump_count >= MAX_PUMPS) { ret BLOCKED; }
+    val index: usize = hedge_storage.secret_table_claim[Pump](controls.pumps);
+    if (index == hedge_storage.NO_INDEX) { ret FAILED; }
+    if (index >= MAX_PUMPS) {
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
+        ret BLOCKED;
+    }
+    val pump: *Pump = pump_at(controls, index);
+    if (pump == nil) {
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
+        ret FAILED;
+    }
+    runtime.pump_generation = next_generation(runtime.pump_generation);
+    pump.storage            = storage;
+    pump.backing            = runtime.backing;
+    pump.generation         = runtime.pump_generation;
+    pump.listener           = listener;
+    pump.keys               = keys;
+    pump.live               = false;
+    pump.scope_live         = false;
+    pump.receive_pending    = false;
+    pump.started            = false;
+    pump.draining           = false;
+    pump.cancelling         = false;
     if (!stateless_sends.make[CompletionContext](?pump.stateless, pump.backing,
         MAX_STATELESS_PENDING)) {
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
         ret FAILED;
     }
     pump.stateless_generation = 0;
@@ -1770,6 +1792,7 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
         if (!stateless_sends.destroy[CompletionContext](?pump.stateless)) {
             connection_failed(runtime);
         }
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
         ret FAILED;
     }
     var i: usize = 0;
@@ -1780,12 +1803,14 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     }
     if (!cid.make(?pump.codec, keys, runtime.worker)) {
         abandon_new_pump(runtime, pump);
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
         ret FAILED;
     }
     if (!operation_ok(cancel.make_child(?pump.storage.scope, root,
         opt[time.Instant].none{}))) {
         cid.destroy(?pump.codec);
         abandon_new_pump(runtime, pump);
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
         ret FAILED;
     }
     pump.scope_live         = true;
@@ -1798,6 +1823,7 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     pump.active_admission   = 0;
     if (!initialize_admission(pump, 0, ?config)) {
         abandon_attached_pump(pump);
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
         ret FAILED;
     }
     apply_pump_config(runtime, pump, ?config);
@@ -1809,6 +1835,7 @@ pub fun attach(controls: *ControlView, runtime: *Runtime, driver: *net_async.Dri
     if (!make_context(?pump.storage.receive_context, runtime, COMPLETION_RECEIVE, index,
         pump.generation, NO_CONNECTION, 0, 0, 0, no_token())) {
         abandon_attached_pump(pump);
+        hedge_storage.secret_table_release[Pump](controls.pumps, index);
         ret FAILED;
     }
     pump.live          = true;
@@ -1948,7 +1975,7 @@ fun rollback_staged_updates(controls: *ControlView, runtime: *Runtime, updates: 
     var i:       usize = 0;
     for (i < count) {
         if (staged[i]) {
-            val pump:   *Pump                = ?controls.pumps[updates[i].handle.index];
+            val pump:   *Pump                = pump_at(controls, updates[i].handle.index);
             val target: usize                = 1 - pump.active_admission;
             val bank:   *AdmissionGeneration = ?pump.admissions[target];
             if (!begin_retire(bank) || !reap_admission(bank)) {
@@ -1963,8 +1990,8 @@ fun rollback_staged_updates(controls: *ControlView, runtime: *Runtime, updates: 
 fun connection_superseded(controls: *ControlView, runtime: *Runtime, value: *Connection) bool {
     if (runtime == nil || value == nil || !value.live
         || value.pump >= MAX_PUMPS) { ret false; }
-    val pump: *Pump = ?controls.pumps[value.pump];
-    ret !pump.live || value.pump_generation != pump.generation
+    val pump: *Pump = pump_at(controls, value.pump);
+    ret pump == nil || !pump.live || value.pump_generation != pump.generation
         || value.admission_bank != pump.active_admission
         || value.plan == nil || pump.plan == nil
         || value.plan.generation != pump.plan.generation;
@@ -1972,8 +1999,8 @@ fun connection_superseded(controls: *ControlView, runtime: *Runtime, value: *Con
 
 fun pending_superseded(controls: *ControlView, pending: *PendingInitial) bool {
     if (pending == nil || !pending.live || pending.pump >= MAX_PUMPS) { ret false; }
-    val pump: *Pump = ?controls.pumps[pending.pump];
-    ret !pump.live || pending.pump_generation != pump.generation
+    val pump: *Pump = pump_at(controls, pending.pump);
+    ret pump == nil || !pump.live || pending.pump_generation != pump.generation
         || pending.admission_bank != pump.active_admission
         || pending.config.plan == nil || pump.plan == nil
         || pending.config.plan.generation != pump.plan.generation;
@@ -2106,7 +2133,7 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
     var i: usize = 0;
     for (i < count) {
         if (changed[i]) {
-            val pump:   *Pump                = ?controls.pumps[updates[i].handle.index];
+            val pump:   *Pump                = pump_at(controls, updates[i].handle.index);
             val target: usize                = 1 - pump.active_admission;
             val next:   *AdmissionGeneration = ?pump.admissions[target];
             if (next.live && !reap_admission(next)) {
@@ -2124,7 +2151,7 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
     }
     i = 0;
     for (i < count) {
-        val pump: *Pump = ?controls.pumps[updates[i].handle.index];
+        val pump: *Pump = pump_at(controls, updates[i].handle.index);
         if (changed[i]) { pump.active_admission = 1 - pump.active_admission; }
         apply_pump_config(runtime, pump, ?updates[i].config);
         i = i + 1;
@@ -2133,7 +2160,7 @@ fun update_transaction(controls: *ControlView, runtime: *Runtime, updates: *Pump
     i = 0;
     for (i < count) {
         if (changed[i]) {
-            val pump: *Pump                = ?controls.pumps[updates[i].handle.index];
+            val pump: *Pump                = pump_at(controls, updates[i].handle.index);
             val old:  *AdmissionGeneration =
                 ?pump.admissions[1 - pump.active_admission];
             if (!begin_retire(old)) {
@@ -2176,7 +2203,8 @@ fun capacity_available(controls: *ControlView, runtime: *Runtime, pump: *Pump) b
 # NO_CONNECTION when the allocator refuses a slot or its storage
 fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     admission_bank: usize, lease: process_admission.Lease) usize {
-    if (runtime == nil || pump_index >= MAX_PUMPS
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (runtime == nil || pump == nil || pump_index >= MAX_PUMPS
         || admission_bank >= ADMISSION_BANKS) {
         ret NO_CONNECTION;
     }
@@ -2206,7 +2234,7 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
     value.source                  = runtime.next_source;
     runtime.next_source           = next_generation(runtime.next_source);
     value.pump                    = pump_index;
-    value.pump_generation         = controls.pumps[pump_index].generation;
+    value.pump_generation         = pump.generation;
     value.admission_bank          = admission_bank;
     value.lease                   = lease;
     value.state                   = CONNECTION_ACCEPTING;
@@ -2234,12 +2262,11 @@ fun acquire_connection(controls: *ControlView, runtime: *Runtime, pump_index: us
     value.superseded = false;
     value.live       = true;
     link_live(controls, runtime, index);
-    runtime.live_connections                      = runtime.live_connections + 1;
-    runtime.live_total                            = runtime.live_total + 1;
-    controls.pumps[pump_index].active_connections =
-        controls.pumps[pump_index].active_connections + 1;
-    controls.pumps[pump_index].admissions[admission_bank].active_connections =
-        controls.pumps[pump_index].admissions[admission_bank].active_connections + 1;
+    runtime.live_connections                           = runtime.live_connections + 1;
+    runtime.live_total                                 = runtime.live_total + 1;
+    pump.active_connections                            = pump.active_connections + 1;
+    pump.admissions[admission_bank].active_connections =
+        pump.admissions[admission_bank].active_connections + 1;
     ret index;
 }
 
@@ -2255,8 +2282,8 @@ fun release_process_lease(runtime: *Runtime, value: *Connection) bool {
 
 fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     val value: *Connection = connection_at(controls, index);
-    if (value.pump < MAX_PUMPS) {
-        val pump: *Pump = ?controls.pumps[value.pump];
+    val pump:  *Pump       = pump_at(controls, value.pump);
+    if (value.pump < MAX_PUMPS && pump != nil) {
         if (pump.active_connections != 0) {
             pump.active_connections = pump.active_connections - 1;
         }
@@ -2273,8 +2300,8 @@ fun free_connection(controls: *ControlView, runtime: *Runtime, index: usize) {
     }
     if (runtime.live_total != 0) { runtime.live_total = runtime.live_total - 1; }
     release_superseded(runtime, ?value.superseded);
-    if (value.pump < MAX_PUMPS) {
-        hold_codepoints(runtime, ?controls.pumps[value.pump], value, 0);
+    if (value.pump < MAX_PUMPS && pump != nil) {
+        hold_codepoints(runtime, pump, value, 0);
     }
     value.lease                    = process_admission.no_lease();
     value.policy                   = nil;
@@ -2382,9 +2409,10 @@ fun owner_of(controls: *ControlView, runtime: *Runtime, pump_index: usize, slot:
         Connection](controls.connections)) { ret NO_CONNECTION; }
     val index: usize       = slot::usize;
     val value: *Connection = connection_at(controls, index);
+    val pump:  *Pump       = pump_at(controls, pump_index);
     if (value == nil || !value.live || value.pump != pump_index
-        || !controls.pumps[pump_index].live
-        || controls.pumps[pump_index].generation != value.pump_generation
+        || pump == nil || !pump.live
+        || pump.generation != value.pump_generation
         || !value.assembly.initialized) { ret NO_CONNECTION; }
     val snapshot: assembly.RoutingSnapshot = assembly.routing_snapshot(?value.assembly);
     if (!snapshot.initialized) { ret NO_CONNECTION; }
@@ -2611,7 +2639,7 @@ fun initialize_tls(value: *Connection, engine: *server.Handshake,
 fun cleanup_accepting(controls: *ControlView, runtime: *Runtime, index: usize,
     now_ns: u64) bool {
     val value: *Connection          = connection_at(controls, index);
-    val pump:  *Pump                = ?controls.pumps[value.pump];
+    val pump:  *Pump                = pump_at(controls, value.pump);
     val bank:  *AdmissionGeneration = ?pump.admissions[value.admission_bank];
     if (value.state != CONNECTION_CLEANUP) { ret false; }
     if (value.assembly_attempted && !assembly.reusable(?value.assembly)) {
@@ -2744,7 +2772,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     bank_index: usize, index: usize, accepted: *quic_listener.Accepted,
     received: *net_types.Packet, config_snapshot: *ConnectionConfig,
     arrival_ns: u64, now_ns: u64) bool {
-    val pump:  *Pump       = ?controls.pumps[pump_index];
+    val pump:  *Pump       = pump_at(controls, pump_index);
     val value: *Connection = connection_at(controls, index);
     value.policy             = config_snapshot.tls_policy;
     value.plan               = config_snapshot.plan;
@@ -2827,7 +2855,7 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
     value.assembly_attempted = true;
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?config, ?value.storage.assembly_storage,
-        ?pump.storage.scratch, ?pump.secret_scratch,
+        ?pump.storage.scratch, controls.secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
         memory.borrowed_secret_source(?value.storage.borrower), engine,
         ?value.storage.scope, clock.from_ns(now_ns));
@@ -2852,8 +2880,8 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
 
 fun submit_stateless(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     received: *net_types.Packet, data: *u8, length: usize) Status {
-    val pump: *Pump = ?controls.pumps[pump_index];
-    if (data == nil || length == 0 || length > assembly.MAX_UDP_PAYLOAD) { ret FAILED; }
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil || data == nil || length == 0 || length > assembly.MAX_UDP_PAYLOAD) { ret FAILED; }
     val index: usize = stateless_sends.claim[CompletionContext](?pump.stateless);
     if (index == stateless_sends.NONE) {
         runtime.stateless_dropped = runtime.stateless_dropped + 1;
@@ -2997,6 +3025,8 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
     named_charge: *budget.Charge, lease: process_admission.Lease,
     deferred: bool, handshake_lease: process_admission.Lease,
     arrival_ns: u64) bool {
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil) { ret false; }
     val index: usize = free_pending_initial(runtime);
     if (index == NO_CONNECTION) { ret false; }
     val pending: *PendingInitial = pending_at(runtime, index);
@@ -3015,7 +3045,7 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
     take_pending_charge(runtime, index, config_snapshot.budgets, named_charge);
     pending.lease              = lease;
     pending.pump               = pump_index;
-    pending.pump_generation    = controls.pumps[pump_index].generation;
+    pending.pump_generation    = pump.generation;
     pending.admission_bank     = bank_index;
     pending.q_charge_live      = false;
     pending.budget_charge_live = pending.budget_charge.live;
@@ -3035,12 +3065,11 @@ fun enqueue_initial(controls: *ControlView, runtime: *Runtime, pump_index: usize
     # the unknown path, which drops them as replays; the client retransmits
     publish_pending_route(runtime, index, key);
     link_pending_live(runtime, index);
-    runtime.pending_initial_count              = runtime.pending_initial_count + 1;
-    runtime.live_total                         = runtime.live_total + 1;
-    controls.pumps[pump_index].queued_initials =
-        controls.pumps[pump_index].queued_initials + 1;
-    controls.pumps[pump_index].admissions[bank_index].queued_initials =
-        controls.pumps[pump_index].admissions[bank_index].queued_initials + 1;
+    runtime.pending_initial_count               = runtime.pending_initial_count + 1;
+    runtime.live_total                          = runtime.live_total + 1;
+    pump.queued_initials                        = pump.queued_initials + 1;
+    pump.admissions[bank_index].queued_initials =
+        pump.admissions[bank_index].queued_initials + 1;
     ret true;
 }
 
@@ -3049,6 +3078,8 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
     q_charge_live: bool, config_snapshot: PumpConfig,
     named_charge: *budget.Charge, lease: process_admission.Lease,
     lease_live: bool) bool {
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil) { ret false; }
     val index: usize = free_pending_initial(runtime);
     if (index == NO_CONNECTION) { ret false; }
     val pending: *PendingInitial = pending_at(runtime, index);
@@ -3061,7 +3092,7 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
     pending.lease              = lease;
     pending.length             = 0;
     pending.pump               = pump_index;
-    pending.pump_generation    = controls.pumps[pump_index].generation;
+    pending.pump_generation    = pump.generation;
     pending.admission_bank     = bank_index;
     pending.q_charge_live      = q_charge_live;
     pending.budget_charge_live = pending.budget_charge.live;
@@ -3071,12 +3102,11 @@ fun own_pending_cleanup(controls: *ControlView, runtime: *Runtime, pump_index: u
     pending.live               = true;
     link_pending_live(runtime, index);
     mark_pending_ready(runtime, index);
-    runtime.pending_initial_count              = runtime.pending_initial_count + 1;
-    runtime.live_total                         = runtime.live_total + 1;
-    controls.pumps[pump_index].queued_initials =
-        controls.pumps[pump_index].queued_initials + 1;
-    controls.pumps[pump_index].admissions[bank_index].queued_initials =
-        controls.pumps[pump_index].admissions[bank_index].queued_initials + 1;
+    runtime.pending_initial_count               = runtime.pending_initial_count + 1;
+    runtime.live_total                          = runtime.live_total + 1;
+    pump.queued_initials                        = pump.queued_initials + 1;
+    pump.admissions[bank_index].queued_initials =
+        pump.admissions[bank_index].queued_initials + 1;
     ret true;
 }
 
@@ -3088,8 +3118,8 @@ fun take_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize
     }
     if (runtime.live_total != 0) { runtime.live_total = runtime.live_total - 1; }
     release_superseded(runtime, ?pending.superseded);
-    if (pending.pump < MAX_PUMPS) {
-        val pump: *Pump = ?controls.pumps[pending.pump];
+    val pump: *Pump = pump_at(controls, pending.pump);
+    if (pending.pump < MAX_PUMPS && pump != nil) {
         if (pump.queued_initials != 0) {
             pump.queued_initials = pump.queued_initials - 1;
         }
@@ -3133,10 +3163,11 @@ fun take_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize
 
 fun release_pending_initial(controls: *ControlView, runtime: *Runtime, index: usize) bool {
     val pending: *PendingInitial = pending_at(runtime, index);
-    if (!pending.live || pending.pump >= MAX_PUMPS
+    val pump:    *Pump           = pump_at(controls, pending.pump);
+    if (!pending.live || pump == nil || pending.pump >= MAX_PUMPS
         || pending.admission_bank >= ADMISSION_BANKS) { ret false; }
     val bank: *AdmissionGeneration =
-        ?controls.pumps[pending.pump].admissions[pending.admission_bank];
+        ?pump.admissions[pending.admission_bank];
     if (pending.budget_charge_live) {
         if (!pending.budget_charge.live) {
             pending.budget_charge_live = false;
@@ -3306,8 +3337,8 @@ fun hold_arrival(runtime: *Runtime, pump: *Pump, received: *net_types.Packet,
 # itself claim storage
 fun preflight_arrival(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     now: time.Instant, now_ns: u64) Status {
-    val pump: *Pump = ?controls.pumps[pump_index];
-    if (!arrival_queue.held(?pump.arrivals)) { ret BLOCKED; }
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil || !arrival_queue.held(?pump.arrivals)) { ret BLOCKED; }
     var copy: arrival_queue.Arrival;
     if (!arrival_queue.take(?pump.arrivals, ?copy)) { ret FAILED; }
     var received:   net_types.Packet                 = arrival_queue.packet(?copy);
@@ -3351,10 +3382,11 @@ fun advance_arrivals(controls: *ControlView, runtime: *Runtime, now: time.Instan
     var status: Status = OK;
     var budget: usize  = PREFLIGHT_BUDGET;
     var spent:  u64    = 0;
+    val slots:  usize  = pump_slots(controls);
     var i:      usize  = 0;
-    for (i < MAX_PUMPS && budget != 0 && spent < runtime.unit_ns) {
-        val pump: *Pump = ?controls.pumps[i];
-        for (pump.live && budget != 0 && spent < runtime.unit_ns
+    for (i < slots && budget != 0 && spent < runtime.unit_ns) {
+        val pump: *Pump = pump_at(controls, i);
+        for (pump != nil && pump.live && budget != 0 && spent < runtime.unit_ns
             && arrival_queue.held(?pump.arrivals)) {
             val started_ns: u64 = monotonic_ns();
             if (preflight_arrival(controls, runtime, i, now, now_ns) == FAILED) {
@@ -3372,8 +3404,8 @@ fun advance_arrivals(controls: *ControlView, runtime: *Runtime, now: time.Instan
 fun handle_unknown(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     received: *net_types.Packet, key: routing.Key, now: time.Instant,
     now_ns: u64, arrival_ns: u64) Status {
-    val pump: *Pump = ?controls.pumps[pump_index];
-    if (pump.draining || pump.cancelling) { ret STOPPED; }
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil || pump.draining || pump.cancelling) { ret STOPPED; }
     val bank_index: usize                = pump.active_admission;
     val bank:       *AdmissionGeneration = ?pump.admissions[bank_index];
     var request:    quic_listener.Request;
@@ -3460,7 +3492,7 @@ fun release_handshake_lease(runtime: *Runtime, lease: *process_admission.Lease) 
 fun abandon_admission(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize, acceptance: quic_listener.Acceptance,
     named_charge: *budget.Charge, lease: process_admission.Lease) Status {
-    val pump:            *Pump                = ?controls.pumps[pump_index];
+    val pump:            *Pump                = pump_at(controls, pump_index);
     val bank:            *AdmissionGeneration = ?pump.admissions[bank_index];
     var charge_released: bool                 = true;
     if (named_charge.live) {
@@ -3554,7 +3586,7 @@ fun force_release_connection(controls: *ControlView, runtime: *Runtime,
         if (!remove_routes(runtime, value)) { ret FAILED; }
         value.routes_removed = true;
     }
-    val pump: *Pump                = ?controls.pumps[value.pump];
+    val pump: *Pump                = pump_at(controls, value.pump);
     val bank: *AdmissionGeneration = ?pump.admissions[value.admission_bank];
     if (value.charge_live) {
         quic_listener.release_connection(?bank.listener, value.charge);
@@ -3808,7 +3840,7 @@ fun fill_send_packet(operation: *SendOperation,
 fun generate_sends(controls: *ControlView, runtime: *Runtime, index: usize,
     now_ns: u64) bool {
     val value:    *Connection = connection_at(controls, index);
-    val pump:     *Pump       = ?controls.pumps[value.pump];
+    val pump:     *Pump       = pump_at(controls, value.pump);
     var attempts: usize       = 0;
     for (attempts < assembly.SEND_CAPACITY) {
         val operation_index: usize = free_send(value);
@@ -3878,7 +3910,7 @@ fun progress_connection(controls: *ControlView, runtime: *Runtime, index: usize,
             value.h3_deadline_ns = due;
         }
     }
-    tend_connection_ids(runtime, ?controls.pumps[value.pump], value, index);
+    tend_connection_ids(runtime, pump_at(controls, value.pump), value, index);
     val sends_ok: bool = generate_sends(controls, runtime, index, now_ns);
     if (value.handshake != NO_HANDSHAKE && assembly.tls_released(?value.assembly)
         && !release_handshake(controls, runtime, index, true, now_ns)) { ret false; }
@@ -3942,7 +3974,8 @@ fun process_datagram(controls: *ControlView, runtime: *Runtime, pump_index: usiz
     if (received == nil || received.truncated || received.zero_length
         || received.length == 0
         || received.length > assembly.MAX_UDP_PAYLOAD) { ret INVALID; }
-    val pump:       *Pump                            = ?controls.pumps[pump_index];
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil) { ret INVALID; }
     val classified: quic_listener.ClassifiedDatagram =
         quic_listener.classify_datagram(received.buffer, received.length,
         CONNECTION_ID_BYTES);
@@ -4030,8 +4063,10 @@ fun build_reset(runtime: *Runtime, pump: *Pump, received: *net_types.Packet, id:
 
 fun send_reset(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     received: *net_types.Packet, id: *u8, now_ns: u64) {
+    val pump: *Pump = pump_at(controls, pump_index);
+    if (pump == nil) { ret; }
     var reset:  [RESET_BYTES]u8;
-    val length: usize = build_reset(runtime, ?controls.pumps[pump_index], received, id,
+    val length: usize = build_reset(runtime, pump, received, id,
         now_ns, ?reset[0]);
     if (length != 0
         && submit_stateless(controls, runtime, pump_index, received, ?reset[0], length) == OK) {
@@ -4074,8 +4109,8 @@ fun take_forwarded(controls: *ControlView, runtime: *Runtime, now: time.Instant,
 fun context_current(controls: *ControlView, runtime: *Runtime, context: *CompletionContext) bool {
     if (runtime == nil || !runtime.initialized || context == nil
         || context.pump >= MAX_PUMPS) { ret false; }
-    val pump: *Pump = ?controls.pumps[context.pump];
-    if (!pump.live || pump.generation != context.pump_generation) {
+    val pump: *Pump = pump_at(controls, context.pump);
+    if (pump == nil || !pump.live || pump.generation != context.pump_generation) {
         ret false;
     }
     if (context.kind == COMPLETION_RECEIVE
@@ -4088,7 +4123,7 @@ fun context_current(controls: *ControlView, runtime: *Runtime, context: *Complet
 fun settle_receive(controls: *ControlView, runtime: *Runtime, context: *CompletionContext,
     completion: io_runtime.Completion, now: time.Instant,
     now_ns: u64) Status {
-    val pump: *Pump = ?controls.pumps[context.pump];
+    val pump: *Pump = pump_at(controls, context.pump);
     if (!pump.receive_pending) { ret STALE; }
     pump.receive_pending = false;
     if (completion.kind != io_runtime.RECEIVE_FROM
@@ -4177,7 +4212,7 @@ fun settle_send(controls: *ControlView, runtime: *Runtime, context: *CompletionC
 
 fun settle_stateless(controls: *ControlView, runtime: *Runtime, context: *CompletionContext,
     completion: io_runtime.Completion) Status {
-    val pump: *Pump = ?controls.pumps[context.pump];
+    val pump: *Pump = pump_at(controls, context.pump);
     if (context.operation >= stateless_sends.capacity[CompletionContext](?pump.stateless)) {
         ret STALE;
     }
@@ -4269,7 +4304,7 @@ fun finalize_connection(controls: *ControlView, runtime: *Runtime, index: usize,
     now_ns: u64) Status {
     val value: *Connection = connection_at(controls, index);
     if (!value.live || value.state != CONNECTION_FINALIZING) { ret INVALID; }
-    val pump:       *Pump = ?controls.pumps[value.pump];
+    val pump:       *Pump = pump_at(controls, value.pump);
     val bank_index: usize = value.admission_bank;
     if (!release_process_lease(runtime, value)) {
         retry_later(runtime, value, now_ns);
@@ -4327,7 +4362,7 @@ fun release_connection(controls: *ControlView, runtime: *Runtime, index: usize,
         if (!remove_routes(runtime, value)) { ret FAILED; }
         value.routes_removed = true;
     }
-    val pump: *Pump                = ?controls.pumps[value.pump];
+    val pump: *Pump                = pump_at(controls, value.pump);
     val bank: *AdmissionGeneration = ?pump.admissions[value.admission_bank];
     if (value.charge_live) {
         if (quic_listener.release_connection(?bank.listener,
@@ -4401,7 +4436,8 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
         var next:    usize           = pending.ready_next;
         if (i == last) { next = NO_CONNECTION; }
         unmark_pending_ready(runtime, i);
-        if (pending.pump >= MAX_PUMPS
+        val pump: *Pump = pump_at(controls, pending.pump);
+        if (pump == nil || pending.pump >= MAX_PUMPS
             || pending.admission_bank >= ADMISSION_BANKS) {
             if (!release_pending_initial(controls, runtime, i)) {
                 retry_release(runtime, i, now_ns);
@@ -4410,7 +4446,6 @@ fun advance_pending_initials(controls: *ControlView, runtime: *Runtime, now: tim
             i = next;
             cnt;
         }
-        val pump: *Pump                = ?controls.pumps[pending.pump];
         val bank: *AdmissionGeneration =
             ?pump.admissions[pending.admission_bank];
         if (pending.cleanup_only) {
@@ -4941,12 +4976,14 @@ pub fun graceful_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHan
 pub fun graceful_all(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
     if (runtime == nil || !runtime.initialized || now_ns == 0) { ret INVALID; }
     var status: Status = OK;
+    val slots:  usize  = pump_slots(controls);
     var i:      usize  = 0;
-    for (i < MAX_PUMPS) {
-        if (controls.pumps[i].live) {
+    for (i < slots) {
+        val pump: *Pump = pump_at(controls, i);
+        if (pump != nil && pump.live) {
             val applied: Status = graceful_pump(controls, runtime,
                 PumpHandle{index: i,
-                generation: controls.pumps[i].generation}, now_ns);
+                generation: pump.generation}, now_ns);
             if (applied != OK) { status = applied; }
         }
         i = i + 1;
@@ -4973,10 +5010,11 @@ pub fun cancel_all(controls: *ControlView, runtime: *Runtime) Status {
         }
         i = next;
     }
+    val slots: usize = pump_slots(controls);
     i = 0;
-    for (i < MAX_PUMPS) {
-        val pump: *Pump = ?controls.pumps[i];
-        if (pump.live) {
+    for (i < slots) {
+        val pump: *Pump = pump_at(controls, i);
+        if (pump != nil && pump.live) {
             pump.draining   = true;
             pump.cancelling = true;
             var bank: usize = 0;
@@ -5043,6 +5081,7 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
     pump.storage              = nil;
     pump.started              = false;
     pump.live                 = false;
+    hedge_storage.secret_table_release[Pump](controls.pumps, handle.index);
     if (runtime.pump_count != 0) { runtime.pump_count = runtime.pump_count - 1; }
     ret OK;
 }
@@ -5051,12 +5090,14 @@ pub fun release(controls: *ControlView, runtime: *Runtime) Status {
     if (runtime == nil || !runtime.initialized) { ret INVALID; }
     if (runtime.live_total != 0 || runtime.live_connections != 0
         || runtime.pending_initial_count != 0 || runtime.routes.len != 0) { ret BLOCKED; }
-    var i: usize = 0;
-    for (i < MAX_PUMPS) {
-        if (controls.pumps[i].live) {
+    val slots: usize = pump_slots(controls);
+    var i:     usize = 0;
+    for (i < slots) {
+        val pump: *Pump = pump_at(controls, i);
+        if (pump != nil && pump.live) {
             val released: Status = release_pump(controls, runtime,
                 PumpHandle{index: i,
-                generation: controls.pumps[i].generation});
+                generation: pump.generation});
             if (released != OK) { ret released; }
         }
         i = i + 1;
@@ -5183,15 +5224,16 @@ fun test_pump_config(generation: u64, policy: *hedge_tls.Policy,
 # the caller-side owner of the runtime's welded records, as composition keeps it
 #[testing]
 rec TestControls {
-    pumps:       [MAX_PUMPS]Pump;
-    connections: hedge_storage.Pair[ConnectionStorage, Connection];
-    handshakes:  hedge_storage.SecretTable[server.Handshake];
-    sessions:    hedge_storage.Pair[h3_session.SessionStorage, h3_session.Session];
-    view:        ControlView;
-    chunks:      hedge_storage.Chunks;
-    memory:      memory.Memory;
-    timers:      wheel.Wheel;
-    wakes:       hedge_wake.Queue;
+    pumps:          hedge_storage.SecretTable[Pump];
+    secret_scratch: assembly.SecretScratch;
+    connections:    hedge_storage.Pair[ConnectionStorage, Connection];
+    handshakes:     hedge_storage.SecretTable[server.Handshake];
+    sessions:       hedge_storage.Pair[h3_session.SessionStorage, h3_session.Session];
+    view:           ControlView;
+    chunks:         hedge_storage.Chunks;
+    memory:         memory.Memory;
+    timers:         wheel.Wheel;
+    wakes:          hedge_wake.Queue;
 }
 
 #[testing]
@@ -5202,6 +5244,9 @@ fun test_controls(fixture: *TestControls) *ControlView {
 # the pairs' plain halves and slab links draw on `a`
 #[testing]
 fun test_controls_on(fixture: *TestControls, a: *A.Allocator) *ControlView {
+    hedge_storage.make_secret_table_from[Pump](?fixture.pumps, test_allocator(), 1);
+    hedge_storage.secret_table_claim[Pump](?fixture.pumps);
+    hedge_storage.secret_table_claim[Pump](?fixture.pumps);
     hedge_storage.make_pair[ConnectionStorage, Connection](?fixture.connections, a);
     hedge_storage.make_secret_table[server.Handshake](?fixture.handshakes, test_allocator());
     hedge_storage.make_pair[h3_session.SessionStorage, h3_session.Session](?fixture.sessions, a);
@@ -5209,9 +5254,10 @@ fun test_controls_on(fixture: *TestControls, a: *A.Allocator) *ControlView {
     wheel.make(?fixture.timers, test_allocator(), 1);
     hedge_wake.make(?fixture.wakes, test_allocator());
     memory.make(?fixture.memory, 64 * 1024 * 1024, test_allocator());
-    fixture.view = ControlView{pumps: ?fixture.pumps[0],
-        connections: ?fixture.connections,
-        handshakes:  ?fixture.handshakes, sessions: ?fixture.sessions};
+    fixture.view = ControlView{pumps: ?fixture.pumps,
+        secret_scratch: ?fixture.secret_scratch,
+        connections:    ?fixture.connections,
+        handshakes:     ?fixture.handshakes, sessions: ?fixture.sessions};
     ret ?fixture.view;
 }
 
@@ -5309,10 +5355,8 @@ test pump_config__listener_identity_required {
 }
 
 test update__multi_pump_rolls_back_staging {
-    var control_pumps:   [MAX_PUMPS]Pump;
-    var control_storage: ControlView;
-    val controls:        *ControlView = ?control_storage;
-    control_storage.pumps = ?control_pumps[0];
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     var storages: [2]PumpStorage;
     runtime.live_head         = NO_CONNECTION;
@@ -5335,10 +5379,12 @@ test update__multi_pump_rolls_back_staging {
         ?selected_plan, ?budgets);
     val second_new: PumpConfig = test_pump_config(21, ?policy,
         ?selected_plan, ?budgets);
-    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?storages[0], 1, ?first_old)
-        || !test_prepare_pump(?runtime, ?controls.pumps[1], ?storages[1], 2, ?second_old)) { ret 1; }
+    val pump0: *Pump = pump_at(controls, 0);
+    val pump1: *Pump = pump_at(controls, 1);
+    if (!test_prepare_pump(?runtime, pump0, ?storages[0], 1, ?first_old)
+        || !test_prepare_pump(?runtime, pump1, ?storages[1], 2, ?second_old)) { ret 1; }
     # the second pump cannot grow a bank, so staging the first must roll back
-    controls.pumps[1].backing = nil;
+    pump1.backing = nil;
     var updates: [2]PumpUpdate;
     updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 1},
         config: first_new};
@@ -5347,25 +5393,23 @@ test update__multi_pump_rolls_back_staging {
     val updated: UpdateResult = test_update_all(controls, ?runtime, ?updates[0], 2);
     if (updated.status != FAILED || updated.committed
         || updated.rollback_failed
-        || controls.pumps[0].active_admission != 0
-        || controls.pumps[1].active_admission != 0
-        || controls.pumps[0].admissions[1].live
-        || controls.pumps[0].admissions[0].retiring
-        || controls.pumps[1].admissions[0].retiring) { ret 2; }
-    if (!begin_retire(?controls.pumps[0].admissions[0])
-        || !reap_admission(?controls.pumps[0].admissions[0])
-        || !begin_retire(?controls.pumps[1].admissions[0])
-        || !reap_admission(?controls.pumps[1].admissions[0])) { ret 3; }
+        || pump0.active_admission != 0
+        || pump1.active_admission != 0
+        || pump0.admissions[1].live
+        || pump0.admissions[0].retiring
+        || pump1.admissions[0].retiring) { ret 2; }
+    if (!begin_retire(?pump0.admissions[0])
+        || !reap_admission(?pump0.admissions[0])
+        || !begin_retire(?pump1.admissions[0])
+        || !reap_admission(?pump1.admissions[0])) { ret 3; }
     ret 0;
 }
 
 test rollback__failure_is_fatal {
-    var control_pumps:   [MAX_PUMPS]Pump;
-    var control_storage: ControlView;
-    val controls:        *ControlView = ?control_storage;
-    control_storage.pumps = ?control_pumps[0];
-    var runtime: Runtime;
-    var storage: PumpStorage;
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    var storage:  PumpStorage;
     runtime.live_head         = NO_CONNECTION;
     runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized       = true;
@@ -5381,10 +5425,11 @@ test rollback__failure_is_fatal {
         ?selected_plan, ?budgets);
     val new_config: PumpConfig = test_pump_config(11, ?policy,
         ?selected_plan, ?budgets);
-    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?storage, 1, ?old_config)
-        || !initialize_admission_inner(?controls.pumps[0], 1, ?new_config,
+    val pump0: *Pump = pump_at(controls, 0);
+    if (!test_prepare_pump(?runtime, pump0, ?storage, 1, ?old_config)
+        || !initialize_admission_inner(pump0, 1, ?new_config,
         false)) { ret 1; }
-    controls.pumps[0].admissions[1].listener.closing = true;
+    pump0.admissions[1].listener.closing = true;
     var update: [1]PumpUpdate;
     update[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 1},
         config: new_config};
@@ -5393,24 +5438,22 @@ test rollback__failure_is_fatal {
     val result: UpdateResult = rollback_result(controls, ?runtime, ?update[0], 1,
         ?staged[0], FAILED);
     if (result.status != FAILED || result.committed
-        || !result.rollback_failed || !controls.pumps[0].admissions[1].live) {
+        || !result.rollback_failed || !pump0.admissions[1].live) {
         ret 2;
     }
-    controls.pumps[0].admissions[1].listener.closing = false;
-    if (!begin_retire(?controls.pumps[0].admissions[0])
-        || !reap_admission(?controls.pumps[0].admissions[0])
-        || !begin_retire(?controls.pumps[0].admissions[1])
-        || !reap_admission(?controls.pumps[0].admissions[1])) { ret 3; }
+    pump0.admissions[1].listener.closing = false;
+    if (!begin_retire(?pump0.admissions[0])
+        || !reap_admission(?pump0.admissions[0])
+        || !begin_retire(?pump0.admissions[1])
+        || !reap_admission(?pump0.admissions[1])) { ret 3; }
     ret 0;
 }
 
 test update__committed_retirement_failure {
-    var control_pumps:   [MAX_PUMPS]Pump;
-    var control_storage: ControlView;
-    val controls:        *ControlView = ?control_storage;
-    control_storage.pumps = ?control_pumps[0];
-    var runtime: Runtime;
-    var storage: PumpStorage;
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    var storage:  PumpStorage;
     runtime.live_head         = NO_CONNECTION;
     runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized       = true;
@@ -5430,23 +5473,24 @@ test update__committed_retirement_failure {
         ?old_plan, ?budgets);
     val new_config: PumpConfig = test_pump_config(41, ?policy,
         ?new_plan, ?budgets);
-    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?storage, 5, ?old_config)) { ret 1; }
-    controls.pumps[0].admissions[0].listener.closing = true;
+    val pump0: *Pump = pump_at(controls, 0);
+    if (!test_prepare_pump(?runtime, pump0, ?storage, 5, ?old_config)) { ret 1; }
+    pump0.admissions[0].listener.closing = true;
     var updates: [1]PumpUpdate;
     updates[0] = PumpUpdate{handle: PumpHandle{index: 0, generation: 5},
         config: new_config};
     val updated: UpdateResult = test_update_all(controls, ?runtime, ?updates[0], 1);
     if (updated.status != FAILED || !updated.committed
         || updated.rollback_failed
-        || controls.pumps[0].active_admission != 1
-        || controls.pumps[0].plan != ?new_plan
-        || !controls.pumps[0].admissions[1].live
-        || controls.pumps[0].admissions[0].retiring) { ret 2; }
-    controls.pumps[0].admissions[0].listener.closing = false;
-    if (!begin_retire(?controls.pumps[0].admissions[0])
-        || !reap_admission(?controls.pumps[0].admissions[0])
-        || !begin_retire(?controls.pumps[0].admissions[1])
-        || !reap_admission(?controls.pumps[0].admissions[1])) { ret 3; }
+        || pump0.active_admission != 1
+        || pump0.plan != ?new_plan
+        || !pump0.admissions[1].live
+        || pump0.admissions[0].retiring) { ret 2; }
+    pump0.admissions[0].listener.closing = false;
+    if (!begin_retire(?pump0.admissions[0])
+        || !reap_admission(?pump0.admissions[0])
+        || !begin_retire(?pump0.admissions[1])
+        || !reap_admission(?pump0.admissions[1])) { ret 3; }
     ret 0;
 }
 
@@ -5473,7 +5517,8 @@ test update__retires_superseded_gracefully {
         ?old_plan, ?old_budgets);
     val new_config: PumpConfig = test_pump_config(31, ?policy,
         ?new_plan, ?new_budgets);
-    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?pump_storage, 4, ?old_config)) { ret 1; }
+    val pump0: *Pump = pump_at(controls, 0);
+    if (!test_prepare_pump(?runtime, pump0, ?pump_storage, 4, ?old_config)) { ret 1; }
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.no_lease());
     if (index != 0) { ret 2; }
@@ -5486,15 +5531,15 @@ test update__retires_superseded_gracefully {
     val updated: UpdateResult = test_update_all(controls, ?runtime, ?updates[0], 1);
     if (updated.status != OK || !updated.committed
         || updated.rollback_failed
-        || controls.pumps[0].active_admission != 1
-        || !controls.pumps[0].admissions[0].retiring
+        || pump0.active_admission != 1
+        || !pump0.admissions[0].retiring
         || connection.state != CONNECTION_GRACEFUL
         || superseded(controls, ?runtime) != 1) { ret 2; }
     return_connection(controls, ?runtime, index);
-    if (!reap_admission(?controls.pumps[0].admissions[0])
+    if (!reap_admission(?pump0.admissions[0])
         || superseded(controls, ?runtime) != 0
-        || !begin_retire(?controls.pumps[0].admissions[1])
-        || !reap_admission(?controls.pumps[0].admissions[1])) { ret 3; }
+        || !begin_retire(?pump0.admissions[1])
+        || !reap_admission(?pump0.admissions[1])) { ret 3; }
     ret 0;
 }
 
@@ -5611,7 +5656,7 @@ fun test_server_accept(prepared: *TestServer, fixture: *TestControls,
     config.local_source        = local;
     config.local_source_length = local_length;
     if (local_length == CONNECTION_ID_BYTES
-        && !advertise_reset_token(?controls.pumps[0], config)) { ret 4; }
+        && !advertise_reset_token(pump_at(controls, 0), config)) { ret 4; }
     config.alpn                 = ?prepared.protocol_bytes[0];
     config.alpn_length          = 2;
     config.entropy_context_size = 0;
@@ -5653,7 +5698,7 @@ test assembly_init__failure_returns_capacity {
     # this pump has no storage attached, so the public scratch is the test's
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
-        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        ?tls_server.scratch, controls.secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
         memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
@@ -5686,20 +5731,19 @@ test assembly_init__failure_returns_capacity {
 }
 
 test context_current__stale_generation {
-    var control_pumps:   [MAX_PUMPS]Pump;
-    var control_storage: ControlView;
-    val controls:        *ControlView = ?control_storage;
-    control_storage.pumps = ?control_pumps[0];
-    var runtime: Runtime;
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
     runtime.live_head         = NO_CONNECTION;
     runtime.pending_live_head = NO_CONNECTION;
     runtime.initialized       = true;
     var context: CompletionContext;
-    context.pump                 = 0;
-    context.pump_generation      = 9;
-    context.kind                 = COMPLETION_RECEIVE;
-    controls.pumps[0].live       = true;
-    controls.pumps[0].generation = 10;
+    context.pump            = 0;
+    context.pump_generation = 9;
+    context.kind            = COMPLETION_RECEIVE;
+    val pump0: *Pump = pump_at(controls, 0);
+    pump0.live       = true;
+    pump0.generation = 10;
     if (context_current(controls, ?runtime, ?context)) { ret 1; }
     context.pump_generation = 10;
     if (!context_current(controls, ?runtime, ?context)) { ret 2; }
@@ -5769,29 +5813,30 @@ test transfer_pending__keeps_old_generation {
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
     val pending: *PendingInitial = test_take_pending(?runtime);
     if (pending == nil) { ret 91; }
-    controls.pumps[0].live             = true;
-    controls.pumps[0].generation       = 4;
-    controls.pumps[0].active_admission = 1;
-    controls.pumps[0].plan             = ?new_plan;
+    val pump0: *Pump = pump_at(controls, 0);
+    pump0.live             = true;
+    pump0.generation       = 4;
+    pump0.active_admission = 1;
+    pump0.plan             = ?new_plan;
     val lease: process_admission.Lease =
         process_admission.Lease{index: 0, generation: 1};
     val index: usize = acquire_connection(controls, ?runtime, 0, 0, lease);
     pending.live = true;
     link_pending_live(?runtime, 0);
-    pending.pump                                    = 0;
-    pending.admission_bank                          = 0;
-    pending.accepted.charge.source                  = 20;
-    pending.accepted.charge.index                   = 3;
-    pending.accepted.charge.generation              = 5;
-    pending.lease                                   = lease;
-    pending.q_charge_live                           = true;
-    pending.lease_live                              = true;
-    pending.config.plan                             = ?old_plan;
-    pending.config.budgets                          = ?old_budgets;
-    runtime.pending_initial_count                   = 1;
-    runtime.live_total                              = runtime.live_total + 1;
-    controls.pumps[0].queued_initials               = 1;
-    controls.pumps[0].admissions[0].queued_initials = 1;
+    pending.pump                        = 0;
+    pending.admission_bank              = 0;
+    pending.accepted.charge.source      = 20;
+    pending.accepted.charge.index       = 3;
+    pending.accepted.charge.generation  = 5;
+    pending.lease                       = lease;
+    pending.q_charge_live               = true;
+    pending.lease_live                  = true;
+    pending.config.plan                 = ?old_plan;
+    pending.config.budgets              = ?old_budgets;
+    runtime.pending_initial_count       = 1;
+    runtime.live_total                  = runtime.live_total + 1;
+    pump0.queued_initials               = 1;
+    pump0.admissions[0].queued_initials = 1;
     val value: *Connection = connection_at(controls, index);
     value.plan = pending.config.plan;
     if (index != 0 || !transfer_pending_ownership(pending, ?pending.accepted, value)) { ret 1; }
@@ -5800,8 +5845,8 @@ test transfer_pending__keeps_old_generation {
     take_pending_initial(controls, ?runtime, 0);
     if (pending.live || pending.config.plan != nil
         || pending.config.budgets != nil || runtime.pending_initial_count != 0
-        || runtime.live_total != 1 || controls.pumps[0].queued_initials != 0
-        || controls.pumps[0].admissions[0].queued_initials != 0
+        || runtime.live_total != 1 || pump0.queued_initials != 0
+        || pump0.admissions[0].queued_initials != 0
         || !value.charge_live || value.charge.source != 20
         || !value.lease_live || value.state != CONNECTION_GRACEFUL) { ret 2; }
     value.charge_live = false;
@@ -5816,14 +5861,15 @@ fun test_queue_pending(controls: *ControlView, runtime: *Runtime,
     budgets: *budget.Set, waiting: *budget.Charge) *PendingInitial {
     val pending: *PendingInitial = test_take_pending(runtime);
     if (pending == nil || !claim_pending_timer(runtime, 0, false, waiting)) { ret nil; }
-    runtime.pending_initial_count                   = 1;
-    runtime.live_total                              = 1;
-    controls.pumps[0].live                          = true;
-    controls.pumps[0].generation                    = 2;
-    controls.pumps[0].queued_initials               = 1;
-    controls.pumps[0].admissions[0].live            = true;
-    controls.pumps[0].admissions[0].queued_initials = 1;
-    pending.live                                    = true;
+    val pump0: *Pump = pump_at(controls, 0);
+    runtime.pending_initial_count       = 1;
+    runtime.live_total                  = 1;
+    pump0.live                          = true;
+    pump0.generation                    = 2;
+    pump0.queued_initials               = 1;
+    pump0.admissions[0].live            = true;
+    pump0.admissions[0].queued_initials = 1;
+    pending.live                        = true;
     link_pending_live(runtime, 0);
     pending.pump            = 0;
     pending.pump_generation = 2;
@@ -5898,7 +5944,7 @@ test queued_initial__woken_by_budget_release {
     wake(controls, ?runtime, taken[0].owner, taken[0].call);
     if (!pending.ready || runtime.pending_ready_head != 0) { ret 6; }
     # the pump went away meanwhile, so the woken initial is released, not admitted
-    controls.pumps[0].live = false;
+    pump_at(controls, 0).live = false;
     if (advance_pending_initials(controls, ?runtime,
         time.Instant{sec: 1, nsec: 0}, 1000000000) != OK
         || pending.live || has_ready(?runtime) || items[0].active != 0) { ret 7; }
@@ -5961,13 +6007,14 @@ test release_pending__retries_lease_once {
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
     val pending: *PendingInitial = test_take_pending(?runtime);
     if (pending == nil) { ret 91; }
-    runtime.pending_initial_count                   = 1;
-    runtime.live_total                              = 1;
-    controls.pumps[0].live                          = true;
-    controls.pumps[0].queued_initials               = 1;
-    controls.pumps[0].admissions[0].live            = true;
-    controls.pumps[0].admissions[0].queued_initials = 1;
-    pending.live                                    = true;
+    val pump0: *Pump = pump_at(controls, 0);
+    runtime.pending_initial_count       = 1;
+    runtime.live_total                  = 1;
+    pump0.live                          = true;
+    pump0.queued_initials               = 1;
+    pump0.admissions[0].live            = true;
+    pump0.admissions[0].queued_initials = 1;
+    pending.live                        = true;
     link_pending_live(?runtime, 0);
     pending.pump           = 0;
     pending.admission_bank = 0;
@@ -6034,10 +6081,11 @@ test cancel_all__releases_queued_ownership {
     runtime.pending_initial_count = 1;
     runtime.live_total            = 1;
     runtime.pump_count            = 1;
-    if (!test_prepare_pump(?runtime, ?controls.pumps[0], ?pump_storage, 1, ?config)) { ret 3; }
-    controls.pumps[0].queued_initials               = 1;
-    controls.pumps[0].admissions[0].queued_initials = 1;
-    pending.live                                    = true;
+    val pump0: *Pump = pump_at(controls, 0);
+    if (!test_prepare_pump(?runtime, pump0, ?pump_storage, 1, ?config)) { ret 3; }
+    pump0.queued_initials               = 1;
+    pump0.admissions[0].queued_initials = 1;
+    pending.live                        = true;
     link_pending_live(?runtime, 0);
     pending.pump            = 0;
     pending.pump_generation = 1;
@@ -6049,8 +6097,8 @@ test cancel_all__releases_queued_ownership {
     pending.lease_live         = true;
     if (cancel_all(controls, ?runtime) != OK || pending.live
         || runtime.pending_initial_count != 0 || runtime.live_total != 0
-        || controls.pumps[0].queued_initials != 0
-        || controls.pumps[0].admissions[0].live
+        || pump0.queued_initials != 0
+        || pump0.admissions[0].live
         || process_admission.in_use(?manager) != 0
         || items[0].waiting != 0) { ret 4; }
     if (!budget.release(?budgets, ?running)) { ret 5; }
@@ -6068,14 +6116,15 @@ test superseded__queued_initial_pins_retirement {
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
     val pending: *PendingInitial = test_take_pending(?runtime);
     if (pending == nil) { ret 91; }
-    controls.pumps[0].live                          = true;
-    controls.pumps[0].generation                    = 1;
-    controls.pumps[0].active_admission              = 1;
-    controls.pumps[0].plan                          = ?new_plan;
-    controls.pumps[0].admissions[0].live            = true;
-    controls.pumps[0].admissions[0].retiring        = true;
-    controls.pumps[0].admissions[0].queued_initials = 1;
-    pending.live                                    = true;
+    val pump0: *Pump = pump_at(controls, 0);
+    pump0.live                          = true;
+    pump0.generation                    = 1;
+    pump0.active_admission              = 1;
+    pump0.plan                          = ?new_plan;
+    pump0.admissions[0].live            = true;
+    pump0.admissions[0].retiring        = true;
+    pump0.admissions[0].queued_initials = 1;
+    pending.live                        = true;
     link_pending_live(?runtime, 0);
     pending.pump            = 0;
     pending.pump_generation = 1;
@@ -6084,7 +6133,7 @@ test superseded__queued_initial_pins_retirement {
     # the swap that left the pump on the new plan is the mark
     mark_superseded_graceful(controls, ?runtime);
     if (superseded(controls, ?runtime) != 1
-        || reap_admission(?controls.pumps[0].admissions[0])) { ret 1; }
+        || reap_admission(?pump0.admissions[0])) { ret 1; }
     take_pending_initial(controls, ?runtime, 0);
     if (superseded(controls, ?runtime) != 0) { ret 2; }
     ret 0;
@@ -6257,7 +6306,7 @@ test connection_limit__caps_only_when_present {
         opt[usize].none{}, opt[usize].none{})) { ret 1; }
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 2; }
     runtime.admission = ?manager;
-    val pump: *Pump = ?controls.pumps[0];
+    val pump: *Pump = pump_at(controls, 0);
     pump.connection_limit   = opt[usize].none{};
     pump.active_connections = 5000;
     pump.queued_initials    = 5000;
@@ -6492,7 +6541,7 @@ test stateless__ceiling_drops_and_counts {
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    val pump: *Pump = ?controls.pumps[0];
+    val pump: *Pump = pump_at(controls, 0);
     if (!stateless_sends.make[CompletionContext](?pump.stateless, test_allocator(), MAX_STATELESS_PENDING)) { ret 91; }
     pump.stateless_generation = 0;
     var i: usize = 0;
@@ -6541,20 +6590,21 @@ fun test_defer_pending(controls: *ControlView, runtime: *Runtime, index: usize,
     pending.arrival_ns                  = arrival_ns;
     pending.config.handshake_timeout_ns = handshake_timeout_ns;
     if (!claim_pending_timer(runtime, index, true, ?pending.budget_charge)) { ret nil; }
-    controls.pumps[0].live               = true;
-    controls.pumps[0].generation         = 2;
-    controls.pumps[0].admissions[0].live = true;
-    pending.live                         = true;
-    pending.pump                         = 0;
-    pending.pump_generation              = 2;
-    pending.admission_bank               = 0;
+    val pump0: *Pump = pump_at(controls, 0);
+    pump0.live               = true;
+    pump0.generation         = 2;
+    pump0.admissions[0].live = true;
+    pending.live             = true;
+    pending.pump             = 0;
+    pending.pump_generation  = 2;
+    pending.admission_bank   = 0;
     link_deferred(runtime, index);
     link_pending_live(runtime, index);
-    runtime.pending_initial_count                   = runtime.pending_initial_count + 1;
-    runtime.live_total                              = runtime.live_total + 1;
-    controls.pumps[0].queued_initials               = controls.pumps[0].queued_initials + 1;
-    controls.pumps[0].admissions[0].queued_initials =
-        controls.pumps[0].admissions[0].queued_initials + 1;
+    runtime.pending_initial_count       = runtime.pending_initial_count + 1;
+    runtime.live_total                  = runtime.live_total + 1;
+    pump0.queued_initials               = pump0.queued_initials + 1;
+    pump0.admissions[0].queued_initials =
+        pump0.admissions[0].queued_initials + 1;
     ret pending;
 }
 
@@ -6634,8 +6684,9 @@ test release_handshake__expiry_classification {
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    controls.pumps[0].live       = true;
-    controls.pumps[0].generation = 4;
+    val pump0: *Pump = pump_at(controls, 0);
+    pump0.live       = true;
+    pump0.generation = 4;
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.Lease{index: 0, generation: 1});
     if (index == NO_CONNECTION) { ret 1; }
@@ -6862,8 +6913,9 @@ test mark_ready__handshake_list_while_record_held {
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    controls.pumps[0].live       = true;
-    controls.pumps[0].generation = 4;
+    val pump0: *Pump = pump_at(controls, 0);
+    pump0.live       = true;
+    pump0.generation = 4;
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.Lease{index: 0, generation: 1});
     if (index == NO_CONNECTION) { ret 1; }
@@ -6892,8 +6944,9 @@ test audit__finds_unlisted_work {
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    controls.pumps[0].live       = true;
-    controls.pumps[0].generation = 4;
+    val pump0: *Pump = pump_at(controls, 0);
+    pump0.live       = true;
+    pump0.generation = 4;
     val index: usize = acquire_connection(controls, ?runtime, 0, 0,
         process_admission.Lease{index: 0, generation: 1});
     if (index == NO_CONNECTION) { ret 1; }
@@ -6976,7 +7029,7 @@ test audit__asks_transport {
     val started:     u64                 = 1000000000;
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
-        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        ?tls_server.scratch, controls.secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
         memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
@@ -7067,7 +7120,7 @@ test arrivals__held_in_order_and_bounded {
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    val pump: *Pump = ?controls.pumps[0];
+    val pump: *Pump = pump_at(controls, 0);
     if (!arrival_queue.make(?pump.arrivals, test_allocator())) { ret 91; }
     # the queue holds what the socket buffer holds, never less than a batch
     if (arrival_capacity(schema.DEFAULT_QUIC_RECEIVE_BUFFER)
@@ -7116,7 +7169,7 @@ test arrivals__eviction_by_class {
     val controls: *ControlView = test_controls(?fixture);
     var runtime:  Runtime;
     if (!test_make(?fixture, ?runtime, test_allocator())) { ret 90; }
-    val pump: *Pump = ?controls.pumps[0];
+    val pump: *Pump = pump_at(controls, 0);
     if (!arrival_queue.make(?pump.arrivals, test_allocator())) { ret 91; }
     arrival_queue.resize(?pump.arrivals, 3);
     if (test_hold(?runtime, pump, 1, arrival_queue.UNTOKEN, 100) != OK
@@ -7353,7 +7406,7 @@ test handshake__refused_memory_resumes_on_wake {
     val started:     u64                 = 1000000000;
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
-        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        ?tls_server.scratch, controls.secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
         memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
@@ -7362,7 +7415,7 @@ test handshake__refused_memory_resumes_on_wake {
     value.tls_live           = true;
     value.assembly_attempted = true;
     var wire: [assembly.MAX_UDP_PAYLOAD]u8;
-    val sent: usize = test_dial(?tls_server, ?controls.pumps[0].secret_scratch, ?wire[0],
+    val sent: usize = test_dial(?tls_server, controls.secret_scratch, ?wire[0],
         assembly.MAX_UDP_PAYLOAD, clock.from_ns(started + 500));
     if (sent == 0) { ret 3; }
     val driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
@@ -7460,7 +7513,7 @@ test accept__mints_its_own_id_beside_the_retry_source {
     var budgets: budget.Set;
     var config:  PumpConfig = test_pump_config(40, ?policy, ?retry_plan, ?budgets);
     config.require_retry = true;
-    val pump: *Pump = ?controls.pumps[0];
+    val pump: *Pump = pump_at(controls, 0);
     if (!test_prepare_pump(?runtime, pump, ?pump_storage, 1, ?config)) { ret 1; }
     val listener:   *quic_listener.Listener = ?pump.admissions[0].listener;
     var tls_server: TestServer;
@@ -7470,7 +7523,7 @@ test accept__mints_its_own_id_beside_the_retry_source {
     val client_at: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
     var now_ns:    u64         = 1000000000;
     var wire:      [assembly.MAX_UDP_PAYLOAD]u8;
-    val first:     usize       = test_dial(?tls_server, ?pump.secret_scratch, ?wire[0],
+    val first:     usize       = test_dial(?tls_server, controls.secret_scratch, ?wire[0],
         assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns));
     if (first == 0) { ret 2; }
     # the first Initial is answered with a Retry whose source names this
@@ -7547,7 +7600,7 @@ test accept__mints_its_own_id_beside_the_retry_source {
     if (prepared != 0) { ret prepared; }
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
-        ?tls_server.scratch, ?pump.secret_scratch,
+        ?tls_server.scratch, controls.secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
         memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
@@ -7679,7 +7732,7 @@ fun test_establish(fixture: *TestControls, controls: *ControlView, runtime: *Run
     established.selected_plan.sealed     = true;
     established.config                   = test_pump_config(40, ?established.policy,
         ?established.selected_plan, ?established.budgets);
-    val pump: *Pump = ?controls.pumps[0];
+    val pump: *Pump = pump_at(controls, 0);
     if (!test_prepare_pump(runtime, pump, ?established.pump_storage, 1,
         ?established.config)) { ret 1; }
     val tls_server: *TestServer = ?established.tls_server;
@@ -7705,7 +7758,7 @@ fun test_establish(fixture: *TestControls, controls: *ControlView, runtime: *Run
     var now_ns:      u64                 = 1000000000;
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
-        ?tls_server.scratch, ?pump.secret_scratch,
+        ?tls_server.scratch, controls.secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
         memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
@@ -7714,7 +7767,7 @@ fun test_establish(fixture: *TestControls, controls: *ControlView, runtime: *Run
     value.tls_live           = true;
     value.assembly_attempted = true;
     var wire:   [assembly.MAX_UDP_PAYLOAD]u8;
-    val dialed: usize = test_dial(tls_server, ?pump.secret_scratch, ?wire[0],
+    val dialed: usize = test_dial(tls_server, controls.secret_scratch, ?wire[0],
         assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns));
     if (dialed == 0) { ret 5; }
     val server_driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;
@@ -7757,7 +7810,7 @@ test connection_ids__spares_route_to_the_owner_and_rotation_moves_them {
     var established: TestEstablished;
     val made:        i32 = test_establish(?fixture, controls, ?runtime, ?established);
     if (made != 0) { ret made; }
-    val pump:            *Pump                       = ?controls.pumps[0];
+    val pump:            *Pump                       = pump_at(controls, 0);
     val index:           usize                       = established.index;
     val value:           *Connection                 = connection_at(controls, index);
     val first_codepoint: u8                          = value.issuing;
@@ -7863,7 +7916,7 @@ test stateless_reset__answers_only_a_shed_connection {
     var established: TestEstablished;
     val made:        i32 = test_establish(?fixture, controls, ?runtime, ?established);
     if (made != 0) { ret made; }
-    val pump:          *Pump                       = ?controls.pumps[0];
+    val pump:          *Pump                       = pump_at(controls, 0);
     val value:         *Connection                 = connection_at(controls, established.index);
     val client_driver: *qt.Driver[binding.Binding] = ?dialer.driver;
     var now_ns:        u64                         = established.now_ns;
@@ -7981,7 +8034,7 @@ test h3_session__out_of_steps_requeued {
     var now_ns:      u64                 = 1000000000;
     val initialized: assembly.InitResult = assembly.init_server(
         ?value.assembly, ?tls_server.config, ?value.storage.assembly_storage,
-        ?tls_server.scratch, ?controls.pumps[0].secret_scratch,
+        ?tls_server.scratch, controls.secret_scratch,
         memory.borrowed_source(?value.storage.borrower),
         memory.borrowed_secret_source(?value.storage.borrower),
         handshake_at(controls, value.handshake),
@@ -7993,7 +8046,7 @@ test h3_session__out_of_steps_requeued {
     val client_at: ip.Endpoint = ip.endpoint(192, 0, 2, 2, 55000);
     var wire:      [assembly.MAX_UDP_PAYLOAD]u8;
     now_ns = now_ns + 1000;
-    val sent: usize = test_dial(?tls_server, ?controls.pumps[0].secret_scratch, ?wire[0],
+    val sent: usize = test_dial(?tls_server, controls.secret_scratch, ?wire[0],
         assembly.MAX_UDP_PAYLOAD, clock.from_ns(now_ns));
     if (sent == 0) { ret 3; }
     val server_driver: *qt.Driver[binding.Binding] = ?value.assembly.driver;

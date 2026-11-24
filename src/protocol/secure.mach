@@ -154,7 +154,6 @@ pub rec Channel {
 
 rec Session {
     transport:        tls_transport.Transport;
-    engine:           tls_server.Handshake;
     stream:           tls_stream.Stream;
     source:           buffers.Source;
     secrets:          buffers.SecretSource;
@@ -164,12 +163,15 @@ rec Session {
     read_scope_live:  bool;
     write_scope:      cancel.Scope;
     write_scope_live: bool;
+    handshake_index:  usize;
     engine_started:   bool;
     stream_started:   bool;
 }
 
 # one worker's sessions. channel (plain) and session (welded) are the two
 # halves of one pair, so they grow and compact in lockstep and share an index.
+# handshake records live in their own secret table and are returned as soon as
+# the TLS stream finishes the handshake into its established core.
 #
 # the tables are module storage addressed by the worker's index, not thread
 # local state: a session is welded, so a callback context cannot reach a table
@@ -178,6 +180,7 @@ rec Session {
 # ever touches its table.
 rec Table {
     paired:     storage.Pair[Channel, Session];
+    handshakes: storage.SecretTable[tls_server.Handshake];
     heap:       A.Allocator;
     prepared:   bool;
     live_count: usize;
@@ -243,9 +246,34 @@ fun prepare(table: usize) {
     if (table >= MAX_TABLES || tables[table].prepared) { ret; }
     val t: *Table = ?tables[table];
     page.make(?t.heap);
-    storage.make_pair[Channel, Session](?t.paired, ?t.heap);
+    storage.make_pair_from[Channel, Session](?t.paired, ?t.heap, 2);
+    storage.make_secret_table_from[tls_server.Handshake](?t.handshakes, ?t.heap, 1);
     t.live_count = 0;
     t.prepared   = true;
+}
+
+fun handshake_at(table: usize, index: usize) *tls_server.Handshake {
+    if (table >= MAX_TABLES || index == storage.NO_INDEX) { ret nil; }
+    ret storage.secret_table_at[tls_server.Handshake](?tables[table].handshakes, index);
+}
+
+fun release_handshake(h: Handle) bool {
+    val record: *Session = session_at(h);
+    if (record == nil || record.handshake_index == storage.NO_INDEX) { ret true; }
+    val index: usize                 = record.handshake_index;
+    val hs:    *tls_server.Handshake = handshake_at(h.table, index);
+    var ok:    bool                  = true;
+    if (record.engine_started) {
+        # destroying the engine releases the credential lease it took at the
+        # ClientHello, which is what lets a retired generation be reclaimed
+        if (hs == nil || !tls_server.destroy(hs)) { ok = false; }
+        record.engine_started = false;
+    }
+    record.handshake_index = storage.NO_INDEX;
+    if (!storage.secret_table_release[tls_server.Handshake](?tables[h.table].handshakes, index)) {
+        ok = false;
+    }
+    ret ok;
 }
 
 fun session_at(h: Handle) *Session {
@@ -286,6 +314,7 @@ pub fun acquire(table: usize) Handle {
     record.root_live        = false;
     record.read_scope_live  = false;
     record.write_scope_live = false;
+    record.handshake_index  = storage.NO_INDEX;
     record.engine_started   = false;
     record.stream_started   = false;
     t.live_count            = t.live_count + 1;
@@ -334,12 +363,7 @@ pub fun release(h: Handle) bool {
         if (!tls_stream.destroy(?record.stream)) { released = false; }
         record.stream_started = false;
     }
-    if (record.engine_started) {
-        # destroying the engine releases the credential lease it took at the
-        # ClientHello, which is what lets a retired generation be reclaimed
-        if (!tls_server.destroy(?record.engine)) { released = false; }
-        record.engine_started = false;
-    }
+    if (!release_handshake(h)) { released = false; }
     destroy_scopes(h);
     reset_channel(value, h);
     val t: *Table = ?tables[h.table];
@@ -595,6 +619,7 @@ fun settle_write(h: Handle, snapshot: tls_transport.Snapshot) {
     tls_stream.destroy_operation(?session_at(h).stream, snapshot.token);
     release_write_scope(h);
     if (kind == KIND_HANDSHAKE) {
+        if (session_at(h).stream.finished) { release_handshake(h); }
         value.handshake_settled = true;
         value.handshake_error   = snapshot.terminal_error;
         if (snapshot.terminal_error == tls_error.OK) { value.state = OPEN; }
@@ -925,27 +950,34 @@ pub fun begin(h: Handle, policy: *tls.Policy, connection: *cancel.Scope,
     extra.kind      = 0;
     extra.data.data = nil;
     extra.data.len  = 0;
-    if (!tls_server.init_with_credential_selector(?session_at(h).engine,
+    val hs_index: usize = storage.secret_table_claim[tls_server.Handshake](
+        ?tables[h.table].handshakes);
+    if (hs_index == storage.NO_INDEX) {
+        destroy_scopes(h);
+        ret false;
+    }
+    session_at(h).handshake_index = hs_index;
+    val hs: *tls_server.Handshake = handshake_at(h.table, hs_index);
+    if (hs == nil || !tls_server.init_with_credential_selector(hs,
         ?policy.configuration, lease(h), extra, 0,
         tls.tls_alpn_selector(policy))) {
+        release_handshake(h);
         destroy_scopes(h);
         ret false;
     }
     session_at(h).engine_started = true;
     if (!renew_scope(h, false, handshake)) {
-        tls_server.destroy(?session_at(h).engine);
-        session_at(h).engine_started = false;
+        release_handshake(h);
         destroy_scopes(h);
         ret false;
     }
     value.write_generation = next_generation(value.write_generation);
-    if (!tls_stream.serve(?session_at(h).stream, ?session_at(h).engine,
+    if (!tls_stream.serve(?session_at(h).stream, hs,
         lease(h), secret_lease(h), ?session_at(h).transport,
         ?session_at(h).write_scope,
         lane_token(WRITE_LANE_TOKEN, value.write_generation),
         completion_context(value))) {
-        tls_server.destroy(?session_at(h).engine);
-        session_at(h).engine_started = false;
+        release_handshake(h);
         destroy_scopes(h);
         ret false;
     }
@@ -1463,5 +1495,31 @@ test acquire__table_per_worker {
     if (!release(second) || live(1) != 0)                { ret 7; }
     # a table outside the bound is refused rather than indexed
     if (!absent(acquire(MAX_TABLES)) || live(MAX_TABLES) != 0) { ret 8; }
+    ret 0;
+}
+
+test handshake__slot_releases_and_compacts {
+    val h: Handle = acquire(0);
+    if (absent(h)) { ret 1; }
+    if (storage.pair_capacity[Channel, Session](?tables[0].paired) != 4
+        || storage.secret_table_capacity[tls_server.Handshake](?tables[0].handshakes) != 0
+        || session_at(h).handshake_index != storage.NO_INDEX) {
+        release(h);
+        ret 2;
+    }
+    val hs: usize = storage.secret_table_claim[tls_server.Handshake](?tables[0].handshakes);
+    if (hs == storage.NO_INDEX
+        || storage.secret_table_capacity[tls_server.Handshake](?tables[0].handshakes) != 2) {
+        release(h);
+        ret 3;
+    }
+    session_at(h).handshake_index = hs;
+    if (!release_handshake(h)
+        || session_at(h).handshake_index != storage.NO_INDEX
+        || storage.secret_table_capacity[tls_server.Handshake](?tables[0].handshakes) != 0) {
+        release(h);
+        ret 4;
+    }
+    if (!release(h) || storage.pair_capacity[Channel, Session](?tables[0].paired) != 0) { ret 5; }
     ret 0;
 }

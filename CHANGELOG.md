@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.18.2] - 2026-11-24
+
+### Changed
+
+- Updated `mach-std` to `v10.1.0` for small secret slab packing and `std.process.limits.locked_memory()`.
+- Log the process locked-memory limit (`RLIMIT_MEMLOCK`) at startup alongside the open-file limit (#484).
+
+### Fixed
+
+- Reduced locked-memory (`VmLck`) footprint across TLS, QUIC, and worker buffer pools so 16-worker Linux hosts stay within the default 8,192 KiB `RLIMIT_MEMLOCK` under 256 concurrent TLS connections (#484):
+  - Replaced eager `[MAX_PUMPS]Pump` arrays with a demand-grown `SecretTable[Pump]` (`first_shift = 0`) and one shared per-worker `SecretScratch`.
+  - Split `tls_server.Handshake` out of `secure.Session` into its own `SecretTable` and release it when the TLS handshake settles.
+  - Moved plain HTTP/3 `requests_slots` from welded `h3_session.Session` into plain `SessionStorage`, and start QUIC welded tables at `first_shift = 0`.
+  - Capped secret buffer pool retention to 4 small slab-packed slots and 2 large TLS record chunks per worker.
+- Synced `test/acme` and `test/fuzz` Mach 7 dependency pins, always rebuild the release binary in `doc/bench/run.sh`, and record `Memlock` in benchmark output (#485).
+
 ## [0.18.1] - 2026-11-23
 
 ### Changed
