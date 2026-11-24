@@ -54,7 +54,23 @@ below TLS rather than in HTTP.
 The property needs hundreds of live connections and a real TLS handshake on
 each. `mach test` runs its cases as parallel processes sharing one machine, so a
 case that saturates the box would change what every other case measures. It
-belongs in a CI lane against a release build instead.
+runs as its own lane against a release build instead.
+
+## The small run
+
+The whole suite at a scale a two- or four-core box carries beside its client:
+
+```sh
+test/load/run.sh
+LOAD_SCALE_SMALL=200 LOAD_SCALE_LARGE=1000 test/load/scale.sh
+LOAD_BURST_WARM=100 LOAD_BURST=1000 test/load/burst.sh
+LOAD_RAMP=1000 test/load/ramp.sh
+LOAD_KEEPALIVE=2000 test/load/keepalive.sh
+LOAD_CHURN_SECONDS=60 LOAD_CHURN_SAMPLE=5 LOAD_CHURN_CPU_TOLERANCE=50 test/load/churn.sh
+LOAD_RATE_DURATION=5 LOAD_RATE_WARMUP=1 test/load/rate.sh
+LOAD_HANDOFF_WORKERS="1 4" LOAD_HANDOFF_DURATION=5 LOAD_HANDOFF_WARMUP=1 test/load/handoff.sh
+test/load/migrate.sh
+```
 
 
 ## The QUIC cells
@@ -281,9 +297,9 @@ within half again the fastest), and under a `connection_memory_bytes` that
 funds one request the same two are served one after the other, because hedge
 advertises only the concurrency its request lane funds.
 
-CI runs it on the light tier at `LOAD_SCALE_SMALL=200 LOAD_SCALE_LARGE=1000`,
-which is enough connections for the slopes to be measured and few enough to
-fit the runner.
+The small run uses `LOAD_SCALE_SMALL=200 LOAD_SCALE_LARGE=1000`, which is
+enough connections for the slopes to be measured and few enough to fit a
+small box.
 
 ### Idle CPU, descriptors and timers (#176)
 
@@ -466,8 +482,8 @@ full-inbox count. It fails when:
   (0.7) for `requests` and `LOAD_HANDOFF_ACCEPT_EFFICIENCY` (0.5) for
   `connections`, since the one acceptor bounds how far those scale.
 
-`LOAD_HANDOFF_CELLS` picks the cells. CI runs 1 and 4 workers on a
-four-core runner, so the split is asserted there and the scaling is left to a
+`LOAD_HANDOFF_CELLS` picks the cells. The small run takes 1 and 4 workers,
+past half of a four-core box, so the split is asserted there and the scaling is left to a
 measured run. The lane binds ports 19190 to 19193.
 
 ## The ramp lane
@@ -551,7 +567,7 @@ Anything a retired connection leaves behind (a record, a timer entry, a pool
 chunk) grows the resident set at rest linearly in the connections served,
 and it fails the second check: the margin is 140 bytes a connection over the
 30,000 HTTP/3 connections of a 10-minute phase, and 1.4 KiB over the 3,000 of
-CI's. A walk over anything that grows the same way fails the third. The lane
+the small run's. A walk over anything that grows the same way fails the third. The lane
 binds ports 19160 to 19163.
 
 The HTTP/3 cell prints, beside the first check, the QUIC listener socket's
@@ -569,8 +585,8 @@ b163699 (+5.3 MiB against the 4 MiB margin). On two cores of a Ryzen 7
 8.6 MiB under load while the client never had more than two connections
 open, so the step was not a backlog of connections.
 
-CI runs 60 s at the default rates, and allows 50% of CPU drift because the
-client shares the runner's cores. An HTTP/3 connection costs the workers about
+The small run takes 60 s at the default rates, and allows 50% of CPU drift
+because the client shares the box's cores. An HTTP/3 connection costs the workers about
 4 ms of CPU, so 100 a second is about 40% of one core, on the CI runner and on
 the 5800X3D alike.
 

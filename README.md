@@ -81,18 +81,17 @@ See [Project boundaries](doc/PROJECTS.md) and [Architecture](doc/ARCHITECTURE.md
 
 ## Local development
 
-Each dependency is selected by an exact released version, and the resolved release is committed as a gitlink under `dep/`.
+Each dependency follows its `dev` branch (`ref = "branch/dev"`) until the mach 7 releases of the family are tagged, and the resolved commit is committed as a gitlink under `dep/`.
 
 ```sh
-mach dep pull
-mach test .
-mach test . --lib tests
+mach dep pull .
+mach test . --all
 mach build .
 ```
 
-`mach test . --lib tests` runs the test-only modules the executable never reaches.
+`mach test . --all` selects every artifact, target and profile, so it also runs the `tests` artifact's test-only modules the executable never reaches.
 
-GitHub Actions CI runs both test selections in both profiles and the live ACME conformance suite on every pull request.
+CI runs `mach test . --all` on every pull request. The load, fuzz and live ACME suites run locally from `test/`.
 
 
 Build output uses Mach's default `out/` directory.

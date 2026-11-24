@@ -26,7 +26,7 @@ Wire parsers, serializers, cryptographic algorithms, TLS handshakes, and compres
 - each input ends on the last byte before an unreadable page, so a read one byte past it faults
 - each harness checks its entry point's promise: a round trip, a comparison law, a model of the RFC or of the state the runtime must hold
 
-The replay is deterministic and runs in both profiles on the heavy tier (a pull request into `main`, or a dispatch with `heavy: fuzz` or `heavy: all`). The lane is built on every pull request so it cannot rot. `fuzz mutate` is the on-demand search: a seeded structural mutator over a boundary's corpus that writes findings and, with `--retain`, adds a minimized input for each outcome the corpus does not hold yet. It is not coverage-guided: no coverage instrumentation exists for Mach, so the search will not find a path that needs a specific constant to reach. [`test/fuzz/README.md`](../test/fuzz/README.md) has the commands.
+The replay is deterministic and is run locally in both profiles. `fuzz mutate` is the on-demand search: a seeded structural mutator over a boundary's corpus that writes findings and, with `--retain`, adds a minimized input for each outcome the corpus does not hold yet. It is not coverage-guided: no coverage instrumentation exists for Mach, so the search will not find a path that needs a specific constant to reach. [`test/fuzz/README.md`](../test/fuzz/README.md) has the commands.
 
 ### Fault injection
 
