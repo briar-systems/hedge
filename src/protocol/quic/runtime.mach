@@ -2768,6 +2768,35 @@ fun advertise_reset_token(pump: *Pump, config: *assembly.Config) bool {
     ret true;
 }
 
+fun connection_assembly_config(value: *Connection, index: usize,
+    config_snapshot: *ConnectionConfig) assembly.Config {
+    var config: assembly.Config = assembly.default_config(value.source,
+        value.local, value.peer);
+    config.local_source        = ?value.storage.local_cid[0];
+    config.local_source_length = CONNECTION_ID_BYTES;
+    config.alpn                = "h3"::*u8;
+    config.alpn_length         = 2;
+    config.server_name         = nil;
+    config.server_name_length  = 0;
+    config.max_idle_timeout    = config_snapshot.idle_timeout_ms::i64 * duration.MILLISECOND;
+    config.drain_timeout       = config_snapshot.drain_timeout_ns::i64 * duration.NANOSECOND;
+    # advertise the exact request stream limit the HTTP/3 session enforces so
+    # peers do not open streams that hedge immediately rejects (#489)
+    config.peer_bidirectional_streams = value.max_requests::u64;
+    config.tls_deadline               = opt[time.Instant].some{clock.from_ns(value.handshake_deadline_ns)};
+    config.tls_budget                 = config_snapshot.memory_budgets.lanes[memory.LANE_TLS::usize];
+    # hedge composes its own lanes onto quic's supply: the lanes after quic's
+    # three carry hedge's io and request budgets, and the account is opened and
+    # woken under the connection's timer owner
+    config.account_handle              = timer_owner(index);
+    config.extra_budgets               = ?config_snapshot.memory_budgets.lanes[quic_supply.LANES::usize];
+    config.extra_lanes                 = memory.LANES::usize - quic_supply.LANES::usize;
+    config.entropy_context_size        = value.policy.configuration.entropy_context_size;
+    config.entropy_secret_context_size = 0;
+    config.enable_early_data           = false;
+    ret config;
+}
+
 fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index: usize,
     bank_index: usize, index: usize, accepted: *quic_listener.Accepted,
     received: *net_types.Packet, config_snapshot: *ConnectionConfig,
@@ -2806,37 +2835,17 @@ fun initialize_connection(controls: *ControlView, runtime: *Runtime, pump_index:
         ret false;
     }
     value.scope_live = true;
-    var config: assembly.Config = assembly.default_config(value.source,
-        value.local, value.peer);
-    config.local_source        = ?value.storage.local_cid[0];
-    config.local_source_length = CONNECTION_ID_BYTES;
-    if (!advertise_reset_token(pump, ?config)) {
-        value.state = CONNECTION_CLEANUP;
-        cleanup_accepting(controls, runtime, index, now_ns);
-        ret false;
-    }
-    config.alpn               = "h3"::*u8;
-    config.alpn_length        = 2;
-    config.server_name        = nil;
-    config.server_name_length = 0;
-    config.max_idle_timeout   = config_snapshot.idle_timeout_ms::i64 * duration.MILLISECOND;
-    config.drain_timeout      = config_snapshot.drain_timeout_ns::i64 * duration.NANOSECOND;
     # the deadline counts from arrival: time spent waiting for a slot was the
     # client's, and a wait that could not fit was refused before this
     value.handshake_started_ns  = now_ns;
     value.handshake_deadline_ns = saturated_add(arrival_ns,
         config_snapshot.handshake_timeout_ns);
-    config.tls_deadline = opt[time.Instant].some{clock.from_ns(value.handshake_deadline_ns)};
-    config.tls_budget   = config_snapshot.memory_budgets.lanes[memory.LANE_TLS::usize];
-    # hedge composes its own lanes onto quic's supply: the lanes after quic's
-    # three carry hedge's io and request budgets, and the account is opened and
-    # woken under the connection's timer owner
-    config.account_handle              = timer_owner(index);
-    config.extra_budgets               = ?config_snapshot.memory_budgets.lanes[quic_supply.LANES::usize];
-    config.extra_lanes                 = memory.LANES::usize - quic_supply.LANES::usize;
-    config.entropy_context_size        = value.policy.configuration.entropy_context_size;
-    config.entropy_secret_context_size = 0;
-    config.enable_early_data           = false;
+    var config: assembly.Config = connection_assembly_config(value, index, config_snapshot);
+    if (!advertise_reset_token(pump, ?config)) {
+        value.state = CONNECTION_CLEANUP;
+        cleanup_accepting(controls, runtime, index, now_ns);
+        ret false;
+    }
     if (!assembly.apply_server_acceptance(?config, accepted)) {
         value.state = CONNECTION_CLEANUP;
         cleanup_accepting(controls, runtime, index, now_ns);
@@ -8310,5 +8319,55 @@ test teardown__holds_connection_until_released {
     if (!h3_session.abandon(?runtime.sessions, controls.sessions, again)
         || !h3_session.abandon(?runtime.sessions, controls.sessions, other)
         || runtime.sessions.live != 0) { ret 8; }
+    ret 0;
+}
+
+test assembly_config__advertises_configured_max_requests {
+    var storage:  ConnectionStorage;
+    var conn:     Connection;
+    var policy:   hedge_tls.Policy;
+    var snapshot: ConnectionConfig;
+    policy.configuration.entropy_context_size = 1;
+    conn.storage                              = ?storage;
+    conn.source                               = 77;
+    conn.local                                = ip.endpoint(192, 0, 2, 1, 443);
+    conn.peer                                 = ip.endpoint(192, 0, 2, 2, 55000);
+    conn.policy                               = ?policy;
+    conn.handshake_deadline_ns                = 5000000000;
+    conn.max_requests                         = 2;
+    storage.local_cid[0]                      = 1;
+    snapshot.idle_timeout_ms                  = 30000;
+    snapshot.drain_timeout_ns                 = CONNECTION_DRAIN_NS;
+    snapshot.memory_budgets                   = memory.connection_budgets(1024 * 1024,
+        memory.TLS_BUDGET, 65536, 0, 0, 16384);
+    var accepted: quic_listener.Accepted;
+    accepted.action                       = quic_listener.ACTION_ACCEPT;
+    accepted.version                      = packet.VERSION_1;
+    accepted.peer                         = conn.peer;
+    accepted.original_destination.len     = 8;
+    accepted.original_destination.data[0] = 9;
+    accepted.initial_destination          = accepted.original_destination;
+    accepted.initial_source.len           = 8;
+    accepted.initial_source.data[0]       = 10;
+    var config: assembly.Config = connection_assembly_config(?conn, 3, ?snapshot);
+    if (!assembly.apply_server_acceptance(?config, ?accepted)) { ret 1; }
+    var encoded: [assembly.PARAMETER_CAPACITY]u8;
+    val out:     transport_parameters.EncodeResult = assembly.encode_parameters(
+        ?config, qt.SERVER, ?encoded[0], assembly.PARAMETER_CAPACITY);
+    var decoded:  transport_parameters.Parameters;
+    var tp_store: transport_parameters.Storage;
+    if (!out.ok || transport_parameters.decode(?encoded[0], out.count, true,
+        transport_parameters.ROLE_SERVER, transport_parameters.default_limits(),
+        tp_store, ?decoded).status != transport_parameters.STATUS_DONE) { ret 2; }
+    if (decoded.initial_max_streams_bidi != 2) { ret 3; }
+    conn.max_requests = 6;
+    config            = connection_assembly_config(?conn, 3, ?snapshot);
+    if (!assembly.apply_server_acceptance(?config, ?accepted)) { ret 4; }
+    val out2: transport_parameters.EncodeResult = assembly.encode_parameters(
+        ?config, qt.SERVER, ?encoded[0], assembly.PARAMETER_CAPACITY);
+    if (!out2.ok || transport_parameters.decode(?encoded[0], out2.count, true,
+        transport_parameters.ROLE_SERVER, transport_parameters.default_limits(),
+        tp_store, ?decoded).status != transport_parameters.STATUS_DONE) { ret 5; }
+    if (decoded.initial_max_streams_bidi != 6) { ret 6; }
     ret 0;
 }
