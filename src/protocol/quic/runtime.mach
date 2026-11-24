@@ -657,6 +657,7 @@ pub rec Runtime {
     connection_failures: u64;
     stateless_dropped:   u64;
     arrivals_dropped:    [arrival_queue.CLASSES]u64;
+    arrivals_held:       usize;
     # Retry-token Initials refused because a replay store was full
     replay_full: u64;
     # the worker this runtime serves for and where it hands other workers'
@@ -1404,6 +1405,7 @@ pub fun make(controls: *ControlView, runtime: *Runtime, config: RuntimeConfig) b
     runtime.superseded_total  = 0;
     runtime.stateless_dropped = 0;
     clear_arrival_drops(runtime);
+    runtime.arrivals_held   = 0;
     runtime.replay_full     = 0;
     runtime.worker          = config.worker;
     runtime.steering        = config.steering;
@@ -2595,6 +2597,7 @@ pub fun has_ready(runtime: *Runtime) bool {
     ret runtime != nil && runtime.initialized
         && (runtime.ready_head != NO_CONNECTION || runtime.completions_head != nil
         || steering.signalled(runtime.steering, runtime.worker)
+        || runtime.arrivals_held != 0
         || runtime.pending_ready_head != NO_CONNECTION
         || runtime.handshake_ready_head != NO_CONNECTION
         || runtime.retire_head != NO_CONNECTION || promotable(runtime));
@@ -3330,8 +3333,16 @@ fun arrival_dropped(runtime: *Runtime, class: usize) {
 # the queue dropped to make room or could not hold
 fun hold_arrival(runtime: *Runtime, pump: *Pump, received: *net_types.Packet,
     key: routing.Key, class: usize, now_ns: u64) Status {
-    val held: arrival_queue.Holding = arrival_queue.hold(?pump.arrivals, received, key,
+    val before: usize                 = arrival_queue.live(?pump.arrivals);
+    val held:   arrival_queue.Holding = arrival_queue.hold(?pump.arrivals, received, key,
         class, now_ns);
+    val after: usize = arrival_queue.live(?pump.arrivals);
+    if (after > before) { runtime.arrivals_held = runtime.arrivals_held + (after - before); }
+    or (before > after) {
+        val diff: usize = before - after;
+        if (runtime.arrivals_held >= diff) { runtime.arrivals_held = runtime.arrivals_held - diff; }
+        or                                 { runtime.arrivals_held = 0; }
+    }
     if (held.evicted != arrival_queue.NONE)    { arrival_dropped(runtime, held.evicted); }
     if (held.outcome == arrival_queue.INVALID) { ret INVALID; }
     if (held.outcome == arrival_queue.DROPPED) {
@@ -3350,6 +3361,7 @@ fun preflight_arrival(controls: *ControlView, runtime: *Runtime, pump_index: usi
     if (pump == nil || !arrival_queue.held(?pump.arrivals)) { ret BLOCKED; }
     var copy: arrival_queue.Arrival;
     if (!arrival_queue.take(?pump.arrivals, ?copy)) { ret FAILED; }
+    if (runtime.arrivals_held != 0)                 { runtime.arrivals_held = runtime.arrivals_held - 1; }
     var received:   net_types.Packet                 = arrival_queue.packet(?copy);
     val classified: quic_listener.ClassifiedDatagram =
         quic_listener.classify_datagram(received.buffer, received.length,
@@ -4883,6 +4895,7 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
         service_connection(controls, runtime, index, now, now_ns);
         runtime.crypto_budget = 0;
         runtime.unit_ns       = elapsed_since(started_ns);
+        if (runtime.unit_ns == 0) { runtime.unit_ns = 1; }
         brk;
     }
     val arrivals_started_ns: u64 = monotonic_ns();
@@ -4890,12 +4903,14 @@ pub fun advance(controls: *ControlView, runtime: *Runtime, now_ns: u64) Status {
         connection_failed(runtime);
     }
     charge_arrival_work(runtime, arrivals_started_ns);
-    val promotion_started_ns: u64 = monotonic_ns();
+    val promotion_budget:     bool = runtime.crypto_budget != 0;
+    val promotion_started_ns: u64  = monotonic_ns();
     if (advance_pending_initials(controls, runtime, now, now_ns) == FAILED) {
         connection_failed(runtime);
     }
-    if (runtime.crypto_budget == 0) {
+    if (promotion_budget && runtime.crypto_budget == 0) {
         runtime.unit_ns = elapsed_since(promotion_started_ns);
+        if (runtime.unit_ns == 0) { runtime.unit_ns = 1; }
     }
     advance_teardown(controls, runtime, now, now_ns);
     ret status;
@@ -5085,7 +5100,12 @@ pub fun release_pump(controls: *ControlView, runtime: *Runtime, handle: PumpHand
     pump.listener_name = nil;
     clear_pump_config(pump);
     if (!stateless_sends.destroy[CompletionContext](?pump.stateless)) { ret FAILED; }
-    if (!arrival_queue.destroy(?pump.arrivals))                       { ret FAILED; }
+    val remaining_arrivals: usize = arrival_queue.live(?pump.arrivals);
+    if (!arrival_queue.destroy(?pump.arrivals)) { ret FAILED; }
+    if (runtime.arrivals_held >= remaining_arrivals) {
+        runtime.arrivals_held = runtime.arrivals_held - remaining_arrivals;
+    }
+    or { runtime.arrivals_held = 0; }
     pump.stateless_generation = 0;
     pump.storage              = nil;
     pump.started              = false;
@@ -8369,5 +8389,52 @@ test assembly_config__advertises_configured_max_requests {
         transport_parameters.ROLE_SERVER, transport_parameters.default_limits(),
         tp_store, ?decoded).status != transport_parameters.STATUS_DONE) { ret 5; }
     if (decoded.initial_max_streams_bidi != 6) { ret 6; }
+    ret 0;
+}
+
+test arrivals__held_arrivals_keep_runtime_ready {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 1; }
+    val slot: usize = hedge_storage.secret_table_claim[Pump](controls.pumps);
+    if (slot == NO_PUMP) { ret 2; }
+    val pump: *Pump = pump_at(controls, slot);
+    if (!arrival_queue.make(?pump.arrivals, test_allocator())) { ret 3; }
+    arrival_queue.resize(?pump.arrivals, 4);
+    if (has_ready(?runtime)) { ret 4; }
+    if (test_hold(?runtime, pump, 1, arrival_queue.UNTOKEN, 100) != OK
+        || runtime.arrivals_held != 1 || !has_ready(?runtime)) { ret 5; }
+    if (test_hold(?runtime, pump, 2, arrival_queue.TOKEN, 200) != OK
+        || runtime.arrivals_held != 2 || !has_ready(?runtime)) { ret 6; }
+    # draining through preflight_arrival drops arrivals_held back to zero
+    var dummy: arrival_queue.Arrival;
+    if (!arrival_queue.take(?pump.arrivals, ?dummy)) { ret 7; }
+    runtime.arrivals_held = runtime.arrivals_held - 1;
+    if (runtime.arrivals_held != 1 || !has_ready(?runtime)) { ret 8; }
+    if (!arrival_queue.take(?pump.arrivals, ?dummy))        { ret 9; }
+    runtime.arrivals_held = runtime.arrivals_held - 1;
+    if (runtime.arrivals_held != 0 || has_ready(?runtime)) { ret 10; }
+    if (!arrival_queue.destroy(?pump.arrivals))            { ret 11; }
+    ret 0;
+}
+
+test advance__preserves_unit_ns_when_handshake_spent_budget {
+    var fixture:  TestControls;
+    val controls: *ControlView = test_controls(?fixture);
+    var runtime:  Runtime;
+    if (!test_make(?fixture, ?runtime, test_allocator())) { ret 1; }
+    val index: usize = acquire_connection(controls, ?runtime, 0, 0,
+        process_admission.no_lease());
+    if (index == NO_CONNECTION) { ret 2; }
+    val value: *Connection = connection_at(controls, index);
+    # a connection in handshake state spends crypto_budget on advance; an idle
+    # advance_pending_initials below must not clobber unit_ns to zero
+    value.state     = CONNECTION_LIVE;
+    value.handshake = 0;
+    mark_ready(controls, ?runtime, index);
+    runtime.unit_ns = 0;
+    if (advance(controls, ?runtime, 1000000000) != OK) { ret 3; }
+    if (runtime.unit_ns == 0)                          { ret 4; }
     ret 0;
 }
