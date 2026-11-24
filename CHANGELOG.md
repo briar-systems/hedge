@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.18.1] - 2026-11-23
+
+### Changed
+
+- Updated `mach-std` to `v10.0.1` for Windows secret storage working-set growth.
+
 ## [0.18.0] - 2026-11-23
 
 ### Changed
